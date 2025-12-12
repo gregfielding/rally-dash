@@ -1,0 +1,49 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Only authenticated admins can access storage
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && 
+             firestore.get(/databases/(default)/documents/admins/$(request.auth.uid)) != null;
+    }
+    
+    // Base photos for mockups
+    match /base-photos/{productId}/{allPaths=**} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+    
+    // Displacement maps
+    match /displacement/{productId}/{allPaths=**} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+    
+    // Design files (SVG, PNG, PDF)
+    match /designs/{designId}/{allPaths=**} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+    
+    // Mockup images
+    match /mockups/{designId}/{allPaths=**} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+    
+    // Social/lifestyle images
+    match /social/{designId}/{allPaths=**} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+    
+    // Deny all other paths
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

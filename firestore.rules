@@ -1,0 +1,123 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper function to check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Helper function to check if user exists in admins collection
+    function isAdmin() {
+      return isAuthenticated() && 
+             exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+    
+    // Helper function to get user's role
+    function getUserRole() {
+      return get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role;
+    }
+    
+    // Helper function to check role permissions
+    function hasRole(requiredRole) {
+      if (!isAdmin()) {
+        return false;
+      }
+      let userRole = getUserRole();
+      let roles = ['viewer', 'editor', 'admin'];
+      return roles.indexOf(userRole) >= roles.indexOf(requiredRole);
+    }
+    
+    // Admins collection - only admins can read/write
+    match /admins/{uid} {
+      allow read: if isAdmin() && (request.auth.uid == uid || hasRole('admin'));
+      allow create: if isAdmin() && hasRole('admin');
+      allow update: if isAdmin() && hasRole('admin');
+      allow delete: if isAdmin() && hasRole('admin');
+    }
+    
+    // Leagues collection
+    match /leagues/{leagueId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && hasRole('editor');
+      allow update: if isAdmin() && hasRole('editor');
+      allow delete: if isAdmin() && hasRole('admin');
+    }
+    
+    // Teams collection
+    match /teams/{teamId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && hasRole('editor');
+      allow update: if isAdmin() && hasRole('editor');
+      allow delete: if isAdmin() && hasRole('admin');
+    }
+    
+    // Products collection
+    match /products/{productId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && hasRole('editor');
+      allow update: if isAdmin() && hasRole('editor');
+      allow delete: if isAdmin() && hasRole('admin');
+    }
+    
+    // Design families collection
+    match /designFamilies/{familyId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && hasRole('editor');
+      allow update: if isAdmin() && hasRole('editor');
+      allow delete: if isAdmin() && hasRole('admin');
+    }
+    
+    // Icons collection
+    match /icons/{iconId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && hasRole('editor');
+      allow update: if isAdmin() && hasRole('editor');
+      allow delete: if isAdmin() && hasRole('admin');
+    }
+    
+    // Model packs collection
+    match /modelPacks/{packId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && hasRole('editor');
+      allow update: if isAdmin() && hasRole('editor');
+      allow delete: if isAdmin() && hasRole('admin');
+    }
+    
+    // Designs collection
+    match /designs/{designId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && hasRole('editor');
+      allow update: if isAdmin() && hasRole('editor');
+      allow delete: if isAdmin() && hasRole('admin');
+    }
+    
+    // Mockups collection
+    match /mockups/{mockupId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && hasRole('editor');
+      allow update: if isAdmin() && hasRole('editor');
+      allow delete: if isAdmin() && hasRole('admin');
+    }
+    
+    // Publishes collection
+    match /publishes/{publishId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && hasRole('editor');
+      allow update: if isAdmin() && hasRole('editor');
+      allow delete: if isAdmin() && hasRole('admin');
+    }
+    
+    // Jobs collection
+    match /jobs/{jobId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && hasRole('editor');
+      allow update: if isAdmin() && hasRole('editor');
+      allow delete: if isAdmin() && hasRole('admin');
+    }
+    
+    // Deny all other collections
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
