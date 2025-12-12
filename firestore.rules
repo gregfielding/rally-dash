@@ -19,12 +19,11 @@ service cloud.firestore {
     
     // Helper function to check role permissions
     function hasRole(requiredRole) {
-      if (!isAdmin()) {
-        return false;
-      }
-      let userRole = getUserRole();
-      let roles = ['viewer', 'editor', 'admin'];
-      return roles.indexOf(userRole) >= roles.indexOf(requiredRole);
+      return isAdmin() && (
+        (requiredRole == 'viewer') || 
+        (requiredRole == 'editor' && (getUserRole() == 'editor' || getUserRole() == 'admin')) ||
+        (requiredRole == 'admin' && getUserRole() == 'admin')
+      );
     }
     
     // Admins collection - only admins can read/write
