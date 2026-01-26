@@ -2,14 +2,13 @@
 
 import { useState } from "react";
 import ProtectedRoute from "@/components/ProtectedRoute";
-import { useAuth } from "@/lib/hooks/useAuth";
 import { useLeagues } from "@/lib/hooks/useLeagues";
 import LeagueForm from "@/components/LeagueForm";
 import Modal from "@/components/Modal";
+import { TableSkeleton } from "@/components/Skeleton";
 import { League } from "@/lib/types/firestore";
 
 function LeaguesContent() {
-  const { adminUser } = useAuth();
   const { leagues, loading, error, createLeague, updateLeague, deleteLeague } = useLeagues();
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingLeague, setEditingLeague] = useState<League | undefined>();
@@ -46,32 +45,8 @@ function LeaguesContent() {
     }
   };
 
-  if (loading && leagues.length === 0) {
-    return (
-      <div className="flex items-center justify-center min-h-screen">
-        <div className="text-lg">Loading leagues...</div>
-      </div>
-    );
-  }
-
   return (
-    <div className="min-h-screen bg-gray-50">
-      <header className="bg-white border-b border-gray-200">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
-          <h1 className="text-2xl font-bold">Leagues</h1>
-          <div className="flex items-center gap-4">
-            <span className="text-sm text-gray-600">{adminUser?.email}</span>
-            <a
-              href="/dashboard"
-              className="px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 rounded"
-            >
-              Dashboard
-            </a>
-          </div>
-        </div>
-      </header>
-
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <>
         {error && (
           <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded text-red-700">
             {error}
@@ -88,7 +63,9 @@ function LeaguesContent() {
           </button>
         </div>
 
-        {leagues.length === 0 ? (
+        {loading && leagues.length === 0 ? (
+          <TableSkeleton />
+        ) : leagues.length === 0 ? (
           <div className="bg-white rounded-lg shadow p-8 text-center">
             <p className="text-gray-500 mb-4">No leagues yet. Create your first league!</p>
             <button
@@ -176,8 +153,7 @@ function LeaguesContent() {
             }}
           />
         </Modal>
-      </main>
-    </div>
+    </>
   );
 }
 

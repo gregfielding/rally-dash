@@ -25,3 +25,22 @@ body {
     text-wrap: balance;
   }
 }
+
+/* Ensure input text is always dark and readable - high specificity to override Tailwind */
+input[type="text"]:not([disabled]),
+input[type="email"]:not([disabled]),
+input[type="password"]:not([disabled]),
+input[type="number"]:not([disabled]),
+textarea:not([disabled]),
+select:not([disabled]) {
+  color: #111827 !important; /* text-gray-900 */
+}
+
+input[disabled] {
+  color: #374151 !important; /* text-gray-700 for disabled */
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: #9ca3af !important; /* text-gray-400 */
+}

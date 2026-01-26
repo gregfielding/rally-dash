@@ -1,7 +1,13 @@
 import { initializeApp, getApps, FirebaseApp } from "firebase/app";
-import { getAuth, Auth } from "firebase/auth";
+import {
+  getAuth,
+  Auth,
+  setPersistence,
+  browserLocalPersistence,
+} from "firebase/auth";
 import { getFirestore, Firestore } from "firebase/firestore";
 import { getStorage, FirebaseStorage } from "firebase/storage";
+import { getFunctions, Functions } from "firebase/functions";
 
 const firebaseConfig = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -16,20 +22,22 @@ let app: FirebaseApp | undefined;
 let auth: Auth | undefined;
 let db: Firestore | undefined;
 let storage: FirebaseStorage | undefined;
+let functionsInstance: Functions | undefined;
 
 if (typeof window !== "undefined") {
-  if (!getApps().length) {
-    app = initializeApp(firebaseConfig);
-  } else {
-    app = getApps()[0];
-  }
-  
-  if (app) {
+  try {
+    app = getApps().length ? getApps()[0] : initializeApp(firebaseConfig);
     auth = getAuth(app);
+    setPersistence(auth, browserLocalPersistence).catch((err) =>
+      console.error("[Firebase Config] Error setting persistence:", err)
+    );
     db = getFirestore(app);
     storage = getStorage(app);
+    functionsInstance = getFunctions(app);
+  } catch (err) {
+    console.error("[Firebase Config] Initialization error:", err);
   }
 }
 
-export { auth, db, storage };
+export { auth, db, storage, functionsInstance as functions };
 export default app;

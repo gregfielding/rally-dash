@@ -6,19 +6,14 @@
   "storage": {
     "rules": "storage.rules"
   },
+  "functions": {
+    "source": "functions"
+  },
   "hosting": {
-    "public": "out",
-    "ignore": [
-      "firebase.json",
-      "**/.*",
-      "**/node_modules/**"
-    ],
-    "rewrites": [
-      {
-        "source": "**",
-        "destination": "/index.html"
-      }
-    ],
+    "source": ".",
+    "frameworksBackend": {
+      "region": "us-central1"
+    },
     "headers": [
       {
         "source": "**/*.@(js|css|jpg|jpeg|gif|png|svg|webp|woff|woff2)",

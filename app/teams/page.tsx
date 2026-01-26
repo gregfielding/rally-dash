@@ -1,16 +1,16 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import ProtectedRoute from "@/components/ProtectedRoute";
-import { useAuth } from "@/lib/hooks/useAuth";
 import { useTeams } from "@/lib/hooks/useTeams";
 import { useLeagues } from "@/lib/hooks/useLeagues";
 import TeamForm from "@/components/TeamForm";
 import Modal from "@/components/Modal";
+import { TableSkeleton } from "@/components/Skeleton";
 import { Team } from "@/lib/types/firestore";
 
 function TeamsContent() {
-  const { adminUser } = useAuth();
   const { leagues } = useLeagues();
   const { teams, loading, error, createTeam, updateTeam, deleteTeam } = useTeams();
   const [selectedLeague, setSelectedLeague] = useState<string>("");
@@ -59,32 +59,9 @@ function TeamsContent() {
     }
   };
 
-  if (loading && teams.length === 0) {
-    return (
-      <div className="flex items-center justify-center min-h-screen">
-        <div className="text-lg">Loading teams...</div>
-      </div>
-    );
-  }
 
   return (
-    <div className="min-h-screen bg-gray-50">
-      <header className="bg-white border-b border-gray-200">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
-          <h1 className="text-2xl font-bold">Teams</h1>
-          <div className="flex items-center gap-4">
-            <span className="text-sm text-gray-600">{adminUser?.email}</span>
-            <a
-              href="/dashboard"
-              className="px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 rounded"
-            >
-              Dashboard
-            </a>
-          </div>
-        </div>
-      </header>
-
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <>
         {error && (
           <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded text-red-700">
             {error}
@@ -119,13 +96,15 @@ function TeamsContent() {
         {leagues.length === 0 && (
           <div className="mb-4 p-4 bg-yellow-50 border border-yellow-200 rounded text-yellow-800">
             <p>You need to create at least one league before adding teams.</p>
-            <a href="/leagues" className="underline mt-2 inline-block">
+            <Link href="/leagues" className="underline mt-2 inline-block">
               Create a league →
-            </a>
+            </Link>
           </div>
         )}
 
-        {filteredTeams.length === 0 && leagues.length > 0 ? (
+        {loading && teams.length === 0 ? (
+          <TableSkeleton />
+        ) : filteredTeams.length === 0 && leagues.length > 0 ? (
           <div className="bg-white rounded-lg shadow p-8 text-center">
             <p className="text-gray-500 mb-4">
               {selectedLeague ? "No teams found in this league." : "No teams yet. Create your first team!"}
@@ -250,8 +229,7 @@ function TeamsContent() {
             loading={saving}
           />
         </Modal>
-      </main>
-    </div>
+    </>
   );
 }
 

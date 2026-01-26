@@ -21,16 +21,19 @@ service cloud.firestore {
     function hasRole(requiredRole) {
       return isAdmin() && (
         (requiredRole == 'viewer') || 
-        (requiredRole == 'editor' && (getUserRole() == 'editor' || getUserRole() == 'admin')) ||
-        (requiredRole == 'admin' && getUserRole() == 'admin')
+        (requiredRole == 'editor' && (getUserRole() == 'editor' || getUserRole() == 'admin' || getUserRole() == 'ops')) ||
+        (requiredRole == 'admin' && getUserRole() == 'admin') ||
+        (requiredRole == 'ops' && (getUserRole() == 'ops' || getUserRole() == 'admin'))
       );
     }
     
-    // Admins collection - only admins can read/write
+    // Admins collection - users can read and create their own doc on first login
     match /admins/{uid} {
-      allow read: if isAdmin() && (request.auth.uid == uid || hasRole('admin'));
-      allow create: if isAdmin() && hasRole('admin');
-      allow update: if isAdmin() && hasRole('admin');
+      allow read: if isAuthenticated() && request.auth.uid == uid;
+      // Allow users to create their own admin doc on first login
+      allow create: if isAuthenticated() && request.auth.uid == uid;
+      // Only admins can update/delete
+      allow update: if isAdmin() && (hasRole('admin') || (request.auth.uid == uid && hasRole('admin')));
       allow delete: if isAdmin() && hasRole('admin');
     }
     
@@ -77,17 +80,304 @@ service cloud.firestore {
     // Model packs collection
     match /modelPacks/{packId} {
       allow read: if isAdmin();
-      allow create: if isAdmin() && hasRole('editor');
-      allow update: if isAdmin() && hasRole('editor');
-      allow delete: if isAdmin() && hasRole('admin');
+      allow create: if isAdmin() && (hasRole('editor') || hasRole('admin') || hasRole('ops'));
+      allow update: if isAdmin() && (hasRole('editor') || hasRole('admin') || hasRole('ops'));
+      allow delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+      // Identities subcollection
+      match /identities/{identityId} {
+        allow read: if isAdmin();
+        allow create, update, delete: if isAdmin() && (hasRole('editor') || hasRole('admin') || hasRole('ops'));
+      }
     }
     
-    // Designs collection
+    // Reference images collection
+    match /referenceImages/{refId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('editor') || hasRole('admin') || hasRole('ops'));
+    }
+    
+    // Training datasets collection
+    match /trainingDatasets/{datasetId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+    
+    // Legacy training jobs collection
+    match /trainingJobs/{jobId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
+    // --------------------------------------------------------------------
+    // LoRA Ops: rp_* collections for fal.ai integration
+    // --------------------------------------------------------------------
+
+    // rp_identities/{identityId}
+    // Source of truth for identity-level LoRA linkage.
+    match /rp_identities/{identityId} {
+      function rpIdentityRequiredFieldsPresent() {
+        return request.resource.data.token is string &&
+               request.resource.data.defaultTriggerPhrase is string &&
+               request.resource.data.status is string;
+      }
+
+      // Disallow changing core source-of-truth fields from the client.
+      function rpIdentitySourceFieldsUnchanged() {
+        return request.resource.data.token == resource.data.token &&
+               request.resource.data.defaultTriggerPhrase == resource.data.defaultTriggerPhrase;
+      }
+
+      allow read: if isAdmin();
+      allow create: if isAdmin() &&
+                    (hasRole('admin') || hasRole('ops')) &&
+                    rpIdentityRequiredFieldsPresent();
+      allow update: if isAdmin() &&
+                    (hasRole('admin') || hasRole('ops')) &&
+                    rpIdentitySourceFieldsUnchanged();
+      allow delete: if isAdmin() && hasRole('admin');
+    }
+
+    // rp_datasets/{datasetId}
+    match /rp_datasets/{datasetId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
+    // rp_dataset_images/{imageId}
+    match /rp_dataset_images/{imageId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
+    // rp_training_jobs/{jobId}
+    match /rp_training_jobs/{jobId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
+    // rp_lora_artifacts/{loraId}
+    // Source of truth for a specific LoRA weights artifact.
+    match /rp_lora_artifacts/{loraId} {
+      function rpArtifactRequiredFieldsPresent() {
+        return request.resource.data.identityId is string &&
+               request.resource.data.trainingJobId is string &&
+               request.resource.data.triggerPhrase is string &&
+               request.resource.data.weightsUrl is string;
+      }
+
+      // Prevent client from changing immutable linkage / weights fields.
+      function rpArtifactSourceFieldsUnchanged() {
+        return request.resource.data.identityId == resource.data.identityId &&
+               request.resource.data.trainingJobId == resource.data.trainingJobId &&
+               request.resource.data.triggerPhrase == resource.data.triggerPhrase &&
+               request.resource.data.weightsUrl == resource.data.weightsUrl;
+      }
+
+      allow read: if isAdmin();
+      allow create: if isAdmin() &&
+                    (hasRole('admin') || hasRole('ops')) &&
+                    rpArtifactRequiredFieldsPresent();
+      allow update: if isAdmin() &&
+                    (hasRole('admin') || hasRole('ops')) &&
+                    rpArtifactSourceFieldsUnchanged();
+      allow delete: if isAdmin() && hasRole('admin');
+    }
+
+    // rp_generations/{genId}
+    match /rp_generations/{genId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
+    // --------------------------------------------------------------------
+    // Product System: rp_products, rp_product_designs, rp_scene_presets,
+    // rp_generation_jobs, rp_product_assets
+    // --------------------------------------------------------------------
+
+    // rp_products/{productId}
+    match /rp_products/{productId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
+    // rp_product_designs/{designId}
+    match /rp_product_designs/{designId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
+    // rp_scene_presets/{presetId}
+    match /rp_scene_presets/{presetId} {
+      allow read: if isAdmin() && (hasRole('ops') || hasRole('admin') || hasRole('editor'));
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
+    // rp_generation_jobs/{jobId}
+    match /rp_generation_jobs/{jobId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
+    // rp_product_assets/{assetId}
+    match /rp_product_assets/{assetId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
+    // --------------------------------------------------------------------
+    // ProductDesign + AI Design Brief System
+    // --------------------------------------------------------------------
+
+    // rp_design_briefs/{briefId}
+    match /rp_design_briefs/{briefId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
+    // rp_design_concepts/{conceptId}
+    match /rp_design_concepts/{conceptId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
+    // rp_design_files/{fileId}
+    match /rp_design_files/{fileId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
+    // --------------------------------------------------------------------
+    // Inspiration Library System
+    // --------------------------------------------------------------------
+
+    // rp_inspirations/{inspirationId}
+    match /rp_inspirations/{inspirationId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops') || hasRole('editor'));
+    }
+
+    // --------------------------------------------------------------------
+    // Notifications System
+    // --------------------------------------------------------------------
+
+    // rp_notifications/{notificationId}
+    match /rp_notifications/{notificationId} {
+      allow read: if isAuthenticated() && request.auth.uid == resource.data.userId;
+      allow create: if false; // Only created by Cloud Functions
+      allow update: if isAuthenticated() && request.auth.uid == resource.data.userId;
+      allow delete: if false; // Not deletable, only mark as read
+    }
+
+    // rp_notification_preferences/{userId}
+    match /rp_notification_preferences/{userId} {
+      allow read: if isAuthenticated() && request.auth.uid == userId;
+      allow create, update: if isAuthenticated() && request.auth.uid == userId;
+      allow delete: if false;
+    }
+
+    // rp_asset_collections/{collectionId}
+    match /rp_asset_collections/{collectionId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops') || hasRole('editor'));
+    }
+
+    // rp_batch_jobs/{batchJobId}
+    match /rp_batch_jobs/{batchJobId} {
+      allow read: if isAdmin();
+      allow create: if false; // Only created by Cloud Functions
+      allow update: if false; // Only updated by Cloud Functions
+      allow delete: if false;
+    }
+
+    // --------------------------------------------------------------------
+    // Blanks Library System (LA Apparel Spec)
+    // --------------------------------------------------------------------
+
+    // blanks/{blankId}
+    // Physical garment templates from LA Apparel (per RP_Blanks_Library_Spec_Final.md)
+    match /blanks/{blankId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() && hasRole('admin');
+    }
+
+    // Legacy: rp_blanks/{blankId} (deprecated, kept for backward compatibility)
+    match /rp_blanks/{blankId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() && hasRole('admin');
+    }
+
+    // Legacy: rp_blank_images/{imageId} (deprecated)
+    match /rp_blank_images/{imageId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() && hasRole('admin');
+    }
+    
+    // Users collection (for first-login user creation)
+    match /users/{uid} {
+      allow read: if isAuthenticated() && request.auth.uid == uid;
+      allow create: if isAuthenticated() && request.auth.uid == uid;
+      allow update: if isAuthenticated() && request.auth.uid == uid;
+      allow delete: if false; // Only via admin functions
+    }
+    
+    // --------------------------------------------------------------------
+    // Design Assets Library System (Per RP_Design_Assets_Spec.md)
+    // --------------------------------------------------------------------
+
+    // designs/{designId} - Artwork designs with PNG/PDF files
     match /designs/{designId} {
       allow read: if isAdmin();
-      allow create: if isAdmin() && hasRole('editor');
-      allow update: if isAdmin() && hasRole('editor');
+      allow create, update: if isAdmin() && hasRole('admin');
       allow delete: if isAdmin() && hasRole('admin');
+
+      // designs/{designId}/links/{linkId} - Links to blanks/products
+      match /links/{linkId} {
+        allow read: if isAdmin();
+        allow create, update, delete: if isAdmin() && hasRole('admin');
+      }
+
+      // designs/{designId}/logs/{logId} - Audit logs
+      match /logs/{logId} {
+        allow read: if isAdmin();
+        allow create: if isAdmin() && hasRole('admin');
+        allow update, delete: if false; // Immutable audit trail
+      }
+    }
+
+    // design_teams/{teamId} - Sports teams for design tagging
+    // Note: Separate from existing teams collection to avoid conflicts
+    match /design_teams/{teamId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && hasRole('admin');
+    }
+
+    // print_packs/{packId} - Exported design packages
+    match /print_packs/{packId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && hasRole('admin');
+    }
+
+    // --------------------------------------------------------------------
+    // Product Mock Generation System (Per RP_Product_Mock_Generation_PNG_On_Blank_Spec.md)
+    // --------------------------------------------------------------------
+
+    // rp_mock_jobs/{jobId} - Mock generation job queue
+    match /rp_mock_jobs/{jobId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && request.auth.token.admin == true;
+    }
+
+    // rp_mock_assets/{assetId} - Generated mock images
+    match /rp_mock_assets/{assetId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && request.auth.token.admin == true;
+    }
+
+    // rp_blank_masks/{maskId} - Print region masks for blanks (Phase 3)
+    // maskId pattern: {blankId}_{view} e.g. "abc123_front"
+    match /rp_blank_masks/{maskId} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin() && hasRole('admin');
     }
     
     // Mockups collection

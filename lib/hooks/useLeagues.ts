@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useCallback } from "react";
+import useSWR from "swr";
 import { 
   collection, 
   getDocs, 
@@ -10,46 +11,34 @@ import {
   doc, 
   query, 
   orderBy,
-  serverTimestamp,
-  Timestamp
+  serverTimestamp
 } from "firebase/firestore";
 import { db } from "@/lib/firebase/config";
 import { League } from "@/lib/types/firestore";
 
-export function useLeagues() {
-  const [leagues, setLeagues] = useState<League[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const fetchLeagues = async () => {
-    if (!db) {
-      setError("Database not initialized");
-      setLoading(false);
-      return;
-    }
-
-    try {
-      setLoading(true);
-      setError(null);
+async function fetchLeagues(): Promise<League[]> {
+  if (!db) throw new Error("Database not initialized");
       const q = query(collection(db, "leagues"), orderBy("name"));
       const snapshot = await getDocs(q);
-      const data = snapshot.docs.map((doc) => ({
+  return snapshot.docs.map((doc) => ({
         id: doc.id,
         ...doc.data(),
       })) as League[];
-      setLeagues(data);
-    } catch (err: any) {
-      setError(err.message || "Failed to fetch leagues");
-    } finally {
-      setLoading(false);
+}
+
+export function useLeagues() {
+  const { data, error, isLoading, mutate } = useSWR<League[]>(
+    "leagues",
+    fetchLeagues,
+    {
+      revalidateOnFocus: false,
+      revalidateOnReconnect: true,
+      dedupingInterval: 5000,
+      keepPreviousData: true,
     }
-  };
+  );
 
-  useEffect(() => {
-    fetchLeagues();
-  }, []);
-
-  const createLeague = async (league: Omit<League, "id" | "createdAt" | "updatedAt">) => {
+  const createLeague = useCallback(async (league: Omit<League, "id" | "createdAt" | "updatedAt">) => {
     if (!db) throw new Error("Database not initialized");
     
     const slug = league.name.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
@@ -60,12 +49,21 @@ export function useLeagues() {
       updatedAt: serverTimestamp(),
     };
     
+    // Optimistic update
+    const optimisticLeague: League = {
+      ...newLeague as League,
+      id: "temp",
+      createdAt: undefined,
+      updatedAt: undefined,
+    };
+    mutate([...(data || []), optimisticLeague], false);
+    
     const docRef = await addDoc(collection(db, "leagues"), newLeague);
-    await fetchLeagues();
+    await mutate();
     return docRef.id;
-  };
+  }, [data, mutate]);
 
-  const updateLeague = async (id: string, updates: Partial<League>) => {
+  const updateLeague = useCallback(async (id: string, updates: Partial<League>) => {
     if (!db) throw new Error("Database not initialized");
     
     const updateData: any = {
@@ -77,24 +75,35 @@ export function useLeagues() {
       updateData.slug = updates.name.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
     }
     
+    // Optimistic update
+    const optimisticData = (data || []).map(league => 
+      league.id === id ? { ...league, ...updates } : league
+    );
+    mutate(optimisticData, false);
+    
     await updateDoc(doc(db, "leagues", id), updateData);
-    await fetchLeagues();
-  };
+    await mutate();
+  }, [data, mutate]);
 
-  const deleteLeague = async (id: string) => {
+  const deleteLeague = useCallback(async (id: string) => {
     if (!db) throw new Error("Database not initialized");
+    
+    // Optimistic update
+    const optimisticData = (data || []).filter(league => league.id !== id);
+    mutate(optimisticData, false);
+    
     await deleteDoc(doc(db, "leagues", id));
-    await fetchLeagues();
-  };
+    await mutate();
+  }, [data, mutate]);
 
   return {
-    leagues,
-    loading,
-    error,
+    leagues: data || [],
+    loading: isLoading,
+    error: error?.message || null,
     createLeague,
     updateLeague,
     deleteLeague,
-    refetch: fetchLeagues,
+    refetch: mutate,
   };
 }
 

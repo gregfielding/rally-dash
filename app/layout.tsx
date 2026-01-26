@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { SWRProvider } from "@/lib/providers/SWRProvider";
+import { AuthProvider } from "@/lib/providers/AuthProvider";
 
 export const metadata: Metadata = {
   title: "Rally Panties DesignOps",
@@ -13,7 +15,11 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        <AuthProvider>
+          <SWRProvider>{children}</SWRProvider>
+        </AuthProvider>
+      </body>
     </html>
   );
 }

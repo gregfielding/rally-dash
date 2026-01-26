@@ -1,46 +1,101 @@
 rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
-    // Only authenticated admins can access storage
+    // Basic helper: any signed-in user
     function isAuthenticated() {
       return request.auth != null;
     }
     
+    // Admin check via custom claim (matches Firestore pattern)
     function isAdmin() {
-      return isAuthenticated() && 
-             firestore.get(/databases/(default)/documents/admins/$(request.auth.uid)) != null;
+      return isAuthenticated() && request.auth.token.admin == true;
     }
-    
+
+    // LoRA Ops: Model pack identity face images
+    match /modelpacks/{packId}/identities/{identityId}/faces/{fileName} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // LoRA Ops: Reference library images
+    match /reference_library/{category}/{fileName} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // Per-identity reference images (saved generations)
+    match /identities/{identityId}/reference/{fileName} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // LoRA Ops: Training dataset zips (any file under packId)
+    match /training_zips/{packId}/{datasetFile} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // LoRA Ops: Dataset images mirrored from generations
+    match /datasets/{datasetId}/{fileName} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
     // Base photos for mockups
     match /base-photos/{productId}/{allPaths=**} {
-      allow read: if isAdmin();
+      allow read: if isAuthenticated();
       allow write: if isAdmin();
     }
-    
+
     // Displacement maps
     match /displacement/{productId}/{allPaths=**} {
-      allow read: if isAdmin();
+      allow read: if isAuthenticated();
       allow write: if isAdmin();
     }
-    
+
     // Design files (SVG, PNG, PDF)
     match /designs/{designId}/{allPaths=**} {
-      allow read: if isAdmin();
+      allow read: if isAuthenticated();
       allow write: if isAdmin();
     }
-    
+
     // Mockup images
     match /mockups/{designId}/{allPaths=**} {
-      allow read: if isAdmin();
+      allow read: if isAuthenticated();
       allow write: if isAdmin();
     }
-    
+
     // Social/lifestyle images
     match /social/{designId}/{allPaths=**} {
-      allow read: if isAdmin();
+      allow read: if isAuthenticated();
       allow write: if isAdmin();
     }
-    
+
+    // Rally Panties: Blank garment images
+    match /rp/blanks/{blankId}/{fileName} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // Rally Panties: Blank masks (Phase 3 - print region masks)
+    // Storage path: rp/blank_masks/{blankId}/{view}/mask.png
+    match /rp/blank_masks/{blankId}/{view}/{fileName} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // Design Assets: Print pack exports (ZIP files)
+    match /print_packs/{designId}/{fileName} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // Product Mock Generation: Output images
+    match /rp/mocks/{allPaths=**} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
     // Deny all other paths
     match /{allPaths=**} {
       allow read, write: if false;
