@@ -281,6 +281,32 @@ service cloud.firestore {
       allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops') || hasRole('editor'));
     }
 
+    // --------------------------------------------------------------------
+    // Taxonomy (Phase 3): Seeded reference data for filters, forms, batch import
+    // Read: authenticated app users (filters, design/product forms, import resolution)
+    // Write: admin/ops only; seeder and admin tools are the intended write path
+    // --------------------------------------------------------------------
+    match /rp_taxonomy_sports/{docId} {
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+    match /rp_taxonomy_leagues/{docId} {
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+    match /rp_taxonomy_entities/{docId} {
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+    match /rp_taxonomy_themes/{docId} {
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+    match /rp_taxonomy_design_families/{docId} {
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
     // rp_batch_jobs/{batchJobId}
     match /rp_batch_jobs/{batchJobId} {
       allow read: if isAdmin();
@@ -360,6 +386,13 @@ service cloud.firestore {
     // --------------------------------------------------------------------
     // Product Mock Generation System (Per RP_Product_Mock_Generation_PNG_On_Blank_Spec.md)
     // --------------------------------------------------------------------
+
+    // shopifySyncJobs/{jobId} - Shopify catalog sync queue (create from UI; worker updates)
+    match /shopifySyncJobs/{jobId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && (hasRole("admin") || hasRole("ops"));
+      allow update, delete: if isAdmin() && (hasRole("admin") || hasRole("ops"));
+    }
 
     // rp_mock_jobs/{jobId} - Mock generation job queue
     match /rp_mock_jobs/{jobId} {

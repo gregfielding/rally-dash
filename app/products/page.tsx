@@ -51,6 +51,7 @@ function ProductsContent() {
   const [batchError, setBatchError] = useState<string | null>(null);
   const [selectedProducts, setSelectedProducts] = useState<Set<string>>(new Set());
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
 
   const [isDesignBlankOpen, setIsDesignBlankOpen] = useState(false);
   const [designBlankDesignId, setDesignBlankDesignId] = useState("");
@@ -255,6 +256,32 @@ function ProductsContent() {
             className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium"
           >
             Create Product
+          </button>
+          <button
+            type="button"
+            onClick={async () => {
+              if (selectedProducts.size === 0) return;
+              const n = selectedProducts.size;
+              if (!window.confirm(`Delete ${n} product${n === 1 ? "" : "s"}? This cannot be undone.`)) return;
+              if (!db) return;
+              setBulkDeleting(true);
+              try {
+                for (const id of selectedProducts) {
+                  await deleteDoc(doc(db, "rp_products", id));
+                }
+                setSelectedProducts(new Set());
+                await refetch();
+              } catch (err) {
+                console.error("[Products] Bulk delete failed:", err);
+                alert("Failed to delete some products. See console for details.");
+              } finally {
+                setBulkDeleting(false);
+              }
+            }}
+            disabled={selectedProducts.size === 0 || bulkDeleting}
+            className="px-4 py-2 border border-red-300 text-red-700 bg-white rounded-lg hover:bg-red-50 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {bulkDeleting ? "Deleting…" : `Delete selected${selectedProducts.size > 0 ? ` (${selectedProducts.size})` : ""}`}
           </button>
         </div>
       </div>
@@ -644,7 +671,8 @@ function ProductsContent() {
                             }
                           }}
                           disabled={deletingId === product.id}
-                          className="text-red-600 hover:text-red-800 disabled:opacity-50"
+                          className="px-2 py-1 rounded border border-red-200 text-red-600 hover:bg-red-50 hover:border-red-300 disabled:opacity-50"
+                          title="Delete this product"
                         >
                           {deletingId === product.id ? "Deleting…" : "Delete"}
                         </button>

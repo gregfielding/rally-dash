@@ -12,7 +12,9 @@
     "start": "npm run shell",
     "deploy": "firebase deploy --only functions",
     "logs": "firebase functions:log",
-    "seed:presets": "node scripts/seed-scene-presets.js"
+    "seed:presets": "node scripts/seed-scene-presets.js",
+    "seed:taxonomy": "node scripts/seed-taxonomy.js",
+    "verify:taxonomy": "node scripts/verify-taxonomy.js"
   },
   "dependencies": {
     "firebase-admin": "^12.0.0",

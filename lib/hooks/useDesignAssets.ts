@@ -47,6 +47,12 @@ export interface UpdateDesignInput {
   colors?: DesignColor[];
   tags?: string[];
   description?: string;
+  /** Taxonomy (from rp_taxonomy_*). Pass null to clear. */
+  sportCode?: string | null;
+  leagueCode?: string | null;
+  teamCode?: string | null;
+  themeCode?: string | null;
+  designFamily?: string | null;
 }
 
 export interface UpdateDesignFileInput {

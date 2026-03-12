@@ -28,6 +28,7 @@ import {
   slugFromString,
   type ParsedForProduct,
 } from "@/lib/batchImport/productGeneration";
+import { resolveParsedTaxonomy, resolutionStatus, type ResolutionStatus } from "@/lib/batchImport/resolveTaxonomy";
 import {
   useDesigns,
   useDesignTeams,
@@ -35,12 +36,13 @@ import {
   useUpdateDesignFile,
 } from "@/lib/hooks/useDesignAssets";
 import { useBlanks } from "@/lib/hooks/useBlanks";
+import { useTaxonomyLeagues, useTaxonomyEntities, useTaxonomyDesignFamilies } from "@/lib/hooks/useTaxonomy";
 import { db, storage } from "@/lib/firebase/config";
 import { useAuth } from "@/lib/providers/AuthProvider";
 import type { DesignDoc } from "@/lib/types/firestore";
 
 type Step = "upload" | "preview";
-type ImportRowResult = { baseKey: string; action: "created" | "updated" | "skipped"; designId: string; error?: string };
+type ImportRowResult = { baseKey: string; action: "created" | "updated" | "skipped"; designId: string; error?: string; warnings?: string[] };
 type ProductRowResult = { baseKey: string; productId: string; productSlug?: string; action: "created" | "updated"; error?: string };
 
 function BatchImportContent() {
@@ -52,11 +54,18 @@ function BatchImportContent() {
 
   const { designs: allDesigns } = useDesigns({});
   const { teams } = useDesignTeams();
+  const { leagues: taxonomyLeagues, loading: taxonomyLeaguesLoading } = useTaxonomyLeagues();
+  const { entities: taxonomyEntities, loading: taxonomyEntitiesLoading } = useTaxonomyEntities({});
+  const { designFamilies: taxonomyDesignFamilies, loading: taxonomyDesignFamiliesLoading } = useTaxonomyDesignFamilies();
+  const taxonomyLoading = taxonomyLeaguesLoading || taxonomyEntitiesLoading || taxonomyDesignFamiliesLoading;
   const { createDesign } = useCreateDesign();
   const { updateFile } = useUpdateDesignFile();
   const { blanks } = useBlanks({ status: "active" });
   const { user } = useAuth();
   const uid = user?.uid ?? "";
+
+  /** teamId for createDesign when taxonomy entity is resolved but design_teams has no match. Must exist in design_teams. */
+  const BATCH_IMPORT_TEAM_ID = "batch_import";
 
   const [selectedForProducts, setSelectedForProducts] = useState<Set<string>>(new Set());
   const [selectedBlankId, setSelectedBlankId] = useState<string>("");
@@ -92,6 +101,21 @@ function BatchImportContent() {
   }));
 
   const grouped = groupParsedFiles(parseResults);
+  const leagues = taxonomyLeagues ?? [];
+  const entities = taxonomyEntities ?? [];
+  const designFamilies = taxonomyDesignFamilies ?? [];
+  /** Resolved taxonomy and status per grouped row (for preview before import) */
+  const resolvedByBaseKey = useMemo(() => {
+    const map = new Map<
+      string,
+      ReturnType<typeof resolveParsedTaxonomy> & { status: ResolutionStatus }
+    >();
+    for (const [baseKey, row] of grouped.entries()) {
+      const resolved = resolveParsedTaxonomy(row.parsed, leagues, entities, designFamilies);
+      map.set(baseKey, { ...resolved, status: resolutionStatus(resolved) });
+    }
+    return map;
+  }, [grouped, leagues, entities, designFamilies]);
   const validCount = parseResults.filter((r) => r.result.status === "valid").length;
   const invalidCount = files.length - validCount;
   const countByExt = files.reduce(
@@ -146,6 +170,9 @@ function BatchImportContent() {
     setImportResults(null);
     const results: ImportRowResult[] = [];
     const defaultColors = [{ hex: "#000000", name: "", role: "ink" as const }];
+    const leagues = taxonomyLeagues ?? [];
+    const entities = taxonomyEntities ?? [];
+    const designFamilies = taxonomyDesignFamilies ?? [];
 
     for (const [baseKey, row] of grouped.entries()) {
       const { parsed, files: rowFiles } = row;
@@ -153,7 +180,26 @@ function BatchImportContent() {
       const existing = existingByImportKey.get(baseKey);
       let designId: string;
 
+      const resolved = resolveParsedTaxonomy(parsed, leagues, entities, designFamilies);
+      if (resolved.teamCode === null) {
+        results.push({
+          baseKey,
+          action: "skipped",
+          designId: "",
+          error: `Team/entity "${parsed.team}" not found in taxonomy (row skipped)`,
+        });
+        continue;
+      }
+
       try {
+        const taxonomyPayload = {
+          ...(resolved.sportCode != null && { sportCode: resolved.sportCode }),
+          ...(resolved.leagueCode != null && { leagueCode: resolved.leagueCode }),
+          ...(resolved.teamCode != null && { teamCode: resolved.teamCode }),
+          ...(resolved.themeCode != null && { themeCode: resolved.themeCode }),
+          ...(resolved.designFamily != null && { designFamily: resolved.designFamily }),
+        };
+
         if (existing?.id) {
           designId = existing.id;
           for (const { file, ext } of rowFiles) {
@@ -176,21 +222,20 @@ function BatchImportContent() {
           const designRef = doc(db, "designs", designId);
           await updateDoc(designRef, {
             importKey: baseKey,
-            leagueCode: parsed.league,
-            designFamily: parsed.designFamily,
-            teamCode: parsed.team,
+            ...taxonomyPayload,
             supportedSides: [sideLower],
             variant: parsed.variant,
             updatedAt: new Date(),
             updatedByUid: uid,
           });
-          results.push({ baseKey, action: "updated", designId });
+          results.push({
+            baseKey,
+            action: "updated",
+            designId,
+            ...(resolved.warnings.length > 0 && { warnings: resolved.warnings }),
+          });
         } else {
-          const teamId = resolveTeamId(parsed.team);
-          if (teamId === null) {
-            results.push({ baseKey, action: "skipped", designId: "", error: "Unresolved team: " + parsed.team + " (no matching team; row skipped)" });
-            continue;
-          }
+          const teamId = resolveTeamId(parsed.team) ?? BATCH_IMPORT_TEAM_ID;
           const name = suggestedDesignName(parsed);
           const { designId: newId } = await createDesign({ name, teamId, colors: defaultColors });
           designId = newId;
@@ -214,15 +259,18 @@ function BatchImportContent() {
           const designRef = doc(db, "designs", designId);
           await updateDoc(designRef, {
             importKey: baseKey,
-            leagueCode: parsed.league,
-            designFamily: parsed.designFamily,
-            teamCode: parsed.team,
+            ...taxonomyPayload,
             supportedSides: [sideLower],
             variant: parsed.variant,
             updatedAt: new Date(),
             updatedByUid: uid,
           });
-          results.push({ baseKey, action: "created", designId });
+          results.push({
+            baseKey,
+            action: "created",
+            designId,
+            ...(resolved.warnings.length > 0 && { warnings: resolved.warnings }),
+          });
         }
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
@@ -237,7 +285,17 @@ function BatchImportContent() {
 
     setImportResults(results);
     setImporting(false);
-  }, [grouped, existingByImportKey, createDesign, updateFile, resolveTeamId, uid]);
+  }, [
+    grouped,
+    existingByImportKey,
+    createDesign,
+    updateFile,
+    resolveTeamId,
+    uid,
+    taxonomyLeagues,
+    taxonomyEntities,
+    taxonomyDesignFamilies,
+  ]);
 
   /** Rows that were successfully imported (created or updated) and can be used for product generation */
   const successfulImportRows = useMemo(() => {
@@ -565,13 +623,16 @@ function BatchImportContent() {
           <section className="bg-white rounded-lg shadow-sm border border-gray-200 p-6 mb-6">
             <h2 className="text-lg font-semibold text-gray-900 mb-3">Grouped designs</h2>
             <p className="text-sm text-gray-500 mb-3">
-              Files with the same base key become one design record. Matching key: league + family + team + side + variant.
+              Files with the same base key become one design record. League, team, and design family are resolved against taxonomy; only resolved codes are stored. Rows with an unresolved team are skipped.
             </p>
+            {taxonomyLoading && (
+              <p className="text-amber-600 text-sm mb-2">Loading taxonomy…</p>
+            )}
             <div className="flex flex-wrap gap-2 mb-4">
               <button
                 type="button"
                 onClick={runImport}
-                disabled={importing || grouped.size === 0}
+                disabled={importing || grouped.size === 0 || taxonomyLoading}
                 className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 text-sm font-medium"
               >
                 {importing ? "Importing…" : `Import ${grouped.size} design${grouped.size !== 1 ? "s" : ""}`}
@@ -583,6 +644,12 @@ function BatchImportContent() {
                   <tr className="bg-gray-50 border-b border-gray-200">
                     <th className="text-left py-2 px-3 font-medium text-gray-700">Key</th>
                     <th className="text-left py-2 px-3 font-medium text-gray-700">Suggested name</th>
+                    <th className="text-left py-2 px-3 font-medium text-gray-700">Sport</th>
+                    <th className="text-left py-2 px-3 font-medium text-gray-700">League</th>
+                    <th className="text-left py-2 px-3 font-medium text-gray-700">Team / Entity</th>
+                    <th className="text-left py-2 px-3 font-medium text-gray-700">Theme</th>
+                    <th className="text-left py-2 px-3 font-medium text-gray-700">Design Family</th>
+                    <th className="text-left py-2 px-3 font-medium text-gray-700">Resolution status</th>
                     <th className="text-left py-2 px-3 font-medium text-gray-700">PNG</th>
                     <th className="text-left py-2 px-3 font-medium text-gray-700">SVG</th>
                     <th className="text-left py-2 px-3 font-medium text-gray-700">PDF</th>
@@ -596,10 +663,24 @@ function BatchImportContent() {
                     const hasPdf = row.files.some((f) => f.ext === "pdf");
                     const existing = existingByImportKey.get(key);
                     const suggestedName = suggestedDesignName(row.parsed);
+                    const resolved = resolvedByBaseKey.get(key);
+                    const status = resolved?.status ?? "Partial resolution";
+                    const statusClass =
+                      status === "Resolved"
+                        ? "text-green-700 font-medium"
+                        : status === "Partial resolution"
+                          ? "text-gray-600"
+                          : "text-amber-700 font-medium";
                     return (
                       <tr key={key} className="border-b border-gray-100">
                         <td className="py-2 px-3 font-mono text-xs text-gray-900">{row.baseKey}</td>
                         <td className="py-2 px-3 text-gray-700">{suggestedName}</td>
+                        <td className="py-2 px-3 text-gray-700">{resolved?.sportCode ?? "—"}</td>
+                        <td className="py-2 px-3 text-gray-700">{resolved?.leagueCode ?? "—"}</td>
+                        <td className="py-2 px-3 text-gray-700">{resolved?.teamCode ?? "—"}</td>
+                        <td className="py-2 px-3 text-gray-500">{resolved?.themeCode ?? "—"}</td>
+                        <td className="py-2 px-3 text-gray-700">{resolved?.designFamily ?? "—"}</td>
+                        <td className={`py-2 px-3 ${statusClass}`}>{status}</td>
                         <td className="py-2 px-3">{hasPng ? "✓" : "—"}</td>
                         <td className="py-2 px-3">{hasSvg ? "✓" : "—"}</td>
                         <td className="py-2 px-3">{hasPdf ? "✓" : "—"}</td>
@@ -616,9 +697,14 @@ function BatchImportContent() {
                 <ul className="space-y-1 text-sm">
                   {importResults.map((r, i) => (
                     <li key={i} className={r.action === "skipped" || r.error ? "text-amber-700" : "text-gray-700"}>
-                      {r.baseKey} → {r.action === "skipped" ? "Skipped (unresolved team)" : r.error ? r.error : (r.action === "created" ? "Created" : "Updated")}
+                      {r.baseKey} → {r.action === "skipped" ? "Skipped (unresolved taxonomy)" : r.error ? r.error : (r.action === "created" ? "Created" : "Updated")}
                       {r.designId && <><span className="ml-1">·</span> <Link href={`/designs/${r.designId}`} className="text-blue-600 hover:underline">View</Link></>}
                       {r.action === "skipped" && r.error && <span className="block text-xs text-amber-600 mt-0.5">{r.error}</span>}
+                      {r.warnings && r.warnings.length > 0 && (
+                        <span className="block text-xs text-amber-600 mt-0.5" title={r.warnings.join("; ")}>
+                          Taxonomy: {r.warnings.join("; ")}
+                        </span>
+                      )}
                     </li>
                   ))}
                 </ul>

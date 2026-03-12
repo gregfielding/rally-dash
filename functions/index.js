@@ -25,6 +25,8 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 const storage = admin.storage();
 
+const shopifySync = require("./shopifySync");
+
 // Resolve a fal-ai model slug or URL into a full HTTPS URL.
 function resolveFalUrl(modelOrUrl) {
   if (!modelOrUrl) return null;
@@ -5102,6 +5104,7 @@ const SAMPLE_DESIGN_TEAMS = [
   { id: "la_lakers", name: "LA Lakers", league: "NBA", primaryColorHex: "#552583", tags: ["nba", "lakers", "la"] },
   { id: "ny_yankees", name: "NY Yankees", league: "MLB", primaryColorHex: "#003087", tags: ["mlb", "yankees", "ny"] },
   { id: "chicago_bulls", name: "Chicago Bulls", league: "NBA", primaryColorHex: "#CE1141", tags: ["nba", "bulls", "chicago"] },
+  { id: "batch_import", name: "Batch Import", league: null, primaryColorHex: "#6B7280", tags: ["batch", "import"] },
 ];
 
 /**
@@ -5375,7 +5378,7 @@ exports.updateDesignAsset = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError("permission-denied", "Only admins can update designs");
   }
 
-  const { designId, status, colors, tags, description, name } = data;
+  const { designId, status, colors, tags, description, name, sportCode, leagueCode, teamCode, themeCode, designFamily } = data;
 
   if (!designId || typeof designId !== "string") {
     throw new functions.https.HttpsError("invalid-argument", "designId is required");
@@ -5415,6 +5418,13 @@ exports.updateDesignAsset = functions.https.onCall(async (data, context) => {
   if (tags && Array.isArray(tags)) {
     updateData.tags = tags;
   }
+
+  // Taxonomy (optional; null clears)
+  if (sportCode !== undefined) updateData.sportCode = sportCode || null;
+  if (leagueCode !== undefined) updateData.leagueCode = leagueCode || null;
+  if (teamCode !== undefined) updateData.teamCode = teamCode || null;
+  if (themeCode !== undefined) updateData.themeCode = themeCode || null;
+  if (designFamily !== undefined) updateData.designFamily = designFamily || null;
 
   // Colors update
   if (colors && Array.isArray(colors)) {
@@ -5760,6 +5770,9 @@ exports.onMockJobCreated = functions
       const { designId, blankId, view, placementId, quality, input } = job;
       const { blankImageUrl, designPngUrl, placement } = input;
 
+      let heroAssetId = null;
+      let heroAssetUrl = null;
+
       // --- Stage A: Deterministic composite ---
       
       // Fetch the blank image
@@ -6006,7 +6019,9 @@ exports.onMockJobCreated = functions
             updatedBy: job.createdByUid,
           };
           const sanitizedAsset = sanitizeForFirestore(assetData);
-          await db.collection("rp_product_assets").add(sanitizedAsset);
+          const heroAssetRef = await db.collection("rp_product_assets").add(sanitizedAsset);
+          heroAssetId = heroAssetRef.id;
+          heroAssetUrl = heroUrl;
           if (job.heroSlot === "hero_front") media.heroFront = heroUrl;
           if (job.heroSlot === "hero_back") media.heroBack = heroUrl;
           console.log("[onMockJobCreated] Created hero asset and set product.media." + (job.heroSlot === "hero_front" ? "heroFront" : "heroBack"));
@@ -6303,12 +6318,13 @@ exports.onMockJobCreated = functions
         }
       }
 
-      // Update job as succeeded
+      // Update job as succeeded (include hero asset id/url when this was a hero job)
       await jobRef.update({
         status: "succeeded",
         output: {
           draftAssetId: draftAssetRef.id,
           finalAssetId: finalAssetId,
+          ...(heroAssetId && { heroAssetId, heroAssetUrl }),
         },
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -6324,6 +6340,132 @@ exports.onMockJobCreated = functions
           message: err.message || String(err),
           code: err.code || "UNKNOWN",
         },
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+  });
+
+/**
+ * Shopify catalog sync worker. Processes shopifySyncJobs (entityType: product, action: create_or_update).
+ * Loads Rally product, validates readiness, runs productSet (media + single variant + metafields), updates Rally and job.
+ */
+exports.onShopifySyncJobCreated = functions
+  .runWith({ memory: "512MB", timeoutSeconds: 120 })
+  .firestore.document("shopifySyncJobs/{jobId}")
+  .onCreate(async (snap, ctx) => {
+    const jobId = ctx.params.jobId;
+    const job = snap.data();
+    const jobRef = db.collection("shopifySyncJobs").doc(jobId);
+
+    if (job.entityType !== "product" || job.action !== "create_or_update") {
+      await jobRef.update({
+        status: "failed",
+        error: `Unsupported job: entityType=${job.entityType}, action=${job.action}`,
+        finishedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return;
+    }
+
+    const entityId = job.entityId;
+    if (!entityId) {
+      await jobRef.update({
+        status: "failed",
+        error: "Missing entityId",
+        finishedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return;
+    }
+
+    await jobRef.update({
+      status: "running",
+      startedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    const productRef = db.collection("rp_products").doc(entityId);
+    const productSnap = await productRef.get();
+
+    if (!productSnap.exists) {
+      await jobRef.update({
+        status: "failed",
+        error: `Product not found: ${entityId}`,
+        finishedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return;
+    }
+
+    const product = productSnap.data();
+    const readiness = shopifySync.readinessCheck(product);
+
+    if (!readiness.ready) {
+      const errorMsg = `Product not ready for sync: ${readiness.missing.join(", ")}`;
+      await productRef.update({
+        shopify: {
+          ...(product.shopify || {}),
+          status: "error",
+          lastSyncError: errorMsg,
+          lastSyncAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedBy: product.updatedBy || "",
+      });
+      await jobRef.update({
+        status: "failed",
+        error: errorMsg,
+        finishedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      console.warn("[onShopifySyncJobCreated] Product not ready:", jobId, readiness.missing);
+      return;
+    }
+
+    try {
+      const { store, accessToken } = shopifySync.getShopifyConfig();
+      const { productId, variantId } = await shopifySync.runProductSync(product, store, accessToken);
+
+      await productRef.update({
+        shopify: {
+          ...(product.shopify || {}),
+          productId,
+          variantId: variantId || null,
+          status: "synced",
+          lastSyncAt: admin.firestore.FieldValue.serverTimestamp(),
+          lastSyncError: null,
+        },
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedBy: product.updatedBy || "",
+      });
+
+      await jobRef.update({
+        status: "succeeded",
+        responseSummary: `productId=${productId}`,
+        finishedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      console.log("[onShopifySyncJobCreated] Sync succeeded:", jobId, productId);
+    } catch (err) {
+      const message = err.message || String(err);
+      console.error("[onShopifySyncJobCreated] Sync failed:", jobId, message);
+
+      await productRef.update({
+        shopify: {
+          ...(product.shopify || {}),
+          status: "error",
+          lastSyncError: message,
+          lastSyncAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedBy: product.updatedBy || "",
+      });
+
+      await jobRef.update({
+        status: "failed",
+        error: message,
+        finishedAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     }

@@ -28,6 +28,87 @@ export interface Team {
   updatedAt?: Timestamp;
 }
 
+// Taxonomy (rp_taxonomy_* collections, per RALLY_TAXONOMY_SPEC / RALLY_TAXONOMY_SEEDER_SPEC)
+export interface RpTaxonomySport {
+  id: string;
+  code: string;
+  name: string;
+  slug: string;
+  active: boolean;
+  sortOrder?: number | null;
+  description?: string | null;
+  createdAt?: Timestamp;
+  updatedAt?: Timestamp;
+}
+
+export interface RpTaxonomyLeague {
+  id: string;
+  code: string;
+  name: string;
+  slug: string;
+  sportCode?: string | null;
+  active: boolean;
+  sortOrder?: number | null;
+  description?: string | null;
+  createdAt?: Timestamp;
+  updatedAt?: Timestamp;
+}
+
+export type RpTaxonomyEntityType = "team" | "college" | "club" | "motorsport_team" | "generic_entity";
+
+export interface RpTaxonomyEntity {
+  id: string;
+  code: string;
+  name: string;
+  slug: string;
+  sportCode?: string | null;
+  leagueCode?: string | null;
+  entityType: RpTaxonomyEntityType;
+  active: boolean;
+  aliases?: string[] | null;
+  sortOrder?: number | null;
+  metadata?: { city?: string | null; state?: string | null; country?: string | null };
+  createdAt?: Timestamp;
+  updatedAt?: Timestamp;
+}
+
+export type RpTaxonomyThemeType = "generic_sport" | "humor" | "lifestyle" | "topical" | "campaign";
+
+export interface RpTaxonomyTheme {
+  id: string;
+  code: string;
+  name: string;
+  slug: string;
+  sportCode?: string | null;
+  leagueCode?: string | null;
+  active: boolean;
+  themeType?: RpTaxonomyThemeType | null;
+  sortOrder?: number | null;
+  description?: string | null;
+  createdAt?: Timestamp;
+  updatedAt?: Timestamp;
+}
+
+export interface RpTaxonomyDesignFamily {
+  id: string;
+  code: string;
+  name: string;
+  slug: string;
+  active: boolean;
+  sortOrder?: number | null;
+  description?: string | null;
+  createdAt?: Timestamp;
+  updatedAt?: Timestamp;
+}
+
+/** Optional display names resolved from taxonomy (e.g. for UI labels). */
+export interface RpTaxonomyDisplay {
+  sportName?: string;
+  leagueName?: string;
+  teamName?: string;
+  themeName?: string;
+}
+
 export interface Product {
   id?: string;
   name: string;
@@ -633,6 +714,14 @@ export interface RpProduct {
   brand?: string;
   productType?: string;
 
+  /** Taxonomy (RALLY_TAXONOMY_SPEC). Resolve against rp_taxonomy_* collections. */
+  sportCode?: string | null;
+  leagueCode?: string | null;
+  teamCode?: string | null;
+  themeCode?: string | null;
+  designFamily?: string | null;
+  taxonomy?: RpTaxonomyDisplay | null;
+
   category: RpProductCategory;
   baseProductKey: string; // "SFGIANTS_PANTY_1" (style family)
   /** Batch import deduplication: leagueCode_designFamily_teamCode_blankId_variant (e.g. MLB_WILL_DROP_FOR_GIANTS_HEATHER_GREY_BIKINI_LIGHT). Side is not part of the key. */
@@ -754,6 +843,7 @@ export interface RpProduct {
   // Spec: Shopify sync status
   shopify?: {
     productId?: string;
+    variantId?: string | null;
     status?: "not_synced" | "queued" | "synced" | "error";
     lastSyncAt?: Timestamp;
     lastSyncError?: string;
@@ -770,6 +860,21 @@ export interface RpProduct {
   updatedAt: Timestamp;
   createdBy: string;
   updatedBy: string;
+}
+
+/** Shopify sync job (shopifySyncJobs). Created by UI; processed by worker. */
+export interface ShopifySyncJob {
+  id?: string;
+  entityType: "product";
+  entityId: string;
+  action: "create_or_update";
+  status: "queued" | "running" | "succeeded" | "failed";
+  requestSummary?: string | null;
+  responseSummary?: string | null;
+  error?: string | null;
+  createdAt: Timestamp;
+  startedAt?: Timestamp | null;
+  finishedAt?: Timestamp | null;
 }
 
 // 1.2 Product Design (rp_product_designs/{designId})
@@ -1403,11 +1508,14 @@ export interface DesignDoc {
   tags: string[];                   // ['sf-giants','mlb','orange-black']
   description?: string;
 
-  // Batch import metadata (RALLY_BATCH_DESIGN_IMPORT)
+  // Batch import metadata (RALLY_BATCH_DESIGN_IMPORT) + taxonomy (RALLY_TAXONOMY_SPEC)
   importKey?: string;               // matching key: LEAGUE_DESIGNNAME_TEAM_SIDE_VARIANT
-  leagueCode?: string;              // e.g. 'MLB'
-  designFamily?: string;            // e.g. 'WILL_DROP_FOR'
-  teamCode?: string;                // e.g. 'GIANTS'
+  sportCode?: string | null;        // e.g. 'BASEBALL'
+  leagueCode?: string | null;      // e.g. 'MLB'
+  designFamily?: string | null;     // e.g. 'WILL_DROP_FOR'
+  teamCode?: string | null;         // e.g. 'GIANTS'
+  themeCode?: string | null;        // e.g. 'FUNNY_BASEBALL' for generic/humor designs
+  taxonomy?: { sportName?: string; leagueName?: string; teamName?: string; themeName?: string } | null;
   supportedSides?: string[];        // e.g. ['back']
   variant?: string;                 // e.g. 'LIGHT'
 

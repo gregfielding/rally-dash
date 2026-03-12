@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, FormEvent } from "react";
 import { useParams } from "next/navigation";
-import { deleteDoc, doc, writeBatch, updateDoc, collection, query, where, getDocs } from "firebase/firestore";
+import { addDoc, collection, deleteDoc, doc, getDocs, query, serverTimestamp, updateDoc, where, writeBatch } from "firebase/firestore";
 import { db } from "@/lib/firebase/config";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import { useProductBySlug } from "@/lib/hooks/useRPProducts";
@@ -23,6 +23,14 @@ import { useBlank, useBlanks } from "@/lib/hooks/useBlanks";
 import { useInspirations } from "@/lib/hooks/useInspirations";
 import { useAttachInspirationToProduct, useAttachInspirationToBrief } from "@/lib/hooks/useInspirationMutations";
 import { useAssetCollections } from "@/lib/hooks/useAssetCollections";
+import {
+  useTaxonomySports,
+  useTaxonomyLeagues,
+  useTaxonomyEntities,
+  useTaxonomyThemes,
+  useTaxonomyDesignFamilies,
+} from "@/lib/hooks/useTaxonomy";
+import { validateTaxonomyClassification } from "@/lib/taxonomy/validateTaxonomy";
 import Modal from "@/components/Modal";
 import {
   RpPrintMethod,
@@ -33,6 +41,7 @@ import {
   RpDesignBrief,
   RpConceptStatus,
 } from "@/lib/types/firestore";
+import { isProductReadyForShopify } from "@/lib/shopify/isProductReadyForShopify";
 
 // Assets Tab Component with Collections
 function AssetsTab({
@@ -1786,6 +1795,63 @@ function ProductDetailContent() {
     });
   }, [product?.id, product?.title, product?.name, product?.handle, product?.slug, product?.descriptionHtml, product?.description, product?.seo?.title, product?.seo?.description, product?.tags, product?.collectionKeys]);
 
+  // Taxonomy form state (product-level)
+  const [taxSportCode, setTaxSportCode] = useState<string | null>(null);
+  const [taxLeagueCode, setTaxLeagueCode] = useState<string | null>(null);
+  const [taxTeamCode, setTaxTeamCode] = useState<string | null>(null);
+  const [taxThemeCode, setTaxThemeCode] = useState<string | null>(null);
+  const [taxDesignFamily, setTaxDesignFamily] = useState<string | null>(null);
+  const [isSavingTaxonomy, setIsSavingTaxonomy] = useState(false);
+  useEffect(() => {
+    if (!product) return;
+    setTaxSportCode(product.sportCode ?? null);
+    setTaxLeagueCode(product.leagueCode ?? null);
+    setTaxTeamCode(product.teamCode ?? null);
+    setTaxThemeCode(product.themeCode ?? null);
+    setTaxDesignFamily(product.designFamily ?? null);
+  }, [product?.id, product?.sportCode, product?.leagueCode, product?.teamCode, product?.themeCode, product?.designFamily]);
+  const { sports: taxonomySports } = useTaxonomySports();
+  const { leagues: taxonomyLeagues } = useTaxonomyLeagues(taxSportCode ?? undefined);
+  const { entities: taxonomyEntities } = useTaxonomyEntities({
+    sportCode: taxSportCode ?? undefined,
+    leagueCode: taxLeagueCode ?? undefined,
+  });
+  const { themes: taxonomyThemes } = useTaxonomyThemes(taxSportCode ?? undefined);
+  const { designFamilies: taxonomyDesignFamilies } = useTaxonomyDesignFamilies();
+
+  const handleSaveProductTaxonomy = async () => {
+    if (!product?.id || !db) return;
+    const validation = validateTaxonomyClassification({
+      sportCode: taxSportCode ?? null,
+      leagueCode: taxLeagueCode ?? null,
+      teamCode: taxTeamCode ?? null,
+    });
+    if (!validation.valid) {
+      showToast(validation.message ?? "Invalid taxonomy", "error");
+      return;
+    }
+    setIsSavingTaxonomy(true);
+    try {
+      const productRef = doc(db, "rp_products", product.id);
+      await updateDoc(productRef, {
+        sportCode: taxSportCode ?? null,
+        leagueCode: taxLeagueCode ?? null,
+        teamCode: taxTeamCode ?? null,
+        themeCode: taxThemeCode ?? null,
+        designFamily: taxDesignFamily ?? null,
+        updatedAt: new Date(),
+        updatedBy: product.updatedBy ?? "",
+      });
+      await refetchProduct();
+      showToast("Taxonomy updated", "success");
+    } catch (err) {
+      console.error("[ProductDetail] Failed to update taxonomy:", err);
+      showToast("Failed to update taxonomy", "error");
+    } finally {
+      setIsSavingTaxonomy(false);
+    }
+  };
+
   // Production form state
   const [production, setProduction] = useState({
     printPdfFront: "",
@@ -1794,6 +1860,7 @@ function ProductDetailContent() {
     productionNotes: "",
   });
   const [savingProduction, setSavingProduction] = useState(false);
+  const [syncingToShopify, setSyncingToShopify] = useState(false);
   useEffect(() => {
     if (!product) return;
     const p = product.production;
@@ -2551,40 +2618,27 @@ function ProductDetailContent() {
             </div>
 
             {/* Section C — Product readiness (Shopify sync) */}
-            {(() => {
-              const hasFrontDesign = !!(designIdForFront);
-              const hasBackDesign = !!(designIdForBack);
-              const needsHeroBack = true; // require both heroes for sync
-              const needsBackDesign = needsHeroBack && !!(product?.media?.heroBack);
-              const checks: { label: string; ok: boolean; detail?: string }[] = [
-                { label: "Title", ok: !!(product?.title?.trim()) },
-                { label: "Handle", ok: !!(product?.handle?.trim()) },
-                { label: "Hero front", ok: !!(product?.media?.heroFront) },
-                { label: "Hero back", ok: !!(product?.media?.heroBack) },
-                { label: "Blank", ok: !!(product?.blankId) },
-                { label: "Design (front)", ok: hasFrontDesign, detail: hasFrontDesign ? undefined : "Set design in Render Setup" },
-                { label: "Design (back)", ok: !needsBackDesign || hasBackDesign, detail: needsBackDesign && !hasBackDesign ? "Set design in Render Setup" : undefined },
-                { label: "Print PDF front", ok: !hasFrontDesign || !!(product?.production?.printPdfFront) },
-                { label: "Print PDF back", ok: !hasBackDesign || !!(product?.production?.printPdfBack) },
-                { label: "Pricing (base)", ok: typeof product?.pricing?.basePrice === "number" && product.pricing.basePrice >= 0 },
-                { label: "Weight", ok: typeof product?.shipping?.defaultWeightGrams === "number" && product.shipping.defaultWeightGrams >= 0 },
-              ];
-              const allOk = checks.every((c) => c.ok);
+            {product && (() => {
+              const { ready, missing, warnings } = isProductReadyForShopify(product);
               return (
-                <div className={`border rounded-lg p-4 ${allOk ? "border-green-300 bg-green-50/50" : "border-amber-200 bg-amber-50/50"}`}>
+                <div className={`border rounded-lg p-4 ${ready ? "border-green-300 bg-green-50/50" : "border-amber-200 bg-amber-50/50"}`}>
                   <h2 className="text-lg font-semibold text-gray-900 mb-2">Product readiness</h2>
                   <p className="text-xs text-gray-500 mb-3">Checks required for Shopify sync. Fix missing items before syncing.</p>
-                  <ul className="space-y-1.5">
-                    {checks.map((c) => (
-                      <li key={c.label} className="flex items-center gap-2 text-sm">
-                        <span className={c.ok ? "text-green-600" : "text-amber-700"}>{c.ok ? "✓" : "✗"}</span>
-                        <span className={c.ok ? "text-gray-700" : "text-amber-800"}>{c.label}</span>
-                        {c.detail && <span className="text-xs text-gray-500">— {c.detail}</span>}
-                      </li>
-                    ))}
-                  </ul>
-                  <p className={`mt-3 text-sm font-medium ${allOk ? "text-green-700" : "text-amber-700"}`}>
-                    {allOk ? "Ready for Shopify sync" : "Not ready — fix items above"}
+                  {missing.length > 0 && (
+                    <ul className="space-y-1.5 mb-2">
+                      {missing.map((label) => (
+                        <li key={label} className="flex items-center gap-2 text-sm">
+                          <span className="text-amber-700">✗</span>
+                          <span className="text-amber-800">{label}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {warnings.length > 0 && (
+                    <p className="text-xs text-gray-500 mb-1">Recommended: {warnings.join(", ")}</p>
+                  )}
+                  <p className={`mt-3 text-sm font-medium ${ready ? "text-green-700" : "text-amber-700"}`}>
+                    {ready ? "Ready for Shopify sync" : "Not ready — fix missing items above"}
                   </p>
                 </div>
               );
@@ -2671,52 +2725,88 @@ function ProductDetailContent() {
             </div>
 
             {/* Section F — Shopify (read-only until sync implemented) */}
-            <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
-              <h2 className="text-lg font-semibold text-gray-900 mb-3">Shopify</h2>
-              <dl className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
-                <div>
-                  <dt className="text-gray-500">Sync status</dt>
-                  <dd className="font-medium">{product.shopify?.status ?? "not_synced"}</dd>
-                </div>
-                <div>
-                  <dt className="text-gray-500">Shopify product ID</dt>
-                  <dd className="font-mono text-gray-700">{product.shopify?.productId ?? "—"}</dd>
-                </div>
-                {product.shopify?.lastSyncAt && (
-                  <div>
-                    <dt className="text-gray-500">Last sync</dt>
-                    <dd>
-                      {typeof (product.shopify.lastSyncAt as { toDate?: () => Date })?.toDate === "function"
-                        ? (product.shopify.lastSyncAt as { toDate: () => Date }).toDate().toLocaleString()
-                        : product.shopify.lastSyncAt instanceof Date
-                        ? product.shopify.lastSyncAt.toLocaleString()
-                        : String(product.shopify.lastSyncAt)}
-                    </dd>
+            {(() => {
+              const shopifyReady = isProductReadyForShopify(product);
+              return (
+                <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
+                  <h2 className="text-lg font-semibold text-gray-900 mb-3">Shopify</h2>
+                  <dl className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                    <div>
+                      <dt className="text-gray-500">Sync status</dt>
+                      <dd className="font-medium">{product.shopify?.status ?? "not_synced"}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-gray-500">Shopify product ID</dt>
+                      <dd className="font-mono text-gray-700">{product.shopify?.productId ?? "—"}</dd>
+                    </div>
+                    {product.shopify?.lastSyncAt && (
+                      <div>
+                        <dt className="text-gray-500">Last sync</dt>
+                        <dd>
+                          {typeof (product.shopify.lastSyncAt as { toDate?: () => Date })?.toDate === "function"
+                            ? (product.shopify.lastSyncAt as { toDate: () => Date }).toDate().toLocaleString()
+                            : product.shopify.lastSyncAt instanceof Date
+                            ? product.shopify.lastSyncAt.toLocaleString()
+                            : String(product.shopify.lastSyncAt)}
+                        </dd>
+                      </div>
+                    )}
+                    {product.shopify?.lastSyncError && (
+                      <div className="md:col-span-2">
+                        <dt className="text-gray-500">Last sync error</dt>
+                        <dd className="text-red-600 text-xs mt-1">{product.shopify.lastSyncError}</dd>
+                      </div>
+                    )}
+                  </dl>
+                  {product.shopify?.productId && (
+                    <a
+                      href={
+                        process.env.NEXT_PUBLIC_SHOPIFY_STORE
+                          ? `https://admin.shopify.com/store/${process.env.NEXT_PUBLIC_SHOPIFY_STORE}/products/${product.shopify.productId}`
+                          : "#"
+                      }
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-block mt-2 text-sm text-blue-600 hover:underline"
+                    >
+                      Open in Shopify →
+                    </a>
+                  )}
+                  <div className="mt-3">
+                    <button
+                      type="button"
+                      disabled={!shopifyReady.ready || syncingToShopify}
+                      className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                      title={!shopifyReady.ready ? `Missing: ${shopifyReady.missing.join(", ")}` : undefined}
+                      onClick={async () => {
+                        if (!db || !product?.id || !shopifyReady.ready) return;
+                        setSyncingToShopify(true);
+                        try {
+                          await addDoc(collection(db, "shopifySyncJobs"), {
+                            entityType: "product",
+                            entityId: product.id,
+                            action: "create_or_update",
+                            status: "queued",
+                            createdAt: serverTimestamp(),
+                          });
+                          showToast("Sync job queued. The worker will process it shortly.", "success");
+                        } catch (err) {
+                          console.error("[Shopify sync] Failed to queue job:", err);
+                          showToast("Failed to queue sync job", "error");
+                        } finally {
+                          setSyncingToShopify(false);
+                        }
+                      }}
+                    >
+                      {syncingToShopify ? "Queuing…" : "Sync to Shopify"}
+                    </button>
+                    {!shopifyReady.ready && (
+                      <p className="text-xs text-amber-700 mt-2">Not ready for Shopify sync. Missing: {shopifyReady.missing.join(", ")}</p>
+                    )}
                   </div>
-                )}
-                {product.shopify?.lastSyncError && (
-                  <div className="md:col-span-2">
-                    <dt className="text-gray-500">Last sync error</dt>
-                    <dd className="text-red-600 text-xs mt-1">{product.shopify.lastSyncError}</dd>
-                  </div>
-                )}
-              </dl>
-              {product.shopify?.productId && (
-                <a
-                  href={
-                    process.env.NEXT_PUBLIC_SHOPIFY_STORE
-                      ? `https://admin.shopify.com/store/${process.env.NEXT_PUBLIC_SHOPIFY_STORE}/products/${product.shopify.productId}`
-                      : "#"
-                  }
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-block mt-2 text-sm text-blue-600 hover:underline"
-                >
-                  Open in Shopify →
-                </a>
-              )}
-              <p className="text-xs text-gray-500 mt-2">Push to Shopify and Publish will be available after sync is implemented.</p>
-            </div>
+                </div>
+              );
+            })()}
 
             {/* Section C — Media (hero slots; assign in Assets tab) */}
             <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
@@ -2794,6 +2884,101 @@ function ProductDetailContent() {
                   </div>
                 )}
               </dl>
+            </div>
+
+            {/* Taxonomy */}
+            <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
+              <h2 className="text-lg font-semibold text-gray-900 mb-3">Taxonomy</h2>
+              <p className="text-xs text-gray-500 mb-3">
+                Team requires League; League requires Sport. Sport can be left empty only for purely thematic/lifestyle products (e.g. PANTY_DROP, PEPTIDES, COUNTRY_CLUB). College: use Sport = COLLEGE_SPORTS, League = NCAA, Team = school code (e.g. COLORADO).
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Sport</label>
+                  <select
+                    value={taxSportCode ?? ""}
+                    onChange={(e) => {
+                      const v = e.target.value || null;
+                      setTaxSportCode(v);
+                      if (!v) setTaxLeagueCode(null);
+                      setTaxTeamCode(null);
+                      setTaxThemeCode(null);
+                    }}
+                    className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
+                  >
+                    <option value="">—</option>
+                    {(taxonomySports ?? []).map((s) => (
+                      <option key={s.id} value={s.code}>{s.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">League</label>
+                  <select
+                    value={taxLeagueCode ?? ""}
+                    onChange={(e) => {
+                      const v = e.target.value || null;
+                      setTaxLeagueCode(v);
+                      setTaxTeamCode(null);
+                    }}
+                    className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
+                  >
+                    <option value="">—</option>
+                    {(taxonomyLeagues ?? []).map((l) => (
+                      <option key={l.id} value={l.code}>{l.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Team / Entity</label>
+                  <select
+                    value={taxTeamCode ?? ""}
+                    onChange={(e) => setTaxTeamCode(e.target.value || null)}
+                    className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
+                  >
+                    <option value="">—</option>
+                    {(taxonomyEntities ?? []).map((ent) => (
+                      <option key={ent.id} value={ent.code}>{ent.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Theme</label>
+                  <select
+                    value={taxThemeCode ?? ""}
+                    onChange={(e) => setTaxThemeCode(e.target.value || null)}
+                    className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
+                  >
+                    <option value="">—</option>
+                    {(taxonomyThemes ?? []).map((t) => (
+                      <option key={t.id} value={t.code}>{t.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Design Family</label>
+                  <select
+                    value={taxDesignFamily ?? ""}
+                    onChange={(e) => setTaxDesignFamily(e.target.value || null)}
+                    className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
+                  >
+                    <option value="">—</option>
+                    {(taxonomyDesignFamilies ?? []).map((f) => (
+                      <option key={f.id} value={f.code}>{f.name}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              <div className="mt-3">
+                <button
+                  type="button"
+                  onClick={handleSaveProductTaxonomy}
+                  disabled={isSavingTaxonomy}
+                  className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                >
+                  {isSavingTaxonomy ? "Saving…" : "Save taxonomy"}
+                </button>
+              </div>
             </div>
 
             {/* Asset Counters */}

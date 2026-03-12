@@ -10,6 +10,14 @@ import {
   useUpdateDesign,
   useUpdateDesignFile,
 } from "@/lib/hooks/useDesignAssets";
+import {
+  useTaxonomySports,
+  useTaxonomyLeagues,
+  useTaxonomyEntities,
+  useTaxonomyThemes,
+  useTaxonomyDesignFamilies,
+} from "@/lib/hooks/useTaxonomy";
+import { validateTaxonomyClassification } from "@/lib/taxonomy/validateTaxonomy";
 import { useBlanks } from "@/lib/hooks/useBlanks";
 import {
   useMockAssets,
@@ -30,6 +38,23 @@ function DesignDetailContent() {
   // Fetch design
   const { design, isLoading, error, mutate } = useDesign(designId);
   const { teams } = useDesignTeams();
+
+  // Taxonomy form state (for dropdowns; must be before taxonomy hooks that filter by it)
+  const [taxSportCode, setTaxSportCode] = useState<string | null>(null);
+  const [taxLeagueCode, setTaxLeagueCode] = useState<string | null>(null);
+  const [taxTeamCode, setTaxTeamCode] = useState<string | null>(null);
+  const [taxThemeCode, setTaxThemeCode] = useState<string | null>(null);
+  const [taxDesignFamily, setTaxDesignFamily] = useState<string | null>(null);
+  const [isSavingTaxonomy, setIsSavingTaxonomy] = useState(false);
+
+  const { sports: taxonomySports } = useTaxonomySports();
+  const { leagues: taxonomyLeagues } = useTaxonomyLeagues(taxSportCode ?? undefined);
+  const { entities: taxonomyEntities } = useTaxonomyEntities({
+    sportCode: taxSportCode ?? undefined,
+    leagueCode: taxLeagueCode ?? undefined,
+  });
+  const { themes: taxonomyThemes } = useTaxonomyThemes(taxSportCode ?? undefined);
+  const { designFamilies: taxonomyDesignFamilies } = useTaxonomyDesignFamilies();
 
   // Mutations
   const { updateDesign } = useUpdateDesign();
@@ -117,6 +142,17 @@ function DesignDetailContent() {
   const [colorError, setColorError] = useState<string | null>(null);
   const [isSavingColors, setIsSavingColors] = useState(false);
 
+  // Sync taxonomy form state from design when design loads/updates
+  useEffect(() => {
+    if (design) {
+      setTaxSportCode(design.sportCode ?? null);
+      setTaxLeagueCode(design.leagueCode ?? null);
+      setTaxTeamCode(design.teamCode ?? null);
+      setTaxThemeCode(design.themeCode ?? null);
+      setTaxDesignFamily(design.designFamily ?? null);
+    }
+  }, [design?.id, design?.sportCode, design?.leagueCode, design?.teamCode, design?.themeCode, design?.designFamily]);
+
   const showToast = (message: string, type: "success" | "error") => {
     setToast({ message, type });
     setTimeout(() => setToast(null), 4000);
@@ -135,6 +171,37 @@ function DesignDetailContent() {
     } catch (err: any) {
       console.error("[DesignDetail] Failed to update status:", err);
       showToast("Failed to update status", "error");
+    }
+  };
+
+  const handleSaveTaxonomy = async () => {
+    if (!design?.id) return;
+    const validation = validateTaxonomyClassification({
+      sportCode: taxSportCode ?? null,
+      leagueCode: taxLeagueCode ?? null,
+      teamCode: taxTeamCode ?? null,
+    });
+    if (!validation.valid) {
+      showToast(validation.message ?? "Invalid taxonomy", "error");
+      return;
+    }
+    setIsSavingTaxonomy(true);
+    try {
+      await updateDesign({
+        designId: design.id,
+        sportCode: taxSportCode ?? null,
+        leagueCode: taxLeagueCode ?? null,
+        teamCode: taxTeamCode ?? null,
+        themeCode: taxThemeCode ?? null,
+        designFamily: taxDesignFamily ?? null,
+      });
+      showToast("Taxonomy updated", "success");
+      mutate();
+    } catch (err: any) {
+      console.error("[DesignDetail] Failed to update taxonomy:", err);
+      showToast("Failed to update taxonomy", "error");
+    } finally {
+      setIsSavingTaxonomy(false);
     }
   };
 
@@ -648,6 +715,99 @@ function DesignDetailContent() {
                         <p className="text-sm text-gray-600">{design.description}</p>
                       </div>
                     )}
+
+                    {/* Taxonomy */}
+                    <div>
+                      <h3 className="font-medium text-gray-700 mb-2">Taxonomy</h3>
+                      <p className="text-xs text-gray-500 mb-3">
+                        Team requires League; League requires Sport. Sport can be left empty only for purely thematic/lifestyle products (e.g. PANTY_DROP, PEPTIDES, COUNTRY_CLUB). College: use Sport = COLLEGE_SPORTS, League = NCAA, Team = school code (e.g. COLORADO). League and Team/Entity filter by Sport; Theme can filter by Sport.
+                      </p>
+                      <div className="space-y-3 text-sm">
+                        <div>
+                          <label className="block text-gray-500 mb-0.5">Sport</label>
+                          <select
+                            value={taxSportCode ?? ""}
+                            onChange={(e) => {
+                              const v = e.target.value || null;
+                              setTaxSportCode(v);
+                              if (!v) setTaxLeagueCode(null);
+                              setTaxTeamCode(null);
+                              setTaxThemeCode(null);
+                            }}
+                            className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white"
+                          >
+                            <option value="">—</option>
+                            {(taxonomySports ?? []).map((s) => (
+                              <option key={s.id} value={s.code}>{s.name}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-gray-500 mb-0.5">League</label>
+                          <select
+                            value={taxLeagueCode ?? ""}
+                            onChange={(e) => {
+                              const v = e.target.value || null;
+                              setTaxLeagueCode(v);
+                              setTaxTeamCode(null);
+                            }}
+                            className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white"
+                          >
+                            <option value="">—</option>
+                            {(taxonomyLeagues ?? []).map((l) => (
+                              <option key={l.id} value={l.code}>{l.name}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-gray-500 mb-0.5">Team / Entity</label>
+                          <select
+                            value={taxTeamCode ?? ""}
+                            onChange={(e) => setTaxTeamCode(e.target.value || null)}
+                            className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white"
+                          >
+                            <option value="">—</option>
+                            {(taxonomyEntities ?? []).map((e) => (
+                              <option key={e.id} value={e.code}>{e.name}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-gray-500 mb-0.5">Theme</label>
+                          <select
+                            value={taxThemeCode ?? ""}
+                            onChange={(e) => setTaxThemeCode(e.target.value || null)}
+                            className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white"
+                          >
+                            <option value="">—</option>
+                            {(taxonomyThemes ?? []).map((t) => (
+                              <option key={t.id} value={t.code}>{t.name}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-gray-500 mb-0.5">Design Family</label>
+                          <select
+                            value={taxDesignFamily ?? ""}
+                            onChange={(e) => setTaxDesignFamily(e.target.value || null)}
+                            className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white"
+                          >
+                            <option value="">—</option>
+                            {(taxonomyDesignFamilies ?? []).map((f) => (
+                              <option key={f.id} value={f.code}>{f.name}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={handleSaveTaxonomy}
+                          disabled={isSavingTaxonomy}
+                          className="px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700 disabled:opacity-50"
+                        >
+                          {isSavingTaxonomy ? "Saving…" : "Save taxonomy"}
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>

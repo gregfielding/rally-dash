@@ -2,7 +2,9 @@
 
 import { useState, useCallback, useMemo } from "react";
 import Link from "next/link";
+import { doc, getDoc } from "firebase/firestore";
 import ProtectedRoute from "@/components/ProtectedRoute";
+import { db } from "@/lib/firebase/config";
 import { useProducts } from "@/lib/hooks/useRPProducts";
 import { useCreateMockJob } from "@/lib/hooks/useMockAssets";
 import type { RpProduct } from "@/lib/types/firestore";
@@ -10,7 +12,16 @@ import type { RpProduct } from "@/lib/types/firestore";
 type SidesOption = "front" | "back" | "both";
 type OverwriteOption = "skip" | "replace";
 type ResultAction = "created" | "skipped_existing" | "skipped_ineligible" | "failed";
-type HeroResult = { productId: string; slug: string; side: "front" | "back"; action: ResultAction; jobId?: string; error?: string };
+type HeroResult = {
+  productId: string;
+  slug: string;
+  side: "front" | "back";
+  action: ResultAction;
+  jobId?: string;
+  error?: string;
+  assetId?: string;
+  assetUrl?: string;
+};
 
 function isFrontEligible(p: RpProduct): boolean {
   const front = p.renderSetup?.front;
@@ -59,6 +70,7 @@ function BatchHeroContent() {
   const [overwrite, setOverwrite] = useState<OverwriteOption>("skip");
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState<HeroResult[] | null>(null);
+  const [refreshingResults, setRefreshingResults] = useState(false);
   const [filterMissingFront, setFilterMissingFront] = useState(false);
   const [filterMissingBack, setFilterMissingBack] = useState(false);
 
@@ -149,6 +161,27 @@ function BatchHeroContent() {
     setResults(out);
     setRunning(false);
   }, [products, selectedIds, sides, overwrite, createMockJob]);
+
+  const refreshResults = useCallback(async () => {
+    if (!results || !db) return;
+    const withJobId = results.filter((r) => r.jobId && !r.assetId);
+    if (withJobId.length === 0) return;
+    setRefreshingResults(true);
+    const next = [...results];
+    for (let i = 0; i < next.length; i++) {
+      const r = next[i];
+      if (!r.jobId || r.assetId) continue;
+      const snap = await getDoc(doc(db, "rp_mock_jobs", r.jobId));
+      const data = snap.exists() ? snap.data() : null;
+      if (data?.status === "succeeded" && data?.output?.heroAssetId) {
+        next[i] = { ...r, assetId: data.output.heroAssetId, assetUrl: data.output.heroAssetUrl ?? undefined };
+      }
+    }
+    setResults(next);
+    setRefreshingResults(false);
+  }, [results]);
+
+  const canRefreshResults = results && db && results.some((r) => r.jobId && !r.assetId);
 
   return (
     <div className="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
@@ -292,10 +325,22 @@ function BatchHeroContent() {
       {results && (
         <section className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
           <h2 className="text-lg font-semibold text-gray-900 mb-3">Results</h2>
-          <p className="text-sm text-gray-500 mb-2">
-            Created: {results.filter((r) => r.action === "created").length} · Skipped (existing): {results.filter((r) => r.action === "skipped_existing").length} · Skipped (ineligible):{" "}
-            {results.filter((r) => r.action === "skipped_ineligible").length} · Failed: {results.filter((r) => r.action === "failed").length}
-          </p>
+          <div className="flex flex-wrap items-center gap-3 mb-2">
+            <p className="text-sm text-gray-500">
+              Created: {results.filter((r) => r.action === "created").length} · Skipped (existing): {results.filter((r) => r.action === "skipped_existing").length} · Skipped (ineligible):{" "}
+              {results.filter((r) => r.action === "skipped_ineligible").length} · Failed: {results.filter((r) => r.action === "failed").length}
+            </p>
+            {canRefreshResults && (
+              <button
+                type="button"
+                onClick={refreshResults}
+                disabled={refreshingResults}
+                className="text-sm px-3 py-1.5 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 disabled:opacity-50"
+              >
+                {refreshingResults ? "Refreshing…" : "Refresh results"}
+              </button>
+            )}
+          </div>
           <div className="overflow-x-auto -mx-2">
             <table className="min-w-full text-sm border border-gray-200">
               <thead>
@@ -321,7 +366,24 @@ function BatchHeroContent() {
                       {r.action === "skipped_ineligible" && "Skipped (ineligible)"}
                       {r.action === "failed" && "Failed"}
                     </td>
-                    <td className="py-2 px-3 text-gray-600">{r.error ?? (r.jobId ? "Job queued" : "")}</td>
+                    <td className="py-2 px-3 text-gray-600">
+                      {r.error ? (
+                        r.error
+                      ) : r.assetId ? (
+                        <span className="flex flex-wrap items-center gap-2">
+                          <Link href={`/products/${r.slug}`} className="text-blue-600 hover:underline">
+                            View product
+                          </Link>
+                          <Link href={`/products/${r.slug}?assetId=${r.assetId}`} className="text-blue-600 hover:underline">
+                            View asset
+                          </Link>
+                        </span>
+                      ) : r.jobId ? (
+                        "Job queued"
+                      ) : (
+                        ""
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
