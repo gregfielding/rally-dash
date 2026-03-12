@@ -9,6 +9,8 @@
 const fetch = (...args) =>
   import("node-fetch").then(({ default: fetchFn }) => fetchFn(...args));
 
+const { buildShopifyTags } = require("./buildShopifyTags");
+
 const SHOPIFY_API_VERSION = "2024-01";
 
 /**
@@ -115,7 +117,7 @@ async function runProductSync(product, store, accessToken) {
     handle: (product.handle || product.slug || "").slice(0, 255),
     descriptionHtml: (product.descriptionHtml || product.description || "").slice(0, 100000) || null,
     productType: (product.productType || "").slice(0, 255) || null,
-    tags: Array.isArray(product.tags) ? product.tags.slice(0, 250).map((t) => String(t).slice(0, 255)) : [],
+    tags: buildShopifyTags(product).slice(0, 250).map((t) => String(t).slice(0, 255)),
     files,
     variants: [
       {

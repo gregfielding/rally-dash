@@ -1,11 +1,13 @@
 "use client";
 
-import { useState, useEffect, useRef, FormEvent } from "react";
+import { useState, useEffect, useRef, useMemo, FormEvent } from "react";
 import { useParams } from "next/navigation";
+import Link from "next/link";
 import { addDoc, collection, deleteDoc, doc, getDocs, query, serverTimestamp, updateDoc, where, writeBatch } from "firebase/firestore";
 import { db } from "@/lib/firebase/config";
 import ProtectedRoute from "@/components/ProtectedRoute";
-import { useProductBySlug } from "@/lib/hooks/useRPProducts";
+import { useProductBySlug, useProducts } from "@/lib/hooks/useRPProducts";
+import { getRelatedProducts } from "@/lib/products/relatedProducts";
 import { useProductDesigns } from "@/lib/hooks/useRPProductDesigns";
 import { useProductAssets } from "@/lib/hooks/useRPProductAssets";
 import { useGenerationJobs } from "@/lib/hooks/useRPGenerationJobs";
@@ -42,6 +44,7 @@ import {
   RpConceptStatus,
 } from "@/lib/types/firestore";
 import { isProductReadyForShopify } from "@/lib/shopify/isProductReadyForShopify";
+import { buildShopifyTags } from "@/lib/shopify/buildShopifyTags";
 
 // Assets Tab Component with Collections
 function AssetsTab({
@@ -1713,6 +1716,12 @@ function ProductDetailContent() {
   const { jobs, loading: jobsLoading, refetch: refetchJobs } = useGenerationJobs(
     product?.id ? { productId: product.id, limit: 10 } : undefined
   );
+  const { products: candidateProducts } = useProducts({ status: "active", limit: 100 });
+  const relatedProducts = useMemo(() => {
+    if (!product || !candidateProducts.length) return [];
+    return getRelatedProducts(product, candidateProducts, 8);
+  }, [product, candidateProducts]);
+
   // Hardcoded presets for now (Firestore query issue)
   // Fallback hardcoded presets with supportedModes (if fetchedPresets fails). Run seed-scene-presets.js for Ecommerce Flat.
   const hardcodedPresets = [
@@ -2727,6 +2736,7 @@ function ProductDetailContent() {
             {/* Section F — Shopify (read-only until sync implemented) */}
             {(() => {
               const shopifyReady = isProductReadyForShopify(product);
+              const shopifyTags = buildShopifyTags(product);
               return (
                 <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
                   <h2 className="text-lg font-semibold text-gray-900 mb-3">Shopify</h2>
@@ -2738,6 +2748,22 @@ function ProductDetailContent() {
                     <div>
                       <dt className="text-gray-500">Shopify product ID</dt>
                       <dd className="font-mono text-gray-700">{product.shopify?.productId ?? "—"}</dd>
+                    </div>
+                    <div className="md:col-span-2">
+                      <dt className="text-gray-500 mb-1">Tags (preview for sync)</dt>
+                      <dd className="text-gray-700">
+                        {shopifyTags.length > 0 ? (
+                          <span className="flex flex-wrap gap-1.5">
+                            {shopifyTags.map((tag) => (
+                              <span key={tag} className="inline-flex px-2 py-0.5 rounded bg-blue-50 text-blue-800 text-xs font-mono">
+                                {tag}
+                              </span>
+                            ))}
+                          </span>
+                        ) : (
+                          <span className="text-gray-400 text-xs">No taxonomy tags (sport/league/team/theme/model). Set classification above to drive Smart Collections.</span>
+                        )}
+                      </dd>
                     </div>
                     {product.shopify?.lastSyncAt && (
                       <div>
@@ -2890,7 +2916,7 @@ function ProductDetailContent() {
             <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
               <h2 className="text-lg font-semibold text-gray-900 mb-3">Taxonomy</h2>
               <p className="text-xs text-gray-500 mb-3">
-                Team requires League; League requires Sport. Sport can be left empty only for purely thematic/lifestyle products (e.g. PANTY_DROP, PEPTIDES, COUNTRY_CLUB). College: use Sport = COLLEGE_SPORTS, League = NCAA, Team = school code (e.g. COLORADO).
+                Entity requires League; League requires Sport. Sport can be left empty only for purely thematic/lifestyle products (e.g. PANTY_DROP, PEPTIDES, COUNTRY_CLUB). College: use Sport = COLLEGE_SPORTS, League = NCAA, Entity = school code (e.g. COLORADO).
               </p>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
@@ -2930,7 +2956,7 @@ function ProductDetailContent() {
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Team / Entity</label>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Entity</label>
                   <select
                     value={taxTeamCode ?? ""}
                     onChange={(e) => setTaxTeamCode(e.target.value || null)}
@@ -3005,6 +3031,55 @@ function ProductDetailContent() {
                 </div>
               </div>
             </div>
+
+            {/* Related Products */}
+            {relatedProducts.length > 0 && (
+              <div>
+                <h3 className="text-sm font-semibold text-gray-900 mb-2">Related Products</h3>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                  {relatedProducts.map(({ product: p, reasons }) => {
+                    const thumb =
+                      p.media?.heroFront ?? p.media?.heroBack ?? p.mockupUrl ?? p.heroAssetPath;
+                    const title = p.title ?? p.name;
+                    const descriptor = [p.colorway?.name, p.category, p.baseProductKey].filter(Boolean).join(" · ");
+                    return (
+                      <Link
+                        key={p.id ?? p.slug}
+                        href={`/products/${encodeURIComponent(p.slug)}`}
+                        className="block rounded-lg border border-gray-200 bg-gray-50/50 p-3 hover:border-blue-300 hover:bg-blue-50/50 transition-colors"
+                      >
+                        {thumb ? (
+                          <img
+                            src={thumb}
+                            alt=""
+                            className="w-full aspect-square object-cover rounded mb-2 bg-white"
+                          />
+                        ) : (
+                          <div className="w-full aspect-square rounded mb-2 bg-gray-200 flex items-center justify-center text-gray-400 text-xs">
+                            No image
+                          </div>
+                        )}
+                        <div className="text-sm font-medium text-gray-900 truncate" title={title}>
+                          {title}
+                        </div>
+                        {descriptor && (
+                          <div className="text-xs text-gray-500 truncate mt-0.5" title={descriptor}>
+                            {descriptor}
+                          </div>
+                        )}
+                        {reasons.length > 0 && (
+                          <div className="text-xs text-blue-600 mt-1 flex flex-wrap gap-x-1 gap-y-0.5" title={reasons.join(", ")}>
+                            {reasons.map((r) => (
+                              <span key={r}>· {r}</span>
+                            ))}
+                          </div>
+                        )}
+                      </Link>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
             {/* Hero Image */}
             {product.heroAssetPath && (

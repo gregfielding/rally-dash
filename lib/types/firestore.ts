@@ -54,7 +54,18 @@ export interface RpTaxonomyLeague {
   updatedAt?: Timestamp;
 }
 
-export type RpTaxonomyEntityType = "team" | "college" | "club" | "motorsport_team" | "generic_entity";
+/** Entity type for taxonomy entities (teamCode resolves from entity record; do not store on product). */
+export type RpTaxonomyEntityType =
+  | "pro_team"
+  | "college"
+  | "club"
+  | "driver"
+  | "constructor"
+  | "brand"
+  | "athlete"
+  | "generic_entity"
+  | "team"        // legacy alias for pro_team
+  | "motorsport_team"; // legacy alias for constructor
 
 export interface RpTaxonomyEntity {
   id: string;

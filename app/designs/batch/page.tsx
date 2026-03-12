@@ -646,7 +646,7 @@ function BatchImportContent() {
                     <th className="text-left py-2 px-3 font-medium text-gray-700">Suggested name</th>
                     <th className="text-left py-2 px-3 font-medium text-gray-700">Sport</th>
                     <th className="text-left py-2 px-3 font-medium text-gray-700">League</th>
-                    <th className="text-left py-2 px-3 font-medium text-gray-700">Team / Entity</th>
+                    <th className="text-left py-2 px-3 font-medium text-gray-700">Entity</th>
                     <th className="text-left py-2 px-3 font-medium text-gray-700">Theme</th>
                     <th className="text-left py-2 px-3 font-medium text-gray-700">Design Family</th>
                     <th className="text-left py-2 px-3 font-medium text-gray-700">Resolution status</th>

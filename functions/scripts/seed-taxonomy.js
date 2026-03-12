@@ -106,33 +106,33 @@ const LEAGUES = [
 }));
 
 const ENTITIES = [
-  // MLB
-  { code: "GIANTS", name: "San Francisco Giants", leagueCode: "MLB", sportCode: "BASEBALL", entityType: "team" },
-  { code: "DODGERS", name: "Los Angeles Dodgers", leagueCode: "MLB", sportCode: "BASEBALL", entityType: "team" },
-  { code: "YANKEES", name: "New York Yankees", leagueCode: "MLB", sportCode: "BASEBALL", entityType: "team" },
-  { code: "RED_SOX", name: "Boston Red Sox", leagueCode: "MLB", sportCode: "BASEBALL", entityType: "team", aliases: ["REDSOX"] },
-  { code: "CUBS", name: "Chicago Cubs", leagueCode: "MLB", sportCode: "BASEBALL", entityType: "team" },
-  { code: "PADRES", name: "San Diego Padres", leagueCode: "MLB", sportCode: "BASEBALL", entityType: "team" },
-  { code: "METS", name: "New York Mets", leagueCode: "MLB", sportCode: "BASEBALL", entityType: "team" },
-  // NBA
-  { code: "LAKERS", name: "Los Angeles Lakers", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "team" },
-  { code: "CELTICS", name: "Boston Celtics", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "team" },
-  { code: "WARRIORS", name: "Golden State Warriors", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "team" },
-  { code: "BULLS", name: "Chicago Bulls", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "team" },
-  { code: "HEAT", name: "Miami Heat", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "team" },
-  { code: "KNICKS", name: "New York Knicks", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "team" },
-  { code: "SUNS", name: "Phoenix Suns", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "team" },
-  { code: "BUCKS", name: "Milwaukee Bucks", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "team" },
-  { code: "NUGGETS", name: "Denver Nuggets", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "team" },
-  { code: "MAVERICKS", name: "Dallas Mavericks", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "team" },
-  // NFL
-  { code: "COWBOYS", name: "Dallas Cowboys", leagueCode: "NFL", sportCode: "FOOTBALL", entityType: "team" },
-  { code: "FORTY_NINERS", name: "San Francisco 49ers", leagueCode: "NFL", sportCode: "FOOTBALL", entityType: "team", aliases: ["49ERS", "NINERS"] },
-  { code: "PACKERS", name: "Green Bay Packers", leagueCode: "NFL", sportCode: "FOOTBALL", entityType: "team" },
-  { code: "RAIDERS", name: "Las Vegas Raiders", leagueCode: "NFL", sportCode: "FOOTBALL", entityType: "team" },
-  { code: "CHIEFS", name: "Kansas City Chiefs", leagueCode: "NFL", sportCode: "FOOTBALL", entityType: "team" },
-  { code: "EAGLES", name: "Philadelphia Eagles", leagueCode: "NFL", sportCode: "FOOTBALL", entityType: "team" },
-  // NCAA Division I colleges (all full members)
+  // MLB (pro_team)
+  { code: "GIANTS", name: "San Francisco Giants", leagueCode: "MLB", sportCode: "BASEBALL", entityType: "pro_team" },
+  { code: "DODGERS", name: "Los Angeles Dodgers", leagueCode: "MLB", sportCode: "BASEBALL", entityType: "pro_team" },
+  { code: "YANKEES", name: "New York Yankees", leagueCode: "MLB", sportCode: "BASEBALL", entityType: "pro_team" },
+  { code: "RED_SOX", name: "Boston Red Sox", leagueCode: "MLB", sportCode: "BASEBALL", entityType: "pro_team", aliases: ["REDSOX"] },
+  { code: "CUBS", name: "Chicago Cubs", leagueCode: "MLB", sportCode: "BASEBALL", entityType: "pro_team" },
+  { code: "PADRES", name: "San Diego Padres", leagueCode: "MLB", sportCode: "BASEBALL", entityType: "pro_team" },
+  { code: "METS", name: "New York Mets", leagueCode: "MLB", sportCode: "BASEBALL", entityType: "pro_team" },
+  // NBA (pro_team)
+  { code: "LAKERS", name: "Los Angeles Lakers", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "pro_team" },
+  { code: "CELTICS", name: "Boston Celtics", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "pro_team" },
+  { code: "WARRIORS", name: "Golden State Warriors", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "pro_team" },
+  { code: "BULLS", name: "Chicago Bulls", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "pro_team" },
+  { code: "HEAT", name: "Miami Heat", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "pro_team" },
+  { code: "KNICKS", name: "New York Knicks", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "pro_team" },
+  { code: "SUNS", name: "Phoenix Suns", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "pro_team" },
+  { code: "BUCKS", name: "Milwaukee Bucks", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "pro_team" },
+  { code: "NUGGETS", name: "Denver Nuggets", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "pro_team" },
+  { code: "MAVERICKS", name: "Dallas Mavericks", leagueCode: "NBA", sportCode: "BASKETBALL", entityType: "pro_team" },
+  // NFL (pro_team)
+  { code: "COWBOYS", name: "Dallas Cowboys", leagueCode: "NFL", sportCode: "FOOTBALL", entityType: "pro_team" },
+  { code: "FORTY_NINERS", name: "San Francisco 49ers", leagueCode: "NFL", sportCode: "FOOTBALL", entityType: "pro_team", aliases: ["49ERS", "NINERS"] },
+  { code: "PACKERS", name: "Green Bay Packers", leagueCode: "NFL", sportCode: "FOOTBALL", entityType: "pro_team" },
+  { code: "RAIDERS", name: "Las Vegas Raiders", leagueCode: "NFL", sportCode: "FOOTBALL", entityType: "pro_team" },
+  { code: "CHIEFS", name: "Kansas City Chiefs", leagueCode: "NFL", sportCode: "FOOTBALL", entityType: "pro_team" },
+  { code: "EAGLES", name: "Philadelphia Eagles", leagueCode: "NFL", sportCode: "FOOTBALL", entityType: "pro_team" },
+  // NCAA Division I colleges (entityType: college)
   ...NCAA_D1_COLLEGES.map(({ code, name }) => ({
     code,
     name,
@@ -140,12 +140,12 @@ const ENTITIES = [
     sportCode: "COLLEGE_SPORTS",
     entityType: "college",
   })),
-  // Racing
-  { code: "FERRARI", name: "Ferrari", leagueCode: "F1", sportCode: "RACING", entityType: "motorsport_team" },
-  { code: "MCLAREN", name: "McLaren", leagueCode: "F1", sportCode: "RACING", entityType: "motorsport_team" },
-  { code: "RED_BULL", name: "Red Bull Racing", leagueCode: "F1", sportCode: "RACING", entityType: "motorsport_team" },
-  { code: "MERCEDES", name: "Mercedes-AMG", leagueCode: "F1", sportCode: "RACING", entityType: "motorsport_team" },
-  // Soccer
+  // F1 constructors (entityType: constructor)
+  { code: "FERRARI", name: "Ferrari", leagueCode: "F1", sportCode: "RACING", entityType: "constructor" },
+  { code: "MCLAREN", name: "McLaren", leagueCode: "F1", sportCode: "RACING", entityType: "constructor" },
+  { code: "RED_BULL", name: "Red Bull Racing", leagueCode: "F1", sportCode: "RACING", entityType: "constructor" },
+  { code: "MERCEDES", name: "Mercedes-AMG", leagueCode: "F1", sportCode: "RACING", entityType: "constructor" },
+  // Soccer clubs (entityType: club)
   { code: "ARSENAL", name: "Arsenal", leagueCode: "PREMIER_LEAGUE", sportCode: "SOCCER", entityType: "club" },
   { code: "MANCHESTER_CITY", name: "Manchester City", leagueCode: "PREMIER_LEAGUE", sportCode: "SOCCER", entityType: "club" },
   { code: "LIVERPOOL", name: "Liverpool", leagueCode: "PREMIER_LEAGUE", sportCode: "SOCCER", entityType: "club" },
@@ -157,7 +157,7 @@ const ENTITIES = [
   slug: codeToSlug(row.code),
   sportCode: row.sportCode || null,
   leagueCode: row.leagueCode || null,
-  entityType: row.entityType || "team",
+  entityType: row.entityType || "pro_team",
   aliases: row.aliases || [],
   sortOrder: i,
 }));

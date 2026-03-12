@@ -720,7 +720,7 @@ function DesignDetailContent() {
                     <div>
                       <h3 className="font-medium text-gray-700 mb-2">Taxonomy</h3>
                       <p className="text-xs text-gray-500 mb-3">
-                        Team requires League; League requires Sport. Sport can be left empty only for purely thematic/lifestyle products (e.g. PANTY_DROP, PEPTIDES, COUNTRY_CLUB). College: use Sport = COLLEGE_SPORTS, League = NCAA, Team = school code (e.g. COLORADO). League and Team/Entity filter by Sport; Theme can filter by Sport.
+                        Entity requires League; League requires Sport. Sport can be left empty only for purely thematic/lifestyle products (e.g. PANTY_DROP, PEPTIDES, COUNTRY_CLUB). College: use Sport = COLLEGE_SPORTS, League = NCAA, Entity = school code (e.g. COLORADO). League and Entity filter by Sport; Theme can filter by Sport.
                       </p>
                       <div className="space-y-3 text-sm">
                         <div>
@@ -760,7 +760,7 @@ function DesignDetailContent() {
                           </select>
                         </div>
                         <div>
-                          <label className="block text-gray-500 mb-0.5">Team / Entity</label>
+                          <label className="block text-gray-500 mb-0.5">Entity</label>
                           <select
                             value={taxTeamCode ?? ""}
                             onChange={(e) => setTaxTeamCode(e.target.value || null)}

@@ -40,10 +40,10 @@ export function validateTaxonomyClassification(
   const hasTeam = hasValue(teamCode);
 
   if (hasTeam && !hasLeague) {
-    return { valid: false, message: "Team requires League. Select a League (e.g. NCAA for college)." };
+    return { valid: false, message: "Entity requires League. Select a League (e.g. NCAA for college)." };
   }
   if (hasTeam && !hasSport) {
-    return { valid: false, message: "Team requires Sport. Select a Sport (e.g. COLLEGE_SPORTS for college)." };
+    return { valid: false, message: "Entity requires Sport. Select a Sport (e.g. COLLEGE_SPORTS for college)." };
   }
   if (hasLeague && !hasSport) {
     return { valid: false, message: "League requires Sport. Sport can be left empty only for purely thematic/lifestyle products." };
