@@ -377,7 +377,7 @@ service cloud.firestore {
     // maskId pattern: {blankId}_{view} e.g. "abc123_front"
     match /rp_blank_masks/{maskId} {
       allow read: if isAuthenticated();
-      allow write: if isAdmin() && hasRole('admin');
+      allow write: if isAdmin() && (hasRole('admin') || hasRole('ops'));
     }
     
     // Mockups collection

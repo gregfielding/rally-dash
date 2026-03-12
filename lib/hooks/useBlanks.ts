@@ -172,6 +172,10 @@ export interface UpdateBlankInput {
   frontImage?: RPImageRef;
   backImage?: RPImageRef;
   imageMeta?: RPImageMeta;
+  /** Set to true to remove the front image from the blank (and delete from storage). */
+  clearFrontImage?: boolean;
+  /** Set to true to remove the back image from the blank (and delete from storage). */
+  clearBackImage?: boolean;
 }
 
 /**

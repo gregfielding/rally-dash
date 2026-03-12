@@ -88,6 +88,29 @@ export function useCreateProduct() {
 }
 
 /**
+ * Create a product from Design + Blank, then optionally trigger mockup generation.
+ * Returns { productId, slug } so caller can call createMockJob with productId.
+ */
+export function useCreateProductFromDesignBlank() {
+  const { mutate } = useSWRConfig();
+
+  const createProductFromDesignBlank = useCallback(
+    async (input: { designId: string; blankId: string }) => {
+      if (!functions) {
+        throw new Error("Cloud Functions not initialized");
+      }
+      const fn = httpsCallable(functions, "createProductFromDesignBlank");
+      const result = await fn(input);
+      await mutate("rp_products", undefined, { revalidate: true });
+      return result.data as { ok: boolean; productId: string; slug: string };
+    },
+    [mutate]
+  );
+
+  return { createProductFromDesignBlank };
+}
+
+/**
  * Hook for generating product assets
  */
 export function useGenerateProductAssets() {

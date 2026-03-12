@@ -80,10 +80,7 @@ async function fetchRPProductBySlug(slug: string): Promise<RpProduct | null> {
   if (!db) throw new Error("Database not initialized");
   if (!slug) return null;
 
-  // Decode URL-encoded slug (in case of special characters)
   const decodedSlug = decodeURIComponent(slug);
-  console.log("[fetchRPProductBySlug] Original slug:", slug, "Decoded:", decodedSlug);
-
   const base = collection(db, "rp_products");
   
   // Query by slug only (slug should be unique, so no need for orderBy)
@@ -93,30 +90,15 @@ async function fetchRPProductBySlug(slug: string): Promise<RpProduct | null> {
     let q = query(base, where("slug", "==", decodedSlug));
     let snapshot = await getDocs(q);
 
-    // If not found and slug is different from decoded, try original
     if (snapshot.empty && slug !== decodedSlug) {
-      console.log("[fetchRPProductBySlug] Trying with original slug:", slug);
       q = query(base, where("slug", "==", slug));
       snapshot = await getDocs(q);
     }
 
-    if (snapshot.empty) {
-      console.log("[fetchRPProductBySlug] No product found with slug:", decodedSlug);
-      // Debug: List all products to see what slugs exist
-      const allProducts = await getDocs(query(base));
-      console.log("[fetchRPProductBySlug] Available products:", allProducts.docs.map(d => ({
-        id: d.id,
-        name: d.data().name,
-        slug: d.data().slug
-      })));
-      return null;
-    }
+    if (snapshot.empty) return null;
 
-    // Since slug should be unique, just take the first result
     const doc = snapshot.docs[0];
-    const product = { id: doc.id, ...(doc.data() as RpProduct) };
-    console.log("[fetchRPProductBySlug] Found product:", product.id, product.slug);
-    return product;
+    return { id: doc.id, ...(doc.data() as RpProduct) };
   } catch (error: any) {
     console.error("[fetchRPProductBySlug] Error fetching product:", error);
     // If query fails (e.g., missing index), return null
@@ -159,13 +141,7 @@ export function useProducts(filters?: UseProductsFilters) {
 export function useProductBySlug(slug: string | undefined) {
   const { data, error, isLoading, mutate } = useSWR<RpProduct | null>(
     slug ? `rp_product:${slug}` : null,
-    async () => {
-      if (!slug) return null;
-      console.log("[useProductBySlug] Fetching product with slug:", slug);
-      const result = await fetchRPProductBySlug(slug);
-      console.log("[useProductBySlug] Result:", result ? `Found product ${result.id}` : "Not found");
-      return result;
-    },
+    (slug ? () => fetchRPProductBySlug(slug) : () => null),
     {
       revalidateOnFocus: false,
       revalidateOnReconnect: true,

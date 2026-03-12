@@ -200,7 +200,17 @@ export interface CreateMockJobInput {
   designId: string;
   blankId: string;
   view: "front" | "back";
+  placementId?: "front_center" | "back_center" | "front_left" | "front_right" | "back_left" | "back_right"; // optional; defaults from view
   quality: "draft" | "final";
+  /** When set, mockup is saved to /products/{productId}/mockup.png and product.mockupUrl is updated */
+  productId?: string;
+  /** Phase 4: when set with productId, creates rp_product_asset and sets product.media.heroFront/heroBack */
+  heroSlot?: "hero_front" | "hero_back";
+  /** Explicit image URLs (RALLY_PHASE1_RENDER_SETUP_UI). When set, renderer uses these instead of resolving from blank/design. */
+  blankImageUrl?: string;
+  designPngUrl?: string;
+  /** Master placement override (normalized 0–1). Overrides blank/design placement so one “master” drives all variants. */
+  placementOverride?: { x?: number; y?: number; scale?: number; width?: number; height?: number };
 }
 
 /**

@@ -446,6 +446,79 @@ export interface AuditLog {
 // Product System Types (rp_* collections)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Bulk Generation Jobs (rp_bulk_generation_jobs)
+// ---------------------------------------------------------------------------
+
+export type RpBulkGenerationJobStatus = "pending" | "running" | "completed" | "failed";
+
+export interface RpBulkGenerationJobProgress {
+  total: number;
+  completed: number;
+  failed: number;
+}
+
+export interface RpBulkGenerationJobOptions {
+  imagesPerProduct?: number;
+  presetId?: string; // Scene preset for generation jobs
+}
+
+export interface RpBulkGenerationJobResult {
+  productId: string;
+  designId: string;
+  blankId: string;
+  mockupStatus: "pending" | "done" | "failed";
+  generationStatus: "pending" | "done" | "failed";
+}
+
+export interface RpBulkGenerationJob {
+  id?: string;
+  designIds: string[];
+  blankIds: string[];
+  identityIds: string[];
+  options?: RpBulkGenerationJobOptions;
+  status: RpBulkGenerationJobStatus;
+  progress: RpBulkGenerationJobProgress;
+  /** designId_blankId -> productId for idempotent product creation */
+  productIdsByKey?: Record<string, string>;
+  /** Number of generation jobs created (used for resumable worker) */
+  generationJobsCreated?: number;
+  results?: RpBulkGenerationJobResult[];
+  createdAt: Timestamp;
+  createdBy: string;
+  updatedAt?: Timestamp;
+}
+
+// ---------------------------------------------------------------------------
+// Bulk Generation Job Items (rp_bulk_generation_job_items) — child tasks
+// ---------------------------------------------------------------------------
+
+export type RpBulkGenerationJobItemStatus =
+  | "pending"
+  | "running"
+  | "awaiting_mock"
+  | "completed"
+  | "failed";
+
+export interface RpBulkGenerationJobItem {
+  id?: string;
+  bulkJobId: string;
+  designId: string;
+  blankId: string;
+  identityId: string;
+  productId?: string | null;
+  mockJobId?: string | null;
+  generationJobId?: string | null;
+  status: RpBulkGenerationJobItemStatus;
+  error?: string | null;
+  attemptCount?: number;
+  lastAttemptAt?: Timestamp | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+}
+
 // 1.1 Product (rp_products/{productId})
 export type RpProductStatus = "draft" | "active" | "archived";
 export type RpProductCategory = "panties" | "bralette" | "tank" | "tee" | "other";
@@ -550,8 +623,22 @@ export interface RpProduct {
   name: string; // "SF Giants Classic Black"
   description?: string;
 
+  // Spec alignment (RALLY_FIRESTORE_AND_PRODUCT_PAGE_MAPPING): merchandising + Shopify
+  title?: string; // display title; fallback: name
+  handle?: string; // URL handle; fallback: slug
+  descriptionHtml?: string;
+  descriptionText?: string;
+  seo?: { title?: string; description?: string };
+  collectionKeys?: string[];
+  brand?: string;
+  productType?: string;
+
   category: RpProductCategory;
   baseProductKey: string; // "SFGIANTS_PANTY_1" (style family)
+  /** Batch import deduplication: leagueCode_designFamily_teamCode_blankId_variant (e.g. MLB_WILL_DROP_FOR_GIANTS_HEATHER_GREY_BIKINI_LIGHT). Side is not part of the key. */
+  productIdentityKey?: string | null;
+  /** Traceability: importKey of the design row(s) this product was generated from (e.g. MLB_WILL_DROP_FOR_GIANTS_BACK_LIGHT). Set on create/update from batch import. */
+  generatedFromImportKey?: string | null;
   colorway: {
     name: string; // "Black"
     hex?: string; // "#000000"
@@ -565,6 +652,63 @@ export interface RpProduct {
 
   // Blank reference (required for product-only generation)
   blankId?: string; // FK to rp_blanks - physical garment template
+
+  // Design + Blank product flow (alignment: product = design + blank, mockup stored here)
+  designId?: string; // FK to designs - artwork used for this product (primary; use designIdFront/Back for spec)
+  designIdFront?: string; // spec: front design
+  designIdBack?: string; // spec: back design
+  mockupUrl?: string; // URL of generated mockup image (e.g. /products/{productId}/mockup.png)
+
+  /**
+   * UI-only state (e.g. which modal is open). Do not use for persisted render configuration.
+   * Canonical render config lives in renderSetup.front / renderSetup.back.
+   */
+  renderConfig?: {
+    renderSide?: "front" | "back";
+    selectedBlankId?: string;
+    selectedBlankImageUrl?: string;
+    selectedDesignImageUrl?: string;
+    selectedDesignImageUrlFront?: string;
+    selectedDesignImageUrlBack?: string;
+    placementKey?: string;
+    placementOverride?: { x?: number; y?: number; scale?: number; width?: number; height?: number };
+  };
+
+  /**
+   * Canonical render setup (RALLY_RENDER_SETUP_DATA_MODEL). Per-side config; renderer uses
+   * renderSetup.front or renderSetup.back based on requested view. No renderSide toggle.
+   */
+  renderSetup?: {
+    front?: {
+      blankAssetId?: string | null;
+      blankImageUrl?: string | null;
+      designAssetId?: string | null;
+      designAssetUrl?: string | null;
+      placementKey?: string | null;
+      placementOverride?: { x?: number; y?: number; scale?: number } | null;
+      maskUrl?: string | null;
+      blendMode?: "normal" | "multiply" | "overlay" | "soft-light" | null;
+      blendOpacity?: number | null;
+    } | null;
+    back?: {
+      blankAssetId?: string | null;
+      blankImageUrl?: string | null;
+      designAssetId?: string | null;
+      designAssetUrl?: string | null;
+      placementKey?: string | null;
+      placementOverride?: { x?: number; y?: number; scale?: number } | null;
+      maskUrl?: string | null;
+      blendMode?: "normal" | "multiply" | "overlay" | "soft-light" | null;
+      blendOpacity?: number | null;
+    } | null;
+    defaults?: {
+      blankId?: string | null;
+      designIdFront?: string | null;
+      designIdBack?: string | null;
+    } | null;
+    lastVerifiedAt?: Timestamp | null;
+    lastVerifiedBy?: string | null;
+  };
 
   // AI Links (core)
   ai: {
@@ -585,9 +729,39 @@ export interface RpProduct {
     assetsPublished?: number;
   };
 
-  // Hero image
+  // Hero image (legacy single hero)
   heroAssetId?: string;
   heroAssetPath?: string;
+
+  // Spec: media slots (hero front/back, gallery, etc.)
+  media?: {
+    heroFront?: string; // URL or assetId
+    heroBack?: string;
+    gallery?: string[];
+    modelAssets?: string[];
+    lifestyleAssets?: string[];
+  };
+
+  // Spec: production (PDFs, print colors, notes)
+  production?: {
+    printPdfFront?: string;
+    printPdfBack?: string;
+    printPdfMaster?: string;
+    printColors?: string[];
+    productionNotes?: string;
+  };
+
+  // Spec: Shopify sync status
+  shopify?: {
+    productId?: string;
+    status?: "not_synced" | "queued" | "synced" | "error";
+    lastSyncAt?: Timestamp;
+    lastSyncError?: string;
+  };
+
+  // Optional: pricing + weight for readiness / Shopify
+  pricing?: { basePrice?: number; compareAtPrice?: number; currencyCode?: string };
+  shipping?: { defaultWeightGrams?: number; requiresShipping?: boolean };
 
   // Inspiration Library
   inspirationIds?: string[];
@@ -947,6 +1121,9 @@ export interface RpProductAsset {
   // NEW: Collections
   collectionIds?: string[]; // Asset collections this belongs to
 
+  // Spec: hero slot assignment (product Detail Media section)
+  heroSlot?: "hero_front" | "hero_back";
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
   createdBy: string;
@@ -1175,11 +1352,11 @@ export type DesignStatus = "draft" | "active" | "archived";
 
 // Design file (embedded in DesignDoc)
 export interface DesignFile {
-  kind: "png" | "pdf";
-  storagePath: string;              // 'designs/{designId}/files/...'
+  kind: "png" | "pdf" | "svg";
+  storagePath: string;              // 'designs/{designId}/png|pdf|svg/...'
   downloadUrl?: string;             // cached, optional
   fileName: string;
-  contentType: string;              // 'image/png' | 'application/pdf'
+  contentType: string;              // 'image/png' | 'application/pdf' | 'image/svg+xml'
   sizeBytes: number;
   widthPx?: number;                 // PNG only
   heightPx?: number;                // PNG only
@@ -1226,8 +1403,17 @@ export interface DesignDoc {
   tags: string[];                   // ['sf-giants','mlb','orange-black']
   description?: string;
 
-  // Files
+  // Batch import metadata (RALLY_BATCH_DESIGN_IMPORT)
+  importKey?: string;               // matching key: LEAGUE_DESIGNNAME_TEAM_SIDE_VARIANT
+  leagueCode?: string;              // e.g. 'MLB'
+  designFamily?: string;            // e.g. 'WILL_DROP_FOR'
+  teamCode?: string;                // e.g. 'GIANTS'
+  supportedSides?: string[];        // e.g. ['back']
+  variant?: string;                 // e.g. 'LIGHT'
+
+  // Files (SVG = master vector, PNG = rendering/AI, PDF = print vendor)
   files: {
+    svg?: DesignFile;
     png?: DesignFile;
     pdf?: DesignFile;
   };
@@ -1244,9 +1430,10 @@ export interface DesignDoc {
   linkedProductCount: number;       // products that use this design
 
   // Completeness indicators
+  hasSvg: boolean;
   hasPng: boolean;
   hasPdf: boolean;
-  isComplete: boolean;              // hasPng && hasPdf && colors.length>0 && teamId set
+  isComplete: boolean;              // hasPng && hasPdf && colors.length>0 && teamId set (SVG optional for completeness)
 
   // Search keywords (for fast queries)
   searchKeywords: string[];

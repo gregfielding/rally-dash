@@ -51,7 +51,7 @@ export interface UpdateDesignInput {
 
 export interface UpdateDesignFileInput {
   designId: string;
-  kind: "png" | "pdf";
+  kind: "png" | "pdf" | "svg";
   storagePath: string;
   downloadUrl: string;
   fileName: string;

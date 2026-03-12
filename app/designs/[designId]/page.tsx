@@ -35,12 +35,13 @@ function DesignDetailContent() {
   const { updateDesign } = useUpdateDesign();
   const { updateFile } = useUpdateDesignFile();
 
-  // Tab state
-  const [activeTab, setActiveTab] = useState<"overview" | "files" | "colors" | "placements" | "notes" | "mocks">("overview");
+  // Tab state: Overview, Files, Mockups, Print Pack
+  const [activeTab, setActiveTab] = useState<"overview" | "files" | "mockups" | "printpack">("overview");
 
-  // Mocks tab state
+  // Mockups tab state
   const [selectedBlankId, setSelectedBlankId] = useState<string>("");
   const [mockView, setMockView] = useState<"front" | "back">("front");
+  const [mockPlacementId, setMockPlacementId] = useState<"front_center" | "back_center" | "front_left" | "front_right" | "back_left" | "back_right">("front_center");
   const [mockQuality, setMockQuality] = useState<"draft" | "final">("draft");
   const [blankSearch, setBlankSearch] = useState("");
   const [pendingJobId, setPendingJobId] = useState<string | null>(null);
@@ -54,6 +55,35 @@ function DesignDetailContent() {
   const { jobs: mockJobs, mutate: mutateMockJobs } = useMockJobs({ designId });
   const { approveAsset, isApproving } = useApproveMockAsset();
   const { job: watchedJob } = useWatchMockJob(pendingJobId);
+
+  // Sync placement when view changes (front -> front_center, back -> back_center)
+  useEffect(() => {
+    setMockPlacementId(mockView === "front" ? "front_center" : "back_center");
+  }, [mockView]);
+
+  // Filter blanks based on search
+  const filteredBlanks = blanks.filter((b) => {
+    if (!blankSearch) return true;
+    const search = blankSearch.toLowerCase();
+    return (
+      b.styleName?.toLowerCase().includes(search) ||
+      b.colorName?.toLowerCase().includes(search) ||
+      b.styleCode?.toLowerCase().includes(search) ||
+      b.slug?.toLowerCase().includes(search)
+    );
+  });
+
+  // Get selected blank (used below for placements and view image)
+  const selectedBlank = blanks.find((b) => b.blankId === selectedBlankId);
+
+  // Get placements for selected blank+view (front_* or back_*)
+  const mockPlacementOptions = (selectedBlank?.placements || design?.placementDefaults || [])
+    .filter((p: { placementId: string }) => (p as { placementId: string }).placementId.startsWith(mockView === "front" ? "front_" : "back_"))
+    .map((p: { placementId: string; label?: string }) => ({ id: (p as { placementId: string }).placementId, label: (p as { label?: string }).label || (p as { placementId: string }).placementId.replace(/_/g, " ") }));
+  const defaultPlacementId = mockView === "front" ? "front_center" : "back_center";
+  const effectivePlacementId = mockPlacementOptions.length > 0
+    ? (mockPlacementOptions.some((o: { id: string }) => o.id === mockPlacementId) ? mockPlacementId : mockPlacementOptions[0]!.id)
+    : defaultPlacementId;
 
   // Clear pending job when it completes
   useEffect(() => {
@@ -69,21 +99,6 @@ function DesignDetailContent() {
     }
   }, [watchedJob]);
 
-  // Filter blanks based on search
-  const filteredBlanks = blanks.filter((b) => {
-    if (!blankSearch) return true;
-    const search = blankSearch.toLowerCase();
-    return (
-      b.styleName?.toLowerCase().includes(search) ||
-      b.colorName?.toLowerCase().includes(search) ||
-      b.styleCode?.toLowerCase().includes(search) ||
-      b.slug?.toLowerCase().includes(search)
-    );
-  });
-
-  // Get selected blank
-  const selectedBlank = blanks.find((b) => b.blankId === selectedBlankId);
-
   // Check if selected blank has the selected view image
   const hasViewImage = selectedBlank?.images?.[mockView]?.downloadUrl;
 
@@ -91,19 +106,16 @@ function DesignDetailContent() {
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
 
   // Upload state
-  const [uploadingKind, setUploadingKind] = useState<"png" | "pdf" | null>(null);
+  const [uploadingKind, setUploadingKind] = useState<"png" | "pdf" | "svg" | null>(null);
   const pngInputRef = useRef<HTMLInputElement>(null);
   const pdfInputRef = useRef<HTMLInputElement>(null);
+  const svgInputRef = useRef<HTMLInputElement>(null);
 
   // Edit state
   const [isEditingColors, setIsEditingColors] = useState(false);
   const [editedColors, setEditedColors] = useState<DesignColor[]>([]);
   const [colorError, setColorError] = useState<string | null>(null);
   const [isSavingColors, setIsSavingColors] = useState(false);
-
-  // Notes state
-  const [editedDescription, setEditedDescription] = useState("");
-  const [isSavingNotes, setIsSavingNotes] = useState(false);
 
   const showToast = (message: string, type: "success" | "error") => {
     setToast({ message, type });
@@ -132,6 +144,11 @@ function DesignDetailContent() {
 
     if (!file.type.startsWith("image/png") && !file.type.startsWith("image/")) {
       showToast("Please upload a PNG image", "error");
+      return;
+    }
+    const PNG_MAX_BYTES = 25 * 1024 * 1024; // 25MB
+    if (file.size > PNG_MAX_BYTES) {
+      showToast("PNG must be under 25MB", "error");
       return;
     }
 
@@ -193,6 +210,11 @@ function DesignDetailContent() {
       showToast("Please upload a PDF file", "error");
       return;
     }
+    const PDF_MAX_BYTES = 50 * 1024 * 1024; // 50MB
+    if (file.size > PDF_MAX_BYTES) {
+      showToast("PDF must be under 50MB", "error");
+      return;
+    }
 
     setUploadingKind("pdf");
 
@@ -229,6 +251,55 @@ function DesignDetailContent() {
       setUploadingKind(null);
       if (pdfInputRef.current) {
         pdfInputRef.current.value = "";
+      }
+    }
+  };
+
+  const handleSvgUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !design?.id) return;
+
+    if (file.type !== "image/svg+xml" && !file.name.toLowerCase().endsWith(".svg")) {
+      showToast("Please upload an SVG file", "error");
+      return;
+    }
+    const SVG_MAX_BYTES = 5 * 1024 * 1024; // 5MB
+    if (file.size > SVG_MAX_BYTES) {
+      showToast("SVG must be under 5MB", "error");
+      return;
+    }
+
+    setUploadingKind("svg");
+
+    try {
+      if (!storage) {
+        throw new Error("Firebase Storage not initialized");
+      }
+
+      const storagePath = `designs/${design.id}/svg/${file.name}`;
+      const storageRef = ref(storage, storagePath);
+      await uploadBytes(storageRef, file);
+      const downloadUrl = await getDownloadURL(storageRef);
+
+      await updateFile({
+        designId: design.id,
+        kind: "svg",
+        storagePath,
+        downloadUrl,
+        fileName: file.name,
+        contentType: file.type || "image/svg+xml",
+        sizeBytes: file.size,
+      });
+
+      showToast("SVG uploaded successfully!", "success");
+      mutate();
+    } catch (err: any) {
+      console.error("[DesignDetail] Failed to upload SVG:", err);
+      showToast("Failed to upload SVG", "error");
+    } finally {
+      setUploadingKind(null);
+      if (svgInputRef.current) {
+        svgInputRef.current.value = "";
       }
     }
   };
@@ -288,24 +359,6 @@ function DesignDetailContent() {
     }
   };
 
-  const handleSaveNotes = async () => {
-    setIsSavingNotes(true);
-
-    try {
-      await updateDesign({
-        designId: design!.id,
-        description: editedDescription,
-      });
-      showToast("Notes updated successfully!", "success");
-      mutate();
-    } catch (err: any) {
-      console.error("[DesignDetail] Failed to update notes:", err);
-      showToast("Failed to update notes", "error");
-    } finally {
-      setIsSavingNotes(false);
-    }
-  };
-
   // Mock generation handler
   const handleGenerateMock = async () => {
     if (!design?.id || !selectedBlankId) {
@@ -327,6 +380,7 @@ function DesignDetailContent() {
       designId: design.id,
       blankId: selectedBlankId,
       view: mockView,
+      placementId: effectivePlacementId as "front_center" | "back_center" | "front_left" | "front_right" | "back_left" | "back_right",
       quality: mockQuality,
     });
 
@@ -396,6 +450,13 @@ function DesignDetailContent() {
         accept="application/pdf"
         className="hidden"
         onChange={handlePdfUpload}
+      />
+      <input
+        ref={svgInputRef}
+        type="file"
+        accept="image/svg+xml,.svg"
+        className="hidden"
+        onChange={handleSvgUpload}
       />
 
       {/* Toast notification */}
@@ -502,7 +563,7 @@ function DesignDetailContent() {
             <div>
               <div className="text-sm text-gray-500">Files</div>
               <div className="text-sm">
-                PNG: {design.hasPng ? "✓" : "✗"} | PDF: {design.hasPdf ? "✓" : "✗"}
+                SVG: {design.files?.svg ? "✓" : "✗"} | PNG: {design.hasPng ? "✓" : "✗"} | PDF: {design.hasPdf ? "✓" : "✗"}
               </div>
             </div>
             <div>
@@ -518,17 +579,17 @@ function DesignDetailContent() {
         <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
           <div className="border-b border-gray-200">
             <nav className="flex -mb-px">
-              {["overview", "files", "colors", "placements", "notes", "mocks"].map((tab) => (
+              {(["overview", "files", "mockups", "printpack"] as const).map((tab) => (
                 <button
                   key={tab}
-                  onClick={() => setActiveTab(tab as typeof activeTab)}
+                  onClick={() => setActiveTab(tab)}
                   className={`px-6 py-3 text-sm font-medium border-b-2 ${
                     activeTab === tab
                       ? "border-blue-600 text-blue-600"
                       : "border-transparent text-gray-500 hover:text-gray-700"
                   }`}
                 >
-                  {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                  {tab === "printpack" ? "Print Pack" : tab.charAt(0).toUpperCase() + tab.slice(1)}
                 </button>
               ))}
             </nav>
@@ -592,17 +653,63 @@ function DesignDetailContent() {
               </div>
             )}
 
-            {/* Files Tab */}
+            {/* Files Tab: SVG + PNG + PDF + colors + validations */}
             {activeTab === "files" && (
               <div className="space-y-6">
                 <p className="text-sm text-gray-600">
-                  Upload PNG (art file) and PDF (print-ready). Max: PNG 25MB, PDF 50MB.
+                  SVG (master vector), PNG (rendering/AI), PDF (print vendor). Max: SVG 5MB, PNG 25MB, PDF 50MB.
                 </p>
 
-                <div className="grid grid-cols-2 gap-6">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                  {/* SVG Upload */}
+                  <div className="border border-gray-200 rounded-lg p-4">
+                    <h3 className="font-medium mb-3">SVG (Master Vector)</h3>
+                    <div className="bg-gray-50 rounded-lg p-6 flex flex-col items-center justify-center min-h-[200px]">
+                      {design.files?.svg?.downloadUrl ? (
+                        <>
+                          <img
+                            src={design.files.svg.downloadUrl}
+                            alt="SVG preview"
+                            className="max-w-full max-h-[150px] object-contain mb-3"
+                          />
+                          <div className="text-xs text-gray-500 text-center">
+                            <p>{design.files.svg.fileName}</p>
+                            <p>{formatBytes(design.files.svg.sizeBytes)}</p>
+                          </div>
+                          <a
+                            href={design.files.svg.downloadUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="mt-2 text-sm text-blue-600 hover:underline"
+                          >
+                            Download SVG
+                          </a>
+                        </>
+                      ) : (
+                        <div className="text-center text-gray-400">
+                          <svg className="w-12 h-12 mx-auto mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                          </svg>
+                          <p>No SVG uploaded</p>
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => svgInputRef.current?.click()}
+                      disabled={uploadingKind === "svg"}
+                      className="mt-3 w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                    >
+                      {uploadingKind === "svg"
+                        ? "Uploading..."
+                        : design.files?.svg
+                        ? "Replace SVG"
+                        : "Upload SVG"}
+                    </button>
+                  </div>
+
                   {/* PNG Upload */}
                   <div className="border border-gray-200 rounded-lg p-4">
-                    <h3 className="font-medium mb-3">PNG (Art File)</h3>
+                    <h3 className="font-medium mb-3">PNG (Rendering / AI)</h3>
                     <div className="bg-gray-50 rounded-lg p-6 flex flex-col items-center justify-center min-h-[200px]">
                       {design.files?.png?.downloadUrl ? (
                         <>
@@ -686,185 +793,117 @@ function DesignDetailContent() {
                     </button>
                   </div>
                 </div>
-              </div>
-            )}
 
-            {/* Colors Tab */}
-            {activeTab === "colors" && (
-              <div className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <h3 className="font-medium">Print Colors ({design.colorCount})</h3>
-                  {!isEditingColors && (
-                    <button
-                      onClick={startEditingColors}
-                      className="text-sm text-blue-600 hover:text-blue-800"
-                    >
-                      Edit Colors
-                    </button>
+                {/* Colors section (inline in Files tab) */}
+                <div className="border-t border-gray-200 pt-6 mt-6">
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="font-medium">Print Colors ({design.colorCount})</h3>
+                    {!isEditingColors && (
+                      <button
+                        onClick={startEditingColors}
+                        className="text-sm text-blue-600 hover:text-blue-800"
+                      >
+                        Edit Colors
+                      </button>
+                    )}
+                  </div>
+                  {colorError && (
+                    <div className="mb-4 p-3 bg-red-50 text-red-700 rounded-lg text-sm">
+                      {colorError}
+                    </div>
+                  )}
+                  {isEditingColors ? (
+                    <div className="space-y-3">
+                      {editedColors.map((color, index) => (
+                        <div key={index} className="flex items-center gap-3 p-3 bg-gray-50 rounded-lg">
+                          <input
+                            type="color"
+                            value={color.hex}
+                            onChange={(e) => handleColorChange(index, "hex", e.target.value)}
+                            className="w-10 h-10 border border-gray-300 rounded cursor-pointer"
+                          />
+                          <input
+                            type="text"
+                            value={color.hex}
+                            onChange={(e) => handleColorChange(index, "hex", e.target.value)}
+                            placeholder="#000000"
+                            className="w-24 px-2 py-1 border border-gray-300 rounded text-sm font-mono"
+                          />
+                          <input
+                            type="text"
+                            value={color.name || ""}
+                            onChange={(e) => handleColorChange(index, "name", e.target.value)}
+                            placeholder="Color name"
+                            className="flex-1 px-2 py-1 border border-gray-300 rounded text-sm"
+                          />
+                          <select
+                            value={color.role || "ink"}
+                            onChange={(e) => handleColorChange(index, "role", e.target.value)}
+                            className="px-2 py-1 border border-gray-300 rounded text-sm"
+                          >
+                            <option value="ink">Ink</option>
+                            <option value="accent">Accent</option>
+                            <option value="underbase">Underbase</option>
+                          </select>
+                          {editedColors.length > 1 && (
+                            <button
+                              onClick={() => handleRemoveColor(index)}
+                              className="text-red-500 hover:text-red-700"
+                            >
+                              ✕
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                      <button
+                        onClick={handleAddColor}
+                        className="text-sm text-blue-600 hover:text-blue-800"
+                      >
+                        + Add Color
+                      </button>
+                      <div className="flex justify-end gap-2 pt-4">
+                        <button
+                          onClick={() => setIsEditingColors(false)}
+                          className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={handleSaveColors}
+                          disabled={isSavingColors}
+                          className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                        >
+                          {isSavingColors ? "Saving..." : "Save Colors"}
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {design.colors.map((color, index) => (
+                        <div key={index} className="flex items-center gap-3 p-3 bg-gray-50 rounded-lg">
+                          <div
+                            className="w-8 h-8 rounded-full border border-gray-300"
+                            style={{ backgroundColor: color.hex }}
+                          />
+                          <div className="flex-1">
+                            <div className="font-medium text-sm">
+                              {color.name || "Unnamed"}
+                            </div>
+                            <div className="text-xs text-gray-500">{color.hex}</div>
+                          </div>
+                          <span className="px-2 py-0.5 bg-gray-200 text-gray-600 rounded text-xs capitalize">
+                            {color.role || "ink"}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
                   )}
                 </div>
-
-                {colorError && (
-                  <div className="p-3 bg-red-50 text-red-700 rounded-lg text-sm">
-                    {colorError}
-                  </div>
-                )}
-
-                {isEditingColors ? (
-                  <div className="space-y-3">
-                    {editedColors.map((color, index) => (
-                      <div key={index} className="flex items-center gap-3 p-3 bg-gray-50 rounded-lg">
-                        <input
-                          type="color"
-                          value={color.hex}
-                          onChange={(e) => handleColorChange(index, "hex", e.target.value)}
-                          className="w-10 h-10 border border-gray-300 rounded cursor-pointer"
-                        />
-                        <input
-                          type="text"
-                          value={color.hex}
-                          onChange={(e) => handleColorChange(index, "hex", e.target.value)}
-                          placeholder="#000000"
-                          className="w-24 px-2 py-1 border border-gray-300 rounded text-sm font-mono"
-                        />
-                        <input
-                          type="text"
-                          value={color.name || ""}
-                          onChange={(e) => handleColorChange(index, "name", e.target.value)}
-                          placeholder="Color name"
-                          className="flex-1 px-2 py-1 border border-gray-300 rounded text-sm"
-                        />
-                        <select
-                          value={color.role || "ink"}
-                          onChange={(e) => handleColorChange(index, "role", e.target.value)}
-                          className="px-2 py-1 border border-gray-300 rounded text-sm"
-                        >
-                          <option value="ink">Ink</option>
-                          <option value="accent">Accent</option>
-                          <option value="underbase">Underbase</option>
-                        </select>
-                        {editedColors.length > 1 && (
-                          <button
-                            onClick={() => handleRemoveColor(index)}
-                            className="text-red-500 hover:text-red-700"
-                          >
-                            ✕
-                          </button>
-                        )}
-                      </div>
-                    ))}
-                    <button
-                      onClick={handleAddColor}
-                      className="text-sm text-blue-600 hover:text-blue-800"
-                    >
-                      + Add Color
-                    </button>
-                    <div className="flex justify-end gap-2 pt-4">
-                      <button
-                        onClick={() => setIsEditingColors(false)}
-                        className="px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        onClick={handleSaveColors}
-                        disabled={isSavingColors}
-                        className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
-                      >
-                        {isSavingColors ? "Saving..." : "Save Colors"}
-                      </button>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    {design.colors.map((color, index) => (
-                      <div key={index} className="flex items-center gap-3 p-3 bg-gray-50 rounded-lg">
-                        <div
-                          className="w-8 h-8 rounded-full border border-gray-300"
-                          style={{ backgroundColor: color.hex }}
-                        />
-                        <div className="flex-1">
-                          <div className="font-medium text-sm">
-                            {color.name || "Unnamed"}
-                          </div>
-                          <div className="text-xs text-gray-500">{color.hex}</div>
-                        </div>
-                        <span className="px-2 py-0.5 bg-gray-200 text-gray-600 rounded text-xs capitalize">
-                          {color.role || "ink"}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
               </div>
             )}
 
-            {/* Placements Tab */}
-            {activeTab === "placements" && (
-              <div className="space-y-4">
-                <p className="text-sm text-gray-600">
-                  Default placement settings for artwork positioning on blanks.
-                </p>
-
-                <div className="space-y-4">
-                  {design.placementDefaults.map((placement, index) => (
-                    <div key={index} className="p-4 bg-gray-50 rounded-lg">
-                      <h4 className="font-medium capitalize mb-3">
-                        {placement.placementId.replace("_", " ")}
-                      </h4>
-                      <dl className="grid grid-cols-2 gap-4 text-sm">
-                        <div>
-                          <dt className="text-gray-500">Position (X, Y)</dt>
-                          <dd>{placement.x}, {placement.y}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-gray-500">Scale</dt>
-                          <dd>{placement.scale}</dd>
-                        </div>
-                        <div>
-                          <dt className="text-gray-500">Safe Area</dt>
-                          <dd>
-                            {placement.safeArea.padX}, {placement.safeArea.padY} (
-                            {(1 - 2 * placement.safeArea.padX).toFixed(2)} ×{" "}
-                            {(1 - 2 * placement.safeArea.padY).toFixed(2)})
-                          </dd>
-                        </div>
-                        <div>
-                          <dt className="text-gray-500">Rotation</dt>
-                          <dd>{placement.rotationDeg || 0}°</dd>
-                        </div>
-                      </dl>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Notes Tab */}
-            {activeTab === "notes" && (
-              <div className="space-y-4">
-                <h3 className="font-medium">Notes / Printer Instructions</h3>
-                <textarea
-                  value={editedDescription || design.description || ""}
-                  onChange={(e) => setEditedDescription(e.target.value)}
-                  placeholder="Add notes for the printer (ink type, mesh count, etc.)..."
-                  rows={6}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
-                />
-                <div className="flex justify-end">
-                  <button
-                    onClick={handleSaveNotes}
-                    disabled={isSavingNotes}
-                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
-                  >
-                    {isSavingNotes ? "Saving..." : "Save Notes"}
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* Mocks Tab */}
-            {activeTab === "mocks" && (
+            {/* Mockups Tab */}
+            {activeTab === "mockups" && (
               <div className="space-y-6">
                 {/* Generator Section */}
                 <div className="bg-gray-50 rounded-lg p-6">
@@ -940,6 +979,29 @@ function DesignDetailContent() {
                           This blank does not have a {mockView} image
                         </p>
                       )}
+                    </div>
+
+                    {/* Placement Selector */}
+                    <div className="md:col-span-2">
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Placement
+                      </label>
+                      <select
+                        value={effectivePlacementId}
+                        onChange={(e) => setMockPlacementId(e.target.value as typeof mockPlacementId)}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      >
+                        {mockPlacementOptions.length > 0 ? (
+                          mockPlacementOptions.map((opt: { id: string; label: string }) => (
+                            <option key={opt.id} value={opt.id}>{opt.label}</option>
+                          ))
+                        ) : (
+                          <>
+                            <option value="front_center">Front Center</option>
+                            <option value="back_center">Back Center</option>
+                          </>
+                        )}
+                      </select>
                     </div>
                   </div>
 

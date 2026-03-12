@@ -304,6 +304,27 @@ function BlankDetailContent() {
     fileInputRef.current?.click();
   };
 
+  const [deletingView, setDeletingView] = useState<"front" | "back" | null>(null);
+  const handleDeleteImage = async (view: "front" | "back") => {
+    if (!blank?.blankId) return;
+    if (!confirm(`Remove the ${view} image? You can upload a new one afterward.`)) return;
+
+    setDeletingView(view);
+    try {
+      await updateBlank({
+        blankId: blank.blankId,
+        ...(view === "front" ? { clearFrontImage: true } : { clearBackImage: true }),
+      });
+      showToast(`${view} image removed`, "success");
+      refetchBlank();
+    } catch (err: any) {
+      console.error("[BlankDetail] Failed to delete image:", err);
+      showToast("Failed to remove image", "error");
+    } finally {
+      setDeletingView(null);
+    }
+  };
+
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !blank?.blankId) return;
@@ -660,13 +681,22 @@ function BlankDetailContent() {
                             {blank.images.front.width} × {blank.images.front.height}px
                             {blank.images.front.bytes && ` • ${Math.round(blank.images.front.bytes / 1024)}KB`}
                           </div>
-                          <button
-                            onClick={() => handleFileSelect("front")}
-                            disabled={uploadingView === "front"}
-                            className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50"
-                          >
-                            {uploadingView === "front" ? "Uploading..." : "Replace Image"}
-                          </button>
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => handleFileSelect("front")}
+                              disabled={uploadingView === "front"}
+                              className="flex-1 px-3 py-1.5 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50"
+                            >
+                              {uploadingView === "front" ? "Uploading..." : "Replace Image"}
+                            </button>
+                            <button
+                              onClick={() => handleDeleteImage("front")}
+                              disabled={deletingView === "front"}
+                              className="px-3 py-1.5 text-sm border border-red-200 text-red-700 rounded hover:bg-red-50 disabled:opacity-50"
+                            >
+                              {deletingView === "front" ? "Removing..." : "Delete"}
+                            </button>
+                          </div>
                         </div>
                       ) : (
                         <div className="text-center py-8">
@@ -705,13 +735,22 @@ function BlankDetailContent() {
                             {blank.images.back.width} × {blank.images.back.height}px
                             {blank.images.back.bytes && ` • ${Math.round(blank.images.back.bytes / 1024)}KB`}
                           </div>
-                          <button
-                            onClick={() => handleFileSelect("back")}
-                            disabled={uploadingView === "back"}
-                            className="w-full px-3 py-1.5 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50"
-                          >
-                            {uploadingView === "back" ? "Uploading..." : "Replace Image"}
-                          </button>
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => handleFileSelect("back")}
+                              disabled={uploadingView === "back"}
+                              className="flex-1 px-3 py-1.5 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50"
+                            >
+                              {uploadingView === "back" ? "Uploading..." : "Replace Image"}
+                            </button>
+                            <button
+                              onClick={() => handleDeleteImage("back")}
+                              disabled={deletingView === "back"}
+                              className="px-3 py-1.5 text-sm border border-red-200 text-red-700 rounded hover:bg-red-50 disabled:opacity-50"
+                            >
+                              {deletingView === "back" ? "Removing..." : "Delete"}
+                            </button>
+                          </div>
                         </div>
                       ) : (
                         <div className="text-center py-8">

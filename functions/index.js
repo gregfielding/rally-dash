@@ -47,6 +47,28 @@ function getFalApiKey() {
   }
 }
 
+/**
+ * Recursively sanitize an object for Firestore: strip undefined (Firestore does not accept undefined).
+ * - undefined → omitted (for object keys) or null (in arrays)
+ * - Nested plain objects and arrays are processed recursively.
+ * - Timestamps, FieldValues, and other non-plain objects are left as-is.
+ */
+function sanitizeForFirestore(value) {
+  if (value === undefined) return null;
+  if (value === null || typeof value !== "object") return value;
+  if (value && typeof value.toDate === "function") return value; // Firestore Timestamp
+  if (Array.isArray(value)) return value.map(sanitizeForFirestore);
+  // Leave non-plain objects (FieldValue, Date, etc.) unchanged
+  if (Object.getPrototypeOf(value) !== Object.prototype) return value;
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (v === undefined) continue;
+    const sanitized = sanitizeForFirestore(v);
+    if (sanitized !== undefined) out[k] = sanitized;
+  }
+  return out;
+}
+
 // Cost estimation for fal.ai generation
 // Based on typical pricing: ~$0.01-0.05 per image depending on size and LoRAs
 function estimateGenerationCost(imageCount, imageSize, loraCount) {
@@ -1687,6 +1709,485 @@ exports.createProduct = functions.https.onCall(async (data, context) => {
 });
 
 /**
+ * Create a product from Design + Blank (product-first workflow).
+ * Creates minimal rp_products record; mockup is generated via createMockJob with productId.
+ */
+exports.createProductFromDesignBlank = functions.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
+  }
+
+  const { designId, blankId } = data || {};
+  if (!designId || typeof designId !== "string") {
+    throw new functions.https.HttpsError("invalid-argument", "designId is required");
+  }
+  if (!blankId || typeof blankId !== "string") {
+    throw new functions.https.HttpsError("invalid-argument", "blankId is required");
+  }
+
+  const designSnap = await db.collection("designs").doc(designId).get();
+  if (!designSnap.exists) {
+    throw new functions.https.HttpsError("not-found", `Design ${designId} not found`);
+  }
+  const design = designSnap.data();
+
+  if (!design.files?.png?.downloadUrl) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "Design missing PNG preview. Upload a PNG in Design Detail → Files before creating a product."
+    );
+  }
+
+  const blankSnap = await db.collection("rp_blanks").doc(blankId).get();
+  if (!blankSnap.exists) {
+    throw new functions.https.HttpsError("not-found", `Blank ${blankId} not found`);
+  }
+  const blank = blankSnap.data();
+
+  const teamName = design.teamNameCache || design.name || "Design";
+  const styleOrColor = blank.colorName || (blank.styleName && blank.styleName.split(/\s+/)[0]) || blank.styleName || "Cotton";
+  const name = `${teamName} ${styleOrColor} Panty`;
+  let slug = generateSlug(name);
+  const existing = await db.collection("rp_products").where("slug", "==", slug).get();
+  if (!existing.empty) {
+    slug = `${slug}-${Date.now().toString(36)}`;
+  }
+
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const userId = context.auth.uid;
+  const firstColor = design.colors && design.colors[0];
+
+  const productData = {
+    slug,
+    name,
+    description: null,
+    category: "panties",
+    baseProductKey: `DESIGN_${designId}_BLANK_${blankId}`,
+    colorway: {
+      name: firstColor?.name || blank.colorName || "Default",
+      hex: firstColor?.hex || blank.colorHex || null,
+    },
+    blankId,
+    designId,
+    mockupUrl: null,
+    ai: {
+      productArtifactId: null,
+      productTrigger: null,
+      productRecommendedScale: null,
+      blankTemplateId: null,
+    },
+    status: "draft",
+    tags: [],
+    counters: { assetsTotal: 0, assetsApproved: 0, assetsPublished: 0 },
+    createdAt: now,
+    updatedAt: now,
+    createdBy: userId,
+    updatedBy: userId,
+  };
+
+  const productRef = await db.collection("rp_products").add(productData);
+  console.log("[createProductFromDesignBlank] Created product:", productRef.id, slug);
+
+  return {
+    ok: true,
+    productId: productRef.id,
+    slug,
+  };
+});
+
+// ---------------------------------------------------------------------------
+// Bulk Generation Jobs
+// ---------------------------------------------------------------------------
+
+const BULK_MAX_MOCK_JOBS_PER_RUN = 5;
+const BULK_MAX_GENERATION_JOBS_PER_RUN = 10;
+
+/**
+ * Create a bulk generation job.
+ * Validates designs (must have PNG), blanks, identities; creates job doc with status=pending.
+ */
+exports.createBulkGenerationJob = functions.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
+  }
+
+  const { designIds, blankIds, identityIds, imagesPerProduct = 3, presetId } = data || {};
+
+  if (!Array.isArray(designIds) || designIds.length === 0) {
+    throw new functions.https.HttpsError("invalid-argument", "designIds must be a non-empty array");
+  }
+  if (!Array.isArray(blankIds) || blankIds.length === 0) {
+    throw new functions.https.HttpsError("invalid-argument", "blankIds must be a non-empty array");
+  }
+  if (!Array.isArray(identityIds) || identityIds.length === 0) {
+    throw new functions.https.HttpsError("invalid-argument", "identityIds must be a non-empty array");
+  }
+
+  const userId = context.auth.uid;
+
+  for (const designId of designIds) {
+    const designSnap = await db.collection("designs").doc(designId).get();
+    if (!designSnap.exists) {
+      throw new functions.https.HttpsError("not-found", `Design ${designId} not found`);
+    }
+    const design = designSnap.data();
+    if (!design.files?.png?.downloadUrl) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        `Design ${designId} is missing PNG. Upload a PNG in Design Detail → Files.`
+      );
+    }
+  }
+
+  for (const blankId of blankIds) {
+    const blankSnap = await db.collection("rp_blanks").doc(blankId).get();
+    if (!blankSnap.exists) {
+      throw new functions.https.HttpsError("not-found", `Blank ${blankId} not found`);
+    }
+  }
+
+  for (const identityId of identityIds) {
+    const identitySnap = await db.collection("rp_identities").doc(identityId).get();
+    if (!identitySnap.exists) {
+      throw new functions.https.HttpsError("not-found", `Identity ${identityId} not found`);
+    }
+  }
+
+  const total = designIds.length * blankIds.length * identityIds.length;
+  const now = admin.firestore.FieldValue.serverTimestamp();
+
+  const jobData = {
+    designIds,
+    blankIds,
+    identityIds,
+    options: {
+      imagesPerProduct: typeof imagesPerProduct === "number" ? imagesPerProduct : 3,
+      presetId: presetId || null,
+    },
+    status: "pending",
+    progress: { total, completed: 0, failed: 0 },
+    productIdsByKey: {},
+    generationJobsCreated: 0,
+    createdAt: now,
+    createdBy: userId,
+    updatedAt: now,
+  };
+
+  const jobRef = await db.collection("rp_bulk_generation_jobs").add(jobData);
+  const bulkJobId = jobRef.id;
+  console.log("[createBulkGenerationJob] Created job:", bulkJobId, "total:", total);
+
+  // Expand designIds × blankIds × identityIds into child job items (two-layer architecture)
+  const itemsRef = db.collection("rp_bulk_generation_job_items");
+  const BATCH_SIZE = 500;
+  const itemDocs = [];
+  for (const designId of designIds) {
+    for (const blankId of blankIds) {
+      for (const identityId of identityIds) {
+        itemDocs.push({
+          bulkJobId,
+          designId,
+          blankId,
+          identityId,
+          productId: null,
+          mockJobId: null,
+          generationJobId: null,
+          status: "pending",
+          error: null,
+          attemptCount: 0,
+          lastAttemptAt: null,
+          errorCode: null,
+          errorMessage: null,
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+    }
+  }
+  for (let i = 0; i < itemDocs.length; i += BATCH_SIZE) {
+    const batch = db.batch();
+    const chunk = itemDocs.slice(i, i + BATCH_SIZE);
+    for (const item of chunk) {
+      const ref = itemsRef.doc();
+      batch.set(ref, item);
+    }
+    await batch.commit();
+  }
+  console.log("[createBulkGenerationJob] Created", itemDocs.length, "job items");
+
+  return {
+    ok: true,
+    jobId: bulkJobId,
+    total,
+  };
+});
+
+/**
+ * Find or create a product for designId + blankId (idempotent for bulk).
+ */
+async function findOrCreateProductForBulk(designId, blankId, userId) {
+  const existing = await db.collection("rp_products")
+    .where("designId", "==", designId)
+    .where("blankId", "==", blankId)
+    .limit(1)
+    .get();
+
+  if (!existing.empty) {
+    return { productId: existing.docs[0].id };
+  }
+
+  const designSnap = await db.collection("designs").doc(designId).get();
+  const blankSnap = await db.collection("rp_blanks").doc(blankId).get();
+  if (!designSnap.exists || !blankSnap.exists) {
+    throw new Error(`Design or blank not found: ${designId}, ${blankId}`);
+  }
+  const design = designSnap.data();
+  const blank = blankSnap.data();
+
+  const teamName = design.teamNameCache || design.name || "Design";
+  const styleOrColor = blank.colorName || (blank.styleName && blank.styleName.split(/\s+/)[0]) || blank.styleName || "Cotton";
+  const name = `${teamName} ${styleOrColor} Panty`;
+  let slug = generateSlug(name);
+  const slugExists = await db.collection("rp_products").where("slug", "==", slug).get();
+  if (!slugExists.empty) {
+    slug = `${slug}-${Date.now().toString(36)}`;
+  }
+
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const firstColor = design.colors && design.colors[0];
+  const productData = {
+    slug,
+    name,
+    description: null,
+    category: "panties",
+    baseProductKey: `DESIGN_${designId}_BLANK_${blankId}`,
+    colorway: {
+      name: firstColor?.name || blank.colorName || "Default",
+      hex: firstColor?.hex || blank.colorHex || null,
+    },
+    blankId,
+    designId,
+    mockupUrl: null,
+    ai: { productArtifactId: null, productTrigger: null, productRecommendedScale: null, blankTemplateId: null },
+    status: "draft",
+    tags: [],
+    counters: { assetsTotal: 0, assetsApproved: 0, assetsPublished: 0 },
+    createdAt: now,
+    updatedAt: now,
+    createdBy: userId,
+    updatedBy: userId,
+  };
+
+  const productRef = await db.collection("rp_products").add(productData);
+  return { productId: productRef.id };
+}
+
+/**
+ * Scheduled worker: process pending bulk generation job items (two-layer architecture).
+ * Queries rp_bulk_generation_job_items where status == "pending", creates product (idempotent),
+ * mock job (once per product, throttled), or generation job (throttled). Progress is derived from items.
+ */
+exports.processBulkGenerationJobs = functions.pubsub
+  .schedule("every 2 minutes")
+  .onRun(async (context) => {
+    const itemsSnap = await db.collection("rp_bulk_generation_job_items")
+      .where("status", "==", "pending")
+      .limit(15)
+      .get();
+
+    if (itemsSnap.empty) {
+      return null;
+    }
+
+    let effectivePresetId = null;
+    const presetSnap = await db.collection("rp_scene_presets")
+      .where("isActive", "==", true)
+      .limit(1)
+      .get();
+    if (!presetSnap.empty) {
+      effectivePresetId = presetSnap.docs[0].id;
+    }
+
+    let mockJobsCreatedThisRun = 0;
+    let genJobsCreatedThisRun = 0;
+    const bulkJobIdsTouched = new Set();
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    for (const itemDoc of itemsSnap.docs) {
+      const itemRef = itemDoc.ref;
+      const item = itemDoc.data();
+      const { bulkJobId, designId, blankId, identityId } = item;
+
+      if (!effectivePresetId && genJobsCreatedThisRun > 0) break;
+
+      try {
+        let jobOptions = {};
+        const bulkRef = db.collection("rp_bulk_generation_jobs").doc(bulkJobId);
+        const bulkSnap = await bulkRef.get();
+        if (bulkSnap.exists) {
+          jobOptions = bulkSnap.data().options || {};
+        }
+        const presetId = jobOptions.presetId || effectivePresetId;
+        const imagesPerProduct = jobOptions.imagesPerProduct ?? 3;
+        const createdBy = bulkSnap.exists ? bulkSnap.data().createdBy : null;
+
+        const { productId } = await findOrCreateProductForBulk(designId, blankId, createdBy);
+        await itemRef.update({
+          productId,
+          updatedAt: now,
+        });
+
+        const productSnap = await db.collection("rp_products").doc(productId).get();
+        const product = productSnap.exists ? productSnap.data() : null;
+        const hasMockup = !!(product && product.mockupUrl);
+
+        if (hasMockup && presetId && genJobsCreatedThisRun < BULK_MAX_GENERATION_JOBS_PER_RUN) {
+          await itemRef.update({
+            status: "running",
+            attemptCount: (item.attemptCount || 0) + 1,
+            lastAttemptAt: now,
+            updatedAt: now,
+          });
+          const genJobResult = await createGenerationJob({
+            productId,
+            presetId,
+            identityId,
+            generationType: "on_model",
+            imageCount: imagesPerProduct,
+            imageSize: "square",
+          }, createdBy);
+          if (genJobResult?.jobId) {
+            await db.collection("rp_generation_jobs").doc(genJobResult.jobId).update({
+              bulkJobId,
+              updatedAt: now,
+            });
+            await itemRef.update({
+              status: "completed",
+              generationJobId: genJobResult.jobId,
+              error: null,
+              errorCode: null,
+              errorMessage: null,
+              updatedAt: now,
+            });
+            genJobsCreatedThisRun++;
+            bulkJobIdsTouched.add(bulkJobId);
+          }
+        } else if (!hasMockup && mockJobsCreatedThisRun < BULK_MAX_MOCK_JOBS_PER_RUN) {
+          const existingMock = await db.collection("rp_mock_jobs")
+            .where("productId", "==", productId)
+            .where("status", "in", ["queued", "processing"])
+            .limit(1)
+            .get();
+          if (!existingMock.empty) {
+            await itemRef.update({
+              status: "awaiting_mock",
+              updatedAt: now,
+            });
+            bulkJobIdsTouched.add(bulkJobId);
+          } else {
+            const designSnap = await db.collection("designs").doc(designId).get();
+            const blankSnap = await db.collection("rp_blanks").doc(blankId).get();
+            const design = designSnap.exists ? designSnap.data() : {};
+            const blank = blankSnap.exists ? blankSnap.data() : {};
+            const viewImage = blank?.images?.front;
+            const placementId = "front_center";
+            let placement = DEFAULT_MOCK_PLACEMENT;
+            const blankPlacement = blank?.placements?.find(p => p.placementId === placementId);
+            if (blankPlacement) {
+              placement = {
+                x: blankPlacement.defaultX ?? placement.x,
+                y: blankPlacement.defaultY ?? placement.y,
+                scale: blankPlacement.defaultScale ?? placement.scale,
+                safeArea: blankPlacement.safeArea ?? placement.safeArea,
+                rotationDeg: 0,
+              };
+            } else {
+              const designPlacement = design?.placementDefaults?.find(p => p.placementId === placementId);
+              if (designPlacement) {
+                placement = {
+                  x: designPlacement.x ?? placement.x,
+                  y: designPlacement.y ?? placement.y,
+                  scale: designPlacement.scale ?? placement.scale,
+                  safeArea: designPlacement.safeArea ?? placement.safeArea,
+                  rotationDeg: designPlacement.rotationDeg ?? 0,
+                };
+              }
+            }
+            await itemRef.update({
+              status: "running",
+              attemptCount: (item.attemptCount || 0) + 1,
+              lastAttemptAt: now,
+              updatedAt: now,
+            });
+            const mockRef = await db.collection("rp_mock_jobs").add({
+              designId,
+              blankId,
+              view: "front",
+              placementId: "front_center",
+              quality: "draft",
+              productId,
+              input: {
+                blankImageUrl: viewImage?.downloadUrl || null,
+                designPngUrl: design?.files?.png?.downloadUrl || null,
+                placement,
+              },
+              output: {},
+              attempts: 0,
+              status: "queued",
+              createdAt: now,
+              createdByUid: createdBy,
+              updatedAt: now,
+            });
+            await itemRef.update({
+              status: "awaiting_mock",
+              mockJobId: mockRef.id,
+              updatedAt: now,
+            });
+            mockJobsCreatedThisRun++;
+            bulkJobIdsTouched.add(bulkJobId);
+          }
+        }
+      } catch (err) {
+        console.warn("[processBulkGenerationJobs] Item failed:", itemDoc.id, err.message);
+        await itemRef.update({
+          status: "failed",
+          error: err.message,
+          errorMessage: err.message,
+          attemptCount: (item.attemptCount || 0) + 1,
+          lastAttemptAt: now,
+          updatedAt: now,
+        });
+        bulkJobIdsTouched.add(bulkJobId);
+      }
+    }
+
+    for (const bulkJobId of bulkJobIdsTouched) {
+      const itemsForJob = await db.collection("rp_bulk_generation_job_items")
+        .where("bulkJobId", "==", bulkJobId)
+        .get();
+      const total = itemsForJob.size;
+      let completed = 0;
+      let failed = 0;
+      itemsForJob.docs.forEach(d => {
+        const s = d.data().status;
+        if (s === "completed") completed++;
+        else if (s === "failed") failed++;
+      });
+      const bulkRef = db.collection("rp_bulk_generation_jobs").doc(bulkJobId);
+      await bulkRef.update({
+        status: completed + failed >= total ? "completed" : "running",
+        progress: { total, completed, failed },
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      if (completed + failed >= total) {
+        console.log("[processBulkGenerationJobs] Bulk job completed:", bulkJobId);
+      }
+    }
+
+    return null;
+  });
+
+/**
  * Helper: Join positive prompt parts with commas
  */
 function joinPos(...parts) {
@@ -1792,7 +2293,7 @@ function resolvePromptWithGuardrails(input) {
           artifactId: faceArtifact.id,
           type: "face",
           weight: weight,
-          trigger: faceArtifact.trigger || undefined,
+          trigger: faceArtifact.trigger || null,
         });
         trace.push(`face artifact added (weight: ${weight})`);
       }
@@ -1804,7 +2305,7 @@ function resolvePromptWithGuardrails(input) {
           artifactId: bodyArtifact.id,
           type: "body",
           weight: weight,
-          trigger: bodyArtifact.trigger || undefined,
+          trigger: bodyArtifact.trigger || null,
         });
         trace.push(`body artifact added (weight: ${weight})`);
       }
@@ -1819,7 +2320,7 @@ function resolvePromptWithGuardrails(input) {
         artifactId: productArtifact.id,
         type: "product",
         weight: weight,
-        trigger: productArtifact.trigger || undefined,
+        trigger: productArtifact.trigger || null,
       });
       trace.push(`product artifact added (weight: ${weight})`);
     }
@@ -2024,11 +2525,12 @@ async function createGenerationJob(data, userId) {
   const loraCount = [artifacts?.faceArtifactId, artifacts?.bodyArtifactId, artifacts?.productArtifactId].filter(Boolean).length;
   const costEstimate = estimateGenerationCost(finalImageCount, imageSize, loraCount);
 
-  // Create generation job
+  // Create generation job (inputImageUrl = product.mockupUrl for LoRA pipeline: mockup → model photos)
   const jobData = {
     productId,
     productSlug: product.slug || null,
     designId: designId || null,
+    inputImageUrl: product.mockupUrl || null,
     generationType,
     presetMode,
     presetId,
@@ -2068,10 +2570,7 @@ async function createGenerationJob(data, userId) {
     updatedBy: userId,
   };
 
-  const sanitized = Object.fromEntries(
-    Object.entries(jobData).filter(([_, value]) => value !== undefined)
-  );
-
+  const sanitized = sanitizeForFirestore(jobData);
   const jobRef = await db.collection("rp_generation_jobs").add(sanitized);
   return { jobId: jobRef.id, costEstimate };
 }
@@ -2106,6 +2605,40 @@ exports.generateProductAssets = functions.https.onCall(async (data, context) => 
       "productId and presetId are required"
     );
   }
+
+  try {
+    return await generateProductAssetsImpl(data, context);
+  } catch (err) {
+    const msg = err?.message || String(err);
+    if (err instanceof functions.https.HttpsError) {
+      throw err;
+    }
+    if (msg.includes("Identity required") || msg.includes("preset") || msg.includes("not found")) {
+      throw new functions.https.HttpsError("failed-precondition", msg);
+    }
+    if (msg.includes("required") || msg.includes("invalid")) {
+      throw new functions.https.HttpsError("invalid-argument", msg);
+    }
+    console.error("[generateProductAssets] Unhandled error:", err);
+    throw new functions.https.HttpsError("internal", msg || "Generation failed");
+  }
+});
+
+async function generateProductAssetsImpl(data, context) {
+  const {
+    productId,
+    designId,
+    generationType = "on_model",
+    identityId,
+    presetId,
+    artifacts,
+    promptOverrides,
+    imageCount = 4,
+    imageSize = "square",
+    seed,
+    experimentId,
+    variantId,
+  } = data || {};
 
   // Validate generationType
   if (generationType !== "product_only" && generationType !== "on_model") {
@@ -2283,11 +2816,20 @@ exports.generateProductAssets = functions.https.onCall(async (data, context) => 
   const now = admin.firestore.FieldValue.serverTimestamp();
   const userId = context.auth.uid;
 
+  // Product-only requires a mockup (input image)
+  if (generationType === "product_only" && !product.mockupUrl) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "Product must have a mockup before generating product-only images. Run \"Generate mockup\" first."
+    );
+  }
+
   // Create generation job with resolved values and trace (Section 4.1)
   const jobData = {
     productId,
     productSlug: product.slug || null, // NEW: snapshot
     designId: designId || null,
+    inputImageUrl: product.mockupUrl || null, // for product_only and on_model (mockup → model)
     generationType, // Legacy, kept for backward compatibility
     presetMode, // NEW: snapshot of preset mode
     presetId,
@@ -2342,10 +2884,7 @@ exports.generateProductAssets = functions.https.onCall(async (data, context) => 
   jobData.retryCount = 0;
   jobData.maxRetries = 3;
 
-  const sanitized = Object.fromEntries(
-    Object.entries(jobData).filter(([_, value]) => value !== undefined)
-  );
-
+  const sanitized = sanitizeForFirestore(jobData);
   const jobRef = await db.collection("rp_generation_jobs").add(sanitized);
 
   console.log("[generateProductAssets] Created job:", jobRef.id, `(estimated cost: $${costEstimate.toFixed(4)})`);
@@ -2355,7 +2894,7 @@ exports.generateProductAssets = functions.https.onCall(async (data, context) => 
     jobId: jobRef.id,
     costEstimate,
   };
-});
+}
 
 /**
  * Batch Generate Product Assets
@@ -2509,6 +3048,7 @@ exports.onRpGenerationJobCreated = functions.firestore
         negativePrompt: job.negativePrompt || null,
         identityTrigger: generationType === "on_model" ? (identity?.trigger || identity?.defaultTriggerPhrase || job.identityId) : null,
         productKey: product?.slug || product?.name || null,
+        inputImageUrl: job.inputImageUrl || product?.mockupUrl || null,
         scenePresetId: job.presetId || null,
         scenePresetName: preset?.name || null,
         faceArtifactId: generationType === "on_model" ? (job.artifacts?.faceArtifactId || null) : null,
@@ -2589,6 +3129,76 @@ exports.onRpGenerationJobCreated = functions.firestore
         debug: debugInfo,
         updatedAt: now,
       });
+
+      // PRODUCT_ONLY: Exact composite path — use mockup as-is (deterministic), no generative model
+      // Phase 1: Rally must output the real blank + design + placement, matching Photoshop benchmark.
+      if (generationType === "product_only") {
+        const mockupUrl = job.inputImageUrl || product?.mockupUrl || null;
+        if (!mockupUrl) {
+          throw new Error("product_only job requires inputImageUrl (product mockup). Generate mockup first.");
+        }
+        console.log(`[onRpGenerationJobCreated] product_only: using exact composite from mockup (no generative pass)`);
+
+        const imageResponse = await fetch(mockupUrl);
+        if (!imageResponse.ok) {
+          throw new Error(`Failed to fetch mockup image: ${imageResponse.status} ${imageResponse.statusText}`);
+        }
+        const contentType = imageResponse.headers.get("content-type") || "image/png";
+        const buffer = Buffer.from(await imageResponse.arrayBuffer());
+
+        const bucket = storage.bucket();
+        const assetPath = `rp/products/${job.productId}/assets/${jobId}_0.png`;
+        const file = bucket.file(assetPath);
+        await file.save(buffer, { contentType });
+        await file.makePublic();
+        const downloadUrl = `https://storage.googleapis.com/${bucket.name}/${assetPath}`;
+
+        const presetMode = "productOnly";
+        const assetType = "productPackshot";
+        const assetData = {
+          productId: job.productId,
+          jobId: jobId,
+          designId: job.designId || null,
+          presetId: job.presetId,
+          presetMode,
+          assetType,
+          generationType: "product_only",
+          identityId: null,
+          type: "image",
+          status: "draft",
+          storagePath: assetPath,
+          downloadUrl,
+          publicUrl: downloadUrl,
+          generationJobId: jobId,
+          prompt: job.resolvedPrompt || job.prompt || null,
+          negativePrompt: job.negativePrompt || null,
+          artifacts: job.artifacts || null,
+          source: "exact_composite",
+          createdAt: now,
+          updatedAt: now,
+          createdBy: job.createdBy || "system",
+          updatedBy: "system",
+        };
+        const sanitizedAsset = Object.fromEntries(
+          Object.entries(assetData).filter(([_, value]) => value !== undefined)
+        );
+        const assetRef = await db.collection("rp_product_assets").add(sanitizedAsset);
+        const assetRefs = [{ assetId: assetRef.id, storagePath: assetPath, downloadUrl }];
+
+        await jobRef.update({
+          status: "succeeded",
+          outputs: { images: assetRefs },
+          actualCost: 0,
+          updatedAt: now,
+        });
+        const productRef = db.collection("rp_products").doc(job.productId);
+        await productRef.update({
+          "counters.assetsTotal": admin.firestore.FieldValue.increment(1),
+          updatedAt: now,
+        });
+        console.log(`[onRpGenerationJobCreated] product_only job ${jobId} completed: 1 exact-composite asset`);
+        return;
+      }
 
       // PLACEHOLDER MODE: Create placeholder assets and return
       if (USE_PLACEHOLDER) {
@@ -3040,6 +3650,42 @@ exports.onRpGenerationJobStatusChanged = functions.firestore
           createdAt: now,
         });
         console.log(`[onRpGenerationJobStatusChanged] Created failure notification for job ${jobId}`);
+      }
+    }
+
+    // Handle bulk generation job progress (legacy: only when job has no child items; item-based jobs use worker-derived progress)
+    if (after.bulkJobId) {
+      const hasItems = await db.collection("rp_bulk_generation_job_items")
+        .where("bulkJobId", "==", after.bulkJobId)
+        .limit(1)
+        .get();
+      if (hasItems.empty) {
+        const bulkRef = db.collection("rp_bulk_generation_jobs").doc(after.bulkJobId);
+        const bulkSnap = await bulkRef.get();
+        if (bulkSnap.exists) {
+          const bulk = bulkSnap.data();
+          const progress = bulk.progress || { total: 0, completed: 0, failed: 0 };
+          const isSuccess = after.status === "succeeded" || after.status === "completed";
+          const update = {
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          };
+          if (isSuccess) {
+            update["progress.completed"] = (progress.completed || 0) + 1;
+          } else if (after.status === "failed") {
+            update["progress.failed"] = (progress.failed || 0) + 1;
+          }
+          await bulkRef.update(update);
+
+          const newCompleted = isSuccess ? (progress.completed || 0) + 1 : (progress.completed || 0);
+          const newFailed = after.status === "failed" ? (progress.failed || 0) + 1 : (progress.failed || 0);
+          if (newCompleted + newFailed >= (progress.total || 0)) {
+            await bulkRef.update({
+              status: "completed",
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            console.log("[onRpGenerationJobStatusChanged] Bulk job completed:", after.bulkJobId);
+          }
+        }
       }
     }
 
@@ -4271,7 +4917,7 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError("permission-denied", "Only admins can update blanks");
   }
 
-  const { blankId, status, frontImage, backImage, imageMeta } = data;
+  const { blankId, status, frontImage, backImage, imageMeta, clearFrontImage, clearBackImage } = data;
 
   if (!blankId || typeof blankId !== "string") {
     throw new functions.https.HttpsError("invalid-argument", "blankId is required");
@@ -4294,8 +4940,38 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
     updateData.status = status;
   }
 
-  // Front image update (RPImageRef object)
-  if (frontImage && frontImage.storagePath && frontImage.downloadUrl) {
+  // Clear front image (delete from storage if present, then remove from doc)
+  if (clearFrontImage) {
+    const blank = blankSnap.data();
+    const frontPath = blank?.images?.front?.storagePath;
+    if (frontPath) {
+      try {
+        const bucket = admin.storage().bucket();
+        await bucket.file(frontPath).delete();
+      } catch (storageErr) {
+        console.warn("[updateBlank] Could not delete front image from storage:", storageErr.message);
+      }
+    }
+    updateData["images.front"] = admin.firestore.FieldValue.delete();
+  }
+
+  // Clear back image (delete from storage if present, then remove from doc)
+  if (clearBackImage) {
+    const blank = blankSnap.data();
+    const backPath = blank?.images?.back?.storagePath;
+    if (backPath) {
+      try {
+        const bucket = admin.storage().bucket();
+        await bucket.file(backPath).delete();
+      } catch (storageErr) {
+        console.warn("[updateBlank] Could not delete back image from storage:", storageErr.message);
+      }
+    }
+    updateData["images.back"] = admin.firestore.FieldValue.delete();
+  }
+
+  // Front image update (RPImageRef object) — only if not clearing
+  if (!clearFrontImage && frontImage && frontImage.storagePath && frontImage.downloadUrl) {
     updateData["images.front"] = {
       storagePath: frontImage.storagePath,
       downloadUrl: frontImage.downloadUrl,
@@ -4306,8 +4982,8 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
     };
   }
 
-  // Back image update (RPImageRef object)
-  if (backImage && backImage.storagePath && backImage.downloadUrl) {
+  // Back image update (RPImageRef object) — only if not clearing
+  if (!clearBackImage && backImage && backImage.storagePath && backImage.downloadUrl) {
     updateData["images.back"] = {
       storagePath: backImage.storagePath,
       downloadUrl: backImage.downloadUrl,
@@ -4570,6 +5246,7 @@ exports.createDesignAsset = functions.https.onCall(async (data, context) => {
     tags: tags || [],
     description: description || null,
     files: {
+      svg: null,
       png: null,
       pdf: null,
     },
@@ -4578,6 +5255,7 @@ exports.createDesignAsset = functions.https.onCall(async (data, context) => {
     placementDefaults: DEFAULT_DESIGN_PLACEMENTS,
     linkedBlankVariantCount: 0,
     linkedProductCount: 0,
+    hasSvg: false,
     hasPng: false,
     hasPdf: false,
     isComplete: false,
@@ -4626,8 +5304,8 @@ exports.updateDesignFile = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError("invalid-argument", "designId is required");
   }
 
-  if (!kind || !["png", "pdf"].includes(kind)) {
-    throw new functions.https.HttpsError("invalid-argument", "kind must be 'png' or 'pdf'");
+  if (!kind || !["png", "pdf", "svg"].includes(kind)) {
+    throw new functions.https.HttpsError("invalid-argument", "kind must be 'png', 'pdf', or 'svg'");
   }
 
   if (!storagePath || !downloadUrl || !fileName) {
@@ -4648,7 +5326,7 @@ exports.updateDesignFile = functions.https.onCall(async (data, context) => {
     storagePath,
     downloadUrl,
     fileName,
-    contentType: contentType || (kind === "png" ? "image/png" : "application/pdf"),
+    contentType: contentType || (kind === "png" ? "image/png" : kind === "svg" ? "image/svg+xml" : "application/pdf"),
     sizeBytes: sizeBytes || 0,
     widthPx: kind === "png" ? (widthPx || null) : null,
     heightPx: kind === "png" ? (heightPx || null) : null,
@@ -4665,9 +5343,11 @@ exports.updateDesignFile = functions.https.onCall(async (data, context) => {
 
   // Update completion flags
   const currentData = designSnap.data();
+  const hasSvg = kind === "svg" ? true : !!currentData.files?.svg;
   const hasPng = kind === "png" ? true : !!currentData.files?.png;
   const hasPdf = kind === "pdf" ? true : !!currentData.files?.pdf;
 
+  updateData.hasSvg = hasSvg;
   updateData.hasPng = hasPng;
   updateData.hasPdf = hasPdf;
   updateData.isComplete = hasPng && hasPdf && currentData.colorCount > 0 && !!currentData.teamId;
@@ -4812,17 +5492,96 @@ exports.getDesignTeams = functions.https.onCall(async (data, context) => {
 });
 
 // ============================================================================
-// Product Mock Generation System (Per RP_Product_Mock_Generation_PNG_On_Blank_Spec.md)
+// Product Mock Generation System — Deterministic Renderer (Phase 1)
+// Aligned with RALLY_PHASE1_DETERMINISTIC_PRODUCT_RENDERER.md
 // ============================================================================
 
-// Default placement values for mock generation
+// Phase 1: deterministic only. Set to false to enable optional AI realism pass (Phase 2).
+const MOCK_PHASE1_DETERMINISTIC_ONLY = process.env.MOCK_PHASE1_DETERMINISTIC_ONLY !== "false";
+
+// Default placement values (normalized 0-1). Blanks may provide printArea: { x, y, width, height }.
+// Per RALLY_PHASE1_DETERMINISTIC_PRODUCT_RENDERER: soft-light for print-on-fabric + 90% opacity; premultiplied alpha for correct blend.
 const DEFAULT_MOCK_PLACEMENT = {
   x: 0.5,
   y: 0.5,
   scale: 0.6,
   safeArea: { padX: 0.2, padY: 0.2 },
   rotationDeg: 0,
+  blendMode: "soft-light",
+  blendOpacity: 0.9,
 };
+
+/** Apply opacity to an RGBA buffer (0-1). Used for blend integration (e.g. 80-90% for heather). */
+function applyOpacityToRgbaBuffer(buffer, width, height, opacity) {
+  const b = Buffer.from(buffer);
+  for (let i = 3; i < b.length; i += 4) {
+    b[i] = Math.round(b[i] * opacity);
+  }
+  return b;
+}
+
+/** Premultiply alpha (R,G,B *= A/255). Required for correct blending in Sharp composite (overlay/soft-light). */
+function premultiplyRgbaBuffer(buffer) {
+  const b = Buffer.from(buffer);
+  for (let i = 0; i < b.length; i += 4) {
+    const a = b[i + 3] / 255;
+    b[i] = Math.round(b[i] * a);
+    b[i + 1] = Math.round(b[i + 1] * a);
+    b[i + 2] = Math.round(b[i + 2] * a);
+  }
+  return b;
+}
+
+/** Alpha threshold for considering a pixel "visible" when detecting artwork bounds (avoid dust/noise). */
+const ARTWORK_BOUNDS_ALPHA_THRESHOLD = 5;
+
+/**
+ * Detect visible artwork bounds in a design PNG and crop to that region.
+ * Makes the renderer resilient to padded PNGs (RALLY_FIX_DESIGN_PNG_PADDING_AND_RENDERER_BOUNDS).
+ * Returns { buffer, width, height } — either cropped to artwork bounds or original if detection fails.
+ */
+async function cropDesignToArtworkBounds(designBuffer, alphaThreshold = ARTWORK_BOUNDS_ALPHA_THRESHOLD) {
+  const sharp = require("sharp");
+  const meta = await sharp(designBuffer).metadata();
+  const w = meta.width;
+  const h = meta.height;
+  if (!w || !h) return { buffer: designBuffer, width: w || 1, height: h || 1 };
+
+  const raw = await sharp(designBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ depth: 8, resolveWithObject: false });
+
+  let minX = w;
+  let minY = h;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      const a = raw[i + 3];
+      if (a > alphaThreshold) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  const boundsW = maxX >= minX ? maxX - minX + 1 : w;
+  const boundsH = maxY >= minY ? maxY - minY + 1 : h;
+  if (boundsW < 1 || boundsH < 1) {
+    return { buffer: designBuffer, width: w, height: h };
+  }
+
+  const cropped = await sharp(designBuffer)
+    .extract({ left: minX, top: minY, width: boundsW, height: boundsH })
+    .png()
+    .toBuffer();
+
+  return { buffer: cropped, width: boundsW, height: boundsH };
+}
 
 /**
  * Create a mock generation job
@@ -4834,7 +5593,7 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
   }
 
-  const { designId, blankId, view = "front", quality = "draft" } = data;
+  const { designId, blankId, view = "front", placementId: inputPlacementId, quality = "draft", productId, heroSlot, blankImageUrl: inputBlankUrl, designPngUrl: inputDesignUrl, placementOverride: inputPlacementOverride } = data;
 
   // Validate required fields
   if (!designId || typeof designId !== "string") {
@@ -4850,7 +5609,7 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError("invalid-argument", "quality must be 'draft' or 'final'");
   }
 
-  // Fetch the design
+  // Fetch the design (needed for placement even when explicit designPngUrl is provided)
   const designRef = db.collection("designs").doc(designId);
   const designSnap = await designRef.get();
   if (!designSnap.exists) {
@@ -4858,16 +5617,19 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
   }
   const design = designSnap.data();
 
-  // Validate design has PNG
-  if (!design.files?.png?.downloadUrl) {
-    throw new functions.https.HttpsError(
-      "failed-precondition",
-      "Design must have a PNG file uploaded"
-    );
+  // Use explicit design URL when provided (Render Setup UI), else design PNG
+  let designPngUrl = typeof inputDesignUrl === "string" && inputDesignUrl ? inputDesignUrl : null;
+  if (!designPngUrl) {
+    if (!design.files?.png?.downloadUrl) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "Design must have a PNG file uploaded"
+      );
+    }
+    designPngUrl = design.files.png.downloadUrl;
   }
-  const designPngUrl = design.files.png.downloadUrl;
 
-  // Fetch the blank
+  // Fetch the blank (needed for placement even when explicit blankImageUrl is provided)
   const blankRef = db.collection("rp_blanks").doc(blankId);
   const blankSnap = await blankRef.get();
   if (!blankSnap.exists) {
@@ -4875,38 +5637,52 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
   }
   const blank = blankSnap.data();
 
-  // Validate blank has the requested view image
-  const viewImage = blank.images?.[view];
-  if (!viewImage?.downloadUrl) {
-    throw new functions.https.HttpsError(
-      "failed-precondition",
-      `Blank must have a ${view} image uploaded`
-    );
+  // Use explicit blank URL when provided (Render Setup UI), else blank view image
+  let blankImageUrl = typeof inputBlankUrl === "string" && inputBlankUrl ? inputBlankUrl : null;
+  if (!blankImageUrl) {
+    const viewImage = blank.images?.[view];
+    if (!viewImage?.downloadUrl) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        `Blank must have a ${view} image uploaded`
+      );
+    }
+    blankImageUrl = viewImage.downloadUrl;
   }
-  const blankImageUrl = viewImage.downloadUrl;
 
-  // Resolve placement
-  const placementId = view === "front" ? "front_center" : "back_center";
+  // Resolve placement (use input if valid for view, else default)
+  const validPlacements = view === "front"
+    ? ["front_center", "front_left", "front_right"]
+    : ["back_center", "back_left", "back_right"];
+  const placementId = (inputPlacementId && validPlacements.includes(inputPlacementId))
+    ? inputPlacementId
+    : (view === "front" ? "front_center" : "back_center");
   
   // Try to get placement from blank, then from design, then use default
   let placement = DEFAULT_MOCK_PLACEMENT;
   
-  // Check blank placements first
+  // Check blank placements first (supports printArea per RALLY_PHASE1_DETERMINISTIC_PRODUCT_RENDERER)
   const blankPlacement = blank.placements?.find(p => p.placementId === placementId);
   if (blankPlacement) {
+    const printArea = blankPlacement.printArea || {};
     placement = {
-      x: blankPlacement.defaultX ?? placement.x,
-      y: blankPlacement.defaultY ?? placement.y,
+      x: printArea.x ?? blankPlacement.defaultX ?? placement.x,
+      y: printArea.y ?? blankPlacement.defaultY ?? placement.y,
+      width: printArea.width,
+      height: printArea.height,
       scale: blankPlacement.defaultScale ?? placement.scale,
       safeArea: blankPlacement.safeArea ?? placement.safeArea,
       rotationDeg: 0,
+      blendMode: blankPlacement.blendMode ?? "multiply",
+      blendOpacity: blankPlacement.blendOpacity ?? 0.87,
     };
   }
-  
+
   // Check design placements as fallback
   const designPlacement = design.placementDefaults?.find(p => p.placementId === placementId);
   if (!blankPlacement && designPlacement) {
     placement = {
+      ...placement,
       x: designPlacement.x ?? placement.x,
       y: designPlacement.y ?? placement.y,
       scale: designPlacement.scale ?? placement.scale,
@@ -4915,13 +5691,25 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
     };
   }
 
-  // Create the job document
+  // Master placement override (product-level "default" placement for all variants)
+  if (inputPlacementOverride && typeof inputPlacementOverride === "object") {
+    if (typeof inputPlacementOverride.x === "number") placement.x = inputPlacementOverride.x;
+    if (typeof inputPlacementOverride.y === "number") placement.y = inputPlacementOverride.y;
+    if (typeof inputPlacementOverride.scale === "number") placement.scale = inputPlacementOverride.scale;
+    if (typeof inputPlacementOverride.width === "number") placement.width = inputPlacementOverride.width;
+    if (typeof inputPlacementOverride.height === "number") placement.height = inputPlacementOverride.height;
+  }
+  console.log("[createMockJob] Resolved placement: x=" + placement.x + ", y=" + placement.y + ", scale=" + placement.scale + (placement.width != null ? ", width=" + placement.width + ", height=" + placement.height : " (no printArea)"));
+
+  // Create the job document (optional productId: link mockup to product; optional heroSlot: create product asset and set product.media.heroFront/heroBack)
   const jobData = {
     designId,
     blankId,
     view,
     placementId,
     quality,
+    productId: productId || null,
+    heroSlot: (heroSlot === "hero_front" || heroSlot === "hero_back") ? heroSlot : null,
     input: {
       blankImageUrl,
       designPngUrl,
@@ -4935,7 +5723,8 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   };
 
-  const jobRef = await db.collection("rp_mock_jobs").add(jobData);
+  const sanitized = sanitizeForFirestore(jobData);
+  const jobRef = await db.collection("rp_mock_jobs").add(sanitized);
   
   console.log("[createMockJob] Created job:", jobRef.id);
 
@@ -4943,9 +5732,10 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
 });
 
 /**
- * Worker: onMockJobCreated - Process mock generation when a job is created
- * Stage A: Deterministic composite using sharp
- * Stage B (if quality=final): AI realism pass via fal.ai (TODO in Phase 2)
+ * Worker: onMockJobCreated — Deterministic product mock engine (Phase 1)
+ * Pipeline per RALLY_PHASE1_DETERMINISTIC_PRODUCT_RENDERER.md:
+ *   Load blank → [optional fabric mask: design × mask] → scale design → position → multiply blend + opacity → export packshot
+ * Stage A: Exact composite (always). Stage B: AI realism (only when quality=final and not MOCK_PHASE1_DETERMINISTIC_ONLY).
  */
 exports.onMockJobCreated = functions
   .runWith({ memory: "1GB", timeoutSeconds: 300 })
@@ -4986,7 +5776,15 @@ exports.onMockJobCreated = functions
       if (!designResp.ok) {
         throw new Error(`Failed to fetch design PNG: ${designResp.status}`);
       }
-      const designBuffer = Buffer.from(await designResp.arrayBuffer());
+      let designBuffer = Buffer.from(await designResp.arrayBuffer());
+
+      // Detect artwork bounds and crop to visible design (resilient to padded PNGs — RALLY_FIX_DESIGN_PNG_PADDING_AND_RENDERER_BOUNDS)
+      const designMetaOriginal = await sharp(designBuffer).metadata();
+      const originalDesignW = designMetaOriginal.width || 1;
+      const originalDesignH = designMetaOriginal.height || 1;
+      const { buffer: designBufferCropped, width: designWidth, height: designHeight } = await cropDesignToArtworkBounds(designBuffer);
+      designBuffer = designBufferCropped;
+      console.log("[onMockJobCreated] Design PNG: original", originalDesignW, "x", originalDesignH, "→ artwork bounds", designWidth, "x", designHeight);
 
       // Get blank image dimensions
       const blankMeta = await sharp(blankBuffer).metadata();
@@ -4994,64 +5792,121 @@ exports.onMockJobCreated = functions
       const blankHeight = blankMeta.height;
       console.log("[onMockJobCreated] Blank dimensions:", blankWidth, "x", blankHeight);
 
-      // Calculate placement
-      const { x, y, scale, safeArea } = placement;
-      const padX = safeArea?.padX ?? 0.2;
-      const padY = safeArea?.padY ?? 0.2;
-
-      // Safe area bounds in normalized coordinates
-      const safeLeft = padX;
-      const safeRight = 1 - padX;
-      const safeTop = padY;
-      const safeBottom = 1 - padY;
-      const safeW = safeRight - safeLeft;
-      const safeH = safeBottom - safeTop;
-      const base = Math.min(safeW, safeH);
-      const artBox = base * scale;
-
-      // Convert to pixels
-      const artBoxPx = Math.round(artBox * blankWidth);
-      const centerXpx = Math.round(x * blankWidth);
-      const centerYpx = Math.round(y * blankHeight);
-
-      console.log("[onMockJobCreated] Art box:", artBoxPx, "px, center:", centerXpx, ",", centerYpx);
-
-      // Get design dimensions
-      const designMeta = await sharp(designBuffer).metadata();
-      const designWidth = designMeta.width;
-      const designHeight = designMeta.height;
-      console.log("[onMockJobCreated] Design dimensions:", designWidth, "x", designHeight);
-
-      // Resize design to fit within artBoxPx (contain)
-      const designAspect = designWidth / designHeight;
-      let resizedWidth, resizedHeight;
-      if (designAspect >= 1) {
-        // Landscape or square - fit to width
-        resizedWidth = artBoxPx;
-        resizedHeight = Math.round(artBoxPx / designAspect);
+      // Placement: support printArea (x, y, width, height) normalized 0-1 per spec, or legacy (x, y, scale, safeArea).
+      // x,y are always "center of design" (match Edit placement modal); scale sizes the art box.
+      const { x, y, scale, safeArea, width: placementWidth, height: placementHeight } = placement;
+      const effectiveScale = scale ?? 0.6;
+      const centerXpx = Math.round((x ?? 0.5) * blankWidth);
+      const centerYpx = Math.round((y ?? 0.5) * blankHeight);
+      let artBoxPxW, artBoxPxH, left, top;
+      if (placementWidth != null && placementHeight != null && placementWidth > 0 && placementHeight > 0) {
+        const fullPrintW = blankWidth * placementWidth;
+        const fullPrintH = blankHeight * placementHeight;
+        artBoxPxW = Math.round(fullPrintW * effectiveScale);
+        artBoxPxH = Math.round(fullPrintH * effectiveScale);
+        // Position by center (x,y) so mockup matches Edit placement modal
+        left = Math.round(centerXpx - artBoxPxW / 2);
+        top = Math.round(centerYpx - artBoxPxH / 2);
       } else {
-        // Portrait - fit to height
-        resizedHeight = artBoxPx;
-        resizedWidth = Math.round(artBoxPx * designAspect);
+        // No printArea: match Edit placement modal exactly — box is scale*50% of image (modal: width/height = scale*50%)
+        const modalBase = 0.5;
+        artBoxPxW = Math.round(blankWidth * modalBase * effectiveScale);
+        artBoxPxH = Math.round(blankHeight * modalBase * effectiveScale);
+        left = Math.round(centerXpx - artBoxPxW / 2);
+        top = Math.round(centerYpx - artBoxPxH / 2);
       }
 
-      const resizedDesign = await sharp(designBuffer)
+      // Max-fit scaling: scale (cropped) design to fit inside print area while keeping aspect ratio (no crop/overflow)
+      const designAspect = designWidth / designHeight;
+      const boxAspect = artBoxPxW / artBoxPxH;
+      let resizedWidth, resizedHeight;
+      if (designAspect >= boxAspect) {
+        resizedWidth = artBoxPxW;
+        resizedHeight = Math.round(artBoxPxW / designAspect);
+      } else {
+        resizedHeight = artBoxPxH;
+        resizedWidth = Math.round(artBoxPxH * designAspect);
+      }
+      console.log("[onMockJobCreated] Scaled artwork to print area: design", designWidth, "x", designHeight, "→", resizedWidth, "x", resizedHeight, "placement:", placementId, "scale:", effectiveScale, "center:", (x ?? 0.5).toFixed(2), (y ?? 0.5).toFixed(2));
+
+      // Pipeline: resize → slight blur (removes sticker look) → desaturate (fabric ink realism) → mask → opacity → multiply
+      const printBlurSigma = placement.printBlurSigma ?? 0.3;
+      const printSaturation = placement.printSaturation ?? 0.96;
+      const resizedResult = await sharp(designBuffer)
         .resize(resizedWidth, resizedHeight, { fit: "inside" })
+        .blur(printBlurSigma)
+        .modulate({ saturation: printSaturation })
+        .ensureAlpha()
+        .raw()
+        .toBuffer({ depth: 8, resolveWithObject: true });
+      let resizedDesignRaw = resizedResult.data;
+      const actualW = resizedResult.info.width;
+      const actualH = resizedResult.info.height;
+
+      // Per RALLY_PHASE1_DETERMINISTIC_PRODUCT_RENDERER: blend (soft-light for print-on-fabric look) + 80–90% opacity
+      const blendMode = placement.blendMode || "soft-light";
+      const effectiveOpacity = placement.blendOpacity ?? 0.9;
+
+      // Fabric mask: design × mask for fabric integration. Skip if mask appears inverted (would zero design on garment).
+      const maskDocId = `${blankId}_${view}`;
+      const maskDoc = await db.collection("rp_blank_masks").doc(maskDocId).get();
+      const maskData = maskDoc.exists ? maskDoc.data() : null;
+      if (maskData?.mask?.downloadUrl) {
+        try {
+          const maskResp = await fetch(maskData.mask.downloadUrl);
+          if (maskResp.ok) {
+            const maskResult = await sharp(await maskResp.arrayBuffer())
+              .resize(actualW, actualH, { fit: "fill" })
+              .grayscale()
+              .ensureAlpha()
+              .raw()
+              .toBuffer({ depth: 8, resolveWithObject: true });
+            const maskBuffer = maskResult.data;
+            let maskSum = 0;
+            let maskCount = 0;
+            for (let i = 0; i < maskBuffer.length; i += 4) {
+              maskSum += maskBuffer[i];
+              maskCount++;
+            }
+            const maskMean = maskCount > 0 ? maskSum / maskCount : 0;
+            // Only apply mask if it looks like "white = garment" (mean > 80). Inverted masks have low mean and would zero the design.
+            if (maskMean > 80) {
+              for (let i = 0; i < resizedDesignRaw.length; i += 4) {
+                const m = maskBuffer[i];
+                resizedDesignRaw[i] = Math.round((resizedDesignRaw[i] * m) / 255);
+                resizedDesignRaw[i + 1] = Math.round((resizedDesignRaw[i + 1] * m) / 255);
+                resizedDesignRaw[i + 2] = Math.round((resizedDesignRaw[i + 2] * m) / 255);
+                resizedDesignRaw[i + 3] = Math.round((resizedDesignRaw[i + 3] * m) / 255);
+              }
+            } else {
+              console.log("[onMockJobCreated] Skipping fabric mask (mean=" + Math.round(maskMean) + ", likely inverted)");
+            }
+          }
+        } catch (maskErr) {
+          console.warn("[onMockJobCreated] Fabric mask apply failed:", maskErr.message);
+        }
+      }
+      const designWithOpacity = applyOpacityToRgbaBuffer(resizedDesignRaw, actualW, actualH, effectiveOpacity);
+      const designPremultiplied = premultiplyRgbaBuffer(designWithOpacity);
+      const designForComposite = await sharp(designPremultiplied, {
+        raw: { width: actualW, height: actualH, channels: 4, premultiplied: true },
+      })
+        .png()
         .toBuffer();
 
-      // Calculate composite position (top-left corner)
-      const left = Math.round(centerXpx - resizedWidth / 2);
-      const top = Math.round(centerYpx - resizedHeight / 2);
+      // Center design inside the art box (design is max-fit inside artBoxPxW x artBoxPxH)
+      left = Math.round(left + (artBoxPxW - actualW) / 2);
+      top = Math.round(top + (artBoxPxH - actualH) / 2);
+      left = Math.max(0, Math.min(left, blankWidth - actualW));
+      top = Math.max(0, Math.min(top, blankHeight - actualH));
 
-      console.log("[onMockJobCreated] Composite at:", left, ",", top, "size:", resizedWidth, "x", resizedHeight);
-
-      // Composite the design onto the blank
       const draftBuffer = await sharp(blankBuffer)
         .composite([{
-          input: resizedDesign,
-          left: Math.max(0, left),
-          top: Math.max(0, top),
-          blend: "over",
+          input: designForComposite,
+          left,
+          top,
+          blend: blendMode,
+          premultiplied: true,
         }])
         .png()
         .toBuffer();
@@ -5104,9 +5959,87 @@ exports.onMockJobCreated = functions
       const draftAssetRef = await db.collection("rp_mock_assets").add(draftAssetData);
       console.log("[onMockJobCreated] Created draft asset:", draftAssetRef.id);
 
-      // --- Stage B: AI realism pass ---
+      // If job is linked to a product, save mockup to /products/{productId}/mockup.png and set product.mockupUrl
+      let mockupBufferForProduct = draftBuffer;
+      let mockupDownloadUrlForProduct = downloadUrl;
+      if (job.productId) {
+        const productMockPath = `products/${job.productId}/mockup.png`;
+        const productMockFile = bucket.file(productMockPath);
+        await productMockFile.save(draftBuffer, {
+          contentType: "image/png",
+          metadata: { cacheControl: "public, max-age=31536000" },
+        });
+        await productMockFile.makePublic();
+        const productMockUrl = `https://storage.googleapis.com/${bucket.name}/${productMockPath}`;
+        const productRef = db.collection("rp_products").doc(job.productId);
+        const currentProduct = (await productRef.get()).data() || {};
+        const media = { ...(currentProduct.media || {}), heroFront: currentProduct.media?.heroFront, heroBack: currentProduct.media?.heroBack, gallery: currentProduct.media?.gallery || [] };
+
+        // Phase 4: If heroSlot is set, create product asset and set product.media.heroFront/heroBack
+        if (job.heroSlot === "hero_front" || job.heroSlot === "hero_back") {
+          const assetPath = `products/${job.productId}/hero/${job.view}/${Date.now()}.png`;
+          const heroFile = bucket.file(assetPath);
+          await heroFile.save(draftBuffer, {
+            contentType: "image/png",
+            metadata: { cacheControl: "public, max-age=31536000" },
+          });
+          await heroFile.makePublic();
+          const heroUrl = `https://storage.googleapis.com/${bucket.name}/${assetPath}`;
+          const now = admin.firestore.FieldValue.serverTimestamp();
+          const assetData = {
+            productId: job.productId,
+            jobId,
+            designId: job.designId,
+            blankId: job.blankId,
+            assetType: "productPackshot",
+            presetMode: "productOnly",
+            status: "approved",
+            heroSlot: job.heroSlot,
+            storagePath: assetPath,
+            publicUrl: heroUrl,
+            downloadUrl: heroUrl,
+            width: draftMeta.width,
+            height: draftMeta.height,
+            createdAt: now,
+            updatedAt: now,
+            createdBy: job.createdByUid,
+            updatedBy: job.createdByUid,
+          };
+          const sanitizedAsset = sanitizeForFirestore(assetData);
+          await db.collection("rp_product_assets").add(sanitizedAsset);
+          if (job.heroSlot === "hero_front") media.heroFront = heroUrl;
+          if (job.heroSlot === "hero_back") media.heroBack = heroUrl;
+          console.log("[onMockJobCreated] Created hero asset and set product.media." + (job.heroSlot === "hero_front" ? "heroFront" : "heroBack"));
+        }
+
+        await productRef.update({
+          mockupUrl: productMockUrl,
+          media,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedBy: job.createdByUid,
+        });
+        console.log("[onMockJobCreated] Saved product mockup:", productMockPath);
+        // Unblock bulk job items waiting for this product's mock (two-layer architecture)
+        const awaitingItems = await db.collection("rp_bulk_generation_job_items")
+          .where("productId", "==", job.productId)
+          .where("status", "==", "awaiting_mock")
+          .get();
+        const batch = db.batch();
+        awaitingItems.docs.forEach(doc => {
+          batch.update(doc.ref, {
+            status: "pending",
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        });
+        if (!awaitingItems.empty) {
+          await batch.commit();
+          console.log("[onMockJobCreated] Unblocked", awaitingItems.size, "bulk job items for product", job.productId);
+        }
+      }
+
+      // --- Stage B: AI realism pass (Phase 2 only; Phase 1 = deterministic only) ---
       let finalAssetId = null;
-      if (quality === "final") {
+      if (quality === "final" && !MOCK_PHASE1_DETERMINISTIC_ONLY) {
         console.log("[onMockJobCreated] Processing Stage B: AI realism pass");
         
         const FAL_API_KEY = getFalApiKey();
@@ -5327,7 +6260,41 @@ exports.onMockJobCreated = functions
             const finalAssetRef = await db.collection("rp_mock_assets").add(finalAssetData);
             finalAssetId = finalAssetRef.id;
             console.log("[onMockJobCreated] Created final asset:", finalAssetId, useMask ? "(with mask/inpaint)" : "(img2img)");
-            
+
+            // Overwrite product mockup with final image when job is linked to a product
+            if (job.productId) {
+              const productMockPath = `products/${job.productId}/mockup.png`;
+              const productMockFile = bucket.file(productMockPath);
+              await productMockFile.save(finalBuffer, {
+                contentType: "image/png",
+                metadata: { cacheControl: "public, max-age=31536000" },
+              });
+              await productMockFile.makePublic();
+              const productMockUrl = `https://storage.googleapis.com/${bucket.name}/${productMockPath}`;
+              await db.collection("rp_products").doc(job.productId).update({
+                mockupUrl: productMockUrl,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                updatedBy: job.createdByUid,
+              });
+              console.log("[onMockJobCreated] Updated product mockup with final:", productMockPath);
+              // Unblock bulk job items waiting for this product's mock (two-layer architecture)
+              const awaitingItemsFinal = await db.collection("rp_bulk_generation_job_items")
+                .where("productId", "==", job.productId)
+                .where("status", "==", "awaiting_mock")
+                .get();
+              const batchFinal = db.batch();
+              awaitingItemsFinal.docs.forEach(doc => {
+                batchFinal.update(doc.ref, {
+                  status: "pending",
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+              });
+              if (!awaitingItemsFinal.empty) {
+                await batchFinal.commit();
+                console.log("[onMockJobCreated] Unblocked", awaitingItemsFinal.size, "bulk job items (final) for product", job.productId);
+              }
+            }
+
           } catch (falError) {
             console.error("[onMockJobCreated] Stage B failed:", falError.message);
             // Don't fail the whole job - draft was still created successfully

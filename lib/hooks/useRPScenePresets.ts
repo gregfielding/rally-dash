@@ -24,8 +24,6 @@ async function fetchRPScenePresets(
 ): Promise<RpScenePreset[]> {
   if (!db) throw new Error("Database not initialized");
 
-  console.log("[fetchRPScenePresets] Fetching with filters:", filters);
-
   const base = collection(db, "rp_scene_presets");
   const conditions: any[] = [];
 
@@ -49,8 +47,6 @@ async function fetchRPScenePresets(
     
     // Sort in memory by name
     presets.sort((a, b) => (a.name || "").localeCompare(b.name || ""));
-    
-    console.log("[fetchRPScenePresets] Found", presets.length, "presets");
     return presets;
   } catch (error: any) {
     console.error("[fetchRPScenePresets] Query error:", error);
@@ -78,13 +74,6 @@ export function useScenePresets(filters?: UseScenePresetsFilters) {
   if (error) {
     console.error("[useScenePresets] Error:", error);
   }
-
-  console.log("[useScenePresets] Result:", {
-    presetsCount: data?.length || 0,
-    loading: isLoading,
-    error: error?.message || null,
-    filters,
-  });
 
   return {
     presets: data || [],

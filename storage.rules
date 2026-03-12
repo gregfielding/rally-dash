@@ -53,10 +53,11 @@ service firebase.storage {
       allow write: if isAdmin();
     }
 
-    // Design files (SVG, PNG, PDF)
+    // Design files (SVG, PNG, PDF). Write: any authenticated user (Designs UI is app-protected).
+    // To restrict to admin/ops only, set custom claims (e.g. admin, ops) and use: allow write: if isAdmin() || request.auth.token.ops == true;
     match /designs/{designId}/{allPaths=**} {
       allow read: if isAuthenticated();
-      allow write: if isAdmin();
+      allow write: if isAuthenticated();
     }
 
     // Mockup images
@@ -79,9 +80,10 @@ service firebase.storage {
 
     // Rally Panties: Blank masks (Phase 3 - print region masks)
     // Storage path: rp/blank_masks/{blankId}/{view}/mask.png
+    // Write allowed for any authenticated user; Blanks/Masks UI is protected by app-level auth/roles.
     match /rp/blank_masks/{blankId}/{view}/{fileName} {
       allow read: if isAuthenticated();
-      allow write: if isAdmin();
+      allow write: if isAuthenticated();
     }
 
     // Design Assets: Print pack exports (ZIP files)
@@ -92,6 +94,12 @@ service firebase.storage {
 
     // Product Mock Generation: Output images
     match /rp/mocks/{allPaths=**} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // Product mockups (Design + Blank → mockup.png)
+    match /products/{productId}/{fileName} {
       allow read: if isAuthenticated();
       allow write: if isAdmin();
     }

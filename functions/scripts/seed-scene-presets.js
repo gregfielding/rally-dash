@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 
 /**
- * Script to seed the 3 initial scene presets into Firestore.
- * 
+ * Script to seed scene presets into Firestore.
+ *
+ * Product-only presets: flat on white background, hanging on hanger.
+ * Run with Firebase project set (e.g. firebase use <projectId> or GOOGLE_APPLICATION_CREDENTIALS).
+ *
  * Usage (from functions directory):
  *   node scripts/seed-scene-presets.js
+ *
+ * Or: npm run seed:presets
  */
 
 const admin = require("firebase-admin");
@@ -17,21 +22,21 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 const presets = [
-  // NEW: Product Packshot White (Section 11.1)
+  // Stage 1: Ecommerce Flat (White Background) — first product-only preset per two-stage pipeline spec
   {
-    name: "Product Packshot White",
-    slug: "product-packshot-white",
+    name: "Ecommerce Flat (White Background)",
+    slug: "ecommerce-flat-white",
     sceneType: "ecommerce",
-    mode: "productOnly", // NEW
-    supportedModes: ["product_only"], // Legacy, kept for backward compatibility
-    description: "Clean product-only packshots on white background",
-    safetyProfile: "general_safe", // NEW
-    requireIdentity: false, // NEW
-    allowFaceArtifact: false, // NEW
-    allowBodyArtifact: false, // NEW
-    allowProductArtifact: true, // NEW
-    defaultProductScale: 0.95, // NEW
-    defaultImageCount: 4, // NEW
+    mode: "productOnly",
+    supportedModes: ["product_only"],
+    description: "Main catalog image. Centered garment, clean white background, soft shadow. Shopify / Etsy / Amazon style.",
+    safetyProfile: "general_safe",
+    requireIdentity: false,
+    allowFaceArtifact: false,
+    allowBodyArtifact: false,
+    allowProductArtifact: true,
+    defaultProductScale: 0.95,
+    defaultImageCount: 4,
     promptTemplate: "clean ecommerce packshot of {productName} ({productColorway}), laid flat, centered, pure white background, soft studio shadow, high detail fabric texture, realistic stitching, product only, no model, no person",
     negativePromptTemplate: "person, model, mannequin, body, wearing, hands, legs, torso, lifestyle scene, clutter, text overlay, watermark",
     defaults: {
@@ -41,7 +46,55 @@ const presets = [
     },
     isActive: true,
   },
-  // NEW: Underwear Studio On-Model (Section 11.2)
+  // Product Packshot White (alias / alternate)
+  {
+    name: "Product Packshot White",
+    slug: "product-packshot-white",
+    sceneType: "ecommerce",
+    mode: "productOnly",
+    supportedModes: ["product_only"],
+    description: "Clean product-only packshots on white background",
+    safetyProfile: "general_safe",
+    requireIdentity: false,
+    allowFaceArtifact: false,
+    allowBodyArtifact: false,
+    allowProductArtifact: true,
+    defaultProductScale: 0.95,
+    defaultImageCount: 4,
+    promptTemplate: "clean ecommerce packshot of {productName} ({productColorway}), laid flat, centered, pure white background, soft studio shadow, high detail fabric texture, realistic stitching, product only, no model, no person",
+    negativePromptTemplate: "person, model, mannequin, body, wearing, hands, legs, torso, lifestyle scene, clutter, text overlay, watermark",
+    defaults: {
+      imageSize: "square",
+      imageCount: 4,
+      productScale: 0.95,
+    },
+    isActive: true,
+  },
+  // Product-only: garment hanging on hanger, fabric draping naturally
+  {
+    name: "Product Hanger (White Background)",
+    slug: "product-hanger-white",
+    sceneType: "ecommerce",
+    mode: "productOnly",
+    supportedModes: ["product_only"],
+    description: "Garment on a hanger, fabric draping naturally, clean white background. Retail / catalog style.",
+    safetyProfile: "general_safe",
+    requireIdentity: false,
+    allowFaceArtifact: false,
+    allowBodyArtifact: false,
+    allowProductArtifact: true,
+    defaultProductScale: 0.95,
+    defaultImageCount: 4,
+    promptTemplate: "clean ecommerce photo of {productName} ({productColorway}), garment hanging on a clothes hanger, fabric draping naturally, soft folds, pure white background, soft studio shadow, high detail fabric texture, realistic stitching, product only, no model, no person",
+    negativePromptTemplate: "person, model, mannequin, body, wearing, hands, legs, torso, laid flat, lifestyle scene, clutter, text overlay, watermark",
+    defaults: {
+      imageSize: "square",
+      imageCount: 4,
+      productScale: 0.95,
+    },
+    isActive: true,
+  },
+  // Underwear Studio On-Model (Section 11.2)
   {
     name: "Underwear Studio On-Model",
     slug: "underwear-studio-on-model",

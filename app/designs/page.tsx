@@ -206,6 +206,12 @@ function DesignsContent() {
             </p>
           </div>
           <div className="flex gap-2">
+            <Link
+              href="/designs/batch"
+              className="px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium"
+            >
+              Batch Import
+            </Link>
             <button
               onClick={() => setIsSeedModalOpen(true)}
               className="px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium"
@@ -337,6 +343,9 @@ function DesignsContent() {
               <thead className="bg-gray-50">
                 <tr>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Preview
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                     Design
                   </th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
@@ -362,7 +371,7 @@ function DesignsContent() {
               <tbody className="bg-white divide-y divide-gray-200">
                 {designs.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="px-4 py-12 text-center text-gray-500">
+                    <td colSpan={8} className="px-4 py-12 text-center text-gray-500">
                       No designs found. Create your first design to get started.
                     </td>
                   </tr>
@@ -372,25 +381,24 @@ function DesignsContent() {
                     return (
                       <tr key={design.id} className="hover:bg-gray-50">
                         <td className="px-4 py-4">
-                          <div className="flex items-center gap-3">
-                            {/* Thumbnail placeholder */}
-                            <div className="w-12 h-12 bg-gray-100 rounded-lg flex items-center justify-center overflow-hidden">
-                              {design.files?.png?.downloadUrl ? (
-                                <img
-                                  src={design.files.png.downloadUrl}
-                                  alt={design.name}
-                                  className="w-full h-full object-contain"
-                                />
-                              ) : (
-                                <svg className="w-6 h-6 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                                </svg>
-                              )}
-                            </div>
-                            <div>
-                              <div className="font-medium text-gray-900">{design.name}</div>
-                              <div className="text-xs text-gray-500">{design.slug}</div>
-                            </div>
+                          <div className="w-12 h-12 bg-gray-100 rounded-lg flex items-center justify-center overflow-hidden flex-shrink-0">
+                            {design.files?.png?.downloadUrl ? (
+                              <img
+                                src={design.files.png.downloadUrl}
+                                alt=""
+                                className="w-full h-full object-contain"
+                              />
+                            ) : (
+                              <svg className="w-6 h-6 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                              </svg>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-4 py-4">
+                          <div>
+                            <div className="font-medium text-gray-900">{design.name}</div>
+                            <div className="text-xs text-gray-500">{design.slug}</div>
                           </div>
                         </td>
                         <td className="px-4 py-4">

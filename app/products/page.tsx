@@ -6,12 +6,15 @@ import ProtectedRoute from "@/components/ProtectedRoute";
 import { TableSkeleton } from "@/components/Skeleton";
 import Modal from "@/components/Modal";
 import { useProducts } from "@/lib/hooks/useRPProducts";
-import { useCreateProduct } from "@/lib/hooks/useRPProductMutations";
+import { useCreateProduct, useCreateProductFromDesignBlank } from "@/lib/hooks/useRPProductMutations";
 import { useBatchGeneration } from "@/lib/hooks/useBatchGeneration";
+import { useDesigns } from "@/lib/hooks/useDesignAssets";
+import { useBlanks } from "@/lib/hooks/useBlanks";
+import { useCreateMockJob } from "@/lib/hooks/useMockAssets";
 import { useScenePresets as useRPScenePresets } from "@/lib/hooks/useRPScenePresets";
 import { RpProductStatus, RpProductCategory } from "@/lib/types/firestore";
 import useSWR from "swr";
-import { collection, getDocs, query, orderBy } from "firebase/firestore";
+import { collection, getDocs, query, orderBy, doc, deleteDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase/config";
 
 function StatusBadge({ status }: { status: RpProductStatus }) {
@@ -47,6 +50,13 @@ function ProductsContent() {
   const [batchGenerating, setBatchGenerating] = useState(false);
   const [batchError, setBatchError] = useState<string | null>(null);
   const [selectedProducts, setSelectedProducts] = useState<Set<string>>(new Set());
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  const [isDesignBlankOpen, setIsDesignBlankOpen] = useState(false);
+  const [designBlankDesignId, setDesignBlankDesignId] = useState("");
+  const [designBlankBlankId, setDesignBlankBlankId] = useState("");
+  const [designBlankCreating, setDesignBlankCreating] = useState(false);
+  const [designBlankError, setDesignBlankError] = useState<string | null>(null);
   
   // Batch generation form state
   const [batchPresetId, setBatchPresetId] = useState("");
@@ -65,8 +75,13 @@ function ProductsContent() {
   const [newProductTrigger, setNewProductTrigger] = useState("");
 
   const { createProduct } = useCreateProduct();
+  const { createProductFromDesignBlank } = useCreateProductFromDesignBlank();
+  const { createJob: createMockJob } = useCreateMockJob();
   const { batchGenerate } = useBatchGeneration();
   const { presets } = useRPScenePresets({ isActive: true });
+  const { designs } = useDesigns();
+  // Load all blanks for the Create from Design + Blank modal (no status filter so dropdown works without requiring composite index)
+  const { blanks } = useBlanks();
   
   // Fetch rp_identities (not model pack identities)
   const { data: identities } = useSWR("rp_identities", async () => {
@@ -143,6 +158,45 @@ function ProductsContent() {
     }
   };
 
+  const handleCreateFromDesignBlank = async (e: FormEvent) => {
+    e.preventDefault();
+    setDesignBlankError(null);
+    if (!designBlankDesignId || !designBlankBlankId) {
+      setDesignBlankError("Select a design and a blank.");
+      return;
+    }
+    try {
+      setDesignBlankCreating(true);
+      const result = await createProductFromDesignBlank({
+        designId: designBlankDesignId,
+        blankId: designBlankBlankId,
+      });
+      const jobId = await createMockJob({
+        designId: designBlankDesignId,
+        blankId: designBlankBlankId,
+        view: "front",
+        quality: "draft",
+        productId: result.productId,
+      });
+      if (jobId) {
+        setIsDesignBlankOpen(false);
+        setDesignBlankDesignId("");
+        setDesignBlankBlankId("");
+        await refetch();
+        window.location.href = `/products/${result.slug}`;
+      } else {
+        setDesignBlankError("Product created but mock generation could not start. Open the product to generate mockup.");
+        await refetch();
+        window.location.href = `/products/${result.slug}`;
+      }
+    } catch (err: any) {
+      console.error("[ProductsContent] Create from Design+Blank failed:", err);
+      setDesignBlankError(err?.message || "Failed to create product or generate mockup.");
+    } finally {
+      setDesignBlankCreating(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="p-6">
@@ -171,6 +225,24 @@ function ProductsContent() {
           </p>
         </div>
         <div className="flex gap-3">
+          <Link
+            href="/products/bulk"
+            className="px-4 py-2 bg-violet-600 text-white rounded-lg hover:bg-violet-700 text-sm font-medium inline-block"
+          >
+            Bulk Generate
+          </Link>
+          <Link
+            href="/products/batch-hero"
+            className="px-4 py-2 bg-amber-600 text-white rounded-lg hover:bg-amber-700 text-sm font-medium inline-block"
+          >
+            Batch Hero Render
+          </Link>
+          <button
+            onClick={() => setIsDesignBlankOpen(true)}
+            className="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 text-sm font-medium"
+          >
+            Create from Design + Blank
+          </button>
           <button
             onClick={() => setIsBatchOpen(true)}
             className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm font-medium"
@@ -319,6 +391,91 @@ function ProductsContent() {
         </form>
       </Modal>
 
+      {/* Create from Design + Blank Modal */}
+      <Modal
+        isOpen={isDesignBlankOpen}
+        onClose={() => {
+          setIsDesignBlankOpen(false);
+          setDesignBlankError(null);
+          setDesignBlankDesignId("");
+          setDesignBlankBlankId("");
+        }}
+        title="Create Product from Design + Blank"
+      >
+        <form onSubmit={handleCreateFromDesignBlank} className="space-y-4">
+          <p className="text-sm text-gray-600">
+            Select a design and a blank. A product will be created and a mockup will be generated automatically.
+          </p>
+          {designBlankError && (
+            <div className="bg-red-50 border border-red-200 rounded p-3 text-red-700 text-sm">
+              {designBlankError}
+            </div>
+          )}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Design *
+            </label>
+            <select
+              value={designBlankDesignId}
+              onChange={(e) => setDesignBlankDesignId(e.target.value)}
+              required
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
+            >
+              <option value="">Select design...</option>
+              {designs.map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.teamNameCache} — {d.name} {d.hasPng ? "" : "(no PNG)"}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Blank *
+            </label>
+            <select
+              value={designBlankBlankId}
+              onChange={(e) => setDesignBlankBlankId(e.target.value)}
+              required
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
+            >
+              <option value="">Select blank...</option>
+              {blanks.map((b) => (
+                <option key={b.blankId} value={b.blankId}>
+                  {b.styleCode} {b.styleName} — {b.colorName}
+                </option>
+              ))}
+            </select>
+          </div>
+          {designBlankDesignId && !designs.find((d) => d.id === designBlankDesignId)?.hasPng && (
+            <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-sm">
+              Selected design has no PNG. Upload a PNG in Design Detail → Files before creating a product.
+            </div>
+          )}
+          <div className="flex justify-end gap-3 pt-4 border-t">
+            <button
+              type="button"
+              onClick={() => setIsDesignBlankOpen(false)}
+              className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={
+                designBlankCreating ||
+                !designBlankDesignId ||
+                !designBlankBlankId ||
+                !designs.find((d) => d.id === designBlankDesignId)?.hasPng
+              }
+              className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 disabled:opacity-50"
+            >
+              {designBlankCreating ? "Creating & generating mockup..." : "Create & Generate Mockup"}
+            </button>
+          </div>
+        </form>
+      </Modal>
+
       {/* Filters */}
       <div className="bg-white rounded-lg shadow p-4">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -457,12 +614,41 @@ function ProductsContent() {
                       ) : null}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-                      <Link
-                        href={`/products/${product.slug}`}
-                        className="text-blue-600 hover:text-blue-800"
-                      >
-                        View →
-                      </Link>
+                      <div className="flex items-center justify-end gap-3">
+                        <Link
+                          href={`/products/${product.slug}`}
+                          className="text-blue-600 hover:text-blue-800"
+                        >
+                          View →
+                        </Link>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const name = product.name || product.slug || "this product";
+                            if (!window.confirm(`Are you sure you want to delete "${name}"?\n\nThis action cannot be undone.`)) return;
+                            if (!db || !product.id) return;
+                            setDeletingId(product.id);
+                            try {
+                              await deleteDoc(doc(db, "rp_products", product.id));
+                              setSelectedProducts((prev) => {
+                                const next = new Set(prev);
+                                next.delete(product.id || "");
+                                return next;
+                              });
+                              await refetch();
+                            } catch (err) {
+                              console.error("[Products] Delete failed:", err);
+                              alert("Failed to delete product. See console for details.");
+                            } finally {
+                              setDeletingId(null);
+                            }
+                          }}
+                          disabled={deletingId === product.id}
+                          className="text-red-600 hover:text-red-800 disabled:opacity-50"
+                        >
+                          {deletingId === product.id ? "Deleting…" : "Delete"}
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}
