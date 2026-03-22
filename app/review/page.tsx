@@ -2,7 +2,6 @@
 
 import { useState, useMemo } from "react";
 import ProtectedRoute from "@/components/ProtectedRoute";
-import Layout from "@/components/Layout";
 import { useAllAssets } from "@/lib/hooks/useAllAssets";
 import { useAssetReview } from "@/lib/hooks/useAssetReview";
 import { useProducts } from "@/lib/hooks/useRPProducts";
@@ -326,11 +325,7 @@ function ReviewQueueContent() {
 export default function ReviewPage() {
   return (
     <ProtectedRoute requiredRole="ops">
-      <Layout>
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-          <ReviewQueueContent />
-        </div>
-      </Layout>
+      <ReviewQueueContent />
     </ProtectedRoute>
   );
 }

@@ -72,10 +72,13 @@ service firebase.storage {
       allow write: if isAdmin();
     }
 
-    // Rally Panties: Blank garment images
-    match /rp/blanks/{blankId}/{fileName} {
+    // Rally Panties: Blank garment images (style-level front/back AND master-blank variant paths)
+    // Variant uploads: rp/blanks/{blankId}/variants/{variantId}/front.jpg (see BlankVariantsManager)
+    // Write: any signed-in user (same as /designs/ and /rp/blank_masks/). Firestore rules gate who can edit rp_blanks;
+    // Storage isAdmin() would require JWT custom claim admin:true, which ops users often don't have.
+    match /rp/blanks/{blankId}/{allPaths=**} {
       allow read: if isAuthenticated();
-      allow write: if isAdmin();
+      allow write: if isAuthenticated();
     }
 
     // Rally Panties: Blank masks (Phase 3 - print region masks)

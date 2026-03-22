@@ -14,7 +14,7 @@ Rally Panties needs a **single source of truth** for reusable artwork files (“
   - **PNG** (primary art file used for mockups/AI/compositing)
   - **PDF** (print-ready file the screen printer needs)
 - A structured way to store required production metadata:
-  - **Team** (e.g., SF Giants)
+  - **Team** (e.g., San Francisco Giants)
   - **Print colors** (one or more **hex codes**, optionally named like “Pantone-ish labels”)
   - Optional notes (ink type, underbase guidance, “white ink required”, etc.)
 - A way to **apply** one design to many blanks (products can be created from “Design × Blank Variant” combos)
@@ -33,7 +33,7 @@ This module is intentionally **simple**: upload, tag, relate, and export. No on-
 ---
 
 ## 2) Key concepts & vocabulary
-- **Design**: A reusable artwork concept (e.g., “SF Giants Design 1”).
+- **Design**: A reusable artwork concept (e.g., “San Francisco Giants Design 1”).
 - **Design Asset**: A specific file (PNG/PDF) attached to a Design.
 - **Blank Variant**: A specific blank garment/colorway (already in Blanks Library).
 - **Product** (existing): Likely “Team + Design + Blank Variant” resulting in a sellable item later.
@@ -114,7 +114,7 @@ We’ll follow the same pattern used in your Blanks Library (single-tenant MVP).
 ```ts
 export type TeamDoc = {
   id: string;                 // 'sf_giants'
-  name: string;               // 'SF Giants'
+  name: string;               // 'San Francisco Giants'
   league?: string;            // 'MLB'
   primaryColorHex?: string;   // '#FD5A1E'
   tags?: string[];            // ['mlb','giants']
@@ -170,7 +170,7 @@ export type DesignDoc = {
   name: string;                     // 'Design 1'
   slug: string;                     // 'sf-giants-design-1'
   teamId: string;                   // 'sf_giants'
-  teamNameCache?: string;           // 'SF Giants' (for list speed)
+  teamNameCache?: string;           // 'San Francisco Giants' (for list speed)
   status: DesignStatus;
 
   tags: string[];                   // ['sf-giants','mlb','orange-black']

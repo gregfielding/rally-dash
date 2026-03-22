@@ -28,6 +28,42 @@ export interface Team {
   updatedAt?: Timestamp;
 }
 
+/**
+ * Design System / color library (Illustrator workflow, future bulk import).
+ * Firestore: collection `design_system`, document ID = leagueCode (e.g. `MLB`).
+ * Logical path: design_system / {leagueCode}
+ */
+export interface DesignSystemCmyk {
+  c: number;
+  m: number;
+  y: number;
+  k: number;
+}
+
+export interface DesignSystemPaletteColor {
+  role: string;
+  name: string;
+  hex: string;
+  cmyk: DesignSystemCmyk;
+}
+
+export interface DesignSystemPaletteTeam {
+  teamCode: string;
+  teamName: string;
+  colors: DesignSystemPaletteColor[];
+}
+
+export interface DesignSystemLeagueDocument {
+  leagueCode: string;
+  leagueName: string;
+  teams: DesignSystemPaletteTeam[];
+}
+
+/** Loaded league doc (id matches leagueCode when stored conventionally). */
+export interface DesignSystemLeague extends DesignSystemLeagueDocument {
+  id: string;
+}
+
 // Taxonomy (rp_taxonomy_* collections, per RALLY_TAXONOMY_SPEC / RALLY_TAXONOMY_SEEDER_SPEC)
 export interface RpTaxonomySport {
   id: string;
@@ -709,10 +745,59 @@ export interface RpInspiration {
   updatedAt?: Timestamp;
 }
 
+/** Step 10 flat mockup look types (MVP). */
+export type RpFlatRenderLookType = "flat_clean" | "flat_blended";
+
+/** Step 10 MVP views (expand later). */
+export type RpFlatRenderView = "front" | "back";
+
+/**
+ * One persisted flat render slot on the product (canonical URLs on doc for UI).
+ */
+export interface RpProductFlatRenderSlot {
+  url: string;
+  storagePath?: string | null;
+  generatedAt: Timestamp;
+  lookType: RpFlatRenderLookType;
+  view: RpFlatRenderView;
+  sourceBlankVariantId: string;
+  /** Which design garment asset was composited. */
+  sourceDesignAssetRef: "light" | "dark";
+  /** SHA-256 hex (prefix) of canonical input payload when this render was built. */
+  inputFingerprint: string;
+}
+
+/**
+ * Nested by look then view. MVP: 8394 uses `back`; tees / crewneck may use `front` when generated.
+ */
+export interface RpProductFlatRendersMvp {
+  flat_clean?: { front?: RpProductFlatRenderSlot | null; back?: RpProductFlatRenderSlot | null };
+  flat_blended?: { front?: RpProductFlatRenderSlot | null; back?: RpProductFlatRenderSlot | null };
+}
+
+/** One deterministic scene output (non-AI composite). */
+export interface RpProductSceneRenderSlot {
+  url: string;
+  storagePath?: string | null;
+  generatedAt: Timestamp;
+  /** Which template produced this image. */
+  sceneId: string;
+  /** flat_blended source used (front vs back). */
+  sourceFlatView: RpFlatRenderView;
+  sourceFlatUrl: string;
+}
+
+/**
+ * Lifestyle-style renders from flat mockups. MVP: `hanger` only.
+ */
+export interface RpProductSceneRendersMvp {
+  hanger?: RpProductSceneRenderSlot | null;
+}
+
 export interface RpProduct {
   id?: string; // productId
   slug: string; // for route /products/:slug
-  name: string; // "SF Giants Classic Black"
+  name: string; // e.g. "San Francisco Giants Classic Black"
   description?: string;
 
   // Spec alignment (RALLY_FIRESTORE_AND_PRODUCT_PAGE_MAPPING): merchandising + Shopify
@@ -731,12 +816,28 @@ export interface RpProduct {
   teamCode?: string | null;
   themeCode?: string | null;
   designFamily?: string | null;
+  /** Denormalized from design when product is created (optional). */
+  designSeries?: string | null;
   taxonomy?: RpTaxonomyDisplay | null;
 
   category: RpProductCategory;
   baseProductKey: string; // "SFGIANTS_PANTY_1" (style family)
-  /** Batch import deduplication: leagueCode_designFamily_teamCode_blankId_variant (e.g. MLB_WILL_DROP_FOR_GIANTS_HEATHER_GREY_BIKINI_LIGHT). Side is not part of the key. */
+  /**
+   * Canonical identity for dedupe/bulk generation.
+   * Format: {leagueCode}_{teamCode}_{designId}_{blankId}_{blankVariantIdOrLegacy}
+   * Set at creation only. See RALLY_GENERATED_PRODUCT_SPEC.md + buildProductIdentityKey.
+   */
   productIdentityKey?: string | null;
+  /**
+   * Blank version (or updatedAt fallback) at time product was materialized from this blank.
+   * Used to derive isBlankStale. Set at create and on "Refresh from blank".
+   */
+  blankVersionUsed?: number | null;
+  /**
+   * Design updatedAt (or version) at time product pulled design assets.
+   * Used to derive isDesignStale. Set at create and on "Refresh design assets".
+   */
+  designVersionUsed?: number | null;
   /** Traceability: importKey of the design row(s) this product was generated from (e.g. MLB_WILL_DROP_FOR_GIANTS_BACK_LIGHT). Set on create/update from batch import. */
   generatedFromImportKey?: string | null;
   colorway: {
@@ -751,7 +852,12 @@ export interface RpProduct {
   };
 
   // Blank reference (required for product-only generation)
-  blankId?: string; // FK to rp_blanks - physical garment template
+  blankId?: string; // FK to rp_blanks - master blank (style)
+  /**
+   * FK to `rp_blanks.variants[].variantId` (schema v2). Ties this product — and Shopify color option —
+   * to one garment color line; storefront gallery for that option should match products with this id.
+   */
+  blankVariantId?: string | null;
 
   // Design + Blank product flow (alignment: product = design + blank, mockup stored here)
   designId?: string; // FK to designs - artwork used for this product (primary; use designIdFront/Back for spec)
@@ -775,8 +881,9 @@ export interface RpProduct {
   };
 
   /**
-   * Canonical render setup (RALLY_RENDER_SETUP_DATA_MODEL). Per-side config; renderer uses
-   * renderSetup.front or renderSetup.back based on requested view. No renderSide toggle.
+   * Per-side **asset selection** (blank/design URLs) and **legacy** placement/blend fields.
+   * **Placement geometry defaults are owned by `rp_blanks.placements[]`;** use `placementOverrides` for explicit SKU overrides.
+   * @deprecated For new work: store overrides in `placementOverrides` / `renderOverrides` only; avoid duplicating blank defaults here.
    */
   renderSetup?: {
     front?: {
@@ -820,7 +927,10 @@ export interface RpProduct {
 
   // Workflow
   status: RpProductStatus; // "draft" until ready
+  /** Display tags: generated from Team + Design + Blank only (proper case). City from Team only; no manual entry. */
   tags?: string[];
+  /** Normalized tags for filtering/search only; do not display. */
+  tagsNormalized?: string[];
 
   // Simple analytics
   counters?: {
@@ -833,7 +943,10 @@ export interface RpProduct {
   heroAssetId?: string;
   heroAssetPath?: string;
 
-  // Spec: media slots (hero front/back, gallery, etc.)
+  /**
+   * MVP: Product owns primary render/media URLs directly on the document.
+   * No required render subcollection for MVP; subcollection can be added later if needed.
+   */
   media?: {
     heroFront?: string; // URL or assetId
     heroBack?: string;
@@ -841,6 +954,17 @@ export interface RpProduct {
     modelAssets?: string[];
     lifestyleAssets?: string[];
   };
+
+  /**
+   * Step 10 MVP: deterministic flat mockups (8394 back-only for now).
+   * Explicit generation only; stale when slot.inputFingerprint !== computeProductFlatRenderFingerprint(...) (lib/products/flatRenderFingerprint).
+   */
+  flatRenders?: RpProductFlatRendersMvp | null;
+
+  /**
+   * Deterministic scene composites (flat_blended → template). Non-AI. MVP: hanger (crewneck template).
+   */
+  sceneRenders?: RpProductSceneRendersMvp | null;
 
   // Spec: production (PDFs, print colors, notes)
   production?: {
@@ -1355,6 +1479,128 @@ export type RPBlankColorName =
 // Blank status
 export type RPBlankStatus = "draft" | "active" | "archived";
 
+// Phase 1: Blank as foundation
+/** Drives which Design asset the renderer uses (lightPng vs darkPng). Derive from colorName if missing. */
+export type RPBlankColorFamily = "light" | "dark";
+
+export interface RPBlankShopifyDefaults {
+  productType?: string | null;
+  /** Shopify brand (display); prefer over vendor for new docs */
+  brand?: string | null;
+  /** @deprecated Use brand */
+  vendor?: string | null;
+  productCategory?: string | null;
+  collectionHandles?: string[] | null;
+}
+
+export interface RPBlankDefaultPricing {
+  retailPrice?: number | null;
+  cost?: number | null;
+  currencyCode?: string | null;
+  /** @deprecated Legacy; use retailPrice */
+  basePrice?: number | null;
+  /** @deprecated */
+  compareAtPrice?: number | null;
+}
+
+export interface RPBlankDefaultShipping {
+  defaultWeightGrams?: number | null;
+  requiresShipping?: boolean | null;
+}
+
+export interface RPBlankRenderDefaults {
+  blendMode?: "normal" | "multiply" | "overlay" | "soft-light" | null;
+  blendOpacity?: number | null;
+  front?: { blendMode?: string | null; blendOpacity?: number | null } | null;
+  back?: { blendMode?: string | null; blendOpacity?: number | null } | null;
+}
+
+/** Style-level sourcing (canonical master blank). */
+export interface RPBlankSourcing {
+  supplier?: string | null;
+  supplierStyleCode?: string | null;
+  supplierProductUrl?: string | null;
+  notes?: string | null;
+  /** @deprecated Legacy fields */
+  vendor?: string | null;
+  vendorSku?: string | null;
+  vendorColorName?: string | null;
+  vendorProductUrl?: string | null;
+}
+
+/**
+ * Normalized team / brand color families for eligibility (garment ↔ team matching).
+ * Teams may expose `colorFamilies[]`; expand list over time without schema churn.
+ */
+export type RPTeamColorFamily =
+  | "black"
+  | "white"
+  | "grey"
+  | "red"
+  | "blue"
+  | "navy"
+  | "green"
+  | "orange"
+  | "purple"
+  | "teal"
+  | "pink"
+  | "yellow";
+
+/** Master-blank eligibility: which teams may use this style (variant may override). */
+export interface RPBlankEligibility {
+  allowedLeagues?: string[] | null;
+  allowAllTeamsInAllowedLeagues?: boolean | null;
+
+  matchTeamColorFamilies?: boolean | null;
+  allowedTeamColorFamilies?: string[] | null;
+
+  supportedDesignZones?: string[] | null;
+  supportedProductFamilies?: string[] | null;
+
+  includedTeamIds?: string[] | null;
+  excludedTeamIds?: string[] | null;
+}
+
+/** When enabled, replaces master eligibility for this variant’s team resolution. */
+export interface RPBlankVariantEligibilityOverride {
+  enabled?: boolean | null;
+
+  allowedLeagues?: string[] | null;
+  allowAllTeamsInAllowedLeagues?: boolean | null;
+
+  matchTeamColorFamilies?: boolean | null;
+  allowedTeamColorFamilies?: string[] | null;
+
+  includedTeamIds?: string[] | null;
+  excludedTeamIds?: string[] | null;
+}
+
+/** One color / SKU line on a master blank */
+export interface RPBlankVariant {
+  variantId: string;
+  colorName: string;
+  colorHex?: string | null;
+  colorFamily: RPBlankColorFamily;
+  vendorColorName?: string | null;
+  vendorColorCode?: string | null;
+  vendorSku?: string | null;
+  isActive?: boolean;
+  /**
+   * Per-color flat/reference mockups for this blank variant (e.g. Heather Grey front/back).
+   * Pipeline: these feed product generation for any `rp_products` with this `blankVariantId`;
+   * shopper-facing Shopify galleries should ultimately reflect **product-owned** `media` built from
+   * that generation — see RALLY_MASTER_BLANK_SCHEMA.md (Storefront / Shopify).
+   */
+  images?: {
+    front?: RPImageRef | null;
+    back?: RPImageRef | null;
+    detail?: RPImageRef | null;
+  };
+  renderOverrides?: { blendMode?: string | null; blendOpacity?: number | null } | null;
+  sortOrder?: number | null;
+  eligibilityOverride?: RPBlankVariantEligibilityOverride | null;
+}
+
 // Image reference
 export interface RPImageRef {
   storagePath: string;
@@ -1381,13 +1627,99 @@ export type RPPlacementId =
   | "back_left"
   | "back_right";
 
+/** Per-zone readiness (canonical render profile on the blank). */
+export type RPPlacementProfileStatus = "draft" | "approved";
+
+/** 8394 back MVP — size preset maps to placement `defaultScale` internally. */
+export type RP8394SizePreset = "small" | "medium" | "large" | "fill_safe";
+
+/**
+ * Simple render tuning for LA Apparel 8394 back (non-designer UI).
+ * Engines use `derivePlacementEngineFields8394` → `renderZoneDefaults` + ink multipliers.
+ */
+export interface RPPlacementSimpleRenderControls8394 {
+  /** 0 = flat sticker look, 100 = more “in the fabric” (internal blend + opacity curve). */
+  realism?: number | null;
+  /** 0 = light / faded print, 100 = bold print (internal opacity + contrast). */
+  inkStrength?: number | null;
+  sizePreset?: RP8394SizePreset | null;
+}
+
+/** Which garment PNGs this zone expects from the design library (MVP metadata). */
+export type RPAllowedDesignAssetMode = "light_dark" | "light_only" | "dark_only";
+
+/** Future: rp_blank_masks / soft clip — stored for expansion without schema churn. */
+export interface RPPlacementMaskConfig {
+  mode?: "none" | "blank_mask_doc" | "safe_area_clip" | string | null;
+  notes?: string | null;
+}
+
+/**
+ * Canonical blank render profile row (a "zone"): geometry + zone-level blend for flat_blended.
+ * Stored in `placements[]` — this is the single source of truth for mockup engines.
+ */
+/**
+ * Optional product-level placement override (per side).
+ * **Blank `placements[]` is canonical;** omit or null here to inherit blank defaults.
+ * Presence = intentional deviation for this SKU only.
+ */
+export interface RpProductPlacementOverrideSlice {
+  defaultX?: number;
+  defaultY?: number;
+  defaultScale?: number;
+  safeArea?: { x?: number; y?: number; w?: number; h?: number };
+}
+
+export interface RpProductPlacementOverrides {
+  front?: RpProductPlacementOverrideSlice | null;
+  back?: RpProductPlacementOverrideSlice | null;
+}
+
+/**
+ * Optional product-level render (blend) override per side.
+ * **Blank zone `renderZoneDefaults` + variant `renderOverrides` are canonical** unless overridden here.
+ */
+export interface RpProductRenderOverrideSlice {
+  blendMode?: string | null;
+  blendOpacity?: number | null;
+  renderStylePreset?: string | null;
+}
+
+export interface RpProductRenderOverrides {
+  front?: RpProductRenderOverrideSlice | null;
+  back?: RpProductRenderOverrideSlice | null;
+}
+
 export interface RPPlacement {
   placementId: RPPlacementId;
   label: string;
+  /** Redundant with `placementId` prefix; explicit for tooling and queries. */
+  view?: "front" | "back" | null;
   defaultX?: number;
   defaultY?: number;
   defaultScale?: number;
   safeArea?: { x: number; y: number; w: number; h: number };
+  /**
+   * Artboard fraction: design box uses `artboardBase * garment dimension * defaultScale` (matches engine).
+   * Default 0.5 (50% of garment width/height before scale).
+   */
+  artboardBase?: number | null;
+  /** Notes on export / print assumptions for this zone. */
+  artboardNotes?: string | null;
+  allowedDesignAssetMode?: RPAllowedDesignAssetMode | null;
+  /** Zone defaults for flat_blended; flat_clean ignores blend. Variant `renderOverrides` still win at product time. */
+  renderZoneDefaults?: {
+    blendMode?: "normal" | "multiply" | "overlay" | "soft-light" | string | null;
+    blendOpacity?: number | null;
+  } | null;
+  /**
+   * 8394 back MVP: persisted simple sliders/preset. Derived `renderZoneDefaults` + `defaultScale` are kept in sync on save.
+   */
+  simpleRenderControls8394?: RPPlacementSimpleRenderControls8394 | null;
+  maskConfig?: RPPlacementMaskConfig | null;
+  profileStatus?: RPPlacementProfileStatus | null;
+  /** Ops / handoff notes for this zone. */
+  notes?: string | null;
 }
 
 // User reference
@@ -1396,47 +1728,87 @@ export interface RPUserRef {
   email?: string;
 }
 
-// RPBlank document (rp_blanks/{blankId})
-// Per Section 3.3 of the spec
+/**
+ * rp_blanks/{blankId}
+ *
+ * **Canonical (schemaVersion === 2):** one document per STYLE (master blank); colors live in `variants[]`.
+ * **Legacy:** one document per style+color; top-level `colorName`, `images`, optional `schemaVersion` omitted.
+ */
 export interface RPBlank {
-  // Identity
   blankId: string;
   slug: string;
   status: RPBlankStatus;
+  /** 2 = master blank + variants; omit/1 = legacy color-specific row */
+  schemaVersion?: number;
 
-  // Supplier + Style
-  supplier: RPBlankSupplier;
-  garmentCategory: RPBlankGarmentCategory;
-  styleCode: RPBlankStyleCode;
+  // —— Style identity (canonical) ——
+  styleCode: string;
   styleName: string;
-  supplierUrl: string;
-  supplierSku?: string;
+  /** Human garment line label, e.g. "Bikini Panty" */
+  garmentStyle?: string;
+  /** Canonical category key (panty | thong | tank | crewneck | string) */
+  category?: string;
+  /** @deprecated Prefer `category`; kept for legacy queries */
+  garmentCategory?: RPBlankGarmentCategory;
+  supplier: string;
+  supplierUrl?: string | null;
+  supplierSku?: string | null;
 
-  // Color
-  colorName: RPBlankColorName;
+  // —— Master model: color variants ——
+  variants?: RPBlankVariant[] | null;
+
+  // —— Legacy only: single color + images at root (omit when using variants) ——
+  colorName?: RPBlankColorName | string;
   colorHex?: string;
-
-  // Images (required: front + back)
-  images: {
+  colorFamily?: RPBlankColorFamily | null;
+  images?: {
     front: RPImageRef | null;
     back: RPImageRef | null;
   };
 
-  // Image metadata (optional)
   imageMeta?: RPImageMeta;
+  placements?: RPPlacement[];
+  /**
+   * Blank-level render profile gate (not product-level).
+   * `approved` = safe for production / bulk generation once zones are tuned.
+   */
+  renderProfileStatus?: "draft" | "approved" | null;
+  renderProfileNotes?: string | null;
+  /** Which sides participate in canonical rendering for this style (editor + validation hint). */
+  supportedRenderViews?: ("front" | "back")[] | null;
+  /**
+   * 8394 MVP: which flat look Merch uses as the primary reference when both are generated (handoff / QA).
+   * Does not change generation; UI + notes only unless downstream reads this field later.
+   */
+  preferredFlatLook8394?: "flat_clean" | "flat_blended" | null;
+  tags?: string[];
+  searchKeywords?: string[];
 
-  // Print placement defaults
-  placements: RPPlacement[];
-
-  // Search + ops
-  tags: string[];
-  searchKeywords: string[];
-
-  // Timestamps
   createdAt: Timestamp;
   createdBy: RPUserRef;
   updatedAt: Timestamp;
   updatedBy: RPUserRef;
+
+  shopifyDefaults?: RPBlankShopifyDefaults | null;
+  titleTemplate?: string | null;
+  descriptionTemplate?: string | null;
+  tagTemplates?: string[] | null;
+  defaultPricing?: RPBlankDefaultPricing | null;
+  defaultShipping?: RPBlankDefaultShipping | null;
+  renderDefaults?: RPBlankRenderDefaults | null;
+  sourcing?: RPBlankSourcing | null;
+  /** @deprecated Prefer defaultPricing.cost */
+  blankCost?: number | null;
+  /** @deprecated Prefer defaultPricing.currencyCode */
+  costCurrency?: string | null;
+  placementNotes?: string | null;
+  version?: number | null;
+
+  /**
+   * Team/catalog eligibility for generation (broad rules + overrides).
+   * Available garment colors are defined only on `variants[]`, not here.
+   */
+  eligibility?: RPBlankEligibility | null;
 }
 
 // Legacy type aliases for backward compatibility
@@ -1452,19 +1824,145 @@ export interface Blank extends RPBlank {}
 // Design Assets Library System (Per RP_Design_Assets_Spec.md)
 // ============================================
 
+/** CMYK approximation for print reference (0–100 per channel). */
+export interface DesignTeamColorCMYK {
+  c: number;
+  m: number;
+  y: number;
+  k: number;
+}
+
+/**
+ * Structured fan phrase / chant. Not safe for automatic product generation without human review;
+ * prefer `verified: true` + explicit `type` before any templated merch copy.
+ */
+export interface DesignTeamFanPhrase {
+  text: string;
+  type: "fan_generated" | "official" | string;
+  verified: boolean;
+}
+
+/** One brand color on a design team (design + print prep). */
+export interface DesignTeamColor {
+  role: "primary" | "secondary" | "tertiary" | string;
+  name: string | null;
+  hex: string;
+  cmyk: DesignTeamColorCMYK;
+  /** Optional Pantone identifier when sourced from brand/print specs (e.g. "PMS 186 C"). */
+  pantone?: string | null;
+}
+
 // Team document (teams/{teamId})
 export interface DesignTeam {
   id: string;                       // 'sf_giants'
-  name: string;                     // 'SF Giants'
-  league?: string;                  // 'MLB'
-  primaryColorHex?: string;         // '#FD5A1E'
-  tags?: string[];                  // ['mlb','giants']
+  /** Full display name, e.g. "San Francisco Giants" */
+  name: string;
+  /** League label, e.g. "MLB" */
+  league?: string | null;
+  /** Stable league key for filters (e.g. "MLB") */
+  leagueId?: string | null;
+  /** Home city for search/filter (e.g. "San Francisco") */
+  city?: string | null;
+  /** US state / DC / province code (e.g. "CA", "ON", "DC") */
+  state?: string | null;
+  /** Club nickname without city (e.g. "Giants", "Dodgers") */
+  teamName?: string | null;
+  /** Venue / stadium name (e.g. "Oracle Park", "FedExForum") */
+  stadiumName?: string | null;
+  /** Team saying / tagline (e.g. "Whoop That Trick") */
+  teamSaying?: string | null;
+  /** Fan phrase / culture phrase */
+  fanPhrase?: string | null;
+  /**
+   * Brand colors with hex + CMYK for design reference and print/production.
+   * Canonical seed ensures at least one entry; roles reflect importance (primary, secondary, …).
+   */
+  teamColors?: DesignTeamColor[] | null;
+  /** Convenience: matches primary team color hex (normalized #RRGGBB). */
+  primaryColorHex?: string | null;
+  /** Convenience: secondary brand hex when present; null if single-color identity in seed. */
+  secondaryColorHex?: string | null;
+  /**
+   * Normalized color families for eligibility (e.g. ["orange","black"]).
+   * Required for canonical Phase 1 teams; resolver treats missing as no match when color rules apply.
+   */
+  colorFamilies?: string[] | null;
+  /** Normalized code for productIdentityKey (e.g. GIANTS). Prefer this over id when present. */
+  teamCode?: string | null;
+  /** Kebab-case URL key (e.g. sf-giants). Canonical Phase 1 seed sets this for all pro teams. */
+  slug?: string | null;
+  /** Mirror of leagueId for templates/filters (e.g. MLB, NFL). */
+  leagueCode?: string | null;
+  /**
+   * MLB: hand-verified brand colors from `mlbVerifiedBrandColors.json` when `"verified"`.
+   * Other leagues may omit or use future statuses (e.g. pending).
+   */
+  colorVerificationStatus?: "verified" | "pending" | string | null;
+  /**
+   * Print pipeline: whether CMYK (and future Pantone) is authoritative vs hex-derived.
+   * `derived` = CMYK computed from hex for consistency; `verified` = manually confirmed for print.
+   */
+  printVerificationStatus?: "derived" | "verified" | null;
+  /**
+   * Normalized lowercase hyphenated tokens for search / filtering / SEO (city, nickname, league, slug, etc.).
+   * Canonical seed merges explicit `tags` with derived tokens.
+   */
+  tags?: string[];
+  /** Broad geography keywords (e.g. "california", "west-coast"); derived from `state` when not set in seed. */
+  region?: string[] | null;
+  /**
+   * Optional rival `teamCode` references (uppercase). Not auto-populated in seed — add manually when curated.
+   */
+  rivals?: string[] | null;
+  /** Public-facing mascot name when known and non-contentious; omit/null in default seed. */
+  mascot?: string | null;
+  /** Social-style hashtags (lowercase), e.g. #sf-giants — generic slug/code based in default seed, no slogans. */
+  hashtags?: string[] | null;
+  /**
+   * Curated phrases; **not** safe for automatic product generation without review.
+   * Default seed uses `[]`; do not bulk-import trademarked slogans without `type` + legal review.
+   */
+  fanPhrases?: DesignTeamFanPhrase[] | null;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
 
 // Design status
 export type DesignStatus = "draft" | "active" | "archived";
+
+/**
+ * Concept / campaign theme for the design library (field name in Firestore remains `designType`).
+ * Style-oriented values (wordmark, script) were removed from the canonical set; see `DesignDesignTypeLegacy`.
+ */
+export type DesignDesignType =
+  | "city_69"
+  | "slogan"
+  | "stadium"
+  | "rivalry"
+  | "number"
+  | "wordplay"
+  | "badge_crest"
+  | "custom_one_off";
+
+/** Older documents may still store these; UI and functions accept them on read/update */
+export type DesignDesignTypeLegacy = "wordmark" | "script" | "other" | "badge";
+
+export type DesignThemeValue = DesignDesignType | DesignDesignTypeLegacy;
+
+/** Print / ink color role (structured); legacy designs may use ink/accent/underbase */
+export type DesignPrintColorRole =
+  | "team_primary"
+  | "team_secondary"
+  | "number_light"
+  | "number_dark"
+  | "accent"
+  | "alt"
+  | "standard_off_black"
+  | "standard_off_white"
+  | "other"
+  | "ink"
+  | "underbase"
+  | "unknown";
 
 // Design file (embedded in DesignDoc)
 export interface DesignFile {
@@ -1484,9 +1982,12 @@ export interface DesignFile {
 // Design color (production ink color)
 export interface DesignColor {
   hex: string;                      // '#000000'
-  name?: string;                    // 'Black' / 'Giants Orange'
-  role?: "ink" | "accent" | "underbase" | "unknown";
+  /** Optional human label (not garment color names) */
+  name?: string;
+  role?: DesignPrintColorRole | string;
   notes?: string;                   // e.g. 'white underbase required'
+  /** Derived from hex unless overridden; 0–100 per channel (sRGB → CMYK reference). */
+  cmyk?: { c: number; m: number; y: number; k: number };
 }
 
 // Design placement default (normalized coordinates)
@@ -1507,17 +2008,91 @@ export interface DesignPlacementDefault {
   rotationDeg?: number;             // default 0
 }
 
+/** Asset slots for reusable artwork (URLs live on DesignFile.downloadUrl) */
+export interface DesignFilesMap {
+  /** Light garment overlay PNG */
+  lightPng?: DesignFile;
+  /** Dark garment overlay PNG */
+  darkPng?: DesignFile;
+  /**
+   * @deprecated Legacy single PNG before light/dark split; migrate to assets.lightPng + assets.darkPng.
+   * Temporarily treated as light-garment variant only.
+   */
+  png?: DesignFile;
+  /** Light-garment production vector (optional) */
+  lightSvg?: DesignFile;
+  /** Dark-garment production vector (optional) */
+  darkSvg?: DesignFile;
+  /**
+   * @deprecated Prefer `lightSvg` + `darkSvg`; kept for older records.
+   * Display/upload fallbacks treat this as light-garment when variants are absent.
+   */
+  svg?: DesignFile;
+  /** Light-garment print-ready PDF (optional) */
+  lightPdf?: DesignFile;
+  /** Dark-garment print-ready PDF (optional) */
+  darkPdf?: DesignFile;
+  /**
+   * @deprecated Prefer `lightPdf` + `darkPdf`; kept for older records.
+   * Display fallbacks treat this as light-garment when variants are absent.
+   */
+  pdf?: DesignFile;
+}
+
+/**
+ * Canonical asset URLs for rendering (light vs dark garment, not ink).
+ * Prefer these for engine logic: e.g. garment.colorFamily === "dark" → assets.darkPng.
+ * Kept in sync with `files` on write; readers may fall back to files.*.downloadUrl.
+ */
+export interface DesignAssetsUrls {
+  lightPng: string | null;
+  darkPng: string | null;
+  lightSvg: string | null;
+  darkSvg: string | null;
+  /**
+   * @deprecated Aggregated / legacy single slot; prefer `lightSvg` + `darkSvg`.
+   */
+  svg: string | null;
+  lightPdf: string | null;
+  darkPdf: string | null;
+  /**
+   * @deprecated Aggregated / legacy single slot; prefer `lightPdf` + `darkPdf`.
+   */
+  pdf: string | null;
+}
+
 // Design document (designs/{designId})
 export interface DesignDoc {
   id: string;                       // auto-id
-  name: string;                     // 'Design 1'
+  name: string;                     // e.g. 'San Francisco Giants – City 69'
   slug: string;                     // 'sf-giants-design-1'
   teamId: string;                   // 'sf_giants'
-  teamNameCache?: string;           // 'SF Giants' (for list speed)
+  teamNameCache?: string;           // 'San Francisco Giants' (for list speed)
+  /** Denormalized from design_teams when available */
+  leagueId?: string | null;
+  /** Denormalized from design_teams.city for search/filter */
+  teamCityCache?: string | null;
+  /** Denormalized from design_teams.state */
+  teamStateCache?: string | null;
+  /** Denormalized from design_teams.teamName (nickname) */
+  teamNicknameCache?: string | null;
   status: DesignStatus;
 
-  tags: string[];                   // ['sf-giants','mlb','orange-black']
+  /** Concept theme for library / filters / automation (Firestore field name unchanged) */
+  designType?: DesignThemeValue | null;
+
+  /**
+   * Optional campaign / grouping slug (snake_case), e.g. `will_drop_for`.
+   * Complements `designType` (theme); does not replace it.
+   */
+  designSeries?: string | null;
+
+  /** @deprecated Prefer internalNotes; kept for Firestore backfill */
+  tags?: string[];
+  /** @deprecated Not for Shopify/product copy — migrate to internalNotes */
   description?: string;
+  /** Internal-only notes (replaces free-form description for MVP) */
+  internalNotes?: string | null;
 
   // Batch import metadata (RALLY_BATCH_DESIGN_IMPORT) + taxonomy (RALLY_TAXONOMY_SPEC)
   importKey?: string;               // matching key: LEAGUE_DESIGNNAME_TEAM_SIDE_VARIANT
@@ -1530,18 +2105,23 @@ export interface DesignDoc {
   supportedSides?: string[];        // e.g. ['back']
   variant?: string;                 // e.g. 'LIGHT'
 
-  // Files (SVG = master vector, PNG = rendering/AI, PDF = print vendor)
-  files: {
-    svg?: DesignFile;
-    png?: DesignFile;
-    pdf?: DesignFile;
-  };
+  /**
+   * Canonical download URLs for asset variants (garment context, not ink).
+   * @see DesignAssetsUrls
+   */
+  assets?: DesignAssetsUrls | null;
+
+  /**
+   * Rich file metadata (storage path, dimensions, etc.).
+   * @deprecated Prefer `assets` for URLs; `files` retained for uploads and migration.
+   */
+  files?: DesignFilesMap;
 
   // Production colors
   colors: DesignColor[];            // 1+ ink colors
   colorCount: number;               // denorm for filtering
 
-  // Placement defaults (used by mock generator / product templates)
+  /** @deprecated Advisory only. Prefer Blank.placements as canonical. Use only when Blank has no placement for that id. */
   placementDefaults: DesignPlacementDefault[];
 
   // Links (denorm quick stats)
@@ -1550,9 +2130,13 @@ export interface DesignDoc {
 
   // Completeness indicators
   hasSvg: boolean;
+  /** True if legacy PNG exists OR both light+dark variants exist */
   hasPng: boolean;
+  hasLightPng?: boolean;
+  hasDarkPng?: boolean;
   hasPdf: boolean;
-  isComplete: boolean;              // hasPng && hasPdf && colors.length>0 && teamId set (SVG optional for completeness)
+  /** Metadata + both PNG variants (or legacy single PNG with partial flag in UI) */
+  isComplete: boolean;
 
   // Search keywords (for fast queries)
   searchKeywords: string[];
@@ -1595,6 +2179,7 @@ export interface PrintPackDoc {
 
   // Snapshot of design data at export time
   colors: DesignColor[];
+  /** @deprecated Advisory only. Prefer Blank.placements as canonical. */
   placementDefaults: DesignPlacementDefault[];
 
   // File URLs

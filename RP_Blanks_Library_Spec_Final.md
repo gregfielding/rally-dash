@@ -32,7 +32,7 @@ No other suppliers, styles, or colors are allowed unless this document changes.
 
 ## Conceptual Model
 Blank = physical garment + color + images  
-Product = branded concept (e.g. SF Giants Panty)  
+Product = branded concept (e.g. San Francisco Giants Panty)  
 Design = artwork applied to blank  
 Asset = rendered output (AI or composited)
 

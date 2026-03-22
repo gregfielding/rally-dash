@@ -26,6 +26,11 @@ const db = admin.firestore();
 const storage = admin.storage();
 
 const shopifySync = require("./shopifySync");
+const { generateProductTags } = require("./lib/productTags");
+const { resolveBlankTemplates } = require("./lib/resolveBlankTemplates");
+const { createRegisterGenerateProductFlatRenders } = require("./lib/productFlatRenderMvp");
+const { createRegisterGenerateProductSceneRender } = require("./lib/productSceneRenderMvp");
+const { normalizeColorsForFirestore } = require("./lib/standardPrintInks");
 
 // Resolve a fal-ai model slug or URL into a full HTTPS URL.
 function resolveFalUrl(modelOrUrl) {
@@ -1719,7 +1724,7 @@ exports.createProductFromDesignBlank = functions.https.onCall(async (data, conte
     throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
   }
 
-  const { designId, blankId } = data || {};
+  const { designId, blankId, blankVariantId } = data || {};
   if (!designId || typeof designId !== "string") {
     throw new functions.https.HttpsError("invalid-argument", "designId is required");
   }
@@ -1733,10 +1738,10 @@ exports.createProductFromDesignBlank = functions.https.onCall(async (data, conte
   }
   const design = designSnap.data();
 
-  if (!design.files?.png?.downloadUrl) {
+  if (!designPngUrlForProcessing(design)) {
     throw new functions.https.HttpsError(
       "failed-precondition",
-      "Design missing PNG preview. Upload a PNG in Design Detail → Files before creating a product."
+      "Design missing PNG overlay. Upload light/dark PNGs (or legacy PNG) in Design Detail → Files before creating a product."
     );
   }
 
@@ -1746,9 +1751,102 @@ exports.createProductFromDesignBlank = functions.https.onCall(async (data, conte
   }
   const blank = blankSnap.data();
 
+  if (blank.schemaVersion === MASTER_BLANK_SCHEMA_VERSION && (!blank.variants || blank.variants.length === 0)) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "Master blank has no variants; add at least one color variant before creating a product."
+    );
+  }
+
+  const variantRow = resolveBlankVariantForProduct(blank, blankVariantId);
+
+  let team = null;
+  if (design.teamId) {
+    const teamSnap = await db.collection("design_teams").doc(design.teamId).get();
+    if (teamSnap.exists) {
+      const teamData = teamSnap.data();
+      team = {
+        id: teamSnap.id,
+        teamCode: teamData.teamCode ?? null,
+        city: teamData.city ?? null,
+        teamName: teamData.teamName ?? null,
+        league: teamData.league ?? null,
+        leagueId: teamData.leagueId ?? null,
+        stadiumName: teamData.stadiumName ?? null,
+        teamSaying: teamData.teamSaying ?? null,
+        fanPhrase: teamData.fanPhrase ?? null,
+      };
+    }
+  }
+
+  // productIdentityKey: canonical source = DesignTeam.teamCode if present, else DesignTeam.id (design.teamId)
+  const leagueCodeRaw = design.leagueCode || (team && (team.leagueId || team.league)) || "";
+  const teamCodeRaw = design.teamCode || (team && (team.teamCode || team.id)) || design.teamId || "";
+  const variantIdOrLegacy =
+    blank.schemaVersion === MASTER_BLANK_SCHEMA_VERSION && variantRow.variantId
+      ? variantRow.variantId
+      : "legacy";
+  const productIdentityKey = buildProductIdentityKey({
+    leagueCode: leagueCodeRaw,
+    teamCode: teamCodeRaw,
+    designId,
+    blankId,
+    blankVariantIdOrLegacy: variantIdOrLegacy,
+  });
+
+  const blankVersionUsed =
+    blank.version != null
+      ? blank.version
+      : blank.updatedAt && typeof blank.updatedAt.toMillis === "function"
+        ? blank.updatedAt.toMillis()
+        : null;
+  const designVersionUsed =
+    design.updatedAt && typeof design.updatedAt.toMillis === "function"
+      ? design.updatedAt.toMillis()
+      : null;
+
+  const colorNameForProduct = variantRow.colorName || "";
+
+  const { displayTags, normalizedTags } = generateProductTags({
+    team,
+    design: {
+      designType: design.designType ?? null,
+      designSeries: design.designSeries ?? null,
+    },
+    blank: {
+      garmentCategory: blank.garmentCategory || blank.category,
+      colorName: colorNameForProduct,
+    },
+  });
+
   const teamName = design.teamNameCache || design.name || "Design";
-  const styleOrColor = blank.colorName || (blank.styleName && blank.styleName.split(/\s+/)[0]) || blank.styleName || "Cotton";
-  const name = `${teamName} ${styleOrColor} Panty`;
+  const designName = design.name || "Design";
+  const templateContext = {
+    teamName,
+    designName,
+    colorName: colorNameForProduct,
+    garmentStyle: blank.garmentStyle || blank.styleName || blank.styleCode || "",
+    category: blank.shopifyDefaults?.productType ?? blank.category ?? blank.garmentCategory ?? "",
+    brand: blank.shopifyDefaults?.brand ?? blank.shopifyDefaults?.vendor ?? "",
+    vendor: blank.shopifyDefaults?.brand ?? blank.shopifyDefaults?.vendor ?? "",
+    league: team?.league ?? "",
+    city: team?.city ?? "",
+    stadiumName: team?.stadiumName ?? "",
+    teamSaying: team?.teamSaying ?? "",
+    fanPhrase: team?.fanPhrase ?? "",
+  };
+  const resolved = resolveBlankTemplates(blank, templateContext);
+
+  const useResolvedTitle = resolved.title && resolved.title.trim();
+  const useResolvedTags = Array.isArray(resolved.tags) && resolved.tags.length > 0;
+  const styleOrColor =
+    colorNameForProduct || (blank.styleName && blank.styleName.split(/\s+/)[0]) || blank.styleName || "Cotton";
+  const name = useResolvedTitle || `${teamName} ${styleOrColor} Panty`;
+  const productTags = useResolvedTags ? resolved.tags : displayTags;
+  const productTagsNormalized = useResolvedTags
+    ? productTags.map((t) => String(t).trim().toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "").replace(/-+/g, "-").replace(/^-|-$/g, "").slice(0, 128))
+    : normalizedTags;
+
   let slug = generateSlug(name);
   const existing = await db.collection("rp_products").where("slug", "==", slug).get();
   if (!existing.empty) {
@@ -1759,18 +1857,32 @@ exports.createProductFromDesignBlank = functions.https.onCall(async (data, conte
   const userId = context.auth.uid;
   const firstColor = design.colors && design.colors[0];
 
+  const dp = blank.defaultPricing || {};
+  const retail = dp.retailPrice != null ? dp.retailPrice : dp.basePrice;
+
+  const isV2Master = blank.schemaVersion === MASTER_BLANK_SCHEMA_VERSION;
   const productData = {
     slug,
     name,
-    description: null,
+    title: useResolvedTitle || name,
+    description: resolved.description && resolved.description.trim() ? resolved.description.trim() : null,
     category: "panties",
+    productType: blank.shopifyDefaults?.productType ?? undefined,
+    brand: blank.shopifyDefaults?.brand ?? blank.shopifyDefaults?.vendor ?? undefined,
+    collectionKeys: Array.isArray(blank.shopifyDefaults?.collectionHandles) ? blank.shopifyDefaults.collectionHandles : undefined,
     baseProductKey: `DESIGN_${designId}_BLANK_${blankId}`,
+    productIdentityKey,
+    blankVersionUsed,
+    designVersionUsed,
     colorway: {
-      name: firstColor?.name || blank.colorName || "Default",
-      hex: firstColor?.hex || blank.colorHex || null,
+      name: firstColor?.name || colorNameForProduct || "Default",
+      hex: firstColor?.hex || variantRow.colorHex || (isV2Master ? null : blank.colorHex) || null,
     },
     blankId,
+    blankVariantId:
+      isV2Master ? variantRow.variantId : blankVariantId || null,
     designId,
+    designSeries: design.designSeries ?? null,
     mockupUrl: null,
     ai: {
       productArtifactId: null,
@@ -1779,7 +1891,29 @@ exports.createProductFromDesignBlank = functions.https.onCall(async (data, conte
       blankTemplateId: null,
     },
     status: "draft",
-    tags: [],
+    tags: productTags,
+    tagsNormalized: productTagsNormalized,
+    pricing:
+      blank.defaultPricing &&
+      (retail != null ||
+        dp.basePrice != null ||
+        dp.compareAtPrice != null ||
+        (dp.currencyCode && String(dp.currencyCode).trim()))
+        ? {
+            basePrice: retail ?? dp.basePrice ?? undefined,
+            compareAtPrice: dp.compareAtPrice ?? undefined,
+            currencyCode: (dp.currencyCode && String(dp.currencyCode).trim()) || "USD",
+          }
+        : undefined,
+    shipping:
+      blank.defaultShipping &&
+      (blank.defaultShipping.defaultWeightGrams != null || blank.defaultShipping.requiresShipping != null)
+        ? {
+            defaultWeightGrams: blank.defaultShipping.defaultWeightGrams ?? undefined,
+            requiresShipping: blank.defaultShipping.requiresShipping ?? true,
+          }
+        : undefined,
+    // Placement + blend: inherit from blank + variant at render time (no duplication on create).
     counters: { assetsTotal: 0, assetsApproved: 0, assetsPublished: 0 },
     createdAt: now,
     updatedAt: now,
@@ -1787,7 +1921,8 @@ exports.createProductFromDesignBlank = functions.https.onCall(async (data, conte
     updatedBy: userId,
   };
 
-  const productRef = await db.collection("rp_products").add(productData);
+  // Firestore rejects undefined at any depth; productData often has optional nested fields as undefined.
+  const productRef = await db.collection("rp_products").add(sanitizeForFirestore(productData));
   console.log("[createProductFromDesignBlank] Created product:", productRef.id, slug);
 
   return {
@@ -1795,6 +1930,29 @@ exports.createProductFromDesignBlank = functions.https.onCall(async (data, conte
     productId: productRef.id,
     slug,
   };
+});
+
+/**
+ * Step 10 MVP: explicit flat_clean + flat_blended back renders for 8394 master blank only.
+ * Writes `flatRenders` on rp_products/{productId}.
+ */
+exports.generateProductFlatRenders = createRegisterGenerateProductFlatRenders({
+  admin,
+  db,
+  storage,
+  fetch,
+  crypto,
+});
+
+/**
+ * MVP: flat_blended → deterministic hanger (crewneck) scene. Non-AI.
+ * Env: SCENE_HANGER_CREWNECK_BACKGROUND_URL (required), SCENE_HANGER_CREWNECK_SHADOW_URL (optional).
+ */
+exports.generateProductSceneRender = createRegisterGenerateProductSceneRender({
+  admin,
+  db,
+  storage,
+  fetch,
 });
 
 // ---------------------------------------------------------------------------
@@ -1833,10 +1991,10 @@ exports.createBulkGenerationJob = functions.https.onCall(async (data, context) =
       throw new functions.https.HttpsError("not-found", `Design ${designId} not found`);
     }
     const design = designSnap.data();
-    if (!design.files?.png?.downloadUrl) {
+    if (!designPngUrlForProcessing(design)) {
       throw new functions.https.HttpsError(
         "failed-precondition",
-        `Design ${designId} is missing PNG. Upload a PNG in Design Detail → Files.`
+        `Design ${designId} is missing PNG overlay. Upload light/dark PNGs in Design Detail → Files.`
       );
     }
   }
@@ -1947,6 +2105,7 @@ async function findOrCreateProductForBulk(designId, blankId, userId) {
   const blank = blankSnap.data();
 
   const teamName = design.teamNameCache || design.name || "Design";
+  // For v2 master blanks, color should come from variant; this bulk path has no variant—uses root as fallback.
   const styleOrColor = blank.colorName || (blank.styleName && blank.styleName.split(/\s+/)[0]) || blank.styleName || "Cotton";
   const name = `${teamName} ${styleOrColor} Panty`;
   let slug = generateSlug(name);
@@ -1966,9 +2125,10 @@ async function findOrCreateProductForBulk(designId, blankId, userId) {
     colorway: {
       name: firstColor?.name || blank.colorName || "Default",
       hex: firstColor?.hex || blank.colorHex || null,
-    },
+    }, // Legacy/bulk: for v2 master blanks, use variant color when blankVariantId is available
     blankId,
     designId,
+    designSeries: design.designSeries ?? null,
     mockupUrl: null,
     ai: { productArtifactId: null, productTrigger: null, productRecommendedScale: null, blankTemplateId: null },
     status: "draft",
@@ -2130,7 +2290,7 @@ exports.processBulkGenerationJobs = functions.pubsub
               productId,
               input: {
                 blankImageUrl: viewImage?.downloadUrl || null,
-                designPngUrl: design?.files?.png?.downloadUrl || null,
+                designPngUrl: designPngUrlForProcessing(design) || null,
                 placement,
               },
               output: {},
@@ -4668,8 +4828,77 @@ function buildBlankSlug(styleCode, colorName) {
   return `laa-${styleCode.toLowerCase()}-${colorName.toLowerCase().replace(/\s+/g, "-")}`;
 }
 
+const MASTER_BLANK_SCHEMA_VERSION = 2;
+
+function buildMasterBlankSlug(styleCode) {
+  return `laa-master-${String(styleCode).toLowerCase()}`;
+}
+
+function deriveColorFamilyFromName(colorName) {
+  const dark = new Set(["Black", "Midnight Navy", "Navy", "Indigo"]);
+  const n = String(colorName || "").trim();
+  return dark.has(n) ? "dark" : "light";
+}
+
+/**
+ * Build canonical product identity key. Format:
+ * {leagueCode}_{teamCode}_{designId}_{blankId}_{blankVariantIdOrLegacy}
+ * Canonical team source: prefer DesignTeam.teamCode, else DesignTeam.id.
+ */
+function buildProductIdentityKey(params) {
+  const norm = (s) => {
+    if (s == null || typeof s !== "string") return "";
+    return String(s)
+      .trim()
+      .toUpperCase()
+      .replace(/\s+/g, "_")
+      .replace(/[^A-Z0-9_-]/g, "")
+      .slice(0, 128) || "";
+  };
+  const league = norm(params.leagueCode) || "LEAGUE";
+  const team = norm(params.teamCode) || "TEAM";
+  const design = norm(params.designId) || "";
+  const blank = norm(params.blankId) || "";
+  const variant = norm(params.blankVariantIdOrLegacy) || "legacy";
+  return [league, team, design, blank, variant].filter(Boolean).join("_");
+}
+
+/** Resolve variant row for product generation; legacy blanks use synthetic variant */
+function resolveBlankVariantForProduct(blank, blankVariantId) {
+  if (blank.schemaVersion === MASTER_BLANK_SCHEMA_VERSION && blank.variants && blank.variants.length > 0) {
+    if (!blankVariantId) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "blankVariantId is required for master blanks with variants"
+      );
+    }
+    const v = blank.variants.find((x) => x.variantId === blankVariantId);
+    if (!v) {
+      throw new functions.https.HttpsError("not-found", `Variant ${blankVariantId} not found on blank`);
+    }
+    if (v.isActive === false) {
+      throw new functions.https.HttpsError("failed-precondition", "Variant is inactive");
+    }
+    return v;
+  }
+  return {
+    variantId: blankVariantId || "legacy",
+    colorName: blank.colorName || "",
+    colorHex: blank.colorHex || null,
+    colorFamily: blank.colorFamily || deriveColorFamilyFromName(blank.colorName),
+    images: {
+      front: blank.images?.front || null,
+      back: blank.images?.back || null,
+      detail: null,
+    },
+  };
+}
+
+const { DEFAULT_GARMENT_SAFE_AREA } = require("./lib/designArtboardSpec");
+
 // Default placements per Section 6.4
 function getDefaultPlacements(category) {
+  const sa = { ...DEFAULT_GARMENT_SAFE_AREA };
   return [
     {
       placementId: "front_center",
@@ -4677,7 +4906,7 @@ function getDefaultPlacements(category) {
       defaultX: 0.5,
       defaultY: 0.5,
       defaultScale: 0.6,
-      safeArea: { x: 0.2, y: 0.2, w: 0.6, h: 0.6 },
+      safeArea: sa,
     },
     {
       placementId: "back_center",
@@ -4685,7 +4914,7 @@ function getDefaultPlacements(category) {
       defaultX: 0.5,
       defaultY: 0.5,
       defaultScale: 0.6,
-      safeArea: { x: 0.2, y: 0.2, w: 0.6, h: 0.6 },
+      safeArea: { ...DEFAULT_GARMENT_SAFE_AREA },
     },
   ];
 }
@@ -4716,8 +4945,7 @@ function generateSearchKeywords(styleCode, styleName, colorName, category) {
 }
 
 /**
- * Create a new Blank (v2 - supports all 5 LA Apparel styles)
- * Per RP_Blanks_Library_Spec_v2.md Section 3.3
+ * Create Blank: master (style-level, schemaVersion 2) or legacy (one doc per color).
  */
 exports.createBlank = functions.https.onCall(async (data, context) => {
   if (!context.auth) {
@@ -4727,67 +4955,124 @@ exports.createBlank = functions.https.onCall(async (data, context) => {
   const userId = context.auth.uid;
   const userEmail = context.auth.token?.email || null;
 
-  // Check if user is admin
   const adminSnap = await db.collection("admins").doc(userId).get();
   if (!adminSnap.exists || adminSnap.data()?.role !== "admin") {
     throw new functions.https.HttpsError("permission-denied", "Only admins can create blanks");
   }
 
-  const { styleCode, colorName } = data;
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const userRef = { uid: userId, email: userEmail };
 
-  // Validate style
+  // Master blank: style-level doc only; colors live in variants[]. Accept redundant flags for robustness.
+  const masterBlank =
+    data.masterBlank === true ||
+    data.masterBlank === "true" ||
+    data.createMasterBlank === true ||
+    data.createMasterBlank === "true" ||
+    data.schemaIntent === "master_v2";
+
+  if (masterBlank) {
+    const styleCode = data.styleCode;
+    if (!styleCode || typeof styleCode !== "string") {
+      throw new functions.https.HttpsError("invalid-argument", "styleCode is required");
+    }
+    const usePreset = data.useStylePreset === true;
+    const preset = STYLE_REGISTRY[styleCode];
+    if (usePreset && !preset) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        `Unknown styleCode for preset: ${styleCode}. Use one of: ${ALL_STYLE_CODES.join(", ")}`
+      );
+    }
+
+    const styleName =
+      data.styleName ||
+      (preset ? preset.styleName : null) ||
+      styleCode;
+    const garmentStyle = data.garmentStyle || styleName;
+    const category =
+      data.category || (preset ? preset.garmentCategory : null) || "panty";
+    const supplier = data.supplier || (preset ? preset.supplier : null) || "Los Angeles Apparel";
+    const supplierUrl =
+      data.supplierUrl !== undefined ? data.supplierUrl : preset ? preset.supplierUrl : null;
+
+    const slug = buildMasterBlankSlug(styleCode);
+    const dup = await db.collection("rp_blanks").where("slug", "==", slug).limit(1).get();
+    if (!dup.empty) {
+      throw new functions.https.HttpsError("already-exists", `Master blank already exists for style ${styleCode}`);
+    }
+
+    const gc = preset ? preset.garmentCategory : category;
+    const blankData = {
+      schemaVersion: MASTER_BLANK_SCHEMA_VERSION,
+      slug,
+      status: "draft",
+      supplier,
+      garmentCategory: gc,
+      category,
+      styleCode,
+      styleName,
+      garmentStyle,
+      supplierUrl,
+      variants: [],
+      images: { front: null, back: null },
+      imageMeta: null,
+      placements: getDefaultPlacements(gc),
+      tags: [category, String(styleCode).toLowerCase(), "master-blank", "los-angeles-apparel", "laa"],
+      searchKeywords: generateSearchKeywords(styleCode, styleName, "", category),
+      createdAt: now,
+      createdBy: userRef,
+      updatedAt: now,
+      updatedBy: userRef,
+    };
+
+    const blankRef = await db.collection("rp_blanks").add(blankData);
+    await blankRef.update({ blankId: blankRef.id });
+    console.log("[createBlank] Created master blank:", blankRef.id, slug);
+    return { ok: true, blankId: blankRef.id, slug, schemaVersion: MASTER_BLANK_SCHEMA_VERSION };
+  }
+
+  // Legacy: one Firestore doc per style+color (deprecated for new work; prefer masterBlank + variants)
+  const { styleCode, colorName } = data;
   if (!styleCode || !STYLE_REGISTRY[styleCode]) {
     throw new functions.https.HttpsError(
       "invalid-argument",
       `styleCode must be one of: ${ALL_STYLE_CODES.join(", ")}`
     );
   }
-
   const styleInfo = STYLE_REGISTRY[styleCode];
-
-  // Validate color is allowed for this style
-  if (!colorName || !styleInfo.allowedColors.includes(colorName)) {
+  if (!colorName) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "This call is missing masterBlank/createMasterBlank flags and has no colorName. " +
+        "To create a master blank (one doc per style, add colors as variants on the blank detail page), pass masterBlank: true with styleCode only. " +
+        "Deploy the latest createBlank Cloud Function if you still see this after passing masterBlank: true."
+    );
+  }
+  if (!styleInfo.allowedColors.includes(colorName)) {
     throw new functions.https.HttpsError(
       "invalid-argument",
       `colorName must be one of: ${styleInfo.allowedColors.join(", ")}`
     );
   }
-
-  // Build slug
   const slug = buildBlankSlug(styleCode, colorName);
-
-  // Check for duplicate by slug
-  const existingQuery = await db
-    .collection("rp_blanks")
-    .where("slug", "==", slug)
-    .limit(1)
-    .get();
-
+  const existingQuery = await db.collection("rp_blanks").where("slug", "==", slug).limit(1).get();
   if (!existingQuery.empty) {
-    throw new functions.https.HttpsError(
-      "already-exists",
-      `A blank with slug "${slug}" already exists`
-    );
+    throw new functions.https.HttpsError("already-exists", `A blank with slug "${slug}" already exists`);
   }
 
-  const now = admin.firestore.FieldValue.serverTimestamp();
-  const userRef = { uid: userId, email: userEmail };
-
-  // Build document per Section 3.3 schema
   const blankData = {
     slug,
     status: "draft",
     supplier: styleInfo.supplier,
     garmentCategory: styleInfo.garmentCategory,
+    category: styleInfo.garmentCategory,
     styleCode,
     styleName: styleInfo.styleName,
     supplierUrl: styleInfo.supplierUrl,
     colorName,
     colorHex: COLOR_REGISTRY[colorName] || null,
-    images: {
-      front: null,
-      back: null,
-    },
+    images: { front: null, back: null },
     imageMeta: null,
     placements: getDefaultPlacements(styleInfo.garmentCategory),
     tags: generateBlankTags(styleCode, colorName, styleInfo.garmentCategory),
@@ -4799,17 +5084,9 @@ exports.createBlank = functions.https.onCall(async (data, context) => {
   };
 
   const blankRef = await db.collection("rp_blanks").add(blankData);
-
-  // Update blankId to match doc id
   await blankRef.update({ blankId: blankRef.id });
-
-  console.log("[createBlank] Created blank:", blankRef.id, slug);
-
-  return {
-    ok: true,
-    blankId: blankRef.id,
-    slug,
-  };
+  console.log("[createBlank] Created legacy blank:", blankRef.id, slug);
+  return { ok: true, blankId: blankRef.id, slug };
 });
 
 /**
@@ -4902,6 +5179,82 @@ exports.seedBlanks = functions.https.onCall(async (data, context) => {
 });
 
 /**
+ * Seed one master blank per style with color variants (canonical model).
+ */
+exports.seedMasterBlanks = functions.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
+  }
+  const userId = context.auth.uid;
+  const userEmail = context.auth.token?.email || null;
+  const adminSnap = await db.collection("admins").doc(userId).get();
+  if (!adminSnap.exists || adminSnap.data()?.role !== "admin") {
+    throw new functions.https.HttpsError("permission-denied", "Only admins can seed blanks");
+  }
+
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const userRef = { uid: userId, email: userEmail };
+  const results = [];
+
+  for (const styleCode of ALL_STYLE_CODES) {
+    const styleInfo = STYLE_REGISTRY[styleCode];
+    const slug = buildMasterBlankSlug(styleCode);
+    const existing = await db.collection("rp_blanks").where("slug", "==", slug).limit(1).get();
+    if (!existing.empty) {
+      results.push({ styleCode, slug, status: "skipped", reason: "master exists" });
+      continue;
+    }
+
+    let sortOrder = 0;
+    const variants = styleInfo.allowedColors.map((colorName) => {
+      const vid = `${styleCode.toLowerCase()}_${colorName.toLowerCase().replace(/\s+/g, "_")}`;
+      return {
+        variantId: vid,
+        colorName,
+        colorHex: COLOR_REGISTRY[colorName] || null,
+        colorFamily: deriveColorFamilyFromName(colorName),
+        isActive: true,
+        sortOrder: sortOrder++,
+        images: { front: null, back: null, detail: null },
+        renderOverrides: null,
+      };
+    });
+
+    const blankData = {
+      schemaVersion: MASTER_BLANK_SCHEMA_VERSION,
+      slug,
+      status: "draft",
+      supplier: styleInfo.supplier,
+      garmentCategory: styleInfo.garmentCategory,
+      category: styleInfo.garmentCategory,
+      styleCode,
+      styleName: styleInfo.styleName,
+      garmentStyle: styleInfo.styleName,
+      supplierUrl: styleInfo.supplierUrl,
+      variants,
+      images: { front: null, back: null },
+      imageMeta: null,
+      placements: getDefaultPlacements(styleInfo.garmentCategory),
+      tags: [styleInfo.garmentCategory, styleCode.toLowerCase(), "master-blank", "los-angeles-apparel", "laa"],
+      searchKeywords: generateSearchKeywords(styleCode, styleInfo.styleName, "", styleInfo.garmentCategory),
+      createdAt: now,
+      createdBy: userRef,
+      updatedAt: now,
+      updatedBy: userRef,
+    };
+
+    const blankRef = await db.collection("rp_blanks").add(blankData);
+    await blankRef.update({ blankId: blankRef.id });
+    results.push({ styleCode, slug, status: "created", blankId: blankRef.id, variantCount: variants.length });
+  }
+
+  const created = results.filter((r) => r.status === "created").length;
+  const skipped = results.filter((r) => r.status === "skipped").length;
+  console.log("[seedMasterBlanks]", created, "created,", skipped, "skipped");
+  return { ok: true, results, created, skipped, total: results.length };
+});
+
+/**
  * Update a Blank (v2)
  * Allows status updates and image attachments
  */
@@ -4919,7 +5272,42 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError("permission-denied", "Only admins can update blanks");
   }
 
-  const { blankId, status, frontImage, backImage, imageMeta, clearFrontImage, clearBackImage } = data;
+  const {
+    blankId,
+    status,
+    frontImage,
+    backImage,
+    imageMeta,
+    clearFrontImage,
+    clearBackImage,
+    colorFamily,
+    shopifyDefaults,
+    titleTemplate,
+    descriptionTemplate,
+    tagTemplates,
+    defaultPricing,
+    defaultShipping,
+    renderDefaults,
+    sourcing,
+    blankCost,
+    costCurrency,
+    placementNotes,
+    version,
+    placements: placementsInput,
+    variants: variantsInput,
+    schemaVersion: schemaVersionInput,
+    category: categoryInput,
+    garmentStyle: garmentStyleInput,
+    garmentCategory: garmentCategoryInput,
+    styleName: styleNameInput,
+    supplier: supplierInput,
+    supplierUrl: supplierUrlInput,
+    eligibility: eligibilityInput,
+    renderProfileStatus,
+    renderProfileNotes,
+    supportedRenderViews: supportedRenderViewsInput,
+    preferredFlatLook8394: preferredFlatLook8394Input,
+  } = data;
 
   if (!blankId || typeof blankId !== "string") {
     throw new functions.https.HttpsError("invalid-argument", "blankId is required");
@@ -5005,6 +5393,275 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
     };
   }
 
+  // Phase 1: Blank as foundation
+  if (colorFamily !== undefined) {
+    updateData.colorFamily = colorFamily === null || colorFamily === "" ? null : colorFamily;
+  }
+  if (shopifyDefaults !== undefined) {
+    updateData.shopifyDefaults =
+      shopifyDefaults == null
+        ? null
+        : {
+            productType: shopifyDefaults.productType ?? null,
+            brand: shopifyDefaults.brand ?? shopifyDefaults.vendor ?? null,
+            vendor: shopifyDefaults.vendor ?? shopifyDefaults.brand ?? null,
+            productCategory: shopifyDefaults.productCategory ?? null,
+            collectionHandles: Array.isArray(shopifyDefaults.collectionHandles) ? shopifyDefaults.collectionHandles : null,
+          };
+  }
+  if (titleTemplate !== undefined) updateData.titleTemplate = titleTemplate == null ? null : titleTemplate;
+  if (descriptionTemplate !== undefined) updateData.descriptionTemplate = descriptionTemplate == null ? null : descriptionTemplate;
+  if (tagTemplates !== undefined) updateData.tagTemplates = Array.isArray(tagTemplates) ? tagTemplates : null;
+  if (defaultPricing !== undefined) {
+    updateData.defaultPricing =
+      defaultPricing == null
+        ? null
+        : {
+            retailPrice: defaultPricing.retailPrice ?? null,
+            cost: defaultPricing.cost ?? null,
+            basePrice: defaultPricing.basePrice ?? null,
+            compareAtPrice: defaultPricing.compareAtPrice ?? null,
+            currencyCode: defaultPricing.currencyCode ?? null,
+          };
+  }
+  if (defaultShipping !== undefined) {
+    updateData.defaultShipping =
+      defaultShipping == null
+        ? null
+        : {
+            defaultWeightGrams: defaultShipping.defaultWeightGrams ?? null,
+            requiresShipping: defaultShipping.requiresShipping ?? null,
+          };
+  }
+  if (renderDefaults !== undefined) {
+    updateData.renderDefaults =
+      renderDefaults == null
+        ? null
+        : {
+            blendMode: renderDefaults.blendMode ?? null,
+            blendOpacity: renderDefaults.blendOpacity ?? null,
+            front: renderDefaults.front ?? null,
+            back: renderDefaults.back ?? null,
+          };
+  }
+  if (sourcing !== undefined) {
+    updateData.sourcing =
+      sourcing == null
+        ? null
+        : {
+            supplier: sourcing.supplier ?? null,
+            supplierStyleCode: sourcing.supplierStyleCode ?? null,
+            supplierProductUrl: sourcing.supplierProductUrl ?? null,
+            notes: sourcing.notes ?? null,
+            vendor: sourcing.vendor ?? null,
+            vendorSku: sourcing.vendorSku ?? null,
+            vendorColorName: sourcing.vendorColorName ?? null,
+            vendorProductUrl: sourcing.vendorProductUrl ?? null,
+          };
+  }
+  if (blankCost !== undefined) updateData.blankCost = blankCost == null ? null : Number(blankCost);
+  if (costCurrency !== undefined) updateData.costCurrency = costCurrency == null ? null : costCurrency;
+  if (placementNotes !== undefined) updateData.placementNotes = placementNotes == null ? null : placementNotes;
+  if (version !== undefined) updateData.version = version == null ? null : Number(version);
+
+  if (placementsInput !== undefined) {
+    if (!Array.isArray(placementsInput)) {
+      throw new functions.https.HttpsError("invalid-argument", "placements must be an array");
+    }
+    updateData.placements = placementsInput.map((p) => ({
+      placementId: p.placementId,
+      label: p.label ?? p.placementId,
+      view: p.view === "front" || p.view === "back" ? p.view : null,
+      defaultX: p.defaultX != null ? Number(p.defaultX) : null,
+      defaultY: p.defaultY != null ? Number(p.defaultY) : null,
+      defaultScale: p.defaultScale != null ? Number(p.defaultScale) : null,
+      safeArea:
+        p.safeArea && typeof p.safeArea === "object"
+          ? {
+              x: Number(p.safeArea.x),
+              y: Number(p.safeArea.y),
+              w: Number(p.safeArea.w),
+              h: Number(p.safeArea.h),
+            }
+          : null,
+      artboardBase: p.artboardBase != null ? Number(p.artboardBase) : null,
+      artboardNotes: p.artboardNotes != null ? String(p.artboardNotes) : null,
+      allowedDesignAssetMode:
+        p.allowedDesignAssetMode === "light_dark" ||
+        p.allowedDesignAssetMode === "light_only" ||
+        p.allowedDesignAssetMode === "dark_only"
+          ? p.allowedDesignAssetMode
+          : null,
+      renderZoneDefaults:
+        p.renderZoneDefaults && typeof p.renderZoneDefaults === "object"
+          ? {
+              blendMode: p.renderZoneDefaults.blendMode ?? null,
+              blendOpacity:
+                p.renderZoneDefaults.blendOpacity != null
+                  ? Number(p.renderZoneDefaults.blendOpacity)
+                  : null,
+            }
+          : null,
+      simpleRenderControls8394:
+        p.simpleRenderControls8394 && typeof p.simpleRenderControls8394 === "object"
+          ? {
+              realism:
+                p.simpleRenderControls8394.realism != null
+                  ? Number(p.simpleRenderControls8394.realism)
+                  : null,
+              inkStrength:
+                p.simpleRenderControls8394.inkStrength != null
+                  ? Number(p.simpleRenderControls8394.inkStrength)
+                  : null,
+              sizePreset: ["small", "medium", "large", "fill_safe"].includes(
+                p.simpleRenderControls8394.sizePreset
+              )
+                ? p.simpleRenderControls8394.sizePreset
+                : null,
+            }
+          : null,
+      maskConfig:
+        p.maskConfig && typeof p.maskConfig === "object"
+          ? {
+              mode: p.maskConfig.mode != null ? String(p.maskConfig.mode) : null,
+              notes: p.maskConfig.notes != null ? String(p.maskConfig.notes) : null,
+            }
+          : null,
+      profileStatus: p.profileStatus === "draft" || p.profileStatus === "approved" ? p.profileStatus : null,
+      notes: p.notes != null ? String(p.notes) : null,
+    }));
+  }
+
+  if (renderProfileStatus !== undefined) {
+    updateData.renderProfileStatus =
+      renderProfileStatus === "draft" || renderProfileStatus === "approved" ? renderProfileStatus : null;
+  }
+  if (renderProfileNotes !== undefined) {
+    updateData.renderProfileNotes =
+      renderProfileNotes == null || renderProfileNotes === "" ? null : String(renderProfileNotes);
+  }
+  if (supportedRenderViewsInput !== undefined) {
+    updateData.supportedRenderViews = Array.isArray(supportedRenderViewsInput)
+      ? supportedRenderViewsInput.filter((v) => v === "front" || v === "back")
+      : null;
+  }
+
+  if (preferredFlatLook8394Input !== undefined) {
+    updateData.preferredFlatLook8394 =
+      preferredFlatLook8394Input === "flat_clean" || preferredFlatLook8394Input === "flat_blended"
+        ? preferredFlatLook8394Input
+        : null;
+  }
+
+  if (variantsInput !== undefined) {
+    if (!Array.isArray(variantsInput)) {
+      throw new functions.https.HttpsError("invalid-argument", "variants must be an array");
+    }
+    updateData.variants = variantsInput.map((v) => ({
+      variantId: v.variantId,
+      colorName: v.colorName,
+      colorHex: v.colorHex ?? null,
+      colorFamily: v.colorFamily || deriveColorFamilyFromName(v.colorName),
+      vendorColorName: v.vendorColorName ?? null,
+      vendorColorCode: v.vendorColorCode ?? null,
+      vendorSku: v.vendorSku ?? null,
+      isActive: v.isActive !== false,
+      sortOrder: v.sortOrder != null ? Number(v.sortOrder) : null,
+      images: v.images || { front: null, back: null, detail: null },
+      renderOverrides: v.renderOverrides ?? null,
+      eligibilityOverride:
+        v.eligibilityOverride && typeof v.eligibilityOverride === "object"
+          ? {
+              enabled: v.eligibilityOverride.enabled === true,
+              allowedLeagues: Array.isArray(v.eligibilityOverride.allowedLeagues)
+                ? v.eligibilityOverride.allowedLeagues
+                : null,
+              allowAllTeamsInAllowedLeagues:
+                v.eligibilityOverride.allowAllTeamsInAllowedLeagues === null
+                  ? null
+                  : v.eligibilityOverride.allowAllTeamsInAllowedLeagues !== false,
+              matchTeamColorFamilies:
+                v.eligibilityOverride.matchTeamColorFamilies === true
+                  ? true
+                  : v.eligibilityOverride.matchTeamColorFamilies === false
+                    ? false
+                    : null,
+              allowedTeamColorFamilies: Array.isArray(v.eligibilityOverride.allowedTeamColorFamilies)
+                ? v.eligibilityOverride.allowedTeamColorFamilies
+                : null,
+              includedTeamIds: Array.isArray(v.eligibilityOverride.includedTeamIds)
+                ? v.eligibilityOverride.includedTeamIds
+                : null,
+              excludedTeamIds: Array.isArray(v.eligibilityOverride.excludedTeamIds)
+                ? v.eligibilityOverride.excludedTeamIds
+                : null,
+            }
+          : null,
+    }));
+  }
+
+  if (schemaVersionInput !== undefined) updateData.schemaVersion = Number(schemaVersionInput);
+  if (categoryInput !== undefined) updateData.category = categoryInput;
+  if (garmentStyleInput !== undefined) updateData.garmentStyle = garmentStyleInput;
+  if (garmentCategoryInput !== undefined) updateData.garmentCategory = garmentCategoryInput;
+  if (styleNameInput !== undefined) updateData.styleName = styleNameInput;
+  if (supplierInput !== undefined) updateData.supplier = supplierInput;
+  if (supplierUrlInput !== undefined) updateData.supplierUrl = supplierUrlInput;
+
+  if (eligibilityInput !== undefined) {
+    updateData.eligibility =
+      eligibilityInput == null
+        ? null
+        : {
+            allowedLeagues: Array.isArray(eligibilityInput.allowedLeagues)
+              ? eligibilityInput.allowedLeagues
+              : null,
+            allowAllTeamsInAllowedLeagues:
+              eligibilityInput.allowAllTeamsInAllowedLeagues === null
+                ? null
+                : eligibilityInput.allowAllTeamsInAllowedLeagues !== false,
+            matchTeamColorFamilies:
+              eligibilityInput.matchTeamColorFamilies === true
+                ? true
+                : eligibilityInput.matchTeamColorFamilies === false
+                  ? false
+                  : null,
+            allowedTeamColorFamilies: Array.isArray(eligibilityInput.allowedTeamColorFamilies)
+              ? eligibilityInput.allowedTeamColorFamilies
+              : null,
+            supportedDesignZones: Array.isArray(eligibilityInput.supportedDesignZones)
+              ? eligibilityInput.supportedDesignZones
+              : null,
+            supportedProductFamilies: Array.isArray(eligibilityInput.supportedProductFamilies)
+              ? eligibilityInput.supportedProductFamilies
+              : null,
+            includedTeamIds: Array.isArray(eligibilityInput.includedTeamIds) ? eligibilityInput.includedTeamIds : null,
+            excludedTeamIds: Array.isArray(eligibilityInput.excludedTeamIds) ? eligibilityInput.excludedTeamIds : null,
+          };
+  }
+
+  // Blank version bump: when style-level or variant-level content changes, bump version so products can detect staleness.
+  // Bump when: placements, renderDefaults, templates, shopifyDefaults, defaultPricing, defaultShipping, variants.
+  const versionBumpKeys = [
+    "placements",
+    "renderDefaults",
+    "renderProfileStatus",
+    "renderProfileNotes",
+    "supportedRenderViews",
+    "titleTemplate",
+    "descriptionTemplate",
+    "tagTemplates",
+    "shopifyDefaults",
+    "defaultPricing",
+    "defaultShipping",
+    "variants",
+  ];
+  const shouldBumpVersion = versionBumpKeys.some((k) => updateData[k] !== undefined);
+  if (shouldBumpVersion) {
+    const current = blankSnap.data().version;
+    updateData.version = (typeof current === "number" ? current : 0) + 1;
+  }
+
   await blankRef.update(updateData);
 
   console.log("[updateBlank] Updated blank:", blankId);
@@ -5013,8 +5670,7 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
 });
 
 /**
- * Delete/Archive a Blank
- * Archives instead of deleting if referenced by products
+ * Delete a Blank. Blocked if any products reference this blank; use Archive (status change) instead.
  */
 exports.deleteBlank = functions.https.onCall(async (data, context) => {
   if (!context.auth) {
@@ -5022,7 +5678,6 @@ exports.deleteBlank = functions.https.onCall(async (data, context) => {
   }
 
   const userId = context.auth.uid;
-  const userEmail = context.auth.token?.email || null;
 
   // Check if user is admin
   const adminSnap = await db.collection("admins").doc(userId).get();
@@ -5043,7 +5698,7 @@ exports.deleteBlank = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError("not-found", "Blank not found");
   }
 
-  // Check if any products reference this blank
+  // Block delete if any products reference this blank
   const productsQuery = await db
     .collection("rp_products")
     .where("blankId", "==", blankId)
@@ -5051,20 +5706,13 @@ exports.deleteBlank = functions.https.onCall(async (data, context) => {
     .get();
 
   if (!productsQuery.empty) {
-    // Archive instead of delete
-    await blankRef.update({
-      status: "archived",
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedBy: { uid: userId, email: userEmail },
-    });
-    
-    console.log("[deleteBlank] Archived blank (referenced by products):", blankId);
-    return { ok: true, action: "archived", reason: "Referenced by products" };
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "This blank is used by existing products and cannot be deleted. Archive it instead."
+    );
   }
 
-  // Safe to delete
   await blankRef.delete();
-  
   console.log("[deleteBlank] Deleted blank:", blankId);
   return { ok: true, action: "deleted" };
 });
@@ -5096,16 +5744,140 @@ const DEFAULT_DESIGN_PLACEMENTS = [
   },
 ];
 
-// Sample teams for seeding
-const SAMPLE_DESIGN_TEAMS = [
-  { id: "sf_giants", name: "SF Giants", league: "MLB", primaryColorHex: "#FD5A1E", tags: ["mlb", "giants", "sf"] },
-  { id: "sf_49ers", name: "SF 49ers", league: "NFL", primaryColorHex: "#AA0000", tags: ["nfl", "49ers", "sf"] },
-  { id: "la_dodgers", name: "LA Dodgers", league: "MLB", primaryColorHex: "#005A9C", tags: ["mlb", "dodgers", "la"] },
-  { id: "la_lakers", name: "LA Lakers", league: "NBA", primaryColorHex: "#552583", tags: ["nba", "lakers", "la"] },
-  { id: "ny_yankees", name: "NY Yankees", league: "MLB", primaryColorHex: "#003087", tags: ["mlb", "yankees", "ny"] },
-  { id: "chicago_bulls", name: "Chicago Bulls", league: "NBA", primaryColorHex: "#CE1141", tags: ["nba", "bulls", "chicago"] },
-  { id: "batch_import", name: "Batch Import", league: null, primaryColorHex: "#6B7280", tags: ["batch", "import"] },
+/** Concept themes (Firestore field `designType`); legacy style-era values still accepted on read/write */
+const DESIGN_THEME_CANONICAL = new Set([
+  "city_69",
+  "slogan",
+  "stadium",
+  "rivalry",
+  "number",
+  "wordplay",
+  "badge_crest",
+  "custom_one_off",
+]);
+const DESIGN_THEME_LEGACY = new Set(["wordmark", "script", "other", "badge"]);
+function isAllowedDesignTheme(v) {
+  return typeof v === "string" && (DESIGN_THEME_CANONICAL.has(v) || DESIGN_THEME_LEGACY.has(v));
+}
+const DESIGN_FILE_KINDS = new Set([
+  "png",
+  "pdf",
+  "svg",
+  "lightPng",
+  "darkPng",
+  "lightSvg",
+  "darkSvg",
+  "lightPdf",
+  "darkPdf",
+]);
+
+/** Canonical asset URLs on design (garment variants); mirrors client resolveDesignAssets */
+function resolveDesignAssetUrls(data) {
+  const a = data.assets || {};
+  const f = data.files || {};
+  const lightSvg =
+    a.lightSvg || (f.lightSvg && f.lightSvg.downloadUrl) || (f.svg && f.svg.downloadUrl) || null;
+  const darkSvg = a.darkSvg || (f.darkSvg && f.darkSvg.downloadUrl) || null;
+  const lightPdf =
+    a.lightPdf || (f.lightPdf && f.lightPdf.downloadUrl) || (f.pdf && f.pdf.downloadUrl) || null;
+  const darkPdf = a.darkPdf || (f.darkPdf && f.darkPdf.downloadUrl) || null;
+  return {
+    lightPng: a.lightPng || (f.lightPng && f.lightPng.downloadUrl) || (f.png && f.png.downloadUrl) || null,
+    darkPng: a.darkPng || (f.darkPng && f.darkPng.downloadUrl) || null,
+    lightSvg,
+    darkSvg,
+    svg:
+      a.svg ||
+      (f.svg && f.svg.downloadUrl) ||
+      (f.lightSvg && f.lightSvg.downloadUrl) ||
+      (f.darkSvg && f.darkSvg.downloadUrl) ||
+      null,
+    lightPdf,
+    darkPdf,
+    pdf:
+      a.pdf ||
+      (f.pdf && f.pdf.downloadUrl) ||
+      (f.lightPdf && f.lightPdf.downloadUrl) ||
+      (f.darkPdf && f.darkPdf.downloadUrl) ||
+      null,
+  };
+}
+
+/** Derive assets map from files (for denormalized writes) */
+function buildAssetsFromFiles(files) {
+  const f = files || {};
+  const lightSvg = (f.lightSvg && f.lightSvg.downloadUrl) || (f.svg && f.svg.downloadUrl) || null;
+  const darkSvg = (f.darkSvg && f.darkSvg.downloadUrl) || null;
+  const lightPdf = (f.lightPdf && f.lightPdf.downloadUrl) || (f.pdf && f.pdf.downloadUrl) || null;
+  const darkPdf = (f.darkPdf && f.darkPdf.downloadUrl) || null;
+  return {
+    lightPng: (f.lightPng && f.lightPng.downloadUrl) || (f.png && f.png.downloadUrl) || null,
+    darkPng: (f.darkPng && f.darkPng.downloadUrl) || null,
+    lightSvg,
+    darkSvg,
+    svg: (f.svg && f.svg.downloadUrl) || lightSvg || darkSvg || null,
+    lightPdf,
+    darkPdf,
+    pdf: (f.pdf && f.pdf.downloadUrl) || lightPdf || darkPdf || null,
+  };
+}
+
+/** Merge file flags for designs/{id}.files + assets */
+function computeDesignPngFlags(files, assets) {
+  const u = resolveDesignAssetUrls({ files: files || {}, assets: assets || {} });
+  const f = files || {};
+  const hasLightPng = !!u.lightPng;
+  const hasDarkPng = !!u.darkPng;
+  const hasLegacyPng = !!(f.png && f.png.downloadUrl) && !(f.lightPng && f.lightPng.downloadUrl);
+  const hasPng = !!(u.lightPng || u.darkPng);
+  return { hasLightPng, hasDarkPng, hasLegacyPng, hasPng };
+}
+
+/** Completeness: name + team + designType + both garment PNG URLs (no print colors required) */
+function computeDesignIsComplete(data) {
+  const u = resolveDesignAssetUrls(data);
+  const nameOk = !!(data.name && String(data.name).trim());
+  return (
+    nameOk &&
+    !!data.teamId &&
+    !!data.designType &&
+    !!u.lightPng &&
+    !!u.darkPng &&
+    data.status !== "archived"
+  );
+}
+
+/** Prefer light garment asset, then dark (for batch / fallback) */
+function designPngUrlForProcessing(design) {
+  const u = resolveDesignAssetUrls(design);
+  return u.lightPng || u.darkPng || null;
+}
+
+const { MLB_DESIGN_TEAMS } = require("./data/mlbDesignTeams");
+const { getCanonicalDesignTeamsPhase1 } = require("./data/canonicalDesignTeamsPhase1");
+
+/**
+ * Non-MLB sample teams (MLB is fully covered by MLB_DESIGN_TEAMS).
+ * Use official full franchise names in `name` (not abbreviations like "SF …"); stable `id` is the machine key.
+ */
+const OTHER_SAMPLE_DESIGN_TEAMS = [
+  {
+    id: "sf_49ers",
+    name: "San Francisco 49ers",
+    league: "NFL",
+    leagueId: "NFL",
+    city: "San Francisco",
+    state: "CA",
+    teamName: "49ers",
+    primaryColorHex: "#AA0000",
+    tags: ["nfl", "49ers", "san-francisco", "sf"],
+  },
+  { id: "la_lakers", name: "LA Lakers", league: "NBA", leagueId: "NBA", city: "Los Angeles", state: "CA", teamName: "Lakers", primaryColorHex: "#552583", tags: ["nba", "lakers", "la"] },
+  { id: "chicago_bulls", name: "Chicago Bulls", league: "NBA", leagueId: "NBA", city: "Chicago", state: "IL", teamName: "Bulls", primaryColorHex: "#CE1141", tags: ["nba", "bulls", "chicago"] },
+  { id: "batch_import", name: "Batch Import", league: null, leagueId: null, city: null, state: null, teamName: null, primaryColorHex: "#6B7280", tags: ["batch", "import"] },
 ];
+
+const SAMPLE_DESIGN_TEAMS = [...MLB_DESIGN_TEAMS, ...OTHER_SAMPLE_DESIGN_TEAMS];
 
 /**
  * Seed design_teams collection with sample sports teams
@@ -5139,6 +5911,10 @@ exports.seedDesignTeams = functions.https.onCall(async (data, context) => {
       id: team.id,
       name: team.name,
       league: team.league,
+      leagueId: team.leagueId !== undefined ? team.leagueId : team.league || null,
+      city: team.city !== undefined ? team.city : null,
+      state: team.state !== undefined ? team.state : null,
+      teamName: team.teamName !== undefined ? team.teamName : null,
       primaryColorHex: team.primaryColorHex,
       tags: team.tags,
       createdAt: now,
@@ -5163,8 +5939,110 @@ exports.seedDesignTeams = functions.https.onCall(async (data, context) => {
 });
 
 /**
- * Create a new Design
- * Required: name, teamId, colors (at least one hex color)
+ * Seed / upsert canonical design_teams Phase 1 (MLB, NFL, NBA, NHL, MLS).
+ * Pass { merge: true } to refresh teamCode, slug, colorFamilies, stadiumName, etc. on existing docs.
+ */
+exports.seedDesignTeamsCanonicalPhase1 = functions.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
+  }
+
+  const userId = context.auth.uid;
+  const adminSnap = await db.collection("admins").doc(userId).get();
+  if (!adminSnap.exists || adminSnap.data()?.role !== "admin") {
+    throw new functions.https.HttpsError("permission-denied", "Only admins can seed teams");
+  }
+
+  const merge = data && data.merge === true;
+  const { teams, countsByLeague } = getCanonicalDesignTeamsPhase1();
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const results = [];
+
+  for (const team of teams) {
+    const teamRef = db.collection("design_teams").doc(team.id);
+    const existingSnap = await teamRef.get();
+    const doc = {
+      id: team.id,
+      name: team.name,
+      league: team.league ?? null,
+      leagueId: team.leagueId ?? team.leagueCode ?? null,
+      leagueCode: team.leagueCode ?? team.leagueId ?? null,
+      city: team.city ?? null,
+      state: team.state ?? null,
+      teamName: team.teamName ?? null,
+      teamCode: team.teamCode,
+      slug: team.slug,
+      teamColors: team.teamColors,
+      primaryColorHex: team.primaryColorHex ?? null,
+      secondaryColorHex: team.secondaryColorHex ?? null,
+      colorFamilies: team.colorFamilies,
+      colorVerificationStatus: team.colorVerificationStatus ?? null,
+      printVerificationStatus: team.printVerificationStatus ?? null,
+      stadiumName: team.stadiumName ?? null,
+      teamSaying: team.teamSaying ?? null,
+      fanPhrase: team.fanPhrase ?? null,
+      tags: Array.isArray(team.tags) ? team.tags : [],
+      region: Array.isArray(team.region) ? team.region : [],
+      rivals: Array.isArray(team.rivals) ? team.rivals : [],
+      mascot: team.mascot ?? null,
+      hashtags: Array.isArray(team.hashtags) ? team.hashtags : [],
+      fanPhrases: Array.isArray(team.fanPhrases) ? team.fanPhrases : [],
+      updatedAt: now,
+    };
+
+    if (!existingSnap.exists) {
+      await teamRef.set({ ...doc, createdAt: now });
+      results.push({ id: team.id, status: "created" });
+    } else if (merge) {
+      const existing = existingSnap.data() || {};
+      await teamRef.set({ ...doc, createdAt: existing.createdAt || now }, { merge: true });
+      results.push({ id: team.id, status: "merged" });
+    } else {
+      results.push({ id: team.id, status: "skipped", reason: "already exists" });
+    }
+  }
+
+  const created = results.filter((r) => r.status === "created").length;
+  const merged = results.filter((r) => r.status === "merged").length;
+  const skipped = results.filter((r) => r.status === "skipped").length;
+
+  console.log(
+    "[seedDesignTeamsCanonicalPhase1]",
+    created,
+    "created,",
+    merged,
+    "merged,",
+    skipped,
+    "skipped"
+  );
+
+  return {
+    ok: true,
+    countsByLeague,
+    total: teams.length,
+    created,
+    merged,
+    skipped,
+    results,
+  };
+});
+
+/** Optional design series / campaign slug: lowercase snake_case */
+function normalizeDesignSeriesInput(v) {
+  if (v == null) return null;
+  const s = String(v).trim().toLowerCase();
+  if (!s) return null;
+  const out = s
+    .replace(/\s+/g, "_")
+    .replace(/[^a-z0-9_]/g, "")
+    .replace(/_+/g, "_")
+    .replace(/^_|_$/g, "");
+  return out || null;
+}
+
+/**
+ * Create a new Design (reusable artwork metadata)
+ * Required: name, teamId, designType, colors (at least one hex color)
  */
 exports.createDesignAsset = functions.https.onCall(async (data, context) => {
   if (!context.auth) {
@@ -5179,7 +6057,16 @@ exports.createDesignAsset = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError("permission-denied", "Only admins can create designs");
   }
 
-  const { name, teamId, colors, tags, description } = data;
+  const {
+    name,
+    teamId,
+    colors,
+    designType,
+    designSeries,
+    internalNotes,
+    tags,
+    description,
+  } = data;
 
   // Validate required fields
   if (!name || typeof name !== "string" || name.trim().length === 0) {
@@ -5188,6 +6075,13 @@ exports.createDesignAsset = functions.https.onCall(async (data, context) => {
 
   if (!teamId || typeof teamId !== "string") {
     throw new functions.https.HttpsError("invalid-argument", "teamId is required");
+  }
+
+  if (!designType || typeof designType !== "string" || !isAllowedDesignTheme(designType)) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "designType (design theme) is required and must be a canonical theme: city_69, slogan, stadium, rivalry, number, wordplay, badge_crest, custom_one_off (or a legacy value: wordmark, script, badge, other)"
+    );
   }
 
   // Validate colors (at least one hex color required)
@@ -5213,6 +6107,10 @@ exports.createDesignAsset = functions.https.onCall(async (data, context) => {
 
   const teamData = teamSnap.data();
   const teamName = teamData.name || teamId;
+  const leagueId = teamData.leagueId || teamData.league || null;
+  const teamCity = teamData.city || null;
+  const teamState = teamData.state || null;
+  const teamNickname = teamData.teamName || null;
 
   // Generate slug
   const slugBase = `${teamName}-${name}`.toLowerCase()
@@ -5220,45 +6118,86 @@ exports.createDesignAsset = functions.https.onCall(async (data, context) => {
     .replace(/^-|-$/g, "");
   const slug = `${slugBase}-${Date.now().toString(36)}`;
 
-  // Normalize colors
-  const normalizedColors = colors.map(c => ({
-    hex: c.hex.toUpperCase(),
-    name: c.name || null,
-    role: c.role || "ink",
-    notes: c.notes || null,
-  }));
+  // Normalize colors + Rally standard Off Black / Off White + CMYK on every swatch
+  const normalizedColors = normalizeColorsForFirestore(colors);
 
-  // Generate search keywords
+  const tagList = Array.isArray(tags) ? tags : [];
+  const internal =
+    internalNotes !== undefined && internalNotes !== null
+      ? String(internalNotes).trim() || null
+      : description !== undefined && description !== null
+        ? String(description).trim() || null
+        : null;
+
+  const seriesNorm = normalizeDesignSeriesInput(designSeries);
+
+  // Generate search keywords (no product/SEO copy)
   const searchKeywords = [
     name.toLowerCase(),
     teamName.toLowerCase(),
     teamId.toLowerCase(),
-    ...(tags || []).map(t => t.toLowerCase()),
+    designType,
+    seriesNorm,
+    leagueId && String(leagueId).toLowerCase(),
+    teamCity && String(teamCity).toLowerCase(),
+    teamState && String(teamState).toLowerCase(),
+    teamNickname && String(teamNickname).toLowerCase(),
+    ...tagList.map(t => String(t).toLowerCase()),
     ...normalizedColors.map(c => c.name?.toLowerCase()).filter(Boolean),
     ...normalizedColors.map(c => c.hex.toLowerCase()),
+    ...normalizedColors.map(c => (c.role && String(c.role).toLowerCase())),
   ].filter(Boolean);
 
   const now = admin.firestore.FieldValue.serverTimestamp();
+
+  const files = {
+    lightPng: null,
+    darkPng: null,
+    png: null,
+    lightSvg: null,
+    darkSvg: null,
+    svg: null,
+    lightPdf: null,
+    darkPdf: null,
+    pdf: null,
+  };
+
+  const assets = {
+    lightPng: null,
+    darkPng: null,
+    lightSvg: null,
+    darkSvg: null,
+    svg: null,
+    lightPdf: null,
+    darkPdf: null,
+    pdf: null,
+  };
 
   const designData = {
     name: name.trim(),
     slug,
     teamId,
     teamNameCache: teamName,
+    leagueId,
+    teamCityCache: teamCity,
+    teamStateCache: teamState,
+    teamNicknameCache: teamNickname,
+    designType,
+    designSeries: seriesNorm,
     status: "draft",
-    tags: tags || [],
-    description: description || null,
-    files: {
-      svg: null,
-      png: null,
-      pdf: null,
-    },
+    tags: tagList,
+    description: null,
+    internalNotes: internal,
+    files,
+    assets,
     colors: normalizedColors,
     colorCount: normalizedColors.length,
     placementDefaults: DEFAULT_DESIGN_PLACEMENTS,
     linkedBlankVariantCount: 0,
     linkedProductCount: 0,
     hasSvg: false,
+    hasLightPng: false,
+    hasDarkPng: false,
     hasPng: false,
     hasPdf: false,
     isComplete: false,
@@ -5307,8 +6246,11 @@ exports.updateDesignFile = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError("invalid-argument", "designId is required");
   }
 
-  if (!kind || !["png", "pdf", "svg"].includes(kind)) {
-    throw new functions.https.HttpsError("invalid-argument", "kind must be 'png', 'pdf', or 'svg'");
+  if (!kind || !DESIGN_FILE_KINDS.has(kind)) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "kind must be a supported design file kind (png, lightPng, darkPng, svg, lightSvg, darkSvg, pdf, lightPdf, darkPdf)"
+    );
   }
 
   if (!storagePath || !downloadUrl || !fileName) {
@@ -5324,36 +6266,82 @@ exports.updateDesignFile = functions.https.onCall(async (data, context) => {
 
   const now = admin.firestore.FieldValue.serverTimestamp();
 
+  const isRasterPng = kind === "png" || kind === "lightPng" || kind === "darkPng";
+  const isSvgFamily = kind === "svg" || kind === "lightSvg" || kind === "darkSvg";
+  const fileKindForDoc = isRasterPng ? "png" : isSvgFamily ? "svg" : "pdf";
+
   const fileData = {
-    kind,
+    kind: fileKindForDoc,
     storagePath,
     downloadUrl,
     fileName,
-    contentType: contentType || (kind === "png" ? "image/png" : kind === "svg" ? "image/svg+xml" : "application/pdf"),
+    contentType:
+      contentType ||
+      (isRasterPng ? "image/png" : isSvgFamily ? "image/svg+xml" : "application/pdf"),
     sizeBytes: sizeBytes || 0,
-    widthPx: kind === "png" ? (widthPx || null) : null,
-    heightPx: kind === "png" ? (heightPx || null) : null,
+    widthPx: isRasterPng ? (widthPx || null) : null,
+    heightPx: isRasterPng ? (heightPx || null) : null,
     sha256: sha256 || null,
     uploadedAt: now,
     uploadedByUid: userId,
   };
 
+  const fieldKey =
+    kind === "lightPng"
+      ? "lightPng"
+      : kind === "darkPng"
+        ? "darkPng"
+        : kind === "lightSvg"
+          ? "lightSvg"
+          : kind === "darkSvg"
+            ? "darkSvg"
+            : kind === "lightPdf"
+              ? "lightPdf"
+              : kind === "darkPdf"
+                ? "darkPdf"
+                : kind;
+
   const updateData = {
-    [`files.${kind}`]: fileData,
+    [`files.${fieldKey}`]: fileData,
     updatedAt: now,
     updatedByUid: userId,
   };
 
   // Update completion flags
   const currentData = designSnap.data();
-  const hasSvg = kind === "svg" ? true : !!currentData.files?.svg;
-  const hasPng = kind === "png" ? true : !!currentData.files?.png;
-  const hasPdf = kind === "pdf" ? true : !!currentData.files?.pdf;
+  const mergedFiles = {
+    ...(currentData.files || {}),
+    [fieldKey]: { ...fileData, downloadUrl },
+  };
+
+  const mergedAssets = buildAssetsFromFiles(mergedFiles);
+  updateData.assets = mergedAssets;
+
+  const hasSvg = !!(
+    mergedFiles.svg ||
+    mergedFiles.lightSvg ||
+    mergedFiles.darkSvg
+  );
+  const hasPdf = !!(
+    mergedFiles.pdf ||
+    mergedFiles.lightPdf ||
+    mergedFiles.darkPdf
+  );
+  const { hasLightPng, hasDarkPng, hasPng } = computeDesignPngFlags(mergedFiles, mergedAssets);
 
   updateData.hasSvg = hasSvg;
+  updateData.hasLightPng = hasLightPng;
+  updateData.hasDarkPng = hasDarkPng;
   updateData.hasPng = hasPng;
   updateData.hasPdf = hasPdf;
-  updateData.isComplete = hasPng && hasPdf && currentData.colorCount > 0 && !!currentData.teamId;
+
+  const nextForComplete = {
+    ...currentData,
+    files: mergedFiles,
+    assets: mergedAssets,
+    colorCount: currentData.colorCount,
+  };
+  updateData.isComplete = computeDesignIsComplete(nextForComplete);
 
   await designRef.update(updateData);
 
@@ -5378,7 +6366,24 @@ exports.updateDesignAsset = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError("permission-denied", "Only admins can update designs");
   }
 
-  const { designId, status, colors, tags, description, name, sportCode, leagueCode, teamCode, themeCode, designFamily } = data;
+  const {
+    designId,
+    status,
+    colors,
+    tags,
+    description,
+    name,
+    sportCode,
+    leagueCode,
+    teamCode,
+    themeCode,
+    designFamily,
+    designType,
+    designSeries,
+    internalNotes,
+    leagueId,
+    supportedSides,
+  } = data;
 
   if (!designId || typeof designId !== "string") {
     throw new functions.https.HttpsError("invalid-argument", "designId is required");
@@ -5409,9 +6414,26 @@ exports.updateDesignAsset = functions.https.onCall(async (data, context) => {
     updateData.name = name.trim();
   }
 
-  // Description update
+  // Description (legacy) / internal notes
   if (description !== undefined) {
     updateData.description = description || null;
+  }
+  if (internalNotes !== undefined) {
+    updateData.internalNotes = internalNotes || null;
+  }
+
+  if (designType !== undefined) {
+    if (designType === null || designType === "") {
+      updateData.designType = null;
+    } else if (!isAllowedDesignTheme(designType)) {
+      throw new functions.https.HttpsError("invalid-argument", "Invalid designType (design theme)");
+    } else {
+      updateData.designType = designType;
+    }
+  }
+
+  if (leagueId !== undefined) {
+    updateData.leagueId = leagueId || null;
   }
 
   // Tags update
@@ -5425,6 +6447,27 @@ exports.updateDesignAsset = functions.https.onCall(async (data, context) => {
   if (teamCode !== undefined) updateData.teamCode = teamCode || null;
   if (themeCode !== undefined) updateData.themeCode = themeCode || null;
   if (designFamily !== undefined) updateData.designFamily = designFamily || null;
+
+  if (designSeries !== undefined) {
+    updateData.designSeries = normalizeDesignSeriesInput(designSeries);
+  }
+
+  if (supportedSides !== undefined) {
+    if (supportedSides === null) {
+      updateData.supportedSides = admin.firestore.FieldValue.delete();
+    } else if (Array.isArray(supportedSides)) {
+      const allowed = new Set(["front", "back"]);
+      const cleaned = [
+        ...new Set(
+          supportedSides
+            .map((s) => String(s).trim().toLowerCase())
+            .filter((s) => allowed.has(s))
+        ),
+      ];
+      updateData.supportedSides =
+        cleaned.length > 0 ? cleaned : admin.firestore.FieldValue.delete();
+    }
+  }
 
   // Colors update
   if (colors && Array.isArray(colors)) {
@@ -5442,12 +6485,7 @@ exports.updateDesignAsset = functions.https.onCall(async (data, context) => {
       }
     }
 
-    const normalizedColors = colors.map(c => ({
-      hex: c.hex.toUpperCase(),
-      name: c.name || null,
-      role: c.role || "ink",
-      notes: c.notes || null,
-    }));
+    const normalizedColors = normalizeColorsForFirestore(colors);
 
     updateData.colors = normalizedColors;
     updateData.colorCount = normalizedColors.length;
@@ -5458,23 +6496,38 @@ exports.updateDesignAsset = functions.https.onCall(async (data, context) => {
   const finalTags = updateData.tags || currentData.tags || [];
   const finalColors = updateData.colors || currentData.colors || [];
   const teamName = currentData.teamNameCache || currentData.teamId;
+  const finalDesignType = updateData.designType !== undefined ? updateData.designType : currentData.designType;
+  const finalLeague = updateData.leagueId !== undefined ? updateData.leagueId : currentData.leagueId;
+  const finalSeries =
+    updateData.designSeries !== undefined ? updateData.designSeries : currentData.designSeries;
 
   updateData.searchKeywords = [
     finalName.toLowerCase(),
     teamName.toLowerCase(),
     currentData.teamId.toLowerCase(),
+    finalDesignType,
+    finalSeries && String(finalSeries).toLowerCase(),
+    finalLeague && String(finalLeague).toLowerCase(),
+    currentData.teamCityCache && String(currentData.teamCityCache).toLowerCase(),
+    currentData.teamStateCache && String(currentData.teamStateCache).toLowerCase(),
+    currentData.teamNicknameCache && String(currentData.teamNicknameCache).toLowerCase(),
     ...finalTags.map(t => t.toLowerCase()),
     ...finalColors.map(c => c.name?.toLowerCase()).filter(Boolean),
     ...finalColors.map(c => c.hex.toLowerCase()),
+    ...finalColors.map(c => (c.role && String(c.role).toLowerCase())),
   ].filter(Boolean);
 
-  // Update completion status
-  const hasPng = currentData.hasPng || !!currentData.files?.png;
-  const hasPdf = currentData.hasPdf || !!currentData.files?.pdf;
-  const colorCount = updateData.colorCount !== undefined ? updateData.colorCount : currentData.colorCount;
-
-  updateData.isComplete = hasPng && hasPdf && colorCount > 0 && !!currentData.teamId && 
-    (updateData.status || currentData.status) !== "archived";
+  // Update completion status (merged files + metadata)
+  const merged = {
+    ...currentData,
+    ...updateData,
+    files: { ...(currentData.files || {}), ...(updateData.files || {}) },
+    colorCount: updateData.colorCount !== undefined ? updateData.colorCount : currentData.colorCount,
+    designType: finalDesignType,
+    teamId: currentData.teamId,
+    status: updateData.status !== undefined ? updateData.status : currentData.status,
+  };
+  updateData.isComplete = computeDesignIsComplete(merged);
 
   await designRef.update(updateData);
 
@@ -5603,6 +6656,8 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
     throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
   }
 
+  const { resolveEffectivePlacement } = require("./lib/resolveProductRenderProfile");
+
   const { designId, blankId, view = "front", placementId: inputPlacementId, quality = "draft", productId, heroSlot, blankImageUrl: inputBlankUrl, designPngUrl: inputDesignUrl, placementOverride: inputPlacementOverride } = data;
 
   // Validate required fields
@@ -5630,13 +6685,13 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
   // Use explicit design URL when provided (Render Setup UI), else design PNG
   let designPngUrl = typeof inputDesignUrl === "string" && inputDesignUrl ? inputDesignUrl : null;
   if (!designPngUrl) {
-    if (!design.files?.png?.downloadUrl) {
+    designPngUrl = designPngUrlForProcessing(design);
+    if (!designPngUrl) {
       throw new functions.https.HttpsError(
         "failed-precondition",
-        "Design must have a PNG file uploaded"
+        "Design must have a PNG file uploaded (light/dark or legacy PNG)"
       );
     }
-    designPngUrl = design.files.png.downloadUrl;
   }
 
   // Fetch the blank (needed for placement even when explicit blankImageUrl is provided)
@@ -5701,7 +6756,25 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
     };
   }
 
-  // Master placement override (product-level "default" placement for all variants)
+  // Product inherits blank placement unless placementOverrides / legacy renderSetup override (see resolveProductRenderProfile)
+  if (productId && typeof productId === "string") {
+    try {
+      const prodSnap = await db.collection("rp_products").doc(productId).get();
+      if (prodSnap.exists) {
+        const eff = resolveEffectivePlacement(prodSnap.data(), blank, view);
+        if (eff) {
+          placement.x = eff.defaultX;
+          placement.y = eff.defaultY;
+          placement.scale = eff.defaultScale;
+          placement.safeArea = eff.safeArea;
+        }
+      }
+    } catch (e) {
+      console.warn("[createMockJob] Could not merge product placement:", e && e.message);
+    }
+  }
+
+  // Explicit per-request override (advanced / UI drag)
   if (inputPlacementOverride && typeof inputPlacementOverride === "object") {
     if (typeof inputPlacementOverride.x === "number") placement.x = inputPlacementOverride.x;
     if (typeof inputPlacementOverride.y === "number") placement.y = inputPlacementOverride.y;

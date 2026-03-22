@@ -1,0 +1,1058 @@
+{
+  "schemaVersion": "1",
+  "leagueCode": "MLB",
+  "description": "Verified MLB brand colors: hex and color names hand-picked from official / widely accepted club and MLB references. colorVerificationStatus=verified (brand identity). CMYK is sRGB→CMYK of those hexes until printVerificationStatus becomes verified. colorFamilies use the Rally normalized eligibility set. Optional pantone on teamColors entries may be added later without changing this file shape.",
+  "teamCount": 30,
+  "teams": [
+    {
+      "id": "arizona_diamondbacks",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "red",
+        "teal"
+      ],
+      "primaryColorHex": "#A71930",
+      "secondaryColorHex": "#30CED8",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Sedona Red",
+          "hex": "#A71930",
+          "cmyk": {
+            "c": 0,
+            "m": 85,
+            "y": 71,
+            "k": 35
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Sonoran Teal",
+          "hex": "#30CED8",
+          "cmyk": {
+            "c": 78,
+            "m": 5,
+            "y": 0,
+            "k": 15
+          }
+        }
+      ]
+    },
+    {
+      "id": "atlanta_braves",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "navy",
+        "red"
+      ],
+      "primaryColorHex": "#CE1141",
+      "secondaryColorHex": "#13274F",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Scarlet",
+          "hex": "#CE1141",
+          "cmyk": {
+            "c": 0,
+            "m": 92,
+            "y": 68,
+            "k": 19
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Navy",
+          "hex": "#13274F",
+          "cmyk": {
+            "c": 76,
+            "m": 51,
+            "y": 0,
+            "k": 69
+          }
+        }
+      ]
+    },
+    {
+      "id": "baltimore_orioles",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "orange",
+        "black"
+      ],
+      "primaryColorHex": "#DF4601",
+      "secondaryColorHex": "#000000",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Orange",
+          "hex": "#DF4601",
+          "cmyk": {
+            "c": 0,
+            "m": 69,
+            "y": 100,
+            "k": 13
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Black",
+          "hex": "#000000",
+          "cmyk": {
+            "c": 0,
+            "m": 0,
+            "y": 0,
+            "k": 100
+          }
+        }
+      ]
+    },
+    {
+      "id": "boston_red_sox",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "red",
+        "navy"
+      ],
+      "primaryColorHex": "#BD3039",
+      "secondaryColorHex": "#0C2340",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Red",
+          "hex": "#BD3039",
+          "cmyk": {
+            "c": 0,
+            "m": 75,
+            "y": 70,
+            "k": 26
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Navy",
+          "hex": "#0C2340",
+          "cmyk": {
+            "c": 81,
+            "m": 45,
+            "y": 0,
+            "k": 75
+          }
+        }
+      ]
+    },
+    {
+      "id": "chicago_cubs",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "blue",
+        "red"
+      ],
+      "primaryColorHex": "#0E3386",
+      "secondaryColorHex": "#CC3433",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Cubbies Blue",
+          "hex": "#0E3386",
+          "cmyk": {
+            "c": 90,
+            "m": 62,
+            "y": 0,
+            "k": 47
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Red",
+          "hex": "#CC3433",
+          "cmyk": {
+            "c": 0,
+            "m": 75,
+            "y": 75,
+            "k": 20
+          }
+        }
+      ]
+    },
+    {
+      "id": "chicago_white_sox",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "black",
+        "grey"
+      ],
+      "primaryColorHex": "#27251F",
+      "secondaryColorHex": "#C4CED4",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Black",
+          "hex": "#27251F",
+          "cmyk": {
+            "c": 0,
+            "m": 5,
+            "y": 21,
+            "k": 85
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Silver",
+          "hex": "#C4CED4",
+          "cmyk": {
+            "c": 8,
+            "m": 3,
+            "y": 0,
+            "k": 17
+          }
+        }
+      ]
+    },
+    {
+      "id": "cincinnati_reds",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "red",
+        "black"
+      ],
+      "primaryColorHex": "#C6011F",
+      "secondaryColorHex": "#000000",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Red",
+          "hex": "#C6011F",
+          "cmyk": {
+            "c": 0,
+            "m": 99,
+            "y": 84,
+            "k": 22
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Black",
+          "hex": "#000000",
+          "cmyk": {
+            "c": 0,
+            "m": 0,
+            "y": 0,
+            "k": 100
+          }
+        }
+      ]
+    },
+    {
+      "id": "cleveland_guardians",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "navy",
+        "red"
+      ],
+      "primaryColorHex": "#00385D",
+      "secondaryColorHex": "#E31937",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Fastball Navy",
+          "hex": "#00385D",
+          "cmyk": {
+            "c": 100,
+            "m": 40,
+            "y": 0,
+            "k": 64
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Guardians Red",
+          "hex": "#E31937",
+          "cmyk": {
+            "c": 0,
+            "m": 89,
+            "y": 76,
+            "k": 11
+          }
+        }
+      ]
+    },
+    {
+      "id": "colorado_rockies",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "purple",
+        "black"
+      ],
+      "primaryColorHex": "#333366",
+      "secondaryColorHex": "#000000",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Purple",
+          "hex": "#333366",
+          "cmyk": {
+            "c": 50,
+            "m": 50,
+            "y": 0,
+            "k": 60
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Black",
+          "hex": "#000000",
+          "cmyk": {
+            "c": 0,
+            "m": 0,
+            "y": 0,
+            "k": 100
+          }
+        }
+      ]
+    },
+    {
+      "id": "detroit_tigers",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "navy",
+        "orange"
+      ],
+      "primaryColorHex": "#0C2340",
+      "secondaryColorHex": "#FA4616",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Navy",
+          "hex": "#0C2340",
+          "cmyk": {
+            "c": 81,
+            "m": 45,
+            "y": 0,
+            "k": 75
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Orange",
+          "hex": "#FA4616",
+          "cmyk": {
+            "c": 0,
+            "m": 72,
+            "y": 91,
+            "k": 2
+          }
+        }
+      ]
+    },
+    {
+      "id": "houston_astros",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "orange",
+        "navy"
+      ],
+      "primaryColorHex": "#EB6E1F",
+      "secondaryColorHex": "#002D62",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Orange",
+          "hex": "#EB6E1F",
+          "cmyk": {
+            "c": 0,
+            "m": 53,
+            "y": 87,
+            "k": 8
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Navy",
+          "hex": "#002D62",
+          "cmyk": {
+            "c": 100,
+            "m": 54,
+            "y": 0,
+            "k": 62
+          }
+        }
+      ]
+    },
+    {
+      "id": "kansas_city_royals",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "blue",
+        "yellow"
+      ],
+      "primaryColorHex": "#004687",
+      "secondaryColorHex": "#BD9B60",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Royal Blue",
+          "hex": "#004687",
+          "cmyk": {
+            "c": 100,
+            "m": 48,
+            "y": 0,
+            "k": 47
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Gold",
+          "hex": "#BD9B60",
+          "cmyk": {
+            "c": 0,
+            "m": 18,
+            "y": 49,
+            "k": 26
+          }
+        }
+      ]
+    },
+    {
+      "id": "los_angeles_angels",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "red",
+        "navy"
+      ],
+      "primaryColorHex": "#BA0022",
+      "secondaryColorHex": "#003263",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Red",
+          "hex": "#BA0022",
+          "cmyk": {
+            "c": 0,
+            "m": 100,
+            "y": 82,
+            "k": 27
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Navy",
+          "hex": "#003263",
+          "cmyk": {
+            "c": 100,
+            "m": 49,
+            "y": 0,
+            "k": 61
+          }
+        }
+      ]
+    },
+    {
+      "id": "los_angeles_dodgers",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "blue",
+        "red"
+      ],
+      "primaryColorHex": "#005A9C",
+      "secondaryColorHex": "#EF3E42",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Dodger Blue",
+          "hex": "#005A9C",
+          "cmyk": {
+            "c": 100,
+            "m": 42,
+            "y": 0,
+            "k": 39
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Red",
+          "hex": "#EF3E42",
+          "cmyk": {
+            "c": 0,
+            "m": 74,
+            "y": 72,
+            "k": 6
+          }
+        }
+      ]
+    },
+    {
+      "id": "miami_marlins",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "blue",
+        "red"
+      ],
+      "primaryColorHex": "#00A3E0",
+      "secondaryColorHex": "#EF3340",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Miami Blue",
+          "hex": "#00A3E0",
+          "cmyk": {
+            "c": 100,
+            "m": 27,
+            "y": 0,
+            "k": 12
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Caliente Red",
+          "hex": "#EF3340",
+          "cmyk": {
+            "c": 0,
+            "m": 79,
+            "y": 73,
+            "k": 6
+          }
+        }
+      ]
+    },
+    {
+      "id": "milwaukee_brewers",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "navy",
+        "yellow"
+      ],
+      "primaryColorHex": "#12284B",
+      "secondaryColorHex": "#FFC52F",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Navy Blue",
+          "hex": "#12284B",
+          "cmyk": {
+            "c": 76,
+            "m": 47,
+            "y": 0,
+            "k": 71
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Yellow",
+          "hex": "#FFC52F",
+          "cmyk": {
+            "c": 0,
+            "m": 23,
+            "y": 82,
+            "k": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "minnesota_twins",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "navy",
+        "red"
+      ],
+      "primaryColorHex": "#002B5C",
+      "secondaryColorHex": "#D31145",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Navy",
+          "hex": "#002B5C",
+          "cmyk": {
+            "c": 100,
+            "m": 53,
+            "y": 0,
+            "k": 64
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Red",
+          "hex": "#D31145",
+          "cmyk": {
+            "c": 0,
+            "m": 92,
+            "y": 67,
+            "k": 17
+          }
+        }
+      ]
+    },
+    {
+      "id": "ny_mets",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "blue",
+        "orange"
+      ],
+      "primaryColorHex": "#002D72",
+      "secondaryColorHex": "#FF5910",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Blue",
+          "hex": "#002D72",
+          "cmyk": {
+            "c": 100,
+            "m": 61,
+            "y": 0,
+            "k": 55
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Orange",
+          "hex": "#FF5910",
+          "cmyk": {
+            "c": 0,
+            "m": 65,
+            "y": 94,
+            "k": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "ny_yankees",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "navy",
+        "white"
+      ],
+      "primaryColorHex": "#003087",
+      "secondaryColorHex": "#FFFFFF",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Navy",
+          "hex": "#003087",
+          "cmyk": {
+            "c": 100,
+            "m": 64,
+            "y": 0,
+            "k": 47
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "White",
+          "hex": "#FFFFFF",
+          "cmyk": {
+            "c": 0,
+            "m": 0,
+            "y": 0,
+            "k": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "oakland_athletics",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "green",
+        "yellow"
+      ],
+      "primaryColorHex": "#003831",
+      "secondaryColorHex": "#EFB21E",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Green",
+          "hex": "#003831",
+          "cmyk": {
+            "c": 100,
+            "m": 0,
+            "y": 13,
+            "k": 78
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Gold",
+          "hex": "#EFB21E",
+          "cmyk": {
+            "c": 0,
+            "m": 26,
+            "y": 87,
+            "k": 6
+          }
+        }
+      ]
+    },
+    {
+      "id": "philadelphia_phillies",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "red",
+        "blue"
+      ],
+      "primaryColorHex": "#E81828",
+      "secondaryColorHex": "#284898",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Red",
+          "hex": "#E81828",
+          "cmyk": {
+            "c": 0,
+            "m": 90,
+            "y": 83,
+            "k": 9
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Blue",
+          "hex": "#284898",
+          "cmyk": {
+            "c": 74,
+            "m": 53,
+            "y": 0,
+            "k": 40
+          }
+        }
+      ]
+    },
+    {
+      "id": "pittsburgh_pirates",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "yellow",
+        "black"
+      ],
+      "primaryColorHex": "#FDB827",
+      "secondaryColorHex": "#000000",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Gold",
+          "hex": "#FDB827",
+          "cmyk": {
+            "c": 0,
+            "m": 27,
+            "y": 85,
+            "k": 1
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Black",
+          "hex": "#000000",
+          "cmyk": {
+            "c": 0,
+            "m": 0,
+            "y": 0,
+            "k": 100
+          }
+        }
+      ]
+    },
+    {
+      "id": "san_diego_padres",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "black",
+        "yellow"
+      ],
+      "primaryColorHex": "#2F241D",
+      "secondaryColorHex": "#FFC425",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Brown",
+          "hex": "#2F241D",
+          "cmyk": {
+            "c": 0,
+            "m": 23,
+            "y": 38,
+            "k": 82
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Gold",
+          "hex": "#FFC425",
+          "cmyk": {
+            "c": 0,
+            "m": 23,
+            "y": 85,
+            "k": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "sf_giants",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "orange",
+        "black"
+      ],
+      "primaryColorHex": "#FD5A1E",
+      "secondaryColorHex": "#27251F",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Orange",
+          "hex": "#FD5A1E",
+          "cmyk": {
+            "c": 0,
+            "m": 64,
+            "y": 88,
+            "k": 1
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Black",
+          "hex": "#27251F",
+          "cmyk": {
+            "c": 0,
+            "m": 5,
+            "y": 21,
+            "k": 85
+          }
+        }
+      ]
+    },
+    {
+      "id": "seattle_mariners",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "navy",
+        "teal"
+      ],
+      "primaryColorHex": "#0C2C56",
+      "secondaryColorHex": "#005C5C",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Navy",
+          "hex": "#0C2C56",
+          "cmyk": {
+            "c": 86,
+            "m": 49,
+            "y": 0,
+            "k": 66
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Northwest Green",
+          "hex": "#005C5C",
+          "cmyk": {
+            "c": 100,
+            "m": 0,
+            "y": 0,
+            "k": 64
+          }
+        }
+      ]
+    },
+    {
+      "id": "st_louis_cardinals",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "red",
+        "navy"
+      ],
+      "primaryColorHex": "#C41E3A",
+      "secondaryColorHex": "#0C2340",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Cardinal Red",
+          "hex": "#C41E3A",
+          "cmyk": {
+            "c": 0,
+            "m": 85,
+            "y": 70,
+            "k": 23
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Navy",
+          "hex": "#0C2340",
+          "cmyk": {
+            "c": 81,
+            "m": 45,
+            "y": 0,
+            "k": 75
+          }
+        }
+      ]
+    },
+    {
+      "id": "tampa_bay_rays",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "navy",
+        "blue"
+      ],
+      "primaryColorHex": "#092C5C",
+      "secondaryColorHex": "#8FBCE6",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Navy",
+          "hex": "#092C5C",
+          "cmyk": {
+            "c": 90,
+            "m": 52,
+            "y": 0,
+            "k": 64
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Columbia Blue",
+          "hex": "#8FBCE6",
+          "cmyk": {
+            "c": 38,
+            "m": 18,
+            "y": 0,
+            "k": 10
+          }
+        }
+      ]
+    },
+    {
+      "id": "texas_rangers",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "blue",
+        "red"
+      ],
+      "primaryColorHex": "#003278",
+      "secondaryColorHex": "#C0111F",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Blue",
+          "hex": "#003278",
+          "cmyk": {
+            "c": 100,
+            "m": 58,
+            "y": 0,
+            "k": 53
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Red",
+          "hex": "#C0111F",
+          "cmyk": {
+            "c": 0,
+            "m": 91,
+            "y": 84,
+            "k": 25
+          }
+        }
+      ]
+    },
+    {
+      "id": "toronto_blue_jays",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "blue",
+        "red"
+      ],
+      "primaryColorHex": "#134A8E",
+      "secondaryColorHex": "#E8291C",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Royal Blue",
+          "hex": "#134A8E",
+          "cmyk": {
+            "c": 87,
+            "m": 48,
+            "y": 0,
+            "k": 44
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Red",
+          "hex": "#E8291C",
+          "cmyk": {
+            "c": 0,
+            "m": 82,
+            "y": 88,
+            "k": 9
+          }
+        }
+      ]
+    },
+    {
+      "id": "washington_nationals",
+      "colorVerificationStatus": "verified",
+      "printVerificationStatus": "derived",
+      "colorFamilies": [
+        "red",
+        "navy"
+      ],
+      "primaryColorHex": "#AB0003",
+      "secondaryColorHex": "#14225A",
+      "teamColors": [
+        {
+          "role": "primary",
+          "name": "Red",
+          "hex": "#AB0003",
+          "cmyk": {
+            "c": 0,
+            "m": 100,
+            "y": 98,
+            "k": 33
+          }
+        },
+        {
+          "role": "secondary",
+          "name": "Navy",
+          "hex": "#14225A",
+          "cmyk": {
+            "c": 78,
+            "m": 62,
+            "y": 0,
+            "k": 65
+          }
+        }
+      ]
+    }
+  ]
+}

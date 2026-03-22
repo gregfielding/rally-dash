@@ -32,7 +32,7 @@ Everything here is written to be:
 ## 1. TERMINOLOGY (LOCKED DEFINITIONS)
 
 ### Product
-A sellable SKU or variant (e.g. *SF Giants Black Panty Brief*).
+A sellable SKU or variant (e.g. *San Francisco Giants Black Panty Brief*).
 
 ### Colorway
 The **fabric color of the garment**.

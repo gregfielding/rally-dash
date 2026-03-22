@@ -50,7 +50,7 @@ type RpProductCategory = "panties" | "bralette" | "tank" | "tee" | "other";
 type RpProduct = {
   productId: string;              // doc id
   slug: string;                   // for route /products/:slug
-  name: string;                   // "SF Giants Classic Black"
+  name: string;                   // "San Francisco Giants Classic Black"
   description?: string;
 
   category: RpProductCategory;

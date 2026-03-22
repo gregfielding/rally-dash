@@ -62,6 +62,35 @@ function TeamsContent() {
 
   return (
     <>
+        <div className="mb-4 p-4 bg-sky-50 border border-sky-200 rounded-lg text-sm text-sky-950">
+          <p className="font-medium">This page is the legacy <code className="bg-sky-100 px-1 rounded">teams</code> collection</p>
+          <p className="mt-2 text-sky-900/90">
+            Bulk seeds (e.g. <code className="bg-sky-100 px-1 rounded text-xs">npm run seed:design-teams</code> in{" "}
+            <code className="bg-sky-100 px-1 rounded text-xs">functions/</code>) write to{" "}
+            <strong>design_teams</strong>, not here — so you will only see rows you (or old tooling) created in{" "}
+            <code className="bg-sky-100 px-1 rounded">teams</code>. The league filter uses the{" "}
+            <code className="bg-sky-100 px-1 rounded">leagues</code> collection (create leagues on{" "}
+            <Link href="/leagues" className="underline font-medium">
+              /leagues
+            </Link>
+            ).
+          </p>
+          <p className="mt-2 text-sky-900/90">
+            For the full seeded roster, open{" "}
+            <Link href="/designs" className="underline font-medium">
+              Designs
+            </Link>{" "}
+            (team picker reads <code className="bg-sky-100 px-1 rounded">design_teams</code>). Illustrator color libraries live on{" "}
+            <Link href="/design-system" className="underline font-medium">
+              /design-system
+            </Link>{" "}
+            (<code className="bg-sky-100 px-1 rounded">design_system</code>).{" "}
+            <Link href="/docs/design-guide" className="underline font-medium">
+              Design guide →
+            </Link>
+          </p>
+        </div>
+
         {error && (
           <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded text-red-700">
             {error}
@@ -70,7 +99,10 @@ function TeamsContent() {
 
         <div className="mb-6 flex justify-between items-center">
           <div className="flex items-center gap-4">
-            <h2 className="text-xl font-semibold">All Teams</h2>
+            <div>
+              <h2 className="text-xl font-semibold">All Teams</h2>
+              <p className="text-xs text-gray-500 mt-0.5">Firestore: <code className="bg-gray-100 px-1 rounded">teams</code></p>
+            </div>
             <select
               value={selectedLeague}
               onChange={(e) => setSelectedLeague(e.target.value)}

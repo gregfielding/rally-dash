@@ -19,8 +19,17 @@ import {
   RPBlankColorName,
   RPBlankStatus,
   RPBlankGarmentCategory,
+  RPBlankColorFamily,
+  RPBlankShopifyDefaults,
+  RPBlankDefaultPricing,
+  RPBlankDefaultShipping,
+  RPBlankRenderDefaults,
+  RPBlankSourcing,
   RPImageRef,
   RPImageMeta,
+  RPPlacement,
+  RPBlankVariant,
+  RPBlankEligibility,
 } from "@/lib/types/firestore";
 
 // Re-export types and constants from style registry
@@ -49,11 +58,13 @@ export type {
 // ============================================
 
 export interface UseBlanksFilters {
-  styleCode?: RPBlankStyleCode;
+  styleCode?: RPBlankStyleCode | string;
   colorName?: RPBlankColorName;
-  garmentCategory?: RPBlankGarmentCategory;
+  garmentCategory?: RPBlankGarmentCategory | string;
   status?: RPBlankStatus;
   search?: string;
+  /** When true, only master blanks (schemaVersion 2) */
+  mastersOnly?: boolean;
 }
 
 async function fetchBlanks(filters?: UseBlanksFilters): Promise<RPBlank[]> {
@@ -71,6 +82,7 @@ async function fetchBlanks(filters?: UseBlanksFilters): Promise<RPBlank[]> {
   if (filters?.garmentCategory) {
     conditions.push(where("garmentCategory", "==", filters.garmentCategory));
   }
+  // Note: mastersOnly is applied client-side (Firestore OR on schemaVersion is awkward)
   if (filters?.status) {
     conditions.push(where("status", "==", filters.status));
   }
@@ -81,6 +93,10 @@ async function fetchBlanks(filters?: UseBlanksFilters): Promise<RPBlank[]> {
   const snapshot = await getDocs(q);
 
   let blanks = snapshot.docs.map((d) => ({ ...d.data(), blankId: d.id } as RPBlank));
+
+  if (filters?.mastersOnly) {
+    blanks = blanks.filter((b) => b.schemaVersion === 2);
+  }
 
   // Client-side search filter
   if (filters?.search) {
@@ -161,10 +177,30 @@ export function useBlank(blankId: string | undefined) {
 // Blank Mutations
 // ============================================
 
-export interface CreateBlankInput {
+/** Create a master blank (one per style; colors are variants). */
+export interface CreateMasterBlankInput {
+  masterBlank: true;
+  /** Redundant flags so createBlank always recognizes master path (some clients / older deploys). */
+  createMasterBlank?: true;
+  schemaIntent?: "master_v2";
+  styleCode: string;
+  /** When true, fill styleName/category/supplier from STYLE_REGISTRY */
+  useStylePreset?: boolean;
+  styleName?: string;
+  garmentStyle?: string;
+  category?: string;
+  supplier?: string;
+  supplierUrl?: string | null;
+}
+
+/** Legacy: one Firestore doc per style+color */
+export interface CreateLegacyBlankInput {
+  masterBlank?: false;
   styleCode: RPBlankStyleCode;
   colorName: RPBlankColorName;
 }
+
+export type CreateBlankInput = CreateMasterBlankInput | CreateLegacyBlankInput;
 
 export interface UpdateBlankInput {
   blankId: string;
@@ -176,6 +212,38 @@ export interface UpdateBlankInput {
   clearFrontImage?: boolean;
   /** Set to true to remove the back image from the blank (and delete from storage). */
   clearBackImage?: boolean;
+  // Phase 1: Blank as foundation
+  colorFamily?: RPBlankColorFamily | null;
+  shopifyDefaults?: RPBlankShopifyDefaults | null;
+  titleTemplate?: string | null;
+  descriptionTemplate?: string | null;
+  tagTemplates?: string[] | null;
+  defaultPricing?: RPBlankDefaultPricing | null;
+  defaultShipping?: RPBlankDefaultShipping | null;
+  renderDefaults?: RPBlankRenderDefaults | null;
+  sourcing?: RPBlankSourcing | null;
+  blankCost?: number | null;
+  costCurrency?: string | null;
+  placementNotes?: string | null;
+  version?: number | null;
+  /** Canonical placement / render zone config; single source of truth for product generation. */
+  placements?: RPPlacement[] | null;
+  /** Blank-level render profile readiness (not product-level). */
+  renderProfileStatus?: "draft" | "approved" | null;
+  renderProfileNotes?: string | null;
+  supportedRenderViews?: ("front" | "back")[] | null;
+  /** 8394 MVP merchandising preference (natural vs fabric-mixed preview). */
+  preferredFlatLook8394?: "flat_clean" | "flat_blended" | null;
+  variants?: RPBlankVariant[] | null;
+  garmentStyle?: string | null;
+  category?: string | null;
+  garmentCategory?: RPBlankGarmentCategory | string | null;
+  styleName?: string | null;
+  supplier?: string | null;
+  supplierUrl?: string | null;
+  schemaVersion?: number | null;
+  /** Team/catalog eligibility (master blank); colors live on variants only */
+  eligibility?: RPBlankEligibility | null;
 }
 
 /**
@@ -192,10 +260,29 @@ export function useCreateBlank() {
     const createBlankFn = httpsCallable(functions, "createBlank");
     const result = await createBlankFn(input);
 
-    return result.data as { ok: boolean; blankId: string; slug: string };
+    return result.data as { ok: boolean; blankId: string; slug: string; schemaVersion?: number };
   }, []);
 
   return { createBlank };
+}
+
+/**
+ * Seed master blanks (one doc per style with color variants)
+ */
+export function useSeedMasterBlanks() {
+  const seedMasterBlanks = useCallback(async () => {
+    if (!functions) throw new Error("Cloud Functions not initialized");
+    const seedFn = httpsCallable(functions, "seedMasterBlanks");
+    const result = await seedFn({});
+    return result.data as {
+      ok: boolean;
+      results: Array<{ styleCode: string; slug: string; status: string; blankId?: string; variantCount?: number }>;
+      created: number;
+      skipped: number;
+      total: number;
+    };
+  }, []);
+  return { seedMasterBlanks };
 }
 
 /**

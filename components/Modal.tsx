@@ -47,7 +47,9 @@ export default function Modal({ isOpen, onClose, title, children, size = "medium
             ×
           </button>
         </div>
-        <div className="p-6 overflow-y-auto flex-1">{children}</div>
+        <div className="p-6 overflow-y-auto flex-1 text-gray-900">
+          {children}
+        </div>
       </div>
     </div>
   );

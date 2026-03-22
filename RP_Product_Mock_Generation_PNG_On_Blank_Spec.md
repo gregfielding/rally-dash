@@ -77,7 +77,7 @@ Below generator:
   - Copy URL (optional)
 
 ### Operator flow
-1) Open design “SF Giants Design 1”
+1) Open design “San Francisco Giants Design 1”
 2) Mocks tab
 3) Select blank “8394 Bikini — Black”
 4) Generate **Draft**

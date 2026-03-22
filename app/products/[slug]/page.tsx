@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect, useRef, useMemo, FormEvent } from "react";
-import { useParams } from "next/navigation";
+import { useState, useEffect, useRef, useMemo, useCallback, FormEvent } from "react";
+import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { addDoc, collection, deleteDoc, doc, getDocs, query, serverTimestamp, updateDoc, where, writeBatch } from "firebase/firestore";
 import { db } from "@/lib/firebase/config";
@@ -12,7 +12,11 @@ import { useProductDesigns } from "@/lib/hooks/useRPProductDesigns";
 import { useProductAssets } from "@/lib/hooks/useRPProductAssets";
 import { useGenerationJobs } from "@/lib/hooks/useRPGenerationJobs";
 import { useScenePresets } from "@/lib/hooks/useRPScenePresets";
-import { useGenerateProductAssets } from "@/lib/hooks/useRPProductMutations";
+import {
+  useGenerateProductAssets,
+  useGenerateProductFlatRenders,
+  useGenerateProductSceneRender,
+} from "@/lib/hooks/useRPProductMutations";
 import { useCreateMockJob, useWatchMockJob } from "@/lib/hooks/useMockAssets";
 import { useIdentities } from "@/lib/hooks/useIdentities";
 import { useModelPacks } from "@/lib/hooks/useModelPacks";
@@ -22,6 +26,17 @@ import { useDesignConcepts } from "@/lib/hooks/useDesignConcepts";
 import { useCreateProductDesign, useCreateDesignFromConcept, useCreateDesignBrief } from "@/lib/hooks/useDesignMutations";
 import { useDesign, useDesigns } from "@/lib/hooks/useDesignAssets";
 import { useBlank, useBlanks } from "@/lib/hooks/useBlanks";
+import { getVariantById } from "@/lib/blanks";
+import { designSupportsGarmentSide, getDesignPreviewUrl } from "@/lib/designs/designHelpers";
+import {
+  computeProductFlatRenderFingerprintAsync,
+  getBackBlendForFlatRender,
+  getBackPlacementRowForFlatRender,
+  getVariantBackImageUrl,
+  isFlatRenderSlotStale,
+  isProductInFlatRenderMvpScope,
+  pickDesignPngUrlForVariant,
+} from "@/lib/products/flatRenderFingerprint";
 import { useInspirations } from "@/lib/hooks/useInspirations";
 import { useAttachInspirationToProduct, useAttachInspirationToBrief } from "@/lib/hooks/useInspirationMutations";
 import { useAssetCollections } from "@/lib/hooks/useAssetCollections";
@@ -42,9 +57,18 @@ import {
   RpDesignConcept,
   RpDesignBrief,
   RpConceptStatus,
+  type DesignDoc,
+  type RPBlank,
 } from "@/lib/types/firestore";
+import {
+  hasProductPlacementOverride,
+  resolveEffectivePlacement,
+} from "@/lib/products/resolveProductRenderProfile";
+import { HANGER_CREWNECK_SCENE_TEMPLATE } from "@/lib/scenes/sceneTemplates";
+import { pickFlatBlendedUrlForScene } from "@/lib/scenes/sceneRenderHelpers";
 import { isProductReadyForShopify } from "@/lib/shopify/isProductReadyForShopify";
 import { buildShopifyTags } from "@/lib/shopify/buildShopifyTags";
+import { formatCmyk, resolveRpInkColorsWithStandard } from "@/lib/print/standardPrintInks";
 
 // Assets Tab Component with Collections
 function AssetsTab({
@@ -459,29 +483,27 @@ function DesignsTable({
                 </span>
               </td>
               <td className="px-6 py-4">
-                <div className="flex flex-wrap gap-1">
-                  {design.inkColors?.map((ink: RpInkColor, idx: number) => (
+                <div className="flex flex-wrap gap-1.5">
+                  {resolveRpInkColorsWithStandard(design.inkColors).map((ink: RpInkColor, idx: number) => (
                     <span
                       key={idx}
-                      className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded"
-                      style={{
-                        backgroundColor: ink.hex ? `${ink.hex}20` : "#f3f4f6",
-                        color: ink.hex || "#374151",
-                        border: ink.hex ? `1px solid ${ink.hex}` : "1px solid #d1d5db",
-                      }}
+                      className="inline-flex flex-col gap-0.5 px-2 py-1 text-xs rounded border border-gray-200 bg-white max-w-[9.5rem]"
                     >
-                      {ink.hex && (
-                        <span
-                          className="w-3 h-3 rounded-full border border-gray-300"
-                          style={{ backgroundColor: ink.hex }}
-                        />
-                      )}
-                      {ink.name}
+                      <span className="inline-flex items-center gap-1 font-medium text-gray-800">
+                        {ink.hex ? (
+                          <span
+                            className="w-3 h-3 rounded-full border border-gray-300 shrink-0"
+                            style={{ backgroundColor: ink.hex }}
+                          />
+                        ) : null}
+                        <span className="truncate">{ink.name}</span>
+                      </span>
+                      {ink.hex ? <span className="font-mono text-[10px] text-gray-600">{ink.hex}</span> : null}
+                      {ink.cmyk ? (
+                        <span className="font-mono text-[9px] text-gray-500 leading-tight">{formatCmyk(ink.cmyk)}</span>
+                      ) : null}
                     </span>
                   ))}
-                  {(!design.inkColors || design.inkColors.length === 0) && (
-                    <span className="text-xs text-gray-400">None</span>
-                  )}
                 </div>
               </td>
               <td className="px-6 py-4 whitespace-nowrap">
@@ -1691,8 +1713,11 @@ function DesignsTabContent({
 
 function ProductDetailContent() {
   const params = useParams();
+  const router = useRouter();
   const slug = (params?.slug as string) || "";
-  const [activeTab, setActiveTab] = useState<"overview" | "designs" | "assets" | "inspiration" | "generate" | "settings">("overview");
+  const [activeTab, setActiveTab] = useState<
+    "overview" | "content" | "assets" | "shopify" | "history"
+  >("overview");
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const mockupPollCancelledRef = useRef(false);
   const [experimentId, setExperimentId] = useState("");
@@ -1733,6 +1758,9 @@ function ProductDetailContent() {
   
   // Generate form state
   const [generating, setGenerating] = useState(false);
+  const [generatingFlatRenders, setGeneratingFlatRenders] = useState(false);
+  const [generatingSceneRender, setGeneratingSceneRender] = useState(false);
+  const [flatRenderFingerprint, setFlatRenderFingerprint] = useState<string | null>(null);
   const [generateError, setGenerateError] = useState<string | null>(null);
   const [showDebug, setShowDebug] = useState(false); // Debug panel toggle
   const [selectedPresetId, setSelectedPresetId] = useState("");
@@ -1758,6 +1786,8 @@ function ProductDetailContent() {
   // Derive generationType from preset mode (for backward compatibility with function)
   const generationType = isProductOnly ? "product_only" : "on_model";
   const { generateProductAssets } = useGenerateProductAssets();
+  const { generateProductFlatRenders } = useGenerateProductFlatRenders();
+  const { generateProductSceneRender } = useGenerateProductSceneRender();
   const { createJob: createMockJob } = useCreateMockJob();
   const [lastMockJobId, setLastMockJobId] = useState<string | null>(null);
   const { job: mockJob } = useWatchMockJob(lastMockJobId);
@@ -1766,9 +1796,125 @@ function ProductDetailContent() {
   // Render Setup: explicit blank/design/side (part of product definition)
   const { blank: currentBlank, loading: blankLoading } = useBlank(product?.blankId);
   const designIdForFront = product?.designIdFront ?? product?.designId ?? null;
-  const designIdForBack = product?.designIdBack ?? null;
+  /** Same design doc as front when product only has `designId` (e.g. Design + Blank). */
+  const designIdForBack = product?.designIdBack ?? product?.designId ?? null;
   const { design: designFront, isLoading: designFrontLoading } = useDesign(designIdForFront);
   const { design: designBack, isLoading: designBackLoading } = useDesign(designIdForBack);
+  const flatRenderDesignId =
+    (product?.designIdBack && product.designIdBack.trim()) || product?.designId || null;
+  const { design: designForFlatRender, isLoading: designFlatLoading } = useDesign(flatRenderDesignId);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!product || !currentBlank || !product.blankVariantId || !designForFlatRender) {
+        if (!cancelled) setFlatRenderFingerprint(null);
+        return;
+      }
+      const v = getVariantById(currentBlank, product.blankVariantId);
+      if (!v) {
+        if (!cancelled) setFlatRenderFingerprint(null);
+        return;
+      }
+      try {
+        const fp = await computeProductFlatRenderFingerprintAsync({
+          blank: currentBlank,
+          variant: v,
+          design: designForFlatRender,
+          product,
+        });
+        if (!cancelled) setFlatRenderFingerprint(fp);
+      } catch {
+        if (!cancelled) setFlatRenderFingerprint(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [product, currentBlank, designForFlatRender]);
+
+  /** Step 10 tuning: only show flat-render tooling when this product uses the 8394 master blank. */
+  const is8394ProductContext = useMemo(
+    () =>
+      !blankLoading &&
+      !!product?.blankId &&
+      !!currentBlank &&
+      String(currentBlank.styleCode || "").trim() === "8394",
+    [blankLoading, product?.blankId, currentBlank]
+  );
+
+  /** Canonical back placement + effective blend + inputs the server would use (8394 back MVP). */
+  const mvp8394VerifyPanel = useMemo(() => {
+    if (!is8394ProductContext || !currentBlank || !designForFlatRender || !product?.blankVariantId) return null;
+    const backRow = getBackPlacementRowForFlatRender(currentBlank);
+    const v = getVariantById(currentBlank, product.blankVariantId);
+    if (!backRow || !v) return null;
+    const blend = getBackBlendForFlatRender(currentBlank, v, backRow);
+    const designPick = pickDesignPngUrlForVariant(designForFlatRender, v);
+    const variantBackUrl = getVariantBackImageUrl(currentBlank, v);
+    const simple8394 = backRow.simpleRenderControls8394;
+    const sizePresetLabel =
+      simple8394?.sizePreset === "fill_safe"
+        ? "Fill safe area"
+        : simple8394?.sizePreset === "small"
+          ? "Small"
+          : simple8394?.sizePreset === "large"
+            ? "Large"
+            : simple8394?.sizePreset === "medium"
+              ? "Medium"
+              : "—";
+    return {
+      backRow,
+      blend,
+      designPick,
+      variantBackUrl,
+      variantLabel: `${v.colorName} · ${v.variantId}`,
+      simple8394,
+      sizePresetLabel,
+    };
+  }, [is8394ProductContext, currentBlank, designForFlatRender, product?.blankVariantId]);
+
+  /** Same blank → quick jump while tuning 8394 across colorways. */
+  const [linked8394Nav, setLinked8394Nav] = useState<{ id: string; slug: string; name: string }[]>([]);
+
+  useEffect(() => {
+    if (!is8394ProductContext || !product?.blankId || !db) {
+      setLinked8394Nav([]);
+      return;
+    }
+    let cancelled = false;
+    getDocs(query(collection(db, "rp_products"), where("blankId", "==", product.blankId)))
+      .then((snap) => {
+        if (cancelled) return;
+        const rows = snap.docs
+          .map((d) => {
+            const x = d.data() as RpProduct;
+            return { id: d.id, slug: x.slug, name: (x.title || x.name || x.slug) as string };
+          })
+          .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+        setLinked8394Nav(rows);
+      })
+      .catch(() => {
+        if (!cancelled) setLinked8394Nav([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [is8394ProductContext, product?.blankId, product?.id]);
+
+  const linkedNavMeta = useMemo(() => {
+    if (!product?.id || linked8394Nav.length === 0) {
+      return { prev: null as { id: string; slug: string; name: string } | null, next: null as { id: string; slug: string; name: string } | null, index: -1 };
+    }
+    const idx = linked8394Nav.findIndex((p) => p.id === product.id);
+    if (idx < 0) return { prev: null, next: null, index: -1 };
+    return {
+      prev: idx > 0 ? linked8394Nav[idx - 1] : null,
+      next: idx < linked8394Nav.length - 1 ? linked8394Nav[idx + 1] : null,
+      index: idx,
+    };
+  }, [linked8394Nav, product?.id]);
+
   const { designs: allDesigns } = useDesigns({});
   const { blanks: allBlanks } = useBlanks();
   const [renderSetupModal, setRenderSetupModal] = useState<"blank_front" | "blank_back" | "placement_front" | "placement_back" | "design_front" | "design_back" | null>(null);
@@ -1909,29 +2055,104 @@ function ProductDetailContent() {
   const blankIdForFallback = product?.renderConfig?.selectedBlankId || product?.blankId;
   const blankForFallback =
     blankIdForFallback === product?.blankId ? currentBlank : allBlanks.find((b) => (b as { blankId?: string }).blankId === blankIdForFallback) || currentBlank;
-  const fallbackFrontBlankUrl = (blankForFallback?.images?.front as { downloadUrl?: string } | null)?.downloadUrl ?? product?.renderConfig?.selectedBlankImageUrl;
-  const fallbackBackBlankUrl = (blankForFallback?.images?.back as { downloadUrl?: string } | null)?.downloadUrl ?? product?.renderConfig?.selectedBlankImageUrl;
+  const resolvedBlankStyleCode = String(
+    currentBlank?.styleCode ||
+      (product?.blankId
+        ? (
+            allBlanks.find((b) => (b as { blankId?: string }).blankId === product.blankId) as
+              | { styleCode?: string }
+              | undefined
+          )?.styleCode || ""
+        : "")
+  ).trim();
+  /** LA Apparel 8394 bikini: catalog print is back-only (no front graphic). */
+  const is8394BackPrintOnlyBlank = resolvedBlankStyleCode === "8394";
+  /** Master blanks store front/back URLs on the variant row, not on blank.images. */
+  const variantForRenderSetup =
+    currentBlank && product?.blankVariantId
+      ? getVariantById(currentBlank, product.blankVariantId)
+      : null;
+  const fallbackFrontBlankUrl =
+    (variantForRenderSetup?.images?.front as { downloadUrl?: string } | null)?.downloadUrl ??
+    (blankForFallback?.images?.front as { downloadUrl?: string } | null)?.downloadUrl ??
+    product?.renderConfig?.selectedBlankImageUrl;
+  const fallbackBackBlankUrl =
+    (variantForRenderSetup?.images?.back as { downloadUrl?: string } | null)?.downloadUrl ??
+    (blankForFallback?.images?.back as { downloadUrl?: string } | null)?.downloadUrl ??
+    product?.renderConfig?.selectedBlankImageUrl;
 
-  const designFrontUrlResolved = product?.renderConfig?.selectedDesignImageUrlFront || (designFront?.files as { png?: { downloadUrl?: string } } | undefined)?.png?.downloadUrl;
-  const designBackUrlResolved = product?.renderConfig?.selectedDesignImageUrlBack || (designBack?.files as { png?: { downloadUrl?: string } } | undefined)?.png?.downloadUrl;
+  const resolveDesignPngForRenderPreview = (d: DesignDoc | null | undefined): string | null => {
+    if (!d) return null;
+    if (variantForRenderSetup) {
+      const picked = pickDesignPngUrlForVariant(d, variantForRenderSetup);
+      if (picked.url) return picked.url;
+    }
+    return getDesignPreviewUrl(d) ?? null;
+  };
+
+  const explicitFrontDesignOnProduct =
+    !!product?.designIdFront ||
+    !!product?.renderSetup?.front?.designAssetId ||
+    !!product?.renderSetup?.front?.designAssetUrl;
+  const allowImplicitFrontDesignFromProductId =
+    !is8394BackPrintOnlyBlank || explicitFrontDesignOnProduct;
+
+  const designFrontUrlResolved =
+    product?.renderConfig?.selectedDesignImageUrlFront ||
+    (allowImplicitFrontDesignFromProductId &&
+    designFront &&
+    designSupportsGarmentSide(designFront, "front")
+      ? resolveDesignPngForRenderPreview(designFront)
+      : null);
+  const designBackUrlResolved =
+    product?.renderConfig?.selectedDesignImageUrlBack ||
+    (designBack && designSupportsGarmentSide(designBack, "back")
+      ? resolveDesignPngForRenderPreview(designBack)
+      : null);
+
+  const implicitFrontDesignId =
+    allowImplicitFrontDesignFromProductId &&
+    designFront &&
+    designSupportsGarmentSide(designFront, "front")
+      ? designIdForFront
+      : null;
+  const implicitBackDesignId =
+    designBack && designSupportsGarmentSide(designBack, "back") ? designIdForBack : null;
+
+  /** PNG URL for design picker modal (light/dark/legacy; matches garment variant when possible). */
+  const resolveDesignPngForPicker = (d: DesignDoc) => resolveDesignPngForRenderPreview(d);
+
+  const blankAsRp = currentBlank as RPBlank | null | undefined;
+  const effPlacementFront = useMemo(
+    () => (blankAsRp && product ? resolveEffectivePlacement(product, blankAsRp, "front") : null),
+    [blankAsRp, product, product?.placementOverrides, product?.renderSetup?.front?.placementOverride]
+  );
+  const effPlacementBack = useMemo(
+    () => (blankAsRp && product ? resolveEffectivePlacement(product, blankAsRp, "back") : null),
+    [blankAsRp, product, product?.placementOverrides, product?.renderSetup?.back?.placementOverride]
+  );
 
   /** Effective config per side: prefer renderSetup, fallback to renderConfig + product (backward compat). */
   type SideConfig = { blankAssetId?: string | null; blankImageUrl?: string | null; designAssetId?: string | null; designAssetUrl?: string | null; placementKey?: string | null; placementOverride?: { x?: number; y?: number; scale?: number } | null };
   const effectiveFrontConfig: SideConfig = {
     blankAssetId: product?.renderSetup?.front?.blankAssetId ?? blankIdForFallback ?? null,
     blankImageUrl: product?.renderSetup?.front?.blankImageUrl ?? fallbackFrontBlankUrl ?? null,
-    designAssetId: product?.renderSetup?.front?.designAssetId ?? designIdForFront ?? null,
+    designAssetId: product?.renderSetup?.front?.designAssetId ?? implicitFrontDesignId ?? null,
     designAssetUrl: product?.renderSetup?.front?.designAssetUrl ?? designFrontUrlResolved ?? null,
     placementKey: product?.renderSetup?.front?.placementKey ?? "front_center",
-    placementOverride: product?.renderSetup?.front?.placementOverride ?? product?.renderConfig?.placementOverride ?? undefined,
+    placementOverride: effPlacementFront
+      ? { x: effPlacementFront.defaultX, y: effPlacementFront.defaultY, scale: effPlacementFront.defaultScale }
+      : product?.renderSetup?.front?.placementOverride ?? product?.renderConfig?.placementOverride ?? undefined,
   };
   const effectiveBackConfig: SideConfig = {
     blankAssetId: product?.renderSetup?.back?.blankAssetId ?? blankIdForFallback ?? null,
     blankImageUrl: product?.renderSetup?.back?.blankImageUrl ?? fallbackBackBlankUrl ?? null,
-    designAssetId: product?.renderSetup?.back?.designAssetId ?? designIdForBack ?? null,
+    designAssetId: product?.renderSetup?.back?.designAssetId ?? implicitBackDesignId ?? null,
     designAssetUrl: product?.renderSetup?.back?.designAssetUrl ?? designBackUrlResolved ?? null,
     placementKey: product?.renderSetup?.back?.placementKey ?? "back_center",
-    placementOverride: product?.renderSetup?.back?.placementOverride ?? product?.renderConfig?.placementOverride ?? undefined,
+    placementOverride: effPlacementBack
+      ? { x: effPlacementBack.defaultX, y: effPlacementBack.defaultY, scale: effPlacementBack.defaultScale }
+      : product?.renderSetup?.back?.placementOverride ?? product?.renderConfig?.placementOverride ?? undefined,
   };
 
   const designFrontUrl = effectiveFrontConfig.designAssetUrl ?? designFrontUrlResolved;
@@ -1983,6 +2204,61 @@ function ProductDetailContent() {
   /** Persist design for a side: renderSetup + product.designIdFront/designIdBack. */
   const persistDesignForSide = async (side: "front" | "back", designId: string, designPngUrl: string) => {
     await persistRenderSetupSide(side, { designAssetUrl: designPngUrl, designAssetId: designId });
+  };
+
+  /** Product-only placement override (advanced). Canonical geometry stays on the blank. */
+  const persistProductPlacementOverride = async (side: "front" | "back", x: number, y: number, scale: number) => {
+    if (!product?.id || !db) return;
+    setSavingRenderSetup(true);
+    try {
+      const productRef = doc(db, "rp_products", product.id);
+      const prevPo = product.placementOverrides ?? {};
+      const nextPo = {
+        ...prevPo,
+        [side]: { defaultX: x, defaultY: y, defaultScale: scale },
+      };
+      const rs = { ...product.renderSetup };
+      const cur = side === "front" ? { ...(rs.front ?? {}) } : { ...(rs.back ?? {}) };
+      const cleared = { ...cur, placementOverride: null };
+      if (side === "front") rs.front = cleared;
+      else rs.back = cleared;
+      await updateDoc(productRef, {
+        placementOverrides: nextPo,
+        renderSetup: rs,
+        updatedAt: new Date(),
+        updatedBy: product.updatedBy || "",
+      });
+      await refetchProduct();
+      showToast("Product placement override saved", "success");
+    } finally {
+      setSavingRenderSetup(false);
+    }
+  };
+
+  /** Clear product placement override for one side → inherit blank default again. */
+  const resetProductPlacementToBlankDefault = async (side: "front" | "back") => {
+    if (!product?.id || !db) return;
+    setSavingRenderSetup(true);
+    try {
+      const productRef = doc(db, "rp_products", product.id);
+      const prevPo = { ...(product.placementOverrides ?? {}) };
+      delete prevPo[side];
+      const rs = { ...product.renderSetup };
+      const cur = side === "front" ? { ...(rs.front ?? {}) } : { ...(rs.back ?? {}) };
+      const cleared = { ...cur, placementOverride: null };
+      if (side === "front") rs.front = cleared;
+      else rs.back = cleared;
+      await updateDoc(productRef, {
+        placementOverrides: Object.keys(prevPo).length ? prevPo : null,
+        renderSetup: rs,
+        updatedAt: new Date(),
+        updatedBy: product.updatedBy || "",
+      });
+      await refetchProduct();
+      showToast("Reset to blank default", "success");
+    } finally {
+      setSavingRenderSetup(false);
+    }
   };
 
   /** Remove design from a side (e.g. front = blank only). Clears renderSetup and designIdFront/Back. */
@@ -2038,8 +2314,68 @@ function ProductDetailContent() {
     setTimeout(() => setToast(null), 5000);
   };
 
-  // Lightbox state
+  const handleGenerateFlatRenders = async () => {
+    if (!product?.id) return;
+    setGeneratingFlatRenders(true);
+    try {
+      await generateProductFlatRenders({ productId: product.id });
+      showToast("Natural preview + fabric blend saved on this product.", "success");
+      await refetchProduct();
+    } catch (err: unknown) {
+      const msg =
+        err && typeof err === "object" && "message" in err
+          ? String((err as { message?: string }).message)
+          : "Failed to generate flat renders";
+      showToast(msg, "error");
+    } finally {
+      setGeneratingFlatRenders(false);
+    }
+  };
+
+  const flatBlendedForScene = useMemo(
+    () => (product ? pickFlatBlendedUrlForScene(product.flatRenders) : null),
+    [product]
+  );
+
+  const handleGenerateSceneRender = async () => {
+    if (!product?.id) return;
+    setGeneratingSceneRender(true);
+    try {
+      await generateProductSceneRender({ productId: product.id, sceneKey: "hanger" });
+      showToast("Hanger scene render saved on product (non-AI composite).", "success");
+      await refetchProduct();
+    } catch (err: unknown) {
+      const msg =
+        err && typeof err === "object" && "message" in err
+          ? String((err as { message?: string }).message)
+          : "Failed to generate scene render";
+      showToast(msg, "error");
+    } finally {
+      setGeneratingSceneRender(false);
+    }
+  };
+
+  // Lightbox state (optional caption for 8394 flat zoom, etc.)
   const [lightboxImage, setLightboxImage] = useState<string | null>(null);
+  const [lightboxCaption, setLightboxCaption] = useState<string | null>(null);
+
+  const closeLightbox = useCallback(() => {
+    setLightboxImage(null);
+    setLightboxCaption(null);
+  }, []);
+
+  const openLightbox = useCallback((src: string, caption?: string | null) => {
+    setLightboxImage(src);
+    setLightboxCaption(caption ?? null);
+  }, []);
+
+  const setLightboxImageCompat = useCallback(
+    (url: string | null) => {
+      if (!url) closeLightbox();
+      else openLightbox(url);
+    },
+    [closeLightbox, openLightbox]
+  );
 
   // Update productScale when product loads
   useEffect(() => {
@@ -2063,12 +2399,12 @@ function ProductDetailContent() {
   useEffect(() => {
     const handleEsc = (e: KeyboardEvent) => {
       if (e.key === "Escape" && lightboxImage) {
-        setLightboxImage(null);
+        closeLightbox();
       }
     };
     window.addEventListener("keydown", handleEsc);
     return () => window.removeEventListener("keydown", handleEsc);
-  }, [lightboxImage]);
+  }, [lightboxImage, closeLightbox]);
 
   const handleGenerate = async (e: FormEvent) => {
     e.preventDefault();
@@ -2242,11 +2578,10 @@ function ProductDetailContent() {
 
   const tabs = [
     { id: "overview", label: "Overview" },
-    { id: "designs", label: "Designs" },
+    { id: "content", label: "Content" },
     { id: "assets", label: "Assets" },
-    { id: "inspiration", label: "Inspiration" },
-    { id: "generate", label: "Generate" },
-    { id: "settings", label: "Settings" },
+    { id: "shopify", label: "Shopify" },
+    { id: "history", label: "History" },
   ] as const;
 
   return (
@@ -2269,14 +2604,14 @@ function ProductDetailContent() {
           onClick={(e) => {
             // Close if clicking the backdrop (not the image itself)
             if (e.target === e.currentTarget) {
-              setLightboxImage(null);
+              closeLightbox();
             }
           }}
         >
           <div className="relative max-w-7xl max-h-full">
             {/* Close button */}
             <button
-              onClick={() => setLightboxImage(null)}
+              onClick={() => closeLightbox()}
               className="absolute -top-10 right-0 text-white hover:text-gray-300 transition-colors"
               aria-label="Close lightbox"
             >
@@ -2298,14 +2633,16 @@ function ProductDetailContent() {
             {/* Image */}
             <img
               src={lightboxImage}
-              alt="Asset preview"
+              alt="Enlarged preview"
               className="max-w-full max-h-[90vh] object-contain rounded-lg shadow-2xl"
               onClick={(e) => e.stopPropagation()}
             />
-            
+            {lightboxCaption ? (
+              <p className="mt-3 text-center text-white text-sm font-medium px-2">{lightboxCaption}</p>
+            ) : null}
             {/* ESC hint */}
             <div className="absolute -bottom-10 left-0 right-0 text-center text-white text-sm opacity-75">
-              Press ESC to close
+              Press ESC or click outside to close
             </div>
           </div>
         </div>
@@ -2346,10 +2683,773 @@ function ProductDetailContent() {
       </div>
 
       {/* Tab Content */}
-      <div className="bg-white rounded-lg shadow p-6">
+      <div className="bg-white rounded-lg shadow p-6 text-gray-900">
         {activeTab === "overview" && (
           <div className="space-y-6">
-            {/* Section A — Merchandising (spec-aligned) */}
+            {/* Section B — Render Setup (product.renderSetup: front and back configs; no renderSide) */}
+            <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
+              <h2 className="text-lg font-semibold text-gray-900 mb-3">Render Setup</h2>
+              {product?.blankId ? (
+                <div className="mb-3 rounded-lg border border-blue-200 bg-blue-50/90 px-3 py-2.5 text-sm text-gray-800">
+                  <p className="font-semibold text-gray-900">Blank render profile (canonical)</p>
+                  <p className="text-xs mt-1 leading-snug">
+                    Position, scale, safe area, and zone blend defaults live on the blank. Products{" "}
+                    <strong>inherit</strong> those settings unless you add a{" "}
+                    <strong className="text-amber-900">product override</strong> (advanced).
+                  </p>
+                  <Link
+                    href={`/blanks/${encodeURIComponent(product.blankId)}`}
+                    className="inline-block mt-2 text-xs font-semibold text-blue-700 hover:text-blue-900 underline"
+                  >
+                    Open blank render profile →
+                  </Link>
+                </div>
+              ) : null}
+              <p className="text-xs text-gray-600 mb-3">
+                Link blank + design per side. Placement numbers below follow the blank unless overridden.
+                {is8394BackPrintOnlyBlank ? (
+                  <span className="block mt-1 text-gray-700">
+                    <strong>8394 bikini:</strong> default layout is <strong>back print only</strong> (no front graphic from the linked design).
+                  </span>
+                ) : null}
+              </p>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {/* Front */}
+                <div className="border border-gray-200 rounded-lg p-4 bg-white">
+                  <h3 className="text-sm font-semibold text-gray-900 mb-3">Front</h3>
+                  <div className="space-y-3">
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1">Blank</label>
+                      {effectiveFrontConfig.blankImageUrl ? (
+                        <>
+                          <div className="flex gap-2 items-center">
+                            <img src={effectiveFrontConfig.blankImageUrl} alt="Front blank" className="w-12 h-12 object-contain bg-gray-100 rounded" />
+                            <p className="text-sm font-medium text-gray-900 truncate">
+                              {(blankForFallback || currentBlank)?.styleName ?? (blankForFallback || currentBlank)?.slug ?? "Blank"}
+                            </p>
+                          </div>
+                          <div className="mt-1 flex gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setRenderSetupModal("blank_front")}
+                              disabled={savingRenderSetup}
+                              className="text-xs px-2 py-1 bg-gray-100 border border-gray-500 text-gray-800 rounded hover:bg-gray-200"
+                            >
+                              Change
+                            </button>
+                            <a href={effectiveFrontConfig.blankImageUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-600 hover:underline font-medium">
+                              View full
+                            </a>
+                          </div>
+                        </>
+                      ) : (
+                        <p className="text-xs text-amber-600">No blank. <button type="button" onClick={() => setRenderSetupModal("blank_front")} className="text-blue-600 underline">Pick blank</button></p>
+                      )}
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1">Design</label>
+                      {is8394BackPrintOnlyBlank && !explicitFrontDesignOnProduct ? (
+                        <p className="text-sm text-gray-800 leading-snug">
+                          <span className="font-mono text-gray-900">8394</span> uses a <strong>back-only</strong> print. Use{" "}
+                          <strong>Back → Set design</strong> to attach artwork. The front stays blank unless you add an optional
+                          front design in Firestore.
+                        </p>
+                      ) : designFrontUrl ? (
+                        <>
+                          <div className="flex gap-2 items-center">
+                            <img src={designFrontUrl} alt="Front design" className="w-12 h-12 object-contain bg-gray-100 rounded" />
+                            <p className="text-sm font-medium text-gray-900 truncate">{designFront?.name ?? "Design"}</p>
+                          </div>
+                          <div className="mt-1 flex gap-2 flex-wrap">
+                            <button
+                              type="button"
+                              onClick={() => setRenderSetupModal("design_front")}
+                              disabled={savingRenderSetup}
+                              className="text-xs px-2 py-1 bg-gray-100 border border-gray-500 text-gray-800 rounded hover:bg-gray-200"
+                            >
+                              Change
+                            </button>
+                            <button type="button" onClick={() => clearDesignForSide("front")} disabled={savingRenderSetup} className="text-xs px-2 py-1 text-amber-900 border border-amber-500 rounded hover:bg-amber-50">Remove design</button>
+                            <a href={designFrontUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-600 hover:underline font-medium">View full</a>
+                          </div>
+                        </>
+                      ) : (
+                        <div className="flex flex-wrap gap-2 items-center">
+                          <p className="text-xs text-amber-700 font-medium">No design.</p>
+                          <button type="button" onClick={() => setRenderSetupModal("design_front")} disabled={savingRenderSetup} className="text-xs px-2 py-1.5 bg-blue-600 text-white rounded hover:bg-blue-700">Set design</button>
+                        </div>
+                      )}
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1">Placement</label>
+                      <p className="text-sm font-mono text-gray-700">{effectiveFrontConfig.placementKey ?? "front_center"}</p>
+                      {product?.blankId ? (
+                        <p className="text-[11px] text-gray-700 mt-1">
+                          {hasProductPlacementOverride(product, "front") ? (
+                            <span className="font-medium text-amber-800">Product override</span>
+                          ) : (
+                            <span>
+                              <span className="font-medium text-green-800">Inherited from blank</span>
+                              <span className="text-gray-600"> (blank default)</span>
+                            </span>
+                          )}
+                        </p>
+                      ) : null}
+                      {effectiveFrontConfig.blankImageUrl && designFrontUrl && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setPlacementEdit({
+                              x: effectiveFrontConfig.placementOverride?.x ?? 0.5,
+                              y: effectiveFrontConfig.placementOverride?.y ?? 0.5,
+                              scale: effectiveFrontConfig.placementOverride?.scale ?? 0.6,
+                            });
+                            setPlacementEditSide("front");
+                            setRenderSetupModal("placement_front");
+                          }}
+                          disabled={savingRenderSetup}
+                          className="mt-1 text-xs px-2 py-1 bg-gray-100 border border-gray-500 text-gray-800 rounded hover:bg-gray-200"
+                        >
+                          Override placement (advanced)
+                        </button>
+                      )}
+                    </div>
+                    {effectiveFrontConfig.blankImageUrl && designFrontUrl && (
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700 mb-1">Preview</label>
+                        <div className="relative w-24 h-24 bg-gray-100 rounded overflow-hidden">
+                          <img src={effectiveFrontConfig.blankImageUrl} alt="" className="absolute inset-0 w-full h-full object-contain" />
+                          <div className="absolute inset-0 flex items-center justify-center p-1">
+                            <img src={designFrontUrl} alt="" className="max-w-full max-h-full object-contain" />
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Back */}
+                <div className="border border-gray-200 rounded-lg p-4 bg-white">
+                  <h3 className="text-sm font-semibold text-gray-900 mb-3">Back</h3>
+                  <div className="space-y-3">
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1">Blank</label>
+                      {effectiveBackConfig.blankImageUrl ? (
+                        <>
+                          <div className="flex gap-2 items-center">
+                            <img src={effectiveBackConfig.blankImageUrl} alt="Back blank" className="w-12 h-12 object-contain bg-gray-100 rounded" />
+                            <p className="text-sm font-medium text-gray-900 truncate">
+                              {(blankForFallback || currentBlank)?.styleName ?? (blankForFallback || currentBlank)?.slug ?? "Blank"}
+                            </p>
+                          </div>
+                          <div className="mt-1 flex gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setRenderSetupModal("blank_back")}
+                              disabled={savingRenderSetup}
+                              className="text-xs px-2 py-1 bg-gray-100 border border-gray-500 text-gray-800 rounded hover:bg-gray-200"
+                            >
+                              Change
+                            </button>
+                            <a href={effectiveBackConfig.blankImageUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-600 hover:underline font-medium">
+                              View full
+                            </a>
+                          </div>
+                        </>
+                      ) : (
+                        <p className="text-xs text-amber-600">No blank. <button type="button" onClick={() => setRenderSetupModal("blank_back")} className="text-blue-600 underline">Pick blank</button></p>
+                      )}
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1">Design</label>
+                      {designBackUrl ? (
+                        <>
+                          <div className="flex gap-2 items-center">
+                            <img src={designBackUrl} alt="Back design" className="w-12 h-12 object-contain bg-gray-100 rounded" />
+                            <p className="text-sm font-medium text-gray-900 truncate">{designBack?.name ?? "Design"}</p>
+                          </div>
+                          <div className="mt-1 flex gap-2 flex-wrap">
+                            <button
+                              type="button"
+                              onClick={() => setRenderSetupModal("design_back")}
+                              disabled={savingRenderSetup}
+                              className="text-xs px-2 py-1 bg-gray-100 border border-gray-500 text-gray-800 rounded hover:bg-gray-200"
+                            >
+                              Change
+                            </button>
+                            <button type="button" onClick={() => clearDesignForSide("back")} disabled={savingRenderSetup} className="text-xs px-2 py-1 text-amber-900 border border-amber-500 rounded hover:bg-amber-50">Remove design</button>
+                            <a href={designBackUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-600 hover:underline font-medium">View full</a>
+                          </div>
+                        </>
+                      ) : (
+                        <div className="flex flex-wrap gap-2 items-center">
+                          <p className="text-xs text-amber-700 font-medium">No design.</p>
+                          <button type="button" onClick={() => setRenderSetupModal("design_back")} disabled={savingRenderSetup} className="text-xs px-2 py-1.5 bg-blue-600 text-white rounded hover:bg-blue-700">Set design</button>
+                        </div>
+                      )}
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1">Placement</label>
+                      <p className="text-sm font-mono text-gray-700">{effectiveBackConfig.placementKey ?? "back_center"}</p>
+                      {product?.blankId ? (
+                        <p className="text-[11px] text-gray-700 mt-1">
+                          {hasProductPlacementOverride(product, "back") ? (
+                            <span className="font-medium text-amber-800">Product override</span>
+                          ) : (
+                            <span>
+                              <span className="font-medium text-green-800">Inherited from blank</span>
+                              <span className="text-gray-600"> (blank default)</span>
+                            </span>
+                          )}
+                        </p>
+                      ) : null}
+                      {effectiveBackConfig.blankImageUrl && designBackUrl && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setPlacementEdit({
+                              x: effectiveBackConfig.placementOverride?.x ?? 0.5,
+                              y: effectiveBackConfig.placementOverride?.y ?? 0.5,
+                              scale: effectiveBackConfig.placementOverride?.scale ?? 0.6,
+                            });
+                            setPlacementEditSide("back");
+                            setRenderSetupModal("placement_back");
+                          }}
+                          disabled={savingRenderSetup}
+                          className="mt-1 text-xs px-2 py-1 bg-gray-100 border border-gray-500 text-gray-800 rounded hover:bg-gray-200"
+                        >
+                          Override placement (advanced)
+                        </button>
+                      )}
+                    </div>
+                    {effectiveBackConfig.blankImageUrl && designBackUrl && (
+                      <div>
+                        <label className="block text-xs font-medium text-gray-700 mb-1">Preview</label>
+                        <div className="relative w-24 h-24 bg-gray-100 rounded overflow-hidden">
+                          <img src={effectiveBackConfig.blankImageUrl} alt="" className="absolute inset-0 w-full h-full object-contain" />
+                          <div className="absolute inset-0 flex items-center justify-center p-1">
+                            <img src={designBackUrl} alt="" className="max-w-full max-h-full object-contain" />
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Section C — Media (hero slots; assign in Assets tab) */}
+            <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
+              <h2 className="text-lg font-semibold text-gray-900 mb-3">Media</h2>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <div className="text-xs font-medium text-gray-600 mb-1">Hero front</div>
+                  {product.media?.heroFront ? (
+                    <img src={product.media.heroFront} alt="Hero front" className="max-w-full h-32 object-contain border border-gray-200 rounded" />
+                  ) : (
+                    <p className="text-sm text-gray-500">Not set. Use Assets tab to set as hero front.</p>
+                  )}
+                </div>
+                <div>
+                  <div className="text-xs font-medium text-gray-600 mb-1">Hero back</div>
+                  {product.media?.heroBack ? (
+                    <img src={product.media.heroBack} alt="Hero back" className="max-w-full h-32 object-contain border border-gray-200 rounded" />
+                  ) : (
+                    <p className="text-sm text-gray-500">Not set. Use Assets tab to set as hero back.</p>
+                  )}
+                </div>
+              </div>
+              {(!product.media?.heroFront || !product.media?.heroBack) && (
+                <p className="text-xs text-gray-500 mt-2">Blank + design mockup can be used as hero; assign in the Assets tab when available.</p>
+              )}
+            </div>
+
+            {/* 8394 back print tuning — same blank, product-level previews */}
+            {is8394ProductContext && product.blankId && (
+              <div className="border-2 border-indigo-200 rounded-xl p-5 bg-gradient-to-b from-indigo-50/90 to-white shadow-sm">
+                <div className="flex flex-wrap items-start justify-between gap-4 mb-3">
+                  <div>
+                    <h2 className="text-lg font-bold text-indigo-950">8394 — back print previews</h2>
+                    <p className="text-sm text-indigo-900/80 mt-1 max-w-2xl">
+                      <strong>Natural preview</strong> shows the print on the garment as-is. <strong>Fabric blend</strong> uses
+                      the same <strong>Position</strong> and <strong>Size</strong> from the blank, plus <strong>Realism</strong>{" "}
+                      and <strong>Ink strength</strong> from the blank profile. After you change the blank, tap{" "}
+                      <strong>Generate</strong> here to refresh.
+                    </p>
+                    {currentBlank?.preferredFlatLook8394 ? (
+                      <p className="text-xs text-indigo-900/90 mt-2 rounded-lg bg-white/80 border border-indigo-200/80 px-2.5 py-1.5 inline-block">
+                        Blank <strong>preferred reference</strong>:{" "}
+                        {currentBlank.preferredFlatLook8394 === "flat_clean" ? (
+                          <>Natural preview</>
+                        ) : (
+                          <>Fabric blend</>
+                        )}
+                      </p>
+                    ) : null}
+                    <p className="text-xs text-indigo-800/75 mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
+                      <Link
+                        href={`/blanks/${product.blankId}?tab=renderProfile`}
+                        className="font-semibold text-indigo-700 underline hover:text-indigo-900"
+                      >
+                        Edit blank (Position, Size, Realism, Ink strength)
+                      </Link>
+                      <span className="text-indigo-400">→</span>
+                      <span>Save on blank</span>
+                      <span className="text-indigo-400">→</span>
+                      <span className="font-medium">Generate here</span>
+                      <span className="text-indigo-400">→</span>
+                      <span>Click a preview to zoom in</span>
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={
+                      generatingFlatRenders ||
+                      !product.id ||
+                      !isProductInFlatRenderMvpScope(product, currentBlank) ||
+                      !designForFlatRender ||
+                      designFlatLoading ||
+                      blankLoading
+                    }
+                    onClick={handleGenerateFlatRenders}
+                    className="px-4 py-2.5 text-sm font-semibold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 disabled:opacity-50 shrink-0 shadow"
+                  >
+                    {generatingFlatRenders ? "Generating…" : "Generate previews"}
+                  </button>
+                </div>
+
+                {linked8394Nav.length > 1 && (
+                  <div className="flex flex-wrap items-center gap-2 sm:gap-3 mb-4 text-sm text-indigo-950 bg-white/70 border border-indigo-100 rounded-lg px-3 py-2">
+                    <span className="text-xs font-semibold text-indigo-700 uppercase tracking-wide shrink-0">Same blank</span>
+                    {linkedNavMeta.prev ? (
+                      <Link
+                        href={`/products/${linkedNavMeta.prev.slug}`}
+                        className="font-medium text-indigo-700 hover:text-indigo-900 underline shrink-0"
+                      >
+                        ← Previous
+                      </Link>
+                    ) : (
+                      <span className="text-gray-400 shrink-0">← Previous</span>
+                    )}
+                    <label className="flex items-center gap-2 min-w-0 flex-1 sm:flex-initial">
+                      <span className="sr-only">Jump to linked product</span>
+                      <select
+                        className="border border-indigo-200 rounded-lg px-2 py-1.5 text-sm bg-white max-w-[min(100%,280px)] truncate"
+                        value={product.slug}
+                        onChange={(e) => router.push(`/products/${e.target.value}`)}
+                      >
+                        {linked8394Nav.map((p) => (
+                          <option key={p.id} value={p.slug}>
+                            {p.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    {linkedNavMeta.next ? (
+                      <Link
+                        href={`/products/${linkedNavMeta.next.slug}`}
+                        className="font-medium text-indigo-700 hover:text-indigo-900 underline shrink-0"
+                      >
+                        Next →
+                      </Link>
+                    ) : (
+                      <span className="text-gray-400 shrink-0">Next →</span>
+                    )}
+                  </div>
+                )}
+
+                {!isProductInFlatRenderMvpScope(product, currentBlank) && (
+                  <p className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-4">
+                    To generate here you need this product on master blank <strong>8394</strong>, a chosen color variant, a{" "}
+                    <strong>back</strong> garment photo for that variant, and a design with PNG artwork.
+                  </p>
+                )}
+
+                {mvp8394VerifyPanel && (
+                  <div className="mb-4 rounded-lg border border-indigo-100 bg-white/80 px-3 py-2 text-xs text-gray-700 grid sm:grid-cols-2 lg:grid-cols-3 gap-x-4 gap-y-2">
+                    <div>
+                      <span className="font-semibold text-gray-500 uppercase tracking-wide">Position</span>
+                      <p className="mt-0.5 text-gray-700">
+                        Set on the blank (drag the print in Render profile). This product uses the saved placement for the back
+                        zone.
+                      </p>
+                    </div>
+                    <div>
+                      <span className="font-semibold text-gray-500 uppercase tracking-wide">Realism · Ink strength · Size</span>
+                      <p className="mt-0.5">
+                        {mvp8394VerifyPanel.simple8394 ? (
+                          <>
+                            Realism <strong>{mvp8394VerifyPanel.simple8394.realism}</strong> · Ink strength{" "}
+                            <strong>{mvp8394VerifyPanel.simple8394.inkStrength}</strong> · Size{" "}
+                            <strong>{mvp8394VerifyPanel.sizePresetLabel}</strong>
+                          </>
+                        ) : (
+                          <span className="text-amber-800">Not set on blank — open Render profile and save.</span>
+                        )}
+                      </p>
+                    </div>
+                    <div className="sm:col-span-2 lg:col-span-1">
+                      <span className="font-semibold text-gray-500 uppercase tracking-wide">This product</span>
+                      <p className="mt-0.5 break-all">
+                        Color: <strong>{mvp8394VerifyPanel.variantLabel}</strong>
+                        <br />
+                        Garment photo (back):{" "}
+                        {mvp8394VerifyPanel.variantBackUrl ? (
+                          <a href={mvp8394VerifyPanel.variantBackUrl} className="text-indigo-600 underline" target="_blank" rel="noreferrer">
+                            View
+                          </a>
+                        ) : (
+                          <span className="text-red-600">Missing</span>
+                        )}
+                        <br />
+                        Design PNG ({mvp8394VerifyPanel.designPick.ref}):{" "}
+                        {mvp8394VerifyPanel.designPick.url ? (
+                          <a href={mvp8394VerifyPanel.designPick.url} className="text-indigo-600 underline" target="_blank" rel="noreferrer">
+                            Open
+                          </a>
+                        ) : (
+                          <span className="text-red-600">Missing</span>
+                        )}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {(() => {
+                  const slotClean = product.flatRenders?.flat_clean?.back;
+                  const slotBlended = product.flatRenders?.flat_blended?.back;
+                  const staleClean =
+                    flatRenderFingerprint != null && isFlatRenderSlotStale(slotClean, flatRenderFingerprint);
+                  const staleBlended =
+                    flatRenderFingerprint != null && isFlatRenderSlotStale(slotBlended, flatRenderFingerprint);
+                  const fmtTs = (ts: unknown) => {
+                    if (ts && typeof (ts as { toDate?: () => Date }).toDate === "function") {
+                      return (ts as { toDate: () => Date }).toDate().toLocaleString();
+                    }
+                    return "—";
+                  };
+
+                  const panel = (
+                    kind: "clean" | "blended",
+                    title: string,
+                    subtitle: string,
+                    zoomCaption: string,
+                    slot: typeof slotClean,
+                    stale: boolean
+                  ) => {
+                    const missing = !slot?.url;
+                    return (
+                      <div
+                        className={`flex flex-col rounded-xl border-2 overflow-hidden bg-white ${
+                          kind === "clean" ? "border-emerald-300/90 shadow-emerald-100/50" : "border-violet-300/90 shadow-violet-100/50"
+                        } shadow-md`}
+                      >
+                        <div
+                          className={`px-3 py-2 text-white text-center ${
+                            kind === "clean" ? "bg-emerald-600" : "bg-violet-600"
+                          }`}
+                        >
+                          <div className="text-sm font-bold tracking-wide">{title}</div>
+                          <div className="text-[11px] opacity-90 font-normal">{subtitle}</div>
+                        </div>
+                        <div className="p-3 flex flex-col flex-1 min-h-[220px]">
+                          {missing ? (
+                            <div className="flex-1 flex items-center justify-center rounded-lg bg-gray-50 border border-dashed border-gray-300 text-gray-500 text-sm font-medium px-4 text-center">
+                              No preview yet — tap Generate previews
+                            </div>
+                          ) : stale ? (
+                            <p className="text-xs font-bold text-amber-800 bg-amber-100 border border-amber-300 rounded-lg px-2 py-1.5 mb-2 text-center">
+                              Out of date — blank or design changed. Generate again to match the blank.
+                            </p>
+                          ) : (
+                            <p className="text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg px-2 py-1 mb-2 text-center">
+                              Matches blank + design
+                            </p>
+                          )}
+                          {!missing && (
+                            <button
+                              type="button"
+                              onClick={() => openLightbox(slot.url, zoomCaption)}
+                              className="flex-1 flex flex-col items-stretch rounded-lg border border-gray-100 bg-gray-50 min-h-[200px] group focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+                            >
+                              <span className="sr-only">Enlarge {title}</span>
+                              <span className="flex-1 flex items-center justify-center p-1">
+                                <img
+                                  src={slot.url}
+                                  alt={title}
+                                  className="max-w-full max-h-[min(52vh,420px)] w-auto object-contain group-hover:opacity-95 transition-opacity"
+                                />
+                              </span>
+                              <span className="text-[11px] text-center text-indigo-700 font-medium py-1.5 group-hover:underline">
+                                Click to enlarge
+                              </span>
+                            </button>
+                          )}
+                          {!missing && (
+                            <p className="text-[10px] text-gray-500 mt-2 text-center">
+                              {fmtTs(slot.generatedAt)} · variant {slot.sourceBlankVariantId} · {slot.sourceDesignAssetRef} PNG
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  };
+
+                  return (
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-stretch">
+                      {panel(
+                        "clean",
+                        "NATURAL PREVIEW",
+                        "Print on garment (no fabric blending)",
+                        "Natural preview — back print (flat_clean)",
+                        slotClean,
+                        staleClean
+                      )}
+                      {panel(
+                        "blended",
+                        "FABRIC BLEND",
+                        "Realism + ink strength from blank profile",
+                        "Fabric blend — back print (flat_blended)",
+                        slotBlended,
+                        staleBlended
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
+            {/* Scene render: deterministic template (non-AI lifestyle) — below flat mocks */}
+            {product?.id && (
+              <div className="border-2 border-teal-200/90 rounded-xl p-5 bg-gradient-to-b from-teal-50/90 to-white shadow-sm">
+                <div className="flex flex-wrap items-start justify-between gap-4 mb-3">
+                  <div>
+                    <h2 className="text-lg font-bold text-teal-950">Scene render · Hanger (lifestyle)</h2>
+                    <p className="text-sm text-teal-900/85 mt-1 max-w-2xl">
+                      <strong>Non-AI</strong> composite: your <strong>Flat blended</strong> mockup is placed into a fixed{" "}
+                      <strong>hanger</strong> template ({HANGER_CREWNECK_SCENE_TEMPLATE.garmentType} layout). Uses{" "}
+                      <strong>front</strong> flat when present, otherwise <strong>back</strong>.
+                    </p>
+                    <p className="text-xs text-teal-800/75 mt-2">
+                      Ops: set <code className="bg-teal-100/80 px-1 rounded">SCENE_HANGER_CREWNECK_BACKGROUND_URL</code> on
+                      Cloud Functions. Optional: <code className="bg-teal-100/80 px-1 rounded">SCENE_HANGER_CREWNECK_SHADOW_URL</code>.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={!flatBlendedForScene || generatingSceneRender}
+                    onClick={handleGenerateSceneRender}
+                    className="px-4 py-2.5 text-sm font-semibold text-white bg-teal-600 rounded-lg hover:bg-teal-700 disabled:opacity-50 shrink-0 shadow"
+                  >
+                    {generatingSceneRender ? "Compositing…" : "Generate hanger scene"}
+                  </button>
+                </div>
+                {!flatBlendedForScene && (
+                  <p className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-4">
+                    Generate a <strong>fabric blend</strong> preview first (8394 section above), then run the hanger scene.
+                  </p>
+                )}
+                {flatBlendedForScene && (
+                  <p className="text-xs text-teal-800 mb-3">
+                    Source flat: <strong>{flatBlendedForScene.view}</strong> ·{" "}
+                    <a
+                      href={flatBlendedForScene.url}
+                      className="text-teal-700 underline font-medium"
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      open PNG
+                    </a>
+                  </p>
+                )}
+                {(() => {
+                  const hanger = product.sceneRenders?.hanger;
+                  const fmtTs = (ts: unknown) => {
+                    if (ts && typeof (ts as { toDate?: () => Date }).toDate === "function") {
+                      return (ts as { toDate: () => Date }).toDate().toLocaleString();
+                    }
+                    return "—";
+                  };
+                  return (
+                    <div className="rounded-xl border-2 border-teal-300/80 overflow-hidden bg-white shadow-md">
+                      <div className="px-3 py-2 bg-teal-700 text-white text-center">
+                        <div className="text-sm font-bold tracking-wide">HANGER · LIFESTYLE (TEMPLATE)</div>
+                        <div className="text-[11px] opacity-90 font-normal">Deterministic composite — not AI</div>
+                      </div>
+                      <div className="p-3">
+                        {!hanger?.url ? (
+                          <div className="flex items-center justify-center min-h-[200px] rounded-lg bg-gray-50 border border-dashed border-gray-300 text-gray-600 text-sm font-medium text-center px-4">
+                            No scene render yet — click Generate hanger scene
+                          </div>
+                        ) : (
+                          <>
+                            <div className="flex items-center justify-center bg-gray-50 rounded-lg border border-gray-100 min-h-[220px]">
+                              <img
+                                src={hanger.url}
+                                alt="Hanger scene render"
+                                className="max-w-full max-h-[min(56vh,480px)] w-auto object-contain"
+                              />
+                            </div>
+                            <p className="text-[10px] text-gray-500 mt-2 text-center">
+                              {fmtTs(hanger.generatedAt)} · scene <span className="font-mono">{hanger.sceneId}</span> · from{" "}
+                              {hanger.sourceFlatView} flat
+                            </p>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
+            <div>
+              <h2 className="text-lg font-semibold text-gray-900 mb-4">Product Overview</h2>
+              <dl className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <dt className="text-sm font-medium text-gray-500">Status</dt>
+                  <dd className="mt-1 text-sm text-gray-900">
+                    <span
+                      className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
+                        product.status === "active"
+                          ? "bg-green-100 text-green-800"
+                          : product.status === "draft"
+                          ? "bg-gray-100 text-gray-800"
+                          : "bg-red-100 text-red-800"
+                      }`}
+                    >
+                      {product.status}
+                    </span>
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-sm font-medium text-gray-500">Category</dt>
+                  <dd className="mt-1 text-sm text-gray-900">{product.category}</dd>
+                </div>
+                <div>
+                  <dt className="text-sm font-medium text-gray-500">Base Product</dt>
+                  <dd className="mt-1 text-sm font-mono text-gray-900">{product.baseProductKey}</dd>
+                </div>
+                <div>
+                  <dt className="text-sm font-medium text-gray-500">Colorway</dt>
+                  <dd className="mt-1 text-sm text-gray-900">{product.colorway.name}</dd>
+                </div>
+                {product.description && (
+                  <div className="md:col-span-2">
+                    <dt className="text-sm font-medium text-gray-500">Description</dt>
+                    <dd className="mt-1 text-sm text-gray-900">{product.description}</dd>
+                  </div>
+                )}
+                {product.ai.productTrigger && (
+                  <div>
+                    <dt className="text-sm font-medium text-gray-500">Product Trigger</dt>
+                    <dd className="mt-1 text-sm font-mono text-gray-900">{product.ai.productTrigger}</dd>
+                  </div>
+                )}
+                {product.ai.productRecommendedScale && (
+                  <div>
+                    <dt className="text-sm font-medium text-gray-500">Recommended Scale</dt>
+                    <dd className="mt-1 text-sm text-gray-900">{product.ai.productRecommendedScale}</dd>
+                  </div>
+                )}
+              </dl>
+            </div>
+
+            {/* Asset Counters */}
+            <div>
+              <h3 className="text-sm font-semibold text-gray-900 mb-2">Asset Statistics</h3>
+              <div className="grid grid-cols-3 gap-4">
+                <div className="bg-gray-50 rounded-lg p-4">
+                  <div className="text-2xl font-bold text-gray-900">
+                    {product.counters?.assetsTotal || 0}
+                  </div>
+                  <div className="text-xs text-gray-500 mt-1">Total Assets</div>
+                </div>
+                <div className="bg-green-50 rounded-lg p-4">
+                  <div className="text-2xl font-bold text-green-600">
+                    {product.counters?.assetsApproved || 0}
+                  </div>
+                  <div className="text-xs text-gray-500 mt-1">Approved</div>
+                </div>
+                <div className="bg-blue-50 rounded-lg p-4">
+                  <div className="text-2xl font-bold text-blue-600">
+                    {product.counters?.assetsPublished || 0}
+                  </div>
+                  <div className="text-xs text-gray-500 mt-1">Published</div>
+                </div>
+              </div>
+            </div>
+
+            {/* Related Products */}
+            {relatedProducts.length > 0 && (
+              <div>
+                <h3 className="text-sm font-semibold text-gray-900 mb-2">Related Products</h3>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                  {relatedProducts.map(({ product: p, reasons }) => {
+                    const thumb =
+                      p.media?.heroFront ?? p.media?.heroBack ?? p.mockupUrl ?? p.heroAssetPath;
+                    const title = p.title ?? p.name;
+                    const descriptor = [p.colorway?.name, p.category, p.baseProductKey].filter(Boolean).join(" · ");
+                    return (
+                      <Link
+                        key={p.id ?? p.slug}
+                        href={`/products/${encodeURIComponent(p.slug)}`}
+                        className="block rounded-lg border border-gray-200 bg-gray-50/50 p-3 hover:border-blue-300 hover:bg-blue-50/50 transition-colors"
+                      >
+                        {thumb ? (
+                          <img
+                            src={thumb}
+                            alt=""
+                            className="w-full aspect-square object-cover rounded mb-2 bg-white"
+                          />
+                        ) : (
+                          <div className="w-full aspect-square rounded mb-2 bg-gray-200 flex items-center justify-center text-gray-400 text-xs">
+                            No image
+                          </div>
+                        )}
+                        <div className="text-sm font-medium text-gray-900 truncate" title={title}>
+                          {title}
+                        </div>
+                        {descriptor && (
+                          <div className="text-xs text-gray-500 truncate mt-0.5" title={descriptor}>
+                            {descriptor}
+                          </div>
+                        )}
+                        {reasons.length > 0 && (
+                          <div className="text-xs text-blue-600 mt-1 flex flex-wrap gap-x-1 gap-y-0.5" title={reasons.join(", ")}>
+                            {reasons.map((r) => (
+                              <span key={r}>· {r}</span>
+                            ))}
+                          </div>
+                        )}
+                      </Link>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Hero Image */}
+            {product.heroAssetPath && (
+              <div>
+                <h3 className="text-sm font-semibold text-gray-900 mb-2">Hero Image</h3>
+                <img
+                  src={product.heroAssetPath}
+                  alt="Hero"
+                  className="max-w-md h-auto rounded-lg border border-gray-200"
+                />
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTab === "content" && (
+          <div className="space-y-6">
+            <p className="text-sm text-gray-500">
+              Descriptions, SEO, tags, collections, and taxonomy classification.
+            </p>
+            {/* Merchandising */}
             <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
               <h2 className="text-lg font-semibold text-gray-900 mb-3">Merchandising</h2>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -2462,456 +3562,6 @@ function ProductDetailContent() {
               </div>
             </div>
 
-            {/* Section B — Render Setup (product.renderSetup: front and back configs; no renderSide) */}
-            <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
-              <h2 className="text-lg font-semibold text-gray-900 mb-3">Render Setup</h2>
-              <p className="text-xs text-gray-500 mb-3">Set blank, design, and placement for each side. Renderer uses the config for the requested view.</p>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                {/* Front */}
-                <div className="border border-gray-200 rounded-lg p-4 bg-white">
-                  <h3 className="text-sm font-semibold text-gray-900 mb-3">Front</h3>
-                  <div className="space-y-3">
-                    <div>
-                      <label className="block text-xs font-medium text-gray-700 mb-1">Blank</label>
-                      {effectiveFrontConfig.blankImageUrl ? (
-                        <>
-                          <div className="flex gap-2 items-center">
-                            <img src={effectiveFrontConfig.blankImageUrl} alt="Front blank" className="w-12 h-12 object-contain bg-gray-100 rounded" />
-                            <p className="text-sm truncate">{(blankForFallback || currentBlank)?.styleName ?? (blankForFallback || currentBlank)?.slug ?? "Blank"}</p>
-                          </div>
-                          <div className="mt-1 flex gap-2">
-                            <button type="button" onClick={() => setRenderSetupModal("blank_front")} disabled={savingRenderSetup} className="text-xs px-2 py-1 bg-gray-200 border border-gray-400 rounded hover:bg-gray-300">Change</button>
-                            <a href={effectiveFrontConfig.blankImageUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-600 hover:underline">View full</a>
-                          </div>
-                        </>
-                      ) : (
-                        <p className="text-xs text-amber-600">No blank. <button type="button" onClick={() => setRenderSetupModal("blank_front")} className="text-blue-600 underline">Pick blank</button></p>
-                      )}
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-gray-700 mb-1">Design</label>
-                      {designFrontUrl ? (
-                        <>
-                          <div className="flex gap-2 items-center">
-                            <img src={designFrontUrl} alt="Front design" className="w-12 h-12 object-contain bg-gray-100 rounded" />
-                            <p className="text-sm truncate">{designFront?.name ?? "Design"}</p>
-                          </div>
-                          <div className="mt-1 flex gap-2">
-                            <button type="button" onClick={() => setRenderSetupModal("design_front")} disabled={savingRenderSetup} className="text-xs px-2 py-1 bg-gray-200 border border-gray-400 rounded hover:bg-gray-300">Change</button>
-                            <button type="button" onClick={() => clearDesignForSide("front")} disabled={savingRenderSetup} className="text-xs px-2 py-1 text-amber-700 border border-amber-400 rounded hover:bg-amber-50">Remove design</button>
-                            <a href={designFrontUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-600 hover:underline">View full</a>
-                          </div>
-                        </>
-                      ) : (
-                        <div className="flex flex-wrap gap-2 items-center">
-                          <p className="text-xs text-amber-600">No design.</p>
-                          <button type="button" onClick={() => setRenderSetupModal("design_front")} disabled={savingRenderSetup} className="text-xs px-2 py-1 bg-blue-600 text-white rounded hover:bg-blue-700">Set design</button>
-                        </div>
-                      )}
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-gray-700 mb-1">Placement</label>
-                      <p className="text-sm font-mono text-gray-700">{effectiveFrontConfig.placementKey ?? "front_center"}</p>
-                      {effectiveFrontConfig.blankImageUrl && designFrontUrl && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setPlacementEdit({
-                              x: effectiveFrontConfig.placementOverride?.x ?? 0.5,
-                              y: effectiveFrontConfig.placementOverride?.y ?? 0.5,
-                              scale: effectiveFrontConfig.placementOverride?.scale ?? 0.6,
-                            });
-                            setPlacementEditSide("front");
-                            setRenderSetupModal("placement_front");
-                          }}
-                          disabled={savingRenderSetup}
-                          className="mt-1 text-xs px-2 py-1 bg-gray-200 border border-gray-400 rounded hover:bg-gray-300"
-                        >
-                          Edit placement
-                        </button>
-                      )}
-                    </div>
-                    {effectiveFrontConfig.blankImageUrl && designFrontUrl && (
-                      <div>
-                        <label className="block text-xs font-medium text-gray-700 mb-1">Preview</label>
-                        <div className="relative w-24 h-24 bg-gray-100 rounded overflow-hidden">
-                          <img src={effectiveFrontConfig.blankImageUrl} alt="" className="absolute inset-0 w-full h-full object-contain" />
-                          <div className="absolute inset-0 flex items-center justify-center p-1">
-                            <img src={designFrontUrl} alt="" className="max-w-full max-h-full object-contain" />
-                          </div>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                {/* Back */}
-                <div className="border border-gray-200 rounded-lg p-4 bg-white">
-                  <h3 className="text-sm font-semibold text-gray-900 mb-3">Back</h3>
-                  <div className="space-y-3">
-                    <div>
-                      <label className="block text-xs font-medium text-gray-700 mb-1">Blank</label>
-                      {effectiveBackConfig.blankImageUrl ? (
-                        <>
-                          <div className="flex gap-2 items-center">
-                            <img src={effectiveBackConfig.blankImageUrl} alt="Back blank" className="w-12 h-12 object-contain bg-gray-100 rounded" />
-                            <p className="text-sm truncate">{(blankForFallback || currentBlank)?.styleName ?? (blankForFallback || currentBlank)?.slug ?? "Blank"}</p>
-                          </div>
-                          <div className="mt-1 flex gap-2">
-                            <button type="button" onClick={() => setRenderSetupModal("blank_back")} disabled={savingRenderSetup} className="text-xs px-2 py-1 bg-gray-200 border border-gray-400 rounded hover:bg-gray-300">Change</button>
-                            <a href={effectiveBackConfig.blankImageUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-600 hover:underline">View full</a>
-                          </div>
-                        </>
-                      ) : (
-                        <p className="text-xs text-amber-600">No blank. <button type="button" onClick={() => setRenderSetupModal("blank_back")} className="text-blue-600 underline">Pick blank</button></p>
-                      )}
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-gray-700 mb-1">Design</label>
-                      {designBackUrl ? (
-                        <>
-                          <div className="flex gap-2 items-center">
-                            <img src={designBackUrl} alt="Back design" className="w-12 h-12 object-contain bg-gray-100 rounded" />
-                            <p className="text-sm truncate">{designBack?.name ?? "Design"}</p>
-                          </div>
-                          <div className="mt-1 flex gap-2">
-                            <button type="button" onClick={() => setRenderSetupModal("design_back")} disabled={savingRenderSetup} className="text-xs px-2 py-1 bg-gray-200 border border-gray-400 rounded hover:bg-gray-300">Change</button>
-                            <button type="button" onClick={() => clearDesignForSide("back")} disabled={savingRenderSetup} className="text-xs px-2 py-1 text-amber-700 border border-amber-400 rounded hover:bg-amber-50">Remove design</button>
-                            <a href={designBackUrl} target="_blank" rel="noopener noreferrer" className="text-xs text-blue-600 hover:underline">View full</a>
-                          </div>
-                        </>
-                      ) : (
-                        <div className="flex flex-wrap gap-2 items-center">
-                          <p className="text-xs text-amber-600">No design.</p>
-                          <button type="button" onClick={() => setRenderSetupModal("design_back")} disabled={savingRenderSetup} className="text-xs px-2 py-1 bg-blue-600 text-white rounded hover:bg-blue-700">Set design</button>
-                        </div>
-                      )}
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-gray-700 mb-1">Placement</label>
-                      <p className="text-sm font-mono text-gray-700">{effectiveBackConfig.placementKey ?? "back_center"}</p>
-                      {effectiveBackConfig.blankImageUrl && designBackUrl && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setPlacementEdit({
-                              x: effectiveBackConfig.placementOverride?.x ?? 0.5,
-                              y: effectiveBackConfig.placementOverride?.y ?? 0.5,
-                              scale: effectiveBackConfig.placementOverride?.scale ?? 0.6,
-                            });
-                            setPlacementEditSide("back");
-                            setRenderSetupModal("placement_back");
-                          }}
-                          disabled={savingRenderSetup}
-                          className="mt-1 text-xs px-2 py-1 bg-gray-200 border border-gray-400 rounded hover:bg-gray-300"
-                        >
-                          Edit placement
-                        </button>
-                      )}
-                    </div>
-                    {effectiveBackConfig.blankImageUrl && designBackUrl && (
-                      <div>
-                        <label className="block text-xs font-medium text-gray-700 mb-1">Preview</label>
-                        <div className="relative w-24 h-24 bg-gray-100 rounded overflow-hidden">
-                          <img src={effectiveBackConfig.blankImageUrl} alt="" className="absolute inset-0 w-full h-full object-contain" />
-                          <div className="absolute inset-0 flex items-center justify-center p-1">
-                            <img src={designBackUrl} alt="" className="max-w-full max-h-full object-contain" />
-                          </div>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Section C — Product readiness (Shopify sync) */}
-            {product && (() => {
-              const { ready, missing, warnings } = isProductReadyForShopify(product);
-              return (
-                <div className={`border rounded-lg p-4 ${ready ? "border-green-300 bg-green-50/50" : "border-amber-200 bg-amber-50/50"}`}>
-                  <h2 className="text-lg font-semibold text-gray-900 mb-2">Product readiness</h2>
-                  <p className="text-xs text-gray-500 mb-3">Checks required for Shopify sync. Fix missing items before syncing.</p>
-                  {missing.length > 0 && (
-                    <ul className="space-y-1.5 mb-2">
-                      {missing.map((label) => (
-                        <li key={label} className="flex items-center gap-2 text-sm">
-                          <span className="text-amber-700">✗</span>
-                          <span className="text-amber-800">{label}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                  {warnings.length > 0 && (
-                    <p className="text-xs text-gray-500 mb-1">Recommended: {warnings.join(", ")}</p>
-                  )}
-                  <p className={`mt-3 text-sm font-medium ${ready ? "text-green-700" : "text-amber-700"}`}>
-                    {ready ? "Ready for Shopify sync" : "Not ready — fix missing items above"}
-                  </p>
-                </div>
-              );
-            })()}
-
-            {/* Section E — Production (spec-aligned) */}
-            <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
-              <h2 className="text-lg font-semibold text-gray-900 mb-3">Production</h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Print PDF Front (URL)</label>
-                  <input
-                    type="text"
-                    value={production.printPdfFront}
-                    onChange={(e) => setProduction((p) => ({ ...p, printPdfFront: e.target.value }))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
-                    placeholder="https://..."
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Print PDF Back (URL)</label>
-                  <input
-                    type="text"
-                    value={production.printPdfBack}
-                    onChange={(e) => setProduction((p) => ({ ...p, printPdfBack: e.target.value }))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
-                    placeholder="https://..."
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Print colors (comma-separated)</label>
-                  <input
-                    type="text"
-                    value={production.printColorsStr}
-                    onChange={(e) => setProduction((p) => ({ ...p, printColorsStr: e.target.value }))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
-                    placeholder="Orange, Black"
-                  />
-                </div>
-                <div className="md:col-span-2">
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Production notes</label>
-                  <textarea
-                    value={production.productionNotes}
-                    onChange={(e) => setProduction((p) => ({ ...p, productionNotes: e.target.value }))}
-                    rows={2}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
-                    placeholder="Notes for printer"
-                  />
-                </div>
-              </div>
-              <div className="mt-3">
-                <button
-                  type="button"
-                  onClick={async () => {
-                    if (!product?.id || !db) return;
-                    setSavingProduction(true);
-                    try {
-                      const productRef = doc(db, "rp_products", product.id);
-                      await updateDoc(productRef, {
-                        production: {
-                          printPdfFront: production.printPdfFront || null,
-                          printPdfBack: production.printPdfBack || null,
-                          printColors: production.printColorsStr ? production.printColorsStr.split(",").map((c) => c.trim()).filter(Boolean) : [],
-                          productionNotes: production.productionNotes || null,
-                        },
-                        updatedAt: new Date(),
-                        updatedBy: product.updatedBy ?? "",
-                      });
-                      await refetchProduct();
-                      showToast("Production saved", "success");
-                    } catch (err) {
-                      console.error(err);
-                      showToast("Failed to save production", "error");
-                    } finally {
-                      setSavingProduction(false);
-                    }
-                  }}
-                  disabled={savingProduction}
-                  className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
-                >
-                  {savingProduction ? "Saving…" : "Save production"}
-                </button>
-              </div>
-            </div>
-
-            {/* Section F — Shopify (read-only until sync implemented) */}
-            {(() => {
-              const shopifyReady = isProductReadyForShopify(product);
-              const shopifyTags = buildShopifyTags(product);
-              return (
-                <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
-                  <h2 className="text-lg font-semibold text-gray-900 mb-3">Shopify</h2>
-                  <dl className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
-                    <div>
-                      <dt className="text-gray-500">Sync status</dt>
-                      <dd className="font-medium">{product.shopify?.status ?? "not_synced"}</dd>
-                    </div>
-                    <div>
-                      <dt className="text-gray-500">Shopify product ID</dt>
-                      <dd className="font-mono text-gray-700">{product.shopify?.productId ?? "—"}</dd>
-                    </div>
-                    <div className="md:col-span-2">
-                      <dt className="text-gray-500 mb-1">Tags (preview for sync)</dt>
-                      <dd className="text-gray-700">
-                        {shopifyTags.length > 0 ? (
-                          <span className="flex flex-wrap gap-1.5">
-                            {shopifyTags.map((tag) => (
-                              <span key={tag} className="inline-flex px-2 py-0.5 rounded bg-blue-50 text-blue-800 text-xs font-mono">
-                                {tag}
-                              </span>
-                            ))}
-                          </span>
-                        ) : (
-                          <span className="text-gray-400 text-xs">No taxonomy tags (sport/league/team/theme/model). Set classification above to drive Smart Collections.</span>
-                        )}
-                      </dd>
-                    </div>
-                    {product.shopify?.lastSyncAt && (
-                      <div>
-                        <dt className="text-gray-500">Last sync</dt>
-                        <dd>
-                          {typeof (product.shopify.lastSyncAt as { toDate?: () => Date })?.toDate === "function"
-                            ? (product.shopify.lastSyncAt as { toDate: () => Date }).toDate().toLocaleString()
-                            : product.shopify.lastSyncAt instanceof Date
-                            ? product.shopify.lastSyncAt.toLocaleString()
-                            : String(product.shopify.lastSyncAt)}
-                        </dd>
-                      </div>
-                    )}
-                    {product.shopify?.lastSyncError && (
-                      <div className="md:col-span-2">
-                        <dt className="text-gray-500">Last sync error</dt>
-                        <dd className="text-red-600 text-xs mt-1">{product.shopify.lastSyncError}</dd>
-                      </div>
-                    )}
-                  </dl>
-                  {product.shopify?.productId && (
-                    <a
-                      href={
-                        process.env.NEXT_PUBLIC_SHOPIFY_STORE
-                          ? `https://admin.shopify.com/store/${process.env.NEXT_PUBLIC_SHOPIFY_STORE}/products/${product.shopify.productId}`
-                          : "#"
-                      }
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline-block mt-2 text-sm text-blue-600 hover:underline"
-                    >
-                      Open in Shopify →
-                    </a>
-                  )}
-                  <div className="mt-3">
-                    <button
-                      type="button"
-                      disabled={!shopifyReady.ready || syncingToShopify}
-                      className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                      title={!shopifyReady.ready ? `Missing: ${shopifyReady.missing.join(", ")}` : undefined}
-                      onClick={async () => {
-                        if (!db || !product?.id || !shopifyReady.ready) return;
-                        setSyncingToShopify(true);
-                        try {
-                          await addDoc(collection(db, "shopifySyncJobs"), {
-                            entityType: "product",
-                            entityId: product.id,
-                            action: "create_or_update",
-                            status: "queued",
-                            createdAt: serverTimestamp(),
-                          });
-                          showToast("Sync job queued. The worker will process it shortly.", "success");
-                        } catch (err) {
-                          console.error("[Shopify sync] Failed to queue job:", err);
-                          showToast("Failed to queue sync job", "error");
-                        } finally {
-                          setSyncingToShopify(false);
-                        }
-                      }}
-                    >
-                      {syncingToShopify ? "Queuing…" : "Sync to Shopify"}
-                    </button>
-                    {!shopifyReady.ready && (
-                      <p className="text-xs text-amber-700 mt-2">Not ready for Shopify sync. Missing: {shopifyReady.missing.join(", ")}</p>
-                    )}
-                  </div>
-                </div>
-              );
-            })()}
-
-            {/* Section C — Media (hero slots; assign in Assets tab) */}
-            <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
-              <h2 className="text-lg font-semibold text-gray-900 mb-3">Media</h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <div className="text-xs font-medium text-gray-600 mb-1">Hero front</div>
-                  {product.media?.heroFront ? (
-                    <img src={product.media.heroFront} alt="Hero front" className="max-w-full h-32 object-contain border border-gray-200 rounded" />
-                  ) : (
-                    <p className="text-sm text-gray-500">Not set. Use Assets tab to set as hero front.</p>
-                  )}
-                </div>
-                <div>
-                  <div className="text-xs font-medium text-gray-600 mb-1">Hero back</div>
-                  {product.media?.heroBack ? (
-                    <img src={product.media.heroBack} alt="Hero back" className="max-w-full h-32 object-contain border border-gray-200 rounded" />
-                  ) : (
-                    <p className="text-sm text-gray-500">Not set. Use Assets tab to set as hero back.</p>
-                  )}
-                </div>
-              </div>
-              {(!product.media?.heroFront || !product.media?.heroBack) && (
-                <p className="text-xs text-gray-500 mt-2">Blank + design mockup can be used as hero; assign in the Assets tab when available.</p>
-              )}
-            </div>
-
-            <div>
-              <h2 className="text-lg font-semibold text-gray-900 mb-4">Product Overview</h2>
-              <dl className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <dt className="text-sm font-medium text-gray-500">Status</dt>
-                  <dd className="mt-1 text-sm text-gray-900">
-                    <span
-                      className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
-                        product.status === "active"
-                          ? "bg-green-100 text-green-800"
-                          : product.status === "draft"
-                          ? "bg-gray-100 text-gray-800"
-                          : "bg-red-100 text-red-800"
-                      }`}
-                    >
-                      {product.status}
-                    </span>
-                  </dd>
-                </div>
-                <div>
-                  <dt className="text-sm font-medium text-gray-500">Category</dt>
-                  <dd className="mt-1 text-sm text-gray-900">{product.category}</dd>
-                </div>
-                <div>
-                  <dt className="text-sm font-medium text-gray-500">Base Product</dt>
-                  <dd className="mt-1 text-sm font-mono text-gray-900">{product.baseProductKey}</dd>
-                </div>
-                <div>
-                  <dt className="text-sm font-medium text-gray-500">Colorway</dt>
-                  <dd className="mt-1 text-sm text-gray-900">{product.colorway.name}</dd>
-                </div>
-                {product.description && (
-                  <div className="md:col-span-2">
-                    <dt className="text-sm font-medium text-gray-500">Description</dt>
-                    <dd className="mt-1 text-sm text-gray-900">{product.description}</dd>
-                  </div>
-                )}
-                {product.ai.productTrigger && (
-                  <div>
-                    <dt className="text-sm font-medium text-gray-500">Product Trigger</dt>
-                    <dd className="mt-1 text-sm font-mono text-gray-900">{product.ai.productTrigger}</dd>
-                  </div>
-                )}
-                {product.ai.productRecommendedScale && (
-                  <div>
-                    <dt className="text-sm font-medium text-gray-500">Recommended Scale</dt>
-                    <dd className="mt-1 text-sm text-gray-900">{product.ai.productRecommendedScale}</dd>
-                  </div>
-                )}
-              </dl>
-            </div>
-
             {/* Taxonomy */}
             <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
               <h2 className="text-lg font-semibold text-gray-900 mb-3">Taxonomy</h2>
@@ -3007,150 +3657,200 @@ function ProductDetailContent() {
               </div>
             </div>
 
-            {/* Asset Counters */}
-            <div>
-              <h3 className="text-sm font-semibold text-gray-900 mb-2">Asset Statistics</h3>
-              <div className="grid grid-cols-3 gap-4">
-                <div className="bg-gray-50 rounded-lg p-4">
-                  <div className="text-2xl font-bold text-gray-900">
-                    {product.counters?.assetsTotal || 0}
-                  </div>
-                  <div className="text-xs text-gray-500 mt-1">Total Assets</div>
-                </div>
-                <div className="bg-green-50 rounded-lg p-4">
-                  <div className="text-2xl font-bold text-green-600">
-                    {product.counters?.assetsApproved || 0}
-                  </div>
-                  <div className="text-xs text-gray-500 mt-1">Approved</div>
-                </div>
-                <div className="bg-blue-50 rounded-lg p-4">
-                  <div className="text-2xl font-bold text-blue-600">
-                    {product.counters?.assetsPublished || 0}
-                  </div>
-                  <div className="text-xs text-gray-500 mt-1">Published</div>
-                </div>
-              </div>
-            </div>
-
-            {/* Related Products */}
-            {relatedProducts.length > 0 && (
-              <div>
-                <h3 className="text-sm font-semibold text-gray-900 mb-2">Related Products</h3>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-                  {relatedProducts.map(({ product: p, reasons }) => {
-                    const thumb =
-                      p.media?.heroFront ?? p.media?.heroBack ?? p.mockupUrl ?? p.heroAssetPath;
-                    const title = p.title ?? p.name;
-                    const descriptor = [p.colorway?.name, p.category, p.baseProductKey].filter(Boolean).join(" · ");
-                    return (
-                      <Link
-                        key={p.id ?? p.slug}
-                        href={`/products/${encodeURIComponent(p.slug)}`}
-                        className="block rounded-lg border border-gray-200 bg-gray-50/50 p-3 hover:border-blue-300 hover:bg-blue-50/50 transition-colors"
-                      >
-                        {thumb ? (
-                          <img
-                            src={thumb}
-                            alt=""
-                            className="w-full aspect-square object-cover rounded mb-2 bg-white"
-                          />
-                        ) : (
-                          <div className="w-full aspect-square rounded mb-2 bg-gray-200 flex items-center justify-center text-gray-400 text-xs">
-                            No image
-                          </div>
-                        )}
-                        <div className="text-sm font-medium text-gray-900 truncate" title={title}>
-                          {title}
-                        </div>
-                        {descriptor && (
-                          <div className="text-xs text-gray-500 truncate mt-0.5" title={descriptor}>
-                            {descriptor}
-                          </div>
-                        )}
-                        {reasons.length > 0 && (
-                          <div className="text-xs text-blue-600 mt-1 flex flex-wrap gap-x-1 gap-y-0.5" title={reasons.join(", ")}>
-                            {reasons.map((r) => (
-                              <span key={r}>· {r}</span>
-                            ))}
-                          </div>
-                        )}
-                      </Link>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-            {/* Hero Image */}
-            {product.heroAssetPath && (
-              <div>
-                <h3 className="text-sm font-semibold text-gray-900 mb-2">Hero Image</h3>
-                <img
-                  src={product.heroAssetPath}
-                  alt="Hero"
-                  className="max-w-md h-auto rounded-lg border border-gray-200"
-                />
+            {product?.id && (
+              <div className="border-t border-gray-200 pt-6">
+                <p className="text-sm text-gray-600 mb-4">
+                  Inspiration references (full library: <span className="font-medium">More → Inspirations</span>).
+                </p>
+                <InspirationTab product={product} productId={product.id} />
               </div>
             )}
           </div>
         )}
 
-        {activeTab === "designs" && (
-          <DesignsTabContent
-            product={product}
-            designs={designs}
-            designsLoading={designsLoading}
-            onRefetchDesigns={refetchDesigns}
-          />
+        {activeTab === "shopify" && product && (
+          <div className="space-y-6">
+            {(() => {
+              const { ready, missing, warnings } = isProductReadyForShopify(product);
+              return (
+                <div className={`border rounded-lg p-4 ${ready ? "border-green-300 bg-green-50/50" : "border-amber-200 bg-amber-50/50"}`}>
+                  <h2 className="text-lg font-semibold text-gray-900 mb-2">Product readiness</h2>
+                  <p className="text-xs text-gray-500 mb-3">Checks required for Shopify sync. Fix missing items before syncing.</p>
+                  {missing.length > 0 && (
+                    <ul className="space-y-1.5 mb-2">
+                      {missing.map((label) => (
+                        <li key={label} className="flex items-center gap-2 text-sm">
+                          <span className="text-amber-700">✗</span>
+                          <span className="text-amber-800">{label}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {warnings.length > 0 && (
+                    <p className="text-xs text-gray-500 mb-1">Recommended: {warnings.join(", ")}</p>
+                  )}
+                  <p className={`mt-3 text-sm font-medium ${ready ? "text-green-700" : "text-amber-700"}`}>
+                    {ready ? "Ready for Shopify sync" : "Not ready — fix missing items above"}
+                  </p>
+                </div>
+              );
+            })()}
+            {(() => {
+              const shopifyReady = isProductReadyForShopify(product);
+              const shopifyTags = buildShopifyTags(product);
+              return (
+                <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
+                  <h2 className="text-lg font-semibold text-gray-900 mb-3">Shopify</h2>
+                  <dl className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                    <div>
+                      <dt className="text-gray-500">Sync status</dt>
+                      <dd className="font-medium">{product.shopify?.status ?? "not_synced"}</dd>
+                    </div>
+                    <div>
+                      <dt className="text-gray-500">Shopify product ID</dt>
+                      <dd className="font-mono text-gray-700">{product.shopify?.productId ?? "—"}</dd>
+                    </div>
+                    <div className="md:col-span-2">
+                      <dt className="text-gray-500 mb-1">Tags (preview for sync)</dt>
+                      <dd className="text-gray-700">
+                        {shopifyTags.length > 0 ? (
+                          <span className="flex flex-wrap gap-1.5">
+                            {shopifyTags.map((tag) => (
+                              <span key={tag} className="inline-flex px-2 py-0.5 rounded bg-blue-50 text-blue-800 text-xs font-mono">
+                                {tag}
+                              </span>
+                            ))}
+                          </span>
+                        ) : (
+                          <span className="text-gray-400 text-xs">No taxonomy tags (sport/league/team/theme/model). Set classification on the Content tab to drive Smart Collections.</span>
+                        )}
+                      </dd>
+                    </div>
+                    {product.shopify?.lastSyncAt && (
+                      <div>
+                        <dt className="text-gray-500">Last sync</dt>
+                        <dd>
+                          {typeof (product.shopify.lastSyncAt as { toDate?: () => Date })?.toDate === "function"
+                            ? (product.shopify.lastSyncAt as { toDate: () => Date }).toDate().toLocaleString()
+                            : product.shopify.lastSyncAt instanceof Date
+                            ? product.shopify.lastSyncAt.toLocaleString()
+                            : String(product.shopify.lastSyncAt)}
+                        </dd>
+                      </div>
+                    )}
+                    {product.shopify?.lastSyncError && (
+                      <div className="md:col-span-2">
+                        <dt className="text-gray-500">Last sync error</dt>
+                        <dd className="text-red-600 text-xs mt-1">{product.shopify.lastSyncError}</dd>
+                      </div>
+                    )}
+                  </dl>
+                  {product.shopify?.productId && (
+                    <a
+                      href={
+                        process.env.NEXT_PUBLIC_SHOPIFY_STORE
+                          ? `https://admin.shopify.com/store/${process.env.NEXT_PUBLIC_SHOPIFY_STORE}/products/${product.shopify.productId}`
+                          : "#"
+                      }
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-block mt-2 text-sm text-blue-600 hover:underline"
+                    >
+                      Open in Shopify →
+                    </a>
+                  )}
+                  <div className="mt-3">
+                    <button
+                      type="button"
+                      disabled={!shopifyReady.ready || syncingToShopify}
+                      className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                      title={!shopifyReady.ready ? `Missing: ${shopifyReady.missing.join(", ")}` : undefined}
+                      onClick={async () => {
+                        if (!db || !product?.id || !shopifyReady.ready) return;
+                        setSyncingToShopify(true);
+                        try {
+                          await addDoc(collection(db, "shopifySyncJobs"), {
+                            entityType: "product",
+                            entityId: product.id,
+                            action: "create_or_update",
+                            status: "queued",
+                            createdAt: serverTimestamp(),
+                          });
+                          showToast("Sync job queued. The worker will process it shortly.", "success");
+                        } catch (err) {
+                          console.error("[Shopify sync] Failed to queue job:", err);
+                          showToast("Failed to queue sync job", "error");
+                        } finally {
+                          setSyncingToShopify(false);
+                        }
+                      }}
+                    >
+                      {syncingToShopify ? "Queuing…" : "Sync to Shopify"}
+                    </button>
+                    {!shopifyReady.ready && (
+                      <p className="text-xs text-amber-700 mt-2">Not ready for Shopify sync. Missing: {shopifyReady.missing.join(", ")}</p>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
         )}
 
         {activeTab === "assets" && (
-          <AssetsTab
-            product={product}
-            assets={assets}
-            assetsLoading={assetsLoading}
-            refetchAssets={refetchAssets}
-            showToast={showToast}
-            lightboxImage={lightboxImage}
-            setLightboxImage={setLightboxImage}
-            onSetHeroSlot={
-              product?.id && db
-                ? (() => {
-                    const firestore = db;
-                    const productId = product.id;
-                    return async (assetId: string, url: string, slot: "hero_front" | "hero_back") => {
-                      const productRef = doc(firestore, "rp_products", productId);
-                      const key = slot === "hero_front" ? "heroFront" : "heroBack";
-                      await updateDoc(productRef, {
-                        media: {
-                          ...product.media,
-                          [key]: url,
-                        },
-                        updatedAt: new Date(),
-                        updatedBy: product.updatedBy ?? "",
-                      });
-                      await refetchProduct();
-                      const assetRef = doc(firestore, "rp_product_assets", assetId);
-                      await updateDoc(assetRef, { heroSlot: slot, updatedAt: new Date() });
-                      refetchAssets();
-                    };
-                  })()
-                : undefined
-            }
-          />
-        )}
+          <>
+            <div className="space-y-8">
+              <div>
+                <h2 className="text-lg font-semibold text-gray-900 mb-1">Designs</h2>
+                <p className="text-sm text-gray-500 mb-4">Designs linked to this product.</p>
+                <DesignsTabContent
+                  product={product}
+                  designs={designs}
+                  designsLoading={designsLoading}
+                  onRefetchDesigns={refetchDesigns}
+                />
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold text-gray-900 mb-1">Gallery & heroes</h2>
+                <p className="text-sm text-gray-500 mb-4">Generated assets and hero slots for storefront.</p>
+                <AssetsTab
+                  product={product}
+                  assets={assets}
+                  assetsLoading={assetsLoading}
+                  refetchAssets={refetchAssets}
+                  showToast={showToast}
+                  lightboxImage={lightboxImage}
+                  setLightboxImage={setLightboxImageCompat}
+                  onSetHeroSlot={
+                    product?.id && db
+                      ? (() => {
+                          const firestore = db;
+                          const productId = product.id;
+                          return async (assetId: string, url: string, slot: "hero_front" | "hero_back") => {
+                            const productRef = doc(firestore, "rp_products", productId);
+                            const key = slot === "hero_front" ? "heroFront" : "heroBack";
+                            await updateDoc(productRef, {
+                              media: {
+                                ...product.media,
+                                [key]: url,
+                              },
+                              updatedAt: new Date(),
+                              updatedBy: product.updatedBy ?? "",
+                            });
+                            await refetchProduct();
+                            const assetRef = doc(firestore, "rp_product_assets", assetId);
+                            await updateDoc(assetRef, { heroSlot: slot, updatedAt: new Date() });
+                            refetchAssets();
+                          };
+                        })()
+                      : undefined
+                  }
+                />
+              </div>
 
-        {activeTab === "inspiration" && product && product.id && (
-          <InspirationTab
-            product={product}
-            productId={product.id}
-          />
-        )}
-
-        {activeTab === "generate" && (
-          <div className="space-y-6">
+              <div className="space-y-6 border-t border-gray-200 pt-8">
             <div>
-              <h2 className="text-lg font-semibold text-gray-900 mb-2">Generate Assets</h2>
+              <h2 className="text-lg font-semibold text-gray-900 mb-2">Generate</h2>
               <p className="text-sm text-gray-500 mb-4">
                 Two-stage pipeline: create product images first (Stage 1), then model images (Stage 2).
               </p>
@@ -3346,7 +4046,7 @@ function ProductDetailContent() {
                                   }}
                                   className="text-sm font-medium px-3 py-1.5 text-gray-700 bg-gray-200 border border-gray-400 rounded-lg hover:bg-gray-300"
                                 >
-                                  Edit placement
+                                  Override placement (advanced)
                                 </button>
                               </div>
                             )}
@@ -3408,7 +4108,7 @@ function ProductDetailContent() {
                       <div className="flex flex-wrap items-start gap-4">
                         <button
                           type="button"
-                          onClick={() => setLightboxImage(mockupDisplayUrl)}
+                          onClick={() => openLightbox(mockupDisplayUrl)}
                           className="rounded-lg overflow-hidden border-2 border-gray-300 hover:border-blue-500 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                         >
                           <img
@@ -3818,47 +4518,9 @@ function ProductDetailContent() {
                 )}
               </div>
             </div>
-
-            {/* Recent Jobs */}
-            <div>
-              <h3 className="text-sm font-semibold text-gray-900 mb-3">Recent Generation Jobs</h3>
-              {jobsLoading ? (
-                <p className="text-sm text-gray-500">Loading jobs…</p>
-              ) : jobs.length === 0 ? (
-                <p className="text-sm text-gray-500">No generation jobs yet.</p>
-              ) : (
-                <div className="space-y-3">
-                  {jobs.map((job) => (
-                    <div key={job.id} className="border border-gray-200 rounded-lg p-4">
-                      <div className="flex items-center justify-between">
-                        <div>
-                          <p className="text-sm font-medium text-gray-900">
-                            Job {job.id?.substring(0, 8)}...
-                          </p>
-                          <p className="text-xs text-gray-500 mt-1">
-                            Status: {job.status} · {job.params?.imageCount || 0} images · {job.params?.size || "square"}
-                          </p>
-                        </div>
-                        <span
-                          className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
-                            job.status === "succeeded"
-                              ? "bg-green-100 text-green-800"
-                              : job.status === "failed"
-                              ? "bg-red-100 text-red-800"
-                              : job.status === "running"
-                              ? "bg-blue-100 text-blue-800"
-                              : "bg-gray-100 text-gray-800"
-                          }`}
-                        >
-                          {job.status}
-                        </span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
           </div>
+            </div>
+          </>
         )}
 
         {/* Render Setup modals — shared so they work from Overview or Generate tab */}
@@ -3866,13 +4528,23 @@ function ProductDetailContent() {
           <Modal
             isOpen
             onClose={() => setRenderSetupModal(null)}
-            title={`Edit placement — ${placementEditSide}`}
+            title={`Override blank placement (${placementEditSide}) — advanced`}
             size="large"
           >
             <div className="space-y-4">
-              <p className="text-sm text-gray-600">
-                Adjust where and how large the design appears on the blank. This placement is used as the default for all renders (mockup, hangar, model).
+              <p className="text-sm text-gray-700">
+                <strong>Blank default:</strong> placement comes from the blank render profile. Use this only when this{" "}
+                <strong>SKU</strong> needs different position/scale. Saves as a <strong>product override</strong>; mockups
+                and flat renders use the effective (merged) values.
               </p>
+              {product?.blankId ? (
+                <p className="text-xs text-gray-600">
+                  Prefer editing shared defaults:{" "}
+                  <Link href={`/blanks/${encodeURIComponent(product.blankId)}`} className="text-blue-600 font-medium underline">
+                    Blank render profile
+                  </Link>
+                </p>
+              ) : null}
               <div className="relative w-full max-w-lg aspect-square mx-auto bg-gray-200 rounded overflow-hidden" style={{ maxHeight: 360 }}>
                 <img
                   src={(placementEditSide === "front" ? effectiveFrontConfig : effectiveBackConfig).blankImageUrl ?? ""}
@@ -3935,7 +4607,20 @@ function ProductDetailContent() {
                   />
                 </div>
               </div>
-              <div className="flex gap-2 justify-end">
+              <div className="flex flex-wrap gap-2 justify-end items-center">
+                {product && hasProductPlacementOverride(product, placementEditSide) ? (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await resetProductPlacementToBlankDefault(placementEditSide);
+                      setRenderSetupModal(null);
+                    }}
+                    disabled={savingRenderSetup}
+                    className="px-3 py-1.5 text-sm border border-amber-500 text-amber-900 rounded-lg hover:bg-amber-50 mr-auto"
+                  >
+                    Reset to blank default
+                  </button>
+                ) : null}
                 <button
                   type="button"
                   onClick={() => setRenderSetupModal(null)}
@@ -3946,16 +4631,18 @@ function ProductDetailContent() {
                 <button
                   type="button"
                   onClick={async () => {
-                    await persistRenderSetupSide(placementEditSide, {
-                      placementOverride: { x: placementEdit.x, y: placementEdit.y, scale: placementEdit.scale },
-                      placementKey: placementEditSide === "front" ? "front_center" : "back_center",
-                    });
+                    await persistProductPlacementOverride(
+                      placementEditSide,
+                      placementEdit.x,
+                      placementEdit.y,
+                      placementEdit.scale
+                    );
                     setRenderSetupModal(null);
                   }}
                   disabled={savingRenderSetup}
                   className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
                 >
-                  {savingRenderSetup ? "Saving…" : "Save placement"}
+                  {savingRenderSetup ? "Saving…" : "Save product override"}
                 </button>
               </div>
             </div>
@@ -4012,7 +4699,7 @@ function ProductDetailContent() {
             <div className="space-y-2 max-h-96 overflow-y-auto">
               <p className="text-sm text-gray-600">Choose a design for the <strong>{renderSetupModal === "design_front" ? "front" : "back"}</strong>.</p>
               {(allDesigns ?? []).map((d) => {
-                const pngUrl = (d.files as { png?: { downloadUrl?: string } } | undefined)?.png?.downloadUrl;
+                const pngUrl = resolveDesignPngForPicker(d as DesignDoc);
                 const side = renderSetupModal === "design_front" ? "front" : "back";
                 const isSelected = (side === "front" ? designIdForFront : designIdForBack) === d.id;
                 return (
@@ -4027,10 +4714,18 @@ function ProductDetailContent() {
                     disabled={savingRenderSetup || !pngUrl}
                     className={`w-full flex gap-3 items-center p-2 rounded border text-left ${isSelected ? "border-blue-500 bg-blue-50" : "border-gray-200 hover:bg-gray-50"}`}
                   >
-                    {pngUrl && <img src={pngUrl} alt="" className="w-12 h-12 object-contain bg-gray-100 rounded" />}
+                    {pngUrl ? (
+                      <img src={pngUrl} alt="" className="w-12 h-12 object-contain bg-gray-100 rounded shrink-0" />
+                    ) : (
+                      <div className="w-12 h-12 bg-gray-100 rounded shrink-0 flex items-center justify-center text-[10px] text-gray-500 text-center px-0.5">
+                        No art
+                      </div>
+                    )}
                     <div className="min-w-0">
-                      <p className="text-sm font-medium truncate">{d.name ?? d.id}</p>
-                      {!pngUrl && <p className="text-xs text-amber-600">No PNG</p>}
+                      <p className="text-sm font-medium text-gray-900 truncate">{d.name ?? d.id}</p>
+                      {!pngUrl && (
+                        <p className="text-xs text-amber-700">No PNG (upload light/dark or legacy PNG in Design Detail → Files).</p>
+                      )}
                     </div>
                   </button>
                 );
@@ -4040,9 +4735,128 @@ function ProductDetailContent() {
           </Modal>
         )}
 
-        {activeTab === "settings" && (
-          <div>
-            <h2 className="text-lg font-semibold text-gray-900 mb-4">Settings</h2>
+        {activeTab === "history" && (
+          <div className="space-y-8">
+            <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
+              <h2 className="text-lg font-semibold text-gray-900 mb-3">Production</h2>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Print PDF Front (URL)</label>
+                  <input
+                    type="text"
+                    value={production.printPdfFront}
+                    onChange={(e) => setProduction((p) => ({ ...p, printPdfFront: e.target.value }))}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                    placeholder="https://..."
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Print PDF Back (URL)</label>
+                  <input
+                    type="text"
+                    value={production.printPdfBack}
+                    onChange={(e) => setProduction((p) => ({ ...p, printPdfBack: e.target.value }))}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                    placeholder="https://..."
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Print colors (comma-separated)</label>
+                  <input
+                    type="text"
+                    value={production.printColorsStr}
+                    onChange={(e) => setProduction((p) => ({ ...p, printColorsStr: e.target.value }))}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                    placeholder="Orange, Black"
+                  />
+                </div>
+                <div className="md:col-span-2">
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Production notes</label>
+                  <textarea
+                    value={production.productionNotes}
+                    onChange={(e) => setProduction((p) => ({ ...p, productionNotes: e.target.value }))}
+                    rows={2}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                    placeholder="Notes for printer"
+                  />
+                </div>
+              </div>
+              <div className="mt-3">
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (!product?.id || !db) return;
+                    setSavingProduction(true);
+                    try {
+                      const productRef = doc(db, "rp_products", product.id);
+                      await updateDoc(productRef, {
+                        production: {
+                          printPdfFront: production.printPdfFront || null,
+                          printPdfBack: production.printPdfBack || null,
+                          printColors: production.printColorsStr ? production.printColorsStr.split(",").map((c) => c.trim()).filter(Boolean) : [],
+                          productionNotes: production.productionNotes || null,
+                        },
+                        updatedAt: new Date(),
+                        updatedBy: product.updatedBy ?? "",
+                      });
+                      await refetchProduct();
+                      showToast("Production saved", "success");
+                    } catch (err) {
+                      console.error(err);
+                      showToast("Failed to save production", "error");
+                    } finally {
+                      setSavingProduction(false);
+                    }
+                  }}
+                  disabled={savingProduction}
+                  className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                >
+                  {savingProduction ? "Saving…" : "Save production"}
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <h2 className="text-lg font-semibold text-gray-900 mb-3">Recent generation jobs</h2>
+              {jobsLoading ? (
+                <p className="text-sm text-gray-500">Loading jobs…</p>
+              ) : jobs.length === 0 ? (
+                <p className="text-sm text-gray-500">No generation jobs yet.</p>
+              ) : (
+                <div className="space-y-3">
+                  {jobs.map((job) => (
+                    <div key={job.id} className="border border-gray-200 rounded-lg p-4">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="text-sm font-medium text-gray-900">
+                            Job {job.id?.substring(0, 8)}...
+                          </p>
+                          <p className="text-xs text-gray-500 mt-1">
+                            Status: {job.status} · {job.params?.imageCount || 0} images · {job.params?.size || "square"}
+                          </p>
+                        </div>
+                        <span
+                          className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
+                            job.status === "succeeded"
+                              ? "bg-green-100 text-green-800"
+                              : job.status === "failed"
+                              ? "bg-red-100 text-red-800"
+                              : job.status === "running"
+                              ? "bg-blue-100 text-blue-800"
+                              : "bg-gray-100 text-gray-800"
+                          }`}
+                        >
+                          {job.status}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div>
+            <h2 className="text-lg font-semibold text-gray-900 mb-4">Data maintenance</h2>
             
             {/* Data Maintenance Section */}
             <div className="bg-white border border-gray-200 rounded-lg p-4 mb-4">
@@ -4098,6 +4912,7 @@ function ProductDetailContent() {
             <p className="text-sm text-gray-500">
               Additional product settings and configuration will be available here.
             </p>
+            </div>
           </div>
         )}
       </div>

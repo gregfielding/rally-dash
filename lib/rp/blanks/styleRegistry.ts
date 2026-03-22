@@ -5,6 +5,8 @@
  * This is the source of truth for all allowed styles and colors.
  */
 
+import { DEFAULT_GARMENT_SAFE_AREA } from "@/lib/render/designArtboardSpec";
+
 export type BlankStyleCode = "8394" | "8390" | "TR3008" | "1822GD" | "HF07";
 export type BlankGarmentCategory = "panty" | "thong" | "tank" | "crewneck";
 
@@ -144,6 +146,7 @@ export interface PlacementConfig {
 
 export function getDefaultPlacements(category: BlankGarmentCategory): PlacementConfig[] {
   // All categories get front_center and back_center for MVP
+  const sa = { ...DEFAULT_GARMENT_SAFE_AREA };
   return [
     {
       placementId: "front_center",
@@ -151,7 +154,7 @@ export function getDefaultPlacements(category: BlankGarmentCategory): PlacementC
       defaultX: 0.5,
       defaultY: 0.5,
       defaultScale: 0.6,
-      safeArea: { x: 0.2, y: 0.2, w: 0.6, h: 0.6 },
+      safeArea: sa,
     },
     {
       placementId: "back_center",
@@ -159,7 +162,7 @@ export function getDefaultPlacements(category: BlankGarmentCategory): PlacementC
       defaultX: 0.5,
       defaultY: 0.5,
       defaultScale: 0.6,
-      safeArea: { x: 0.2, y: 0.2, w: 0.6, h: 0.6 },
+      safeArea: { ...sa },
     },
   ];
 }

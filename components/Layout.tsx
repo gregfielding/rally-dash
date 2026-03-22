@@ -1,6 +1,6 @@
 "use client";
 
-import { ReactNode, useState } from "react";
+import { ReactNode, useState, useRef, useEffect } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useAuth } from "@/lib/providers/AuthProvider";
@@ -11,24 +11,37 @@ interface LayoutProps {
   children: ReactNode;
 }
 
+type NavItem = {
+  name: string;
+  href: string;
+  roles: string[];
+};
+
+const primaryNav: NavItem[] = [
+  { name: "Dashboard", href: "/dashboard", roles: ["viewer", "editor", "ops", "admin"] },
+  { name: "Catalog", href: "/catalog", roles: ["viewer", "editor", "ops", "admin"] },
+  { name: "Products", href: "/products", roles: ["ops", "admin"] },
+  { name: "Publish", href: "/publish", roles: ["ops", "admin", "editor"] },
+];
+
+const moreNav: NavItem[] = [
+  { name: "Design system", href: "/design-system", roles: ["viewer", "editor", "ops", "admin"] },
+  { name: "Team roster", href: "/design-teams", roles: ["viewer", "editor", "ops", "admin"] },
+  { name: "Designs", href: "/designs", roles: ["ops", "admin"] },
+  { name: "Blanks", href: "/blanks", roles: ["ops", "admin"] },
+  { name: "Inspirations", href: "/inspirations", roles: ["ops", "admin", "editor"] },
+  { name: "Analytics", href: "/analytics", roles: ["ops", "admin"] },
+  { name: "LoRA Ops", href: "/lora", roles: ["ops", "admin"] },
+  { name: "Asset review", href: "/review", roles: ["ops", "admin", "editor"] },
+];
+
 export default function Layout({ children }: LayoutProps) {
   const { user, adminUser, signOut, loading } = useAuth();
   const pathname = usePathname();
-  
-  const isActive = (path: string) => pathname === path || pathname?.startsWith(path + "/");
+  const [moreOpen, setMoreOpen] = useState(false);
+  const moreRef = useRef<HTMLDivElement>(null);
 
-  const navigation = [
-    { name: "Dashboard", href: "/dashboard", roles: ["viewer", "editor", "ops", "admin"] },
-    { name: "Products", href: "/products", roles: ["ops", "admin"] },
-    { name: "Designs", href: "/designs", roles: ["ops", "admin"] },
-    { name: "Blanks", href: "/blanks", roles: ["ops", "admin"] },
-    { name: "Review", href: "/review", roles: ["ops", "admin", "editor"] },
-    { name: "Inspirations", href: "/inspirations", roles: ["ops", "admin", "editor"] },
-    { name: "Analytics", href: "/analytics", roles: ["ops", "admin"] },
-    { name: "Leagues", href: "/leagues", roles: ["editor", "admin"] },
-    { name: "Teams", href: "/teams", roles: ["editor", "admin"] },
-    { name: "LoRA Ops", href: "/lora", roles: ["ops", "admin"] },
-  ];
+  const isActive = (path: string) => pathname === path || pathname?.startsWith(path + "/");
 
   const loraNav = [
     { name: "Packs", href: "/lora/packs" },
@@ -39,11 +52,7 @@ export default function Layout({ children }: LayoutProps) {
   ];
 
   const canAccess = (roles: string[]) => {
-    // If we have a user but adminUser is not loaded yet, show navigation optimistically
-    // This prevents the menu from disappearing while admin data is being fetched
     if (!adminUser) {
-      // Show menu optimistically if we have a user (admin fetch might still be in progress)
-      // This way menu appears immediately and updates when adminUser loads
       return !!user;
     }
     return roles.includes(adminUser.role);
@@ -51,15 +60,28 @@ export default function Layout({ children }: LayoutProps) {
 
   const showLoRANav = pathname?.startsWith("/lora");
 
+  useEffect(() => {
+    const onDoc = (e: MouseEvent) => {
+      if (moreRef.current && !moreRef.current.contains(e.target as Node)) {
+        setMoreOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, []);
+
+  const moreVisible = moreNav.filter((item) => canAccess(item.roles));
+  const isMoreActive = moreVisible.some((item) => isActive(item.href));
+
   return (
     <div className="min-h-screen bg-gray-50">
       <header className="bg-white border-b border-gray-200">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center h-16">
             <div className="flex items-center">
-              <h1 className="text-xl font-bold mr-8 text-gray-900">Rally Panties DesignOps</h1>
-              <nav className="flex space-x-4">
-                {navigation.map((item) => {
+              <h1 className="text-xl font-bold mr-6 text-gray-900 shrink-0">Rally Panties DesignOps</h1>
+              <nav className="flex flex-wrap items-center gap-1 sm:gap-2">
+                {primaryNav.map((item) => {
                   if (!canAccess(item.roles)) return null;
                   return (
                     <Link
@@ -75,6 +97,43 @@ export default function Layout({ children }: LayoutProps) {
                     </Link>
                   );
                 })}
+
+                {moreVisible.length > 0 && (
+                  <div className="relative" ref={moreRef}>
+                    <button
+                      type="button"
+                      onClick={() => setMoreOpen((o) => !o)}
+                      className={`px-3 py-2 rounded-md text-sm font-medium ${
+                        isMoreActive || moreOpen
+                          ? "bg-blue-100 text-blue-700"
+                          : "text-gray-700 hover:bg-gray-100"
+                      }`}
+                      aria-expanded={moreOpen}
+                      aria-haspopup="menu"
+                    >
+                      More
+                      <span className="ml-2 text-gray-500">▾</span>
+                    </button>
+                    {moreOpen && (
+                      <div
+                        className="absolute left-0 top-full z-50 mt-1 min-w-[12rem] rounded-lg border border-gray-200 bg-white py-1 shadow-lg"
+                        role="menu"
+                      >
+                        {moreVisible.map((item) => (
+                          <Link
+                            key={item.href}
+                            href={item.href}
+                            role="menuitem"
+                            className="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                            onClick={() => setMoreOpen(false)}
+                          >
+                            {item.name}
+                          </Link>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
               </nav>
             </div>
             <div className="flex items-center gap-4">
@@ -121,15 +180,14 @@ export default function Layout({ children }: LayoutProps) {
 function NotificationsBell() {
   const [isOpen, setIsOpen] = useState(false);
   const { notifications, unreadCount, markAsRead, markAllAsRead } = useNotifications();
-  const router = useRouter();  const handleNotificationClick = (notification: any) => {
+  const router = useRouter();
+  const handleNotificationClick = (notification: any) => {
     if (notification.id) {
       markAsRead(notification.id);
     }
     setIsOpen(false);
-    
-    // Navigate based on notification type
+
     if (notification.relatedProductId) {
-      // Need to get product slug first, or navigate to products list
       router.push(`/products`);
     }
   };

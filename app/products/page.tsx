@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, FormEvent } from "react";
+import { useMemo, useState, useEffect, FormEvent } from "react";
 import Link from "next/link";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import { TableSkeleton } from "@/components/Skeleton";
@@ -13,6 +13,7 @@ import { useBlanks } from "@/lib/hooks/useBlanks";
 import { useCreateMockJob } from "@/lib/hooks/useMockAssets";
 import { useScenePresets as useRPScenePresets } from "@/lib/hooks/useRPScenePresets";
 import { RpProductStatus, RpProductCategory } from "@/lib/types/firestore";
+import { isMasterBlank, getBlankVariants } from "@/lib/blanks";
 import useSWR from "swr";
 import { collection, getDocs, query, orderBy, doc, deleteDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase/config";
@@ -43,6 +44,7 @@ function ProductsContent() {
   const [statusFilter, setStatusFilter] = useState<RpProductStatus | "all">("all");
   const [categoryFilter, setCategoryFilter] = useState<RpProductCategory | "all">("all");
   const [searchQuery, setSearchQuery] = useState("");
+  const [moreActionsOpen, setMoreActionsOpen] = useState(false);
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -56,6 +58,7 @@ function ProductsContent() {
   const [isDesignBlankOpen, setIsDesignBlankOpen] = useState(false);
   const [designBlankDesignId, setDesignBlankDesignId] = useState("");
   const [designBlankBlankId, setDesignBlankBlankId] = useState("");
+  const [designBlankVariantId, setDesignBlankVariantId] = useState("");
   const [designBlankCreating, setDesignBlankCreating] = useState(false);
   const [designBlankError, setDesignBlankError] = useState<string | null>(null);
   
@@ -83,6 +86,28 @@ function ProductsContent() {
   const { designs } = useDesigns();
   // Load all blanks for the Create from Design + Blank modal (no status filter so dropdown works without requiring composite index)
   const { blanks } = useBlanks();
+
+  const selectedDesignBlank = useMemo(
+    () => blanks.find((b) => b.blankId === designBlankBlankId),
+    [blanks, designBlankBlankId]
+  );
+  const designBlankVariantOptions = useMemo(() => {
+    if (!selectedDesignBlank || !isMasterBlank(selectedDesignBlank)) return [];
+    return getBlankVariants(selectedDesignBlank).filter((v) => v.isActive !== false);
+  }, [selectedDesignBlank]);
+
+  useEffect(() => {
+    if (!selectedDesignBlank || !isMasterBlank(selectedDesignBlank)) {
+      setDesignBlankVariantId("");
+      return;
+    }
+    const opts = getBlankVariants(selectedDesignBlank).filter((v) => v.isActive !== false);
+    if (opts.length === 0) {
+      setDesignBlankVariantId("");
+      return;
+    }
+    setDesignBlankVariantId((prev) => (prev && opts.some((v) => v.variantId === prev) ? prev : opts[0].variantId));
+  }, [selectedDesignBlank]);
   
   // Fetch rp_identities (not model pack identities)
   const { data: identities } = useSWR("rp_identities", async () => {
@@ -166,11 +191,21 @@ function ProductsContent() {
       setDesignBlankError("Select a design and a blank.");
       return;
     }
+    const selBlank = blanks.find((b) => b.blankId === designBlankBlankId);
+    if (selBlank && isMasterBlank(selBlank)) {
+      const active = getBlankVariants(selBlank).filter((v) => v.isActive !== false);
+      if (active.length > 0 && !designBlankVariantId) {
+        setDesignBlankError("Select a color variant for this master blank.");
+        return;
+      }
+    }
     try {
       setDesignBlankCreating(true);
       const result = await createProductFromDesignBlank({
         designId: designBlankDesignId,
         blankId: designBlankBlankId,
+        blankVariantId:
+          selBlank && isMasterBlank(selBlank) && designBlankVariantId ? designBlankVariantId : undefined,
       });
       const jobId = await createMockJob({
         designId: designBlankDesignId,
@@ -225,19 +260,13 @@ function ProductsContent() {
             Manage products, designs, and generated assets
           </p>
         </div>
-        <div className="flex gap-3">
-          <Link
-            href="/products/bulk"
-            className="px-4 py-2 bg-violet-600 text-white rounded-lg hover:bg-violet-700 text-sm font-medium inline-block"
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={handleOpenCreate}
+            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium"
           >
-            Bulk Generate
-          </Link>
-          <Link
-            href="/products/batch-hero"
-            className="px-4 py-2 bg-amber-600 text-white rounded-lg hover:bg-amber-700 text-sm font-medium inline-block"
-          >
-            Batch Hero Render
-          </Link>
+            Create Product
+          </button>
           <button
             onClick={() => setIsDesignBlankOpen(true)}
             className="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 text-sm font-medium"
@@ -251,38 +280,67 @@ function ProductsContent() {
           >
             Batch Generate
           </button>
-          <button
-            onClick={handleOpenCreate}
-            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium"
-          >
-            Create Product
-          </button>
-          <button
-            type="button"
-            onClick={async () => {
-              if (selectedProducts.size === 0) return;
-              const n = selectedProducts.size;
-              if (!window.confirm(`Delete ${n} product${n === 1 ? "" : "s"}? This cannot be undone.`)) return;
-              if (!db) return;
-              setBulkDeleting(true);
-              try {
-                for (const id of selectedProducts) {
-                  await deleteDoc(doc(db, "rp_products", id));
-                }
-                setSelectedProducts(new Set());
-                await refetch();
-              } catch (err) {
-                console.error("[Products] Bulk delete failed:", err);
-                alert("Failed to delete some products. See console for details.");
-              } finally {
-                setBulkDeleting(false);
-              }
-            }}
-            disabled={selectedProducts.size === 0 || bulkDeleting}
-            className="px-4 py-2 border border-red-300 text-red-700 bg-white rounded-lg hover:bg-red-50 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {bulkDeleting ? "Deleting…" : `Delete selected${selectedProducts.size > 0 ? ` (${selectedProducts.size})` : ""}`}
-          </button>
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setMoreActionsOpen((o) => !o)}
+              className="px-4 py-2 border border-gray-300 bg-white text-gray-800 rounded-lg hover:bg-gray-50 text-sm font-medium"
+            >
+              More ▾
+            </button>
+            {moreActionsOpen && (
+              <>
+                <div
+                  className="fixed inset-0 z-40"
+                  aria-hidden
+                  onClick={() => setMoreActionsOpen(false)}
+                />
+                <div className="absolute right-0 top-full z-50 mt-1 w-56 rounded-lg border border-gray-200 bg-white py-1 shadow-lg">
+                  <Link
+                    href="/products/bulk"
+                    className="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                    onClick={() => setMoreActionsOpen(false)}
+                  >
+                    Bulk Generate
+                  </Link>
+                  <Link
+                    href="/products/batch-hero"
+                    className="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                    onClick={() => setMoreActionsOpen(false)}
+                  >
+                    Batch Hero Render
+                  </Link>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setMoreActionsOpen(false);
+                      if (selectedProducts.size === 0) return;
+                      const n = selectedProducts.size;
+                      if (!window.confirm(`Delete ${n} product${n === 1 ? "" : "s"}? This cannot be undone.`)) return;
+                      if (!db) return;
+                      setBulkDeleting(true);
+                      try {
+                        for (const id of selectedProducts) {
+                          await deleteDoc(doc(db, "rp_products", id));
+                        }
+                        setSelectedProducts(new Set());
+                        await refetch();
+                      } catch (err) {
+                        console.error("[Products] Bulk delete failed:", err);
+                        alert("Failed to delete some products. See console for details.");
+                      } finally {
+                        setBulkDeleting(false);
+                      }
+                    }}
+                    disabled={selectedProducts.size === 0 || bulkDeleting}
+                    className="block w-full text-left px-4 py-2 text-sm text-red-700 hover:bg-red-50 disabled:opacity-50"
+                  >
+                    {bulkDeleting ? "Deleting…" : `Delete selected${selectedProducts.size > 0 ? ` (${selectedProducts.size})` : ""}`}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
         </div>
       </div>
 
@@ -305,7 +363,7 @@ function ProductsContent() {
               onChange={(e) => setNewName(e.target.value)}
               required
               className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-              placeholder="SF Giants Classic Black"
+              placeholder="San Francisco Giants Classic Black"
             />
           </div>
 
@@ -426,6 +484,7 @@ function ProductsContent() {
           setDesignBlankError(null);
           setDesignBlankDesignId("");
           setDesignBlankBlankId("");
+          setDesignBlankVariantId("");
         }}
         title="Create Product from Design + Blank"
       >
@@ -469,11 +528,31 @@ function ProductsContent() {
               <option value="">Select blank...</option>
               {blanks.map((b) => (
                 <option key={b.blankId} value={b.blankId}>
-                  {b.styleCode} {b.styleName} — {b.colorName}
+                  {b.styleCode} — {b.styleName}
+                  {b.colorName ? ` (${b.colorName})` : ""}
                 </option>
               ))}
             </select>
           </div>
+          {designBlankVariantOptions.length > 0 && (
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Blank color variant *</label>
+              <select
+                value={designBlankVariantId}
+                onChange={(e) => setDesignBlankVariantId(e.target.value)}
+                required
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
+              >
+                {designBlankVariantOptions.map((v) => (
+                  <option key={v.variantId} value={v.variantId}>
+                    {v.colorName}
+                    {v.vendorSku ? ` (${v.vendorSku})` : ""}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-gray-500 mt-1">Master blanks require a variant; color resolves into the product and templates.</p>
+            </div>
+          )}
           {designBlankDesignId && !designs.find((d) => d.id === designBlankDesignId)?.hasPng && (
             <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-sm">
               Selected design has no PNG. Upload a PNG in Design Detail → Files before creating a product.
@@ -493,6 +572,7 @@ function ProductsContent() {
                 designBlankCreating ||
                 !designBlankDesignId ||
                 !designBlankBlankId ||
+                (designBlankVariantOptions.length > 0 && !designBlankVariantId) ||
                 !designs.find((d) => d.id === designBlankDesignId)?.hasPng
               }
               className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 disabled:opacity-50"

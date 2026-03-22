@@ -14,6 +14,11 @@
     "logs": "firebase functions:log",
     "seed:presets": "node scripts/seed-scene-presets.js",
     "seed:taxonomy": "node scripts/seed-taxonomy.js",
+    "seed:design-teams": "node scripts/seed-design-teams-phase1.js",
+    "seed:design-teams:merge": "node scripts/seed-design-teams-phase1.js --merge",
+    "export:design-teams-json": "node scripts/seed-design-teams-phase1.js --export-json",
+    "patch:sf-team-display-names": "node scripts/patch-sf-design-team-display-names.js",
+    "materialize:mlb-verified-colors": "node scripts/materialize-mlb-verified-brand-colors.js",
     "verify:taxonomy": "node scripts/verify-taxonomy.js"
   },
   "dependencies": {

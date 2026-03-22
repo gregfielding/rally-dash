@@ -95,7 +95,7 @@ export function useCreateProductFromDesignBlank() {
   const { mutate } = useSWRConfig();
 
   const createProductFromDesignBlank = useCallback(
-    async (input: { designId: string; blankId: string }) => {
+    async (input: { designId: string; blankId: string; blankVariantId?: string | null }) => {
       if (!functions) {
         throw new Error("Cloud Functions not initialized");
       }
@@ -145,4 +145,67 @@ export function useGenerateProductAssets() {
   );
 
   return { generateProductAssets };
+}
+
+/**
+ * Step 10 MVP: explicit flat_clean + flat_blended back renders (8394 only; server-enforced).
+ */
+export function useGenerateProductFlatRenders() {
+  const { mutate } = useSWRConfig();
+
+  const generateProductFlatRenders = useCallback(
+    async (input: { productId: string }) => {
+      if (!functions) {
+        throw new Error("Cloud Functions not initialized");
+      }
+      const fn = httpsCallable(functions, "generateProductFlatRenders");
+      const result = await fn(input);
+      await mutate(
+        (key) => typeof key === "string" && key.startsWith("rp_product"),
+        undefined,
+        { revalidate: true }
+      );
+      return result.data as {
+        ok: boolean;
+        productId: string;
+        inputFingerprint: string;
+        urls: { flat_clean_back: string; flat_blended_back: string };
+      };
+    },
+    [mutate]
+  );
+
+  return { generateProductFlatRenders };
+}
+
+/**
+ * MVP: composite flat_blended into hanger scene template (non-AI). Requires function env for background URL.
+ */
+export function useGenerateProductSceneRender() {
+  const { mutate } = useSWRConfig();
+
+  const generateProductSceneRender = useCallback(
+    async (input: { productId: string; sceneKey?: "hanger" }) => {
+      if (!functions) {
+        throw new Error("Cloud Functions not initialized");
+      }
+      const fn = httpsCallable(functions, "generateProductSceneRender");
+      const result = await fn(input);
+      await mutate(
+        (key) => typeof key === "string" && key.startsWith("rp_product"),
+        undefined,
+        { revalidate: true }
+      );
+      return result.data as {
+        ok: boolean;
+        productId: string;
+        sceneKey: string;
+        url: string;
+        sourceFlatView: "front" | "back";
+      };
+    },
+    [mutate]
+  );
+
+  return { generateProductSceneRender };
 }

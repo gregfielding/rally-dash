@@ -1,0 +1,24 @@
+{
+  "leagueCode": "MLB",
+  "leagueName": "Major League Baseball",
+  "teams": [
+    {
+      "teamCode": "SFGIANTS",
+      "teamName": "San Francisco Giants",
+      "colors": [
+        {
+          "role": "primary",
+          "name": "Giants Orange",
+          "hex": "#FD5A1E",
+          "cmyk": { "c": 0, "m": 75, "y": 100, "k": 0 }
+        },
+        {
+          "role": "secondary",
+          "name": "Black",
+          "hex": "#27251F",
+          "cmyk": { "c": 0, "m": 0, "y": 0, "k": 90 }
+        }
+      ]
+    }
+  ]
+}

@@ -1,19 +1,460 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import ProtectedRoute from "@/components/ProtectedRoute";
-import { useBlank, useUpdateBlank, useDeleteBlank, COLOR_REGISTRY } from "@/lib/hooks/useBlanks";
+import { useBlank, useUpdateBlank, useDeleteBlank, COLOR_REGISTRY, type UpdateBlankInput } from "@/lib/hooks/useBlanks";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { storage, db } from "@/lib/firebase/config";
-import { doc, getDoc, setDoc, serverTimestamp } from "firebase/firestore";
-import { RPImageRef, RPBlankMask } from "@/lib/types/firestore";
+import { collection, doc, getDoc, getDocs, query, setDoc, serverTimestamp, where } from "firebase/firestore";
+import { RPBlank, RPImageRef, RPBlankMask, RPBlankColorFamily, RpProduct, RPBlankRenderDefaults } from "@/lib/types/firestore";
 import { useAuth } from "@/lib/providers/AuthProvider";
+import { getEffectiveColorFamily, isMasterBlank, getEffectiveCategory, countActiveVariants } from "@/lib/blanks";
+import { BlankVariantsManager } from "./BlankVariantsManager";
+import { BlankRenderProfileEditor } from "./BlankRenderProfileEditor";
+import { BlankEligibilityTab } from "./BlankEligibilityTab";
+
+/** Readable on white inputs when OS dark theme sets a light inherited `color` on the page. */
+const BLANK_FIELD =
+  "w-full rounded border border-gray-300 bg-white px-2 py-1.5 text-sm text-gray-900 placeholder:text-[#999999] shadow-sm";
+const BLANK_FIELD_SELECT = `${BLANK_FIELD} appearance-none`;
+const BLANK_FIELD_COMPACT =
+  "rounded border border-gray-300 bg-white px-2 py-1 text-sm text-gray-900 shadow-sm";
+
+function ColorFamilyField({
+  blank,
+  onSave,
+}: {
+  blank: { colorFamily?: RPBlankColorFamily | null; colorName?: string };
+  onSave: (value: RPBlankColorFamily | null) => Promise<void>;
+}) {
+  const effective = getEffectiveColorFamily(blank.colorFamily, blank.colorName);
+  const [saving, setSaving] = useState(false);
+  const [local, setLocal] = useState<RPBlankColorFamily | "">(blank.colorFamily ?? "");
+  useEffect(() => {
+    setLocal(blank.colorFamily ?? "");
+  }, [blank.colorFamily]);
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-sm text-gray-600">
+        {blank.colorFamily ? "Set: " : "Derived: "}
+        <strong>{effective}</strong>
+      </span>
+      <select
+        value={local}
+        onChange={(e) => setLocal(e.target.value as RPBlankColorFamily | "")}
+        className={BLANK_FIELD_COMPACT}
+      >
+        <option value="">—</option>
+        <option value="light">Light</option>
+        <option value="dark">Dark</option>
+      </select>
+      <button
+        type="button"
+        disabled={saving || (local === "" && blank.colorFamily == null) || (local !== "" && local === blank.colorFamily)}
+        onClick={async () => {
+          setSaving(true);
+          try {
+            await onSave(local === "" ? null : local);
+          } finally {
+            setSaving(false);
+          }
+        }}
+        className="px-2 py-1 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+      >
+        {saving ? "Saving…" : "Save"}
+      </button>
+    </div>
+  );
+}
+
+const BLEND_MODES = ["normal", "multiply", "overlay", "soft-light"] as const;
+
+function RenderDefaultsForm({
+  blank,
+  onSave,
+}: {
+  blank: { renderDefaults?: { blendMode?: string | null; blendOpacity?: number | null; front?: { blendMode?: string | null; blendOpacity?: number | null } | null; back?: { blendMode?: string | null; blendOpacity?: number | null } | null } | null };
+  onSave: (renderDefaults: NonNullable<typeof blank.renderDefaults>) => Promise<void>;
+}) {
+  const rd = blank.renderDefaults;
+  const [blendMode, setBlendMode] = useState(rd?.blendMode ?? "soft-light");
+  const [blendOpacity, setBlendOpacity] = useState(rd?.blendOpacity ?? 1);
+  const [saving, setSaving] = useState(false);
+  return (
+    <div className="space-y-4 max-w-md">
+      <div>
+        <label className="block text-sm text-gray-600 mb-1">Blend mode</label>
+        <select value={blendMode} onChange={(e) => setBlendMode(e.target.value)} className={BLANK_FIELD_SELECT}>
+          {BLEND_MODES.map((m) => (
+            <option key={m} value={m}>{m}</option>
+          ))}
+        </select>
+      </div>
+      <div>
+        <label className="block text-sm text-gray-600 mb-1">Blend opacity (0–1)</label>
+        <input type="number" min={0} max={1} step={0.1} value={blendOpacity} onChange={(e) => setBlendOpacity(Number(e.target.value))} className={BLANK_FIELD} />
+      </div>
+      <button
+        type="button"
+        disabled={saving}
+        onClick={async () => {
+          setSaving(true);
+          try {
+            await onSave({ blendMode, blendOpacity, front: rd?.front ?? null, back: rd?.back ?? null });
+          } finally {
+            setSaving(false);
+          }
+        }}
+        className="px-4 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+      >
+        {saving ? "Saving…" : "Save"}
+      </button>
+    </div>
+  );
+}
+
+function ShopifyDefaultsSection({ blank, updateBlank, refetchBlank, showToast }: { blank: RPBlank; updateBlank: (i: UpdateBlankInput) => Promise<unknown>; refetchBlank: () => void; showToast: (m: string, t: "success" | "error") => void }) {
+  const sd = blank.shopifyDefaults;
+  const [productType, setProductType] = useState(sd?.productType ?? "");
+  const [brand, setBrand] = useState(sd?.brand ?? sd?.vendor ?? "");
+  const [productCategory, setProductCategory] = useState(sd?.productCategory ?? "");
+  const [collectionHandles, setCollectionHandles] = useState((sd?.collectionHandles ?? []).join(", "));
+  const [saving, setSaving] = useState(false);
+  return (
+    <div className="space-y-4 max-w-lg">
+      <p className="text-sm text-gray-700">Shopify merchandising defaults (style-level). Supplier/sourcing is not duplicated here—use Sourcing.</p>
+      <div>
+        <label className="block text-sm font-medium text-gray-800 mb-1">Product type</label>
+        <input value={productType} onChange={(e) => setProductType(e.target.value)} className={BLANK_FIELD} placeholder="e.g. Panties" />
+      </div>
+      <div>
+        <label className="block text-sm font-medium text-gray-800 mb-1">Brand</label>
+        <input value={brand} onChange={(e) => setBrand(e.target.value)} className={BLANK_FIELD} placeholder="e.g. Rally" />
+      </div>
+      <div>
+        <label className="block text-sm font-medium text-gray-800 mb-1">Product category</label>
+        <input value={productCategory} onChange={(e) => setProductCategory(e.target.value)} className={BLANK_FIELD} />
+      </div>
+      <div>
+        <label className="block text-sm font-medium text-gray-800 mb-1">Collection handles (comma-separated)</label>
+        <input value={collectionHandles} onChange={(e) => setCollectionHandles(e.target.value)} className={BLANK_FIELD} placeholder="panties, cotton" />
+      </div>
+      <button
+        type="button"
+        disabled={saving}
+        onClick={async () => {
+          setSaving(true);
+          try {
+            await updateBlank({
+              blankId: blank.blankId,
+              shopifyDefaults: {
+                productType: productType.trim() || null,
+                brand: brand.trim() || null,
+                vendor: brand.trim() || null,
+                productCategory: productCategory.trim() || null,
+                collectionHandles: collectionHandles.trim() ? collectionHandles.split(",").map((h) => h.trim()).filter(Boolean) : null,
+              },
+            });
+            refetchBlank();
+            showToast("Shopify defaults updated", "success");
+          } finally {
+            setSaving(false);
+          }
+        }}
+        className="px-4 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+      >
+        {saving ? "Saving…" : "Save"}
+      </button>
+    </div>
+  );
+}
+
+const TEMPLATE_TOKEN_HINT =
+  "Tokens: {teamName}, {designName}, {colorName} (from variant at product creation), {garmentStyle}, {category}, {brand}, {vendor} (alias of brand), {league}, {city}, {stadiumName}, {teamSaying}, {fanPhrase}.";
+
+function TemplatesSection({ blank, updateBlank, refetchBlank, showToast }: { blank: RPBlank; updateBlank: (i: UpdateBlankInput) => Promise<unknown>; refetchBlank: () => void; showToast: (m: string, t: "success" | "error") => void }) {
+  const [titleTemplate, setTitleTemplate] = useState(blank.titleTemplate ?? "");
+  const [descriptionTemplate, setDescriptionTemplate] = useState(blank.descriptionTemplate ?? "");
+  const [tagTemplates, setTagTemplates] = useState((blank.tagTemplates ?? []).join("\n"));
+  const [saving, setSaving] = useState(false);
+  return (
+    <div className="space-y-4 max-w-2xl">
+      <p className="text-sm text-gray-500">{TEMPLATE_TOKEN_HINT}</p>
+      <p className="text-xs text-gray-500">
+        Tags are generated from these templates and source data at product creation, not manually typed on each product.
+      </p>
+      <div>
+        <label className="block text-sm text-gray-600 mb-1">Title template</label>
+        <p className="text-xs text-gray-500 mb-1">Product title pattern. Resolved at product creation with team, design, and blank context.</p>
+        <input value={titleTemplate} onChange={(e) => setTitleTemplate(e.target.value)} className={BLANK_FIELD} placeholder="{teamName} {designName} – {colorName}" />
+      </div>
+      <div>
+        <label className="block text-sm text-gray-600 mb-1">Description template</label>
+        <p className="text-xs text-gray-500 mb-1">Reusable body copy pattern. Plain text or HTML; resolved at product creation.</p>
+        <textarea value={descriptionTemplate} onChange={(e) => setDescriptionTemplate(e.target.value)} rows={3} className={BLANK_FIELD} />
+      </div>
+      <div>
+        <label className="block text-sm text-gray-600 mb-1">Tag templates (one per line)</label>
+        <p className="text-xs text-gray-500 mb-1">One tag per line; each line can contain tokens. Generated automatically into final product tags at creation.</p>
+        <textarea value={tagTemplates} onChange={(e) => setTagTemplates(e.target.value)} rows={4} className={BLANK_FIELD} placeholder={`{teamName}\n{league}\npanties\n{colorName}`} />
+      </div>
+      <button
+        type="button"
+        disabled={saving}
+        onClick={async () => {
+          setSaving(true);
+          try {
+            const tags = tagTemplates.trim() ? tagTemplates.split("\n").map((t) => t.trim()).filter(Boolean) : [];
+            await updateBlank({ blankId: blank.blankId, titleTemplate: titleTemplate.trim() || null, descriptionTemplate: descriptionTemplate.trim() || null, tagTemplates: tags.length ? tags : null });
+            refetchBlank();
+            showToast("Templates updated", "success");
+          } finally {
+            setSaving(false);
+          }
+        }}
+        className="px-4 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+      >
+        {saving ? "Saving…" : "Save"}
+      </button>
+    </div>
+  );
+}
+
+function PricingWeightSection({ blank, updateBlank, refetchBlank, showToast }: { blank: RPBlank; updateBlank: (i: UpdateBlankInput) => Promise<unknown>; refetchBlank: () => void; showToast: (m: string, t: "success" | "error") => void }) {
+  const dp = blank.defaultPricing;
+  const ds = blank.defaultShipping;
+  const [retailPrice, setRetailPrice] = useState(dp?.retailPrice ?? dp?.basePrice ?? "");
+  const [cost, setCost] = useState(dp?.cost ?? blank.blankCost ?? "");
+  const [currencyCode] = useState("USD");
+  const [defaultWeightGrams, setDefaultWeightGrams] = useState(ds?.defaultWeightGrams ?? "");
+  const [requiresShipping, setRequiresShipping] = useState(ds?.requiresShipping ?? true);
+  const [saving, setSaving] = useState(false);
+  return (
+    <div className="space-y-4 max-w-md">
+      <p className="text-sm text-gray-500">Style-level retail and garment cost. Inherited at product creation.</p>
+      <div className="grid grid-cols-2 gap-4">
+        <div>
+          <label className="block text-sm text-gray-600 mb-1">Retail price</label>
+          <input type="number" value={retailPrice} onChange={(e) => setRetailPrice(e.target.value)} className={BLANK_FIELD} />
+        </div>
+        <div>
+          <label className="block text-sm text-gray-600 mb-1">Cost (garment)</label>
+          <input type="number" value={cost} onChange={(e) => setCost(e.target.value)} className={BLANK_FIELD} />
+        </div>
+      </div>
+      <div>
+        <label className="block text-sm text-gray-600 mb-1">Currency</label>
+        <input value={currencyCode} readOnly className="border border-gray-200 rounded px-2 py-1.5 text-sm w-full bg-gray-50 text-gray-600" />
+      </div>
+      <div>
+        <label className="block text-sm text-gray-600 mb-1">Default weight (grams)</label>
+        <input type="number" value={defaultWeightGrams} onChange={(e) => setDefaultWeightGrams(e.target.value)} className={BLANK_FIELD} />
+      </div>
+      <label className="flex items-center gap-2">
+        <input type="checkbox" checked={requiresShipping} onChange={(e) => setRequiresShipping(e.target.checked)} />
+        <span className="text-sm text-gray-700">Requires shipping</span>
+      </label>
+      <button
+        type="button"
+        disabled={saving}
+        onClick={async () => {
+          setSaving(true);
+          try {
+            await updateBlank({
+              blankId: blank.blankId,
+              defaultPricing: {
+                retailPrice: retailPrice === "" ? null : Number(retailPrice),
+                cost: cost === "" ? null : Number(cost),
+                currencyCode: "USD",
+                basePrice: retailPrice === "" ? null : Number(retailPrice),
+              },
+              defaultShipping: { defaultWeightGrams: defaultWeightGrams === "" ? null : Number(defaultWeightGrams), requiresShipping },
+              blankCost: cost === "" ? null : Number(cost),
+              costCurrency: "USD",
+            });
+            refetchBlank();
+            showToast("Pricing / weight updated", "success");
+          } finally {
+            setSaving(false);
+          }
+        }}
+        className="px-4 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+      >
+        {saving ? "Saving…" : "Save"}
+      </button>
+    </div>
+  );
+}
+
+function SourcingCostSection({ blank, updateBlank, refetchBlank, showToast }: { blank: RPBlank; updateBlank: (i: UpdateBlankInput) => Promise<unknown>; refetchBlank: () => void; showToast: (m: string, t: "success" | "error") => void }) {
+  const src = blank.sourcing;
+  const [supplier, setSupplier] = useState(src?.supplier ?? src?.vendor ?? blank.supplier ?? "");
+  const [supplierStyleCode, setSupplierStyleCode] = useState(src?.supplierStyleCode ?? "");
+  const [supplierProductUrl, setSupplierProductUrl] = useState(src?.supplierProductUrl ?? src?.vendorProductUrl ?? "");
+  const [notes, setNotes] = useState(src?.notes ?? "");
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    const s = blank.sourcing;
+    setSupplier(s?.supplier ?? s?.vendor ?? blank.supplier ?? "");
+    setSupplierStyleCode(s?.supplierStyleCode ?? "");
+    setSupplierProductUrl(s?.supplierProductUrl ?? s?.vendorProductUrl ?? "");
+    setNotes(s?.notes ?? "");
+  }, [blank.blankId, blank.supplier, blank.sourcing]);
+  return (
+    <div className="space-y-4 max-w-lg">
+      <p className="text-sm text-gray-500">
+        Style-level supplier sourcing only. <strong>Retail price and garment cost</strong> are edited on <strong>Pricing / Weight</strong>. Per-color vendor SKUs belong on each <strong>variant</strong>.
+      </p>
+      <div>
+        <label className="block text-sm text-gray-600 mb-1">Supplier</label>
+        <input value={supplier} onChange={(e) => setSupplier(e.target.value)} className={BLANK_FIELD} />
+      </div>
+      <div>
+        <label className="block text-sm text-gray-600 mb-1">Supplier style code</label>
+        <input value={supplierStyleCode} onChange={(e) => setSupplierStyleCode(e.target.value)} className={BLANK_FIELD} />
+      </div>
+      <div>
+        <label className="block text-sm text-gray-600 mb-1">Supplier product URL</label>
+        <input value={supplierProductUrl} onChange={(e) => setSupplierProductUrl(e.target.value)} className={BLANK_FIELD} placeholder="https://" />
+      </div>
+      <div>
+        <label className="block text-sm text-gray-600 mb-1">Sourcing notes</label>
+        <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} className={BLANK_FIELD} />
+      </div>
+      <button
+        type="button"
+        disabled={saving}
+        onClick={async () => {
+          setSaving(true);
+          try {
+            await updateBlank({
+              blankId: blank.blankId,
+              sourcing: {
+                supplier: supplier.trim() || null,
+                supplierStyleCode: supplierStyleCode.trim() || null,
+                supplierProductUrl: supplierProductUrl.trim() || null,
+                notes: notes.trim() || null,
+              },
+            });
+            refetchBlank();
+            showToast("Sourcing updated", "success");
+          } finally {
+            setSaving(false);
+          }
+        }}
+        className="px-4 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+      >
+        {saving ? "Saving…" : "Save"}
+      </button>
+    </div>
+  );
+}
+
+function PlacementEditorSection({ blank, updateBlank, refetchBlank, showToast }: { blank: RPBlank; updateBlank: (i: UpdateBlankInput) => Promise<unknown>; refetchBlank: () => void; showToast: (m: string, t: "success" | "error") => void }) {
+  const is8394 = String(blank.styleCode || "").trim() === "8394";
+  return (
+    <div>
+      <p className="text-sm text-gray-500 mb-4">
+        <strong>Blank render profile</strong> — canonical zones stored on this style (<code className="text-xs">placements[]</code>
+        ). Tune position, scale, safe area, and per-zone blend for <code className="text-xs">flat_blended</code>. Not
+        product-level: generated products consume this + variant images + designs.
+      </p>
+      {is8394 && (
+        <p className="text-xs text-indigo-800 bg-indigo-50 border border-indigo-200 rounded-lg px-3 py-2 mb-4">
+          <strong>8394 workflow:</strong> Save here → open a product from{" "}
+          <Link href={`/blanks/${blank.blankId}?tab=linked`} className="underline font-medium">
+            Linked products
+          </Link>{" "}
+          → <strong>Generate flat renders</strong> on the product Overview to compare Flat Clean vs Flat Blended.
+        </p>
+      )}
+      <BlankRenderProfileEditor
+        blank={blank}
+        updateBlank={updateBlank}
+        refetchBlank={refetchBlank}
+        showToast={showToast}
+      />
+    </div>
+  );
+}
+
+function LinkedProductsSection({ blankId }: { blankId: string }) {
+  const [products, setProducts] = useState<(RpProduct & { id: string })[]>([]);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    if (!db || !blankId) return;
+    const q = collection(db, "rp_products");
+    const w = where("blankId", "==", blankId);
+    getDocs(query(q, w))
+      .then((snap) => setProducts(snap.docs.map((d) => ({ id: d.id, ...d.data() } as RpProduct & { id: string }))))
+      .catch(() => setProducts([]))
+      .finally(() => setLoading(false));
+  }, [blankId]);
+  if (loading) return <p className="text-sm text-gray-500">Loading…</p>;
+  return (
+    <div>
+      <p className="text-sm text-gray-500 mb-4">
+        Products generated from this blank. Color comes from the selected <strong>variant</strong> (per product), not from the master blank itself.
+      </p>
+      {products.length === 0 ? (
+        <p className="text-sm text-gray-500">No linked products.</p>
+      ) : (
+        <div className="border border-gray-200 rounded-lg overflow-x-auto">
+          <table className="min-w-full divide-y divide-gray-200 text-sm">
+            <thead className="bg-gray-50">
+              <tr>
+                <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Product</th>
+                <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Team</th>
+                <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Design</th>
+                <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Color (variant)</th>
+                <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Shopify</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-200 bg-white">
+              {products.map((p) => (
+                <tr key={p.id}>
+                  <td className="px-3 py-2">
+                    <Link href={`/products/${p.slug ?? p.id}`} className="text-blue-600 hover:underline font-medium">
+                      {p.title ?? p.name ?? p.slug ?? p.id}
+                    </Link>
+                  </td>
+                  <td className="px-3 py-2 text-gray-700">{p.teamCode ?? "—"}</td>
+                  <td className="px-3 py-2">
+                    {p.designId ? (
+                      <Link href={`/designs/${p.designId}`} className="text-blue-600 hover:underline">
+                        {p.designId}
+                      </Link>
+                    ) : (
+                      "—"
+                    )}
+                  </td>
+                  <td className="px-3 py-2">
+                    <span className="font-medium text-gray-900">{p.colorway?.name ?? "—"}</span>
+                    {p.blankVariantId && (
+                      <span className="block font-mono text-xs text-gray-500 mt-0.5">{p.blankVariantId}</span>
+                    )}
+                  </td>
+                  <td className="px-3 py-2">
+                    <span className="inline-flex px-2 py-0.5 text-xs rounded-full bg-gray-100 text-gray-800">{p.status ?? "—"}</span>
+                  </td>
+                  <td className="px-3 py-2 text-gray-700">{p.shopify?.status ?? "not_synced"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function BlankDetailContent() {
   const params = useParams();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const blankId = params.blankId as string;
   const { user } = useAuth();
 
@@ -24,8 +465,37 @@ function BlankDetailContent() {
   const { updateBlank } = useUpdateBlank();
   const { deleteBlank } = useDeleteBlank();
 
-  // Tab state
-  const [activeTab, setActiveTab] = useState<"overview" | "images" | "placements" | "masks">("overview");
+  type BlankTab =
+    | "overview"
+    | "variants"
+    | "images"
+    | "renderProfile"
+    | "rendering"
+    | "shopify"
+    | "templates"
+    | "pricing"
+    | "sourcing"
+    | "eligibility"
+    | "linked";
+  const [activeTab, setActiveTab] = useState<BlankTab>("overview");
+
+  useEffect(() => {
+    const t = searchParams.get("tab");
+    if (!t) return;
+    if (t === "renderProfile" || t === "placement") setActiveTab("renderProfile");
+    else if (t === "linked") setActiveTab("linked");
+    else if (t === "variants") setActiveTab("variants");
+    else if (t === "images") {
+      if (blank && isMasterBlank(blank)) setActiveTab("variants");
+      else setActiveTab("images");
+    } else if (t === "rendering") setActiveTab("rendering");
+  }, [searchParams, blank]);
+
+  // Master blanks use per-variant images only — never stay on Images / Views tab
+  useEffect(() => {
+    if (!blank || !isMasterBlank(blank) || activeTab !== "images") return;
+    setActiveTab("variants");
+  }, [blank, activeTab]);
 
   // Toast state
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
@@ -35,6 +505,11 @@ function BlankDetailContent() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [currentUploadView, setCurrentUploadView] = useState<"front" | "back">("front");
 
+  // Linked products (for delete/archive behavior)
+  const [linkedProductCount, setLinkedProductCount] = useState(0);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
   // Mask state
   const [masks, setMasks] = useState<{ front: RPBlankMask | null; back: RPBlankMask | null }>({ front: null, back: null });
   const [masksLoading, setMasksLoading] = useState(true);
@@ -43,6 +518,14 @@ function BlankDetailContent() {
   const maskFileInputRef = useRef<HTMLInputElement>(null);
   const [currentMaskUploadView, setCurrentMaskUploadView] = useState<"front" | "back">("front");
   const [autoGenerating, setAutoGenerating] = useState<"front" | "back" | null>(null);
+
+  // Fetch linked products count
+  useEffect(() => {
+    if (!db || !blankId) return;
+    getDocs(query(collection(db, "rp_products"), where("blankId", "==", blankId)))
+      .then((snap) => setLinkedProductCount(snap.size))
+      .catch(() => setLinkedProductCount(0));
+  }, [blankId]);
 
   // Fetch masks
   useEffect(() => {
@@ -280,22 +763,26 @@ function BlankDetailContent() {
     }
   };
 
-  const handleDelete = async () => {
-    if (!blank?.blankId) return;
-    if (!confirm("Are you sure you want to delete this blank? It will be archived if referenced by products.")) return;
+  const handleDeleteClick = () => {
+    if (linkedProductCount > 0) return;
+    setDeleteConfirmOpen(true);
+  };
 
+  const handleDeleteConfirm = async () => {
+    if (!blank?.blankId) return;
+    setDeleting(true);
     try {
       const result = await deleteBlank(blank.blankId);
       if (result.action === "deleted") {
         showToast("Blank deleted", "success");
+        setDeleteConfirmOpen(false);
         router.push("/blanks");
-      } else {
-        showToast(`Blank archived (${result.reason})`, "success");
-        refetchBlank();
       }
     } catch (err: any) {
       console.error("[BlankDetail] Failed to delete blank:", err);
-      showToast("Failed to delete blank", "error");
+      showToast(err?.message || "Failed to delete blank", "error");
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -434,6 +921,36 @@ function BlankDetailContent() {
         </div>
       )}
 
+      {/* Delete confirmation modal */}
+      {deleteConfirmOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" role="dialog" aria-modal="true" aria-labelledby="delete-modal-title">
+          <div className="bg-white rounded-lg shadow-xl max-w-sm w-full mx-4 p-6">
+            <h2 id="delete-modal-title" className="text-lg font-semibold text-gray-900 mb-2">Delete blank permanently?</h2>
+            <p className="text-sm text-gray-600 mb-4">
+              This cannot be undone. The blank will be removed from the system.
+            </p>
+            <div className="flex gap-3 justify-end">
+              <button
+                type="button"
+                onClick={() => setDeleteConfirmOpen(false)}
+                disabled={deleting}
+                className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleDeleteConfirm}
+                disabled={deleting}
+                className="px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-lg hover:bg-red-700 disabled:opacity-50"
+              >
+                {deleting ? "Deleting…" : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="max-w-5xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
         {/* Breadcrumb */}
         <div className="mb-4">
@@ -463,67 +980,62 @@ function BlankDetailContent() {
                 </span>
               </div>
               <p className="text-sm text-gray-500 mt-1">
-                {blank.supplier} • {blank.garmentCategory} • {blank.colorName}
+                {blank.supplier} • {getEffectiveCategory(blank) || blank.garmentCategory}
+                {isMasterBlank(blank) ? ` • ${countActiveVariants(blank)} variant(s)` : blank.colorName ? ` • ${blank.colorName}` : ""}
               </p>
+              {isMasterBlank(blank) && (
+                <p className="text-xs text-gray-500 mt-1">Colors are defined per variant.</p>
+              )}
               <p className="text-xs text-gray-400 mt-1 font-mono">{blank.slug}</p>
             </div>
-            <div className="flex items-center gap-2">
-              <div
-                className="w-10 h-10 rounded-lg border border-gray-300"
-                style={{ backgroundColor: blank.colorHex || COLOR_REGISTRY[blank.colorName] || "#ccc" }}
-                title={blank.colorName}
-              />
-            </div>
+            {!isMasterBlank(blank) && blank.colorName && (
+              <div className="flex items-center gap-2">
+                <div
+                  className="w-10 h-10 rounded-lg border border-gray-300"
+                  style={{ backgroundColor: blank.colorHex || COLOR_REGISTRY[blank.colorName as keyof typeof COLOR_REGISTRY] || "#ccc" }}
+                  title={String(blank.colorName)}
+                />
+              </div>
+            )}
           </div>
         </div>
 
         {/* Tabs */}
         <div className="bg-white border border-gray-200 rounded-lg">
-          <div className="border-b border-gray-200">
-            <nav className="flex -mb-px">
-              <button
-                onClick={() => setActiveTab("overview")}
-                className={`px-6 py-3 text-sm font-medium border-b-2 ${
-                  activeTab === "overview"
-                    ? "border-blue-600 text-blue-600"
-                    : "border-transparent text-gray-500 hover:text-gray-700"
-                }`}
-              >
-                Overview
-              </button>
-              <button
-                onClick={() => setActiveTab("images")}
-                className={`px-6 py-3 text-sm font-medium border-b-2 ${
-                  activeTab === "images"
-                    ? "border-blue-600 text-blue-600"
-                    : "border-transparent text-gray-500 hover:text-gray-700"
-                }`}
-              >
-                Images
-              </button>
-              <button
-                onClick={() => setActiveTab("placements")}
-                className={`px-6 py-3 text-sm font-medium border-b-2 ${
-                  activeTab === "placements"
-                    ? "border-blue-600 text-blue-600"
-                    : "border-transparent text-gray-500 hover:text-gray-700"
-                }`}
-              >
-                Placements
-              </button>
-              <button
-                onClick={() => setActiveTab("masks")}
-                className={`px-6 py-3 text-sm font-medium border-b-2 ${
-                  activeTab === "masks"
-                    ? "border-blue-600 text-blue-600"
-                    : "border-transparent text-gray-500 hover:text-gray-700"
-                }`}
-              >
-                Masks
-                {(masks.front || masks.back) && (
-                  <span className="ml-2 inline-flex items-center justify-center w-2 h-2 bg-green-500 rounded-full" />
-                )}
-              </button>
+          <div className="border-b border-gray-200 overflow-x-auto">
+            <nav className="flex -mb-px min-w-max">
+              {(
+                [
+                  ["overview", "Overview"],
+                  ["variants", "Variants"],
+                  ["images", "Images / Views"],
+                  ["renderProfile", "Render profile"],
+                  ["rendering", "Rendering"],
+                  ["shopify", "Shopify Defaults"],
+                  ["templates", "Templates"],
+                  ["pricing", "Pricing / Weight"],
+                  ["sourcing", "Sourcing"],
+                  ["eligibility", "Eligibility"],
+                  ["linked", "Linked Products"],
+                ] as const
+              )
+                .filter(([key]) => key !== "images" || !isMasterBlank(blank))
+                .map(([key, label]) => (
+                <button
+                  key={key}
+                  onClick={() => setActiveTab(key)}
+                  className={`px-4 py-3 text-sm font-medium border-b-2 whitespace-nowrap ${
+                    activeTab === key
+                      ? "border-blue-600 text-blue-600"
+                      : "border-transparent text-gray-500 hover:text-gray-700"
+                  }`}
+                >
+                  {label}
+                  {key === "rendering" && (masks.front || masks.back) && (
+                    <span className="ml-1.5 inline-flex items-center justify-center w-2 h-2 bg-green-500 rounded-full" />
+                  )}
+                </button>
+              ))}
             </nav>
           </div>
 
@@ -531,6 +1043,10 @@ function BlankDetailContent() {
             {/* Overview Tab */}
             {activeTab === "overview" && (
               <div className="space-y-6">
+                <p className="text-sm text-gray-500">
+                  This blank is the base for products. Set defaults and templates in the tabs below so new products inherit them.
+                  {isMasterBlank(blank) && " Master blank = style level; colors and variant images are set per variant."}
+                </p>
                 <div className="grid grid-cols-2 gap-6">
                   <div>
                     <h3 className="text-sm font-semibold text-gray-900 mb-3">
@@ -551,42 +1067,71 @@ function BlankDetailContent() {
                       </div>
                       <div className="flex justify-between">
                         <dt className="text-sm text-gray-500">Category</dt>
-                        <dd className="text-sm text-gray-900 capitalize">{blank.garmentCategory}</dd>
+                        <dd className="text-sm text-gray-900 capitalize">{getEffectiveCategory(blank) || blank.garmentCategory || "—"}</dd>
                       </div>
                       <div className="flex justify-between">
-                        <dt className="text-sm text-gray-500">Supplier URL</dt>
-                        <dd className="text-sm">
-                          <a 
-                            href={blank.supplierUrl} 
-                            target="_blank" 
-                            rel="noopener noreferrer"
-                            className="text-blue-600 hover:underline"
-                          >
-                            View on LA Apparel
-                          </a>
-                        </dd>
+                        <dt className="text-sm text-gray-500">Variants</dt>
+                        <dd className="text-sm text-gray-900">{countActiveVariants(blank)} active</dd>
                       </div>
+                      <div className="flex justify-between">
+                        <dt className="text-sm text-gray-500">Linked products</dt>
+                        <dd className="text-sm text-gray-900">{linkedProductCount}</dd>
+                      </div>
+                      {blank.supplierUrl && (
+                        <div className="flex justify-between">
+                          <dt className="text-sm text-gray-500">Supplier URL</dt>
+                          <dd className="text-sm">
+                            <a href={blank.supplierUrl} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
+                              Open supplier
+                            </a>
+                          </dd>
+                        </div>
+                      )}
                     </dl>
                   </div>
 
                   <div>
-                    <h3 className="text-sm font-semibold text-gray-900 mb-3">
-                      Colorway
-                    </h3>
-                    <div className="flex items-center gap-3 mb-4">
-                      <div
-                        className="w-16 h-16 rounded-lg border border-gray-300"
-                        style={{ backgroundColor: blank.colorHex || COLOR_REGISTRY[blank.colorName] || "#ccc" }}
-                      />
-                      <div>
-                        <p className="text-sm font-medium text-gray-900">
-                          {blank.colorName}
+                    {isMasterBlank(blank) ? (
+                      <div className="mb-4">
+                        <h3 className="text-sm font-semibold text-gray-900 mb-2">Master blank</h3>
+                        <p className="text-sm text-gray-600">
+                          Colors and color families are defined per <strong>variant</strong> on the Variants tab. Product images for each color
+                          live on variants, not here.
                         </p>
-                        <p className="text-xs text-gray-500 font-mono">
-                          {blank.colorHex || COLOR_REGISTRY[blank.colorName]}
-                        </p>
+                        {blank.schemaVersion === 2 && (
+                          <p className="text-xs text-gray-400 mt-2">schemaVersion: 2</p>
+                        )}
                       </div>
-                    </div>
+                    ) : (
+                      <>
+                        <h3 className="text-sm font-semibold text-gray-900 mb-3">Legacy colorway</h3>
+                        <div className="flex items-center gap-3 mb-4">
+                          <div
+                            className="w-16 h-16 rounded-lg border border-gray-300"
+                            style={{
+                              backgroundColor:
+                                blank.colorHex || COLOR_REGISTRY[blank.colorName as keyof typeof COLOR_REGISTRY] || "#ccc",
+                            }}
+                          />
+                          <div>
+                            <p className="text-sm font-medium text-gray-900">{blank.colorName || "—"}</p>
+                            <p className="text-xs text-gray-500 font-mono">
+                              {blank.colorHex || (blank.colorName && COLOR_REGISTRY[blank.colorName as keyof typeof COLOR_REGISTRY])}
+                            </p>
+                          </div>
+                        </div>
+                        <h3 className="text-sm font-semibold text-gray-900 mb-2 mt-4">Color family</h3>
+                        <p className="text-xs text-gray-500 mb-2">Legacy: single color on document.</p>
+                        <ColorFamilyField
+                          blank={blank}
+                          onSave={async (colorFamily: RPBlankColorFamily | null) => {
+                            await updateBlank({ blankId: blank.blankId, colorFamily });
+                            refetchBlank();
+                            showToast("Color family updated", "success");
+                          }}
+                        />
+                      </>
+                    )}
 
                     <h3 className="text-sm font-semibold text-gray-900 mb-3 mt-6">
                       Tags
@@ -605,10 +1150,14 @@ function BlankDetailContent() {
                   <h3 className="text-sm font-semibold text-gray-900 mb-3">
                     Status
                   </h3>
+                  <p className="text-xs text-gray-500 mb-2">
+                    Draft = still being configured; Active = available for product generation; Archived = no new generation, existing products unchanged.
+                  </p>
                   <div className="flex gap-2">
                     <button
                       onClick={() => handleStatusChange("draft")}
                       disabled={blank.status === "draft"}
+                      title="Not ready for product generation yet."
                       className={`px-4 py-2 rounded-lg text-sm font-medium ${
                         blank.status === "draft"
                           ? "bg-yellow-600 text-white"
@@ -620,6 +1169,7 @@ function BlankDetailContent() {
                     <button
                       onClick={() => handleStatusChange("active")}
                       disabled={blank.status === "active"}
+                      title="Available for new product generation."
                       className={`px-4 py-2 rounded-lg text-sm font-medium ${
                         blank.status === "active"
                           ? "bg-green-600 text-white"
@@ -631,6 +1181,7 @@ function BlankDetailContent() {
                     <button
                       onClick={() => handleStatusChange("archived")}
                       disabled={blank.status === "archived"}
+                      title="Stops future product generation. Existing products remain unchanged."
                       className={`px-4 py-2 rounded-lg text-sm font-medium ${
                         blank.status === "archived"
                           ? "bg-gray-600 text-white"
@@ -646,9 +1197,18 @@ function BlankDetailContent() {
                   <h3 className="text-sm font-semibold text-gray-900 mb-3">
                     Danger Zone
                   </h3>
+                  <p className="text-xs text-gray-500 mb-2">
+                    Delete permanently removes this blank. Deletion is disabled once products use this blank.
+                  </p>
+                  {linkedProductCount > 0 && (
+                    <p className="text-sm text-amber-700 mb-2">
+                      This blank is used by {linkedProductCount} existing product{linkedProductCount !== 1 ? "s" : ""} and cannot be deleted. Archive it instead.
+                    </p>
+                  )}
                   <button
-                    onClick={handleDelete}
-                    className="px-4 py-2 rounded-lg text-sm font-medium bg-red-100 text-red-700 hover:bg-red-200"
+                    onClick={handleDeleteClick}
+                    disabled={linkedProductCount > 0}
+                    className="px-4 py-2 rounded-lg text-sm font-medium bg-red-100 text-red-700 hover:bg-red-200 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     Delete Blank
                   </button>
@@ -656,10 +1216,22 @@ function BlankDetailContent() {
               </div>
             )}
 
-            {/* Images Tab */}
-            {activeTab === "images" && (
+            {activeTab === "variants" && (
+              <BlankVariantsManager
+                blank={blank}
+                updateBlank={updateBlank}
+                refetchBlank={refetchBlank}
+                showToast={showToast}
+              />
+            )}
+
+            {/* Images Tab — legacy blanks only (master blanks: Images / Views tab hidden; use Variants → Edit) */}
+            {activeTab === "images" && !isMasterBlank(blank) && (
               <div>
-                <p className="text-sm text-gray-500 mb-4">
+                <div className="mb-4 p-3 bg-blue-50 border border-blue-100 rounded-lg text-sm text-blue-900">
+                  <strong>Legacy blank:</strong> one color per document — front/back images apply to this blank only.
+                </div>
+                <p className="text-sm text-gray-600 mb-4">
                   Upload clean flat-lay images. White or transparent background preferred.
                 </p>
 
@@ -775,76 +1347,47 @@ function BlankDetailContent() {
               </div>
             )}
 
-            {/* Placements Tab */}
-            {activeTab === "placements" && (
-              <div>
-                <p className="text-sm text-gray-500 mb-4">
-                  Default print placement configurations for this blank.
-                </p>
-
-                {blank.placements && blank.placements.length > 0 ? (
-                  <div className="border border-gray-200 rounded-lg overflow-hidden">
-                    <table className="min-w-full divide-y divide-gray-200">
-                      <thead className="bg-gray-50">
-                        <tr>
-                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">
-                            Placement
-                          </th>
-                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">
-                            Position (X, Y)
-                          </th>
-                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">
-                            Scale
-                          </th>
-                          <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase">
-                            Safe Area
-                          </th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-gray-200">
-                        {blank.placements.map((placement: any, i: number) => (
-                          <tr key={i}>
-                            <td className="px-4 py-3">
-                              <span className="text-sm font-medium text-gray-900">{placement.label}</span>
-                              <span className="text-xs text-gray-500 ml-2">({placement.placementId})</span>
-                            </td>
-                            <td className="px-4 py-3 text-sm text-gray-600 font-mono">
-                              {placement.defaultX?.toFixed(2)}, {placement.defaultY?.toFixed(2)}
-                            </td>
-                            <td className="px-4 py-3 text-sm text-gray-600 font-mono">
-                              {placement.defaultScale?.toFixed(2)}
-                            </td>
-                            <td className="px-4 py-3 text-sm text-gray-600 font-mono">
-                              {placement.safeArea ? 
-                                `${placement.safeArea.x?.toFixed(2)}, ${placement.safeArea.y?.toFixed(2)} (${placement.safeArea.w?.toFixed(2)} × ${placement.safeArea.h?.toFixed(2)})` 
-                                : "-"}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                ) : (
-                  <div className="bg-gray-50 border border-gray-200 rounded-lg p-8 text-center text-gray-500">
-                    No placements configured
-                  </div>
-                )}
-
-                <p className="text-xs text-gray-400 mt-4">
-                  Note: Placement editing is not available in MVP. Contact admin to modify.
-                </p>
-              </div>
+            {/* Render profile tab — canonical blank-level zones (placements[]) */}
+            {activeTab === "renderProfile" && (
+              <PlacementEditorSection
+                blank={blank}
+                updateBlank={updateBlank}
+                refetchBlank={refetchBlank}
+                showToast={showToast}
+              />
             )}
 
-            {/* Masks Tab */}
-            {activeTab === "masks" && (
-              <div>
-                <div className="mb-4">
-                  <p className="text-sm text-gray-500">
-                    Print region masks control which areas the AI can modify during the realism pass.
-                    White = editable (print area), Black = protected (garment + background).
+            {/* Rendering Tab (render defaults + masks) */}
+            {activeTab === "rendering" && (
+              <div className="space-y-8">
+                <div>
+                  <h3 className="text-sm font-semibold text-gray-900 mb-2">Render defaults</h3>
+                  <p className="text-sm text-gray-500 mb-4">
+                    Style-wide blend fallbacks when a zone does not set its own{" "}
+                    <code className="text-xs">renderZoneDefaults</code>. Tune per-zone blend on the{" "}
+                    <strong>Render profile</strong> tab. Variant <code className="text-xs">renderOverrides</code> still win
+                    at product time.
                   </p>
+                  <RenderDefaultsForm
+                    blank={blank}
+                    onSave={async (renderDefaults) => {
+                      await updateBlank({
+                        blankId: blank.blankId,
+                        renderDefaults: renderDefaults as RPBlankRenderDefaults,
+                      });
+                      refetchBlank();
+                      showToast("Render defaults updated", "success");
+                    }}
+                  />
                 </div>
+                <div className="border-t pt-6">
+                  <h3 className="text-sm font-semibold text-gray-900 mb-2">Masks</h3>
+                  <div className="mb-4">
+                    <p className="text-sm text-gray-500">
+                      Print region masks control which areas the AI can modify during the realism pass.
+                      White = editable (print area), Black = protected (garment + background).
+                    </p>
+                  </div>
 
                 {/* View Toggle */}
                 <div className="flex gap-2 mb-6">
@@ -1003,7 +1546,37 @@ function BlankDetailContent() {
                     Without masks, img2img is used on the full image.
                   </p>
                 </div>
+                </div>
               </div>
+            )}
+
+            {/* Shopify Defaults Tab */}
+            {activeTab === "shopify" && (
+              <ShopifyDefaultsSection blank={blank} updateBlank={updateBlank} refetchBlank={refetchBlank} showToast={showToast} />
+            )}
+            {/* Templates Tab */}
+            {activeTab === "templates" && (
+              <TemplatesSection blank={blank} updateBlank={updateBlank} refetchBlank={refetchBlank} showToast={showToast} />
+            )}
+            {/* Pricing / Weight Tab */}
+            {activeTab === "pricing" && (
+              <PricingWeightSection blank={blank} updateBlank={updateBlank} refetchBlank={refetchBlank} showToast={showToast} />
+            )}
+            {/* Sourcing Tab */}
+            {activeTab === "sourcing" && (
+              <SourcingCostSection blank={blank} updateBlank={updateBlank} refetchBlank={refetchBlank} showToast={showToast} />
+            )}
+            {activeTab === "eligibility" && (
+              <BlankEligibilityTab
+                blank={blank}
+                updateBlank={updateBlank}
+                refetchBlank={refetchBlank}
+                showToast={showToast}
+              />
+            )}
+            {/* Linked Products Tab */}
+            {activeTab === "linked" && (
+              <LinkedProductsSection blankId={blankId} />
             )}
           </div>
         </div>

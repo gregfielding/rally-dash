@@ -10,6 +10,8 @@ import {
   where,
   doc,
   getDoc,
+  deleteDoc,
+  writeBatch,
 } from "firebase/firestore";
 import { httpsCallable } from "firebase/functions";
 import { db, functions } from "@/lib/firebase/config";
@@ -18,6 +20,8 @@ import {
   DesignTeam,
   DesignColor,
   DesignStatus,
+  DesignDesignType,
+  type DesignThemeValue,
 } from "@/lib/types/firestore";
 
 // ============================================================================
@@ -35,8 +39,15 @@ export interface UseDesignsFilters {
 export interface CreateDesignInput {
   name: string;
   teamId: string;
+  designType: DesignDesignType;
+  /** Optional campaign / grouping (snake_case; normalized server-side too) */
+  designSeries?: string | null;
   colors: DesignColor[];
+  /** Internal-only */
+  internalNotes?: string;
+  /** @deprecated */
   tags?: string[];
+  /** @deprecated use internalNotes */
   description?: string;
 }
 
@@ -47,17 +58,35 @@ export interface UpdateDesignInput {
   colors?: DesignColor[];
   tags?: string[];
   description?: string;
+  internalNotes?: string | null;
+  designType?: DesignThemeValue | null;
+  leagueId?: string | null;
   /** Taxonomy (from rp_taxonomy_*). Pass null to clear. */
   sportCode?: string | null;
   leagueCode?: string | null;
   teamCode?: string | null;
   themeCode?: string | null;
   designFamily?: string | null;
+  /** Optional campaign / grouping (snake_case); null clears */
+  designSeries?: string | null;
+  /**
+   * Which garment sides this artwork applies to. `null` clears the field (default: infer from placement defaults / legacy both).
+   */
+  supportedSides?: string[] | null;
 }
 
 export interface UpdateDesignFileInput {
   designId: string;
-  kind: "png" | "pdf" | "svg";
+  kind:
+    | "png"
+    | "pdf"
+    | "svg"
+    | "lightPng"
+    | "darkPng"
+    | "lightSvg"
+    | "darkSvg"
+    | "lightPdf"
+    | "darkPdf";
   storagePath: string;
   downloadUrl: string;
   fileName: string;
@@ -108,8 +137,14 @@ async function fetchDesigns(filters: UseDesignsFilters = {}): Promise<DesignDoc[
         (d) =>
           d.name.toLowerCase().includes(searchLower) ||
           d.teamNameCache?.toLowerCase().includes(searchLower) ||
-          d.tags.some((t) => t.toLowerCase().includes(searchLower)) ||
-          d.searchKeywords?.some((k) => k.includes(searchLower))
+          (d.leagueId && String(d.leagueId).toLowerCase().includes(searchLower)) ||
+          (d.teamCityCache && String(d.teamCityCache).toLowerCase().includes(searchLower)) ||
+          (d.teamStateCache && String(d.teamStateCache).toLowerCase().includes(searchLower)) ||
+          (d.teamNicknameCache && String(d.teamNicknameCache).toLowerCase().includes(searchLower)) ||
+          (d.designType && String(d.designType).toLowerCase().includes(searchLower)) ||
+          (d.designSeries && String(d.designSeries).toLowerCase().includes(searchLower)) ||
+          d.searchKeywords?.some((k) => k.includes(searchLower)) ||
+          (d.tags || []).some((t) => t.toLowerCase().includes(searchLower))
       );
     }
 
@@ -216,7 +251,8 @@ export function useDesignTeams() {
 }
 
 /**
- * Hook for seeding design teams
+ * Callable `seedDesignTeams` (legacy sample MLB + extras). No longer exposed in the Designs UI — use
+ * `functions/scripts/seed-design-teams-phase1.js` for canonical Phase 1 data. Kept for scripts or one-off admin use.
  */
 export function useSeedDesignTeams() {
   const seedTeams = useCallback(async () => {
@@ -303,4 +339,37 @@ export function useUpdateDesignFile() {
   }, []);
 
   return { updateFile };
+}
+
+const FIRESTORE_BATCH_MAX = 450;
+
+/**
+ * Deletes `designs/{designId}` and all `links` subdocuments.
+ * Audit `logs/*` subdocs are not client-deletable per rules and may remain as orphans under the old path.
+ * Storage objects under `designs/...` are not removed here.
+ */
+export function useDeleteDesign() {
+  const deleteDesign = useCallback(async (designId: string) => {
+    if (!db) {
+      throw new Error("Firestore not initialized");
+    }
+    if (!designId?.trim()) {
+      throw new Error("designId is required");
+    }
+
+    const linksSnap = await getDocs(collection(db, "designs", designId, "links"));
+    const linkDocs = linksSnap.docs;
+    for (let i = 0; i < linkDocs.length; i += FIRESTORE_BATCH_MAX) {
+      const chunk = linkDocs.slice(i, i + FIRESTORE_BATCH_MAX);
+      const batch = writeBatch(db);
+      for (const d of chunk) {
+        batch.delete(d.ref);
+      }
+      await batch.commit();
+    }
+
+    await deleteDoc(doc(db, "designs", designId));
+  }, []);
+
+  return { deleteDesign };
 }

@@ -36,7 +36,7 @@ No Firestore rules changes are required for the current product flow.
 
 ## 4. After deploy – quick test
 
-1. Open a product that has **Design + Blank** (e.g. SF Giants Heather Grey).
+1. Open a product that has **Design + Blank** (e.g. San Francisco Giants Heather Grey).
 2. **Generate** tab → **Product Images** → click **Generate mockup**. Wait ~30–60 s (or until the product-only form appears).
 3. Select a product-only preset (e.g. Ecommerce Flat or Ecommerce White), click **Generate N product image(s)**.
 4. In **Assets**, you should see **one** new asset: the exact composite (heather grey + Giants print), no generic black panties.

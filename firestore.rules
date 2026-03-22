@@ -436,6 +436,13 @@ service cloud.firestore {
       allow update: if isAdmin() && hasRole('editor');
       allow delete: if isAdmin() && hasRole('admin');
     }
+
+    // Design System — league color libraries (Illustrator / future importers)
+    // Path: design_system/{leagueCode} e.g. design_system/MLB
+    match /design_system/{leagueCode} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
     
     // Deny all other collections
     match /{document=**} {

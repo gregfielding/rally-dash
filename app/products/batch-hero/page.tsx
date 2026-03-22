@@ -233,11 +233,11 @@ function BatchHeroContent() {
       <section className="bg-white rounded-lg shadow-sm border border-gray-200 p-4 mb-6">
         <h2 className="text-sm font-semibold text-gray-900 mb-2">Quick filters</h2>
         <div className="flex flex-wrap gap-4">
-          <label className="flex items-center gap-2 text-sm">
+          <label className="flex items-center gap-2 text-sm text-gray-900">
             <input type="checkbox" checked={filterMissingFront} onChange={(e) => setFilterMissingFront(e.target.checked)} className="rounded border-gray-300" />
             Missing hero front
           </label>
-          <label className="flex items-center gap-2 text-sm">
+          <label className="flex items-center gap-2 text-sm text-gray-900">
             <input type="checkbox" checked={filterMissingBack} onChange={(e) => setFilterMissingBack(e.target.checked)} className="rounded border-gray-300" />
             Missing hero back
           </label>

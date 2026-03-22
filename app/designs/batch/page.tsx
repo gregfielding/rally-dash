@@ -40,6 +40,7 @@ import { useTaxonomyLeagues, useTaxonomyEntities, useTaxonomyDesignFamilies } fr
 import { db, storage } from "@/lib/firebase/config";
 import { useAuth } from "@/lib/providers/AuthProvider";
 import type { DesignDoc } from "@/lib/types/firestore";
+import { getDesignPreviewUrl, resolveDesignAssets } from "@/lib/designs/designHelpers";
 
 type Step = "upload" | "preview";
 type ImportRowResult = { baseKey: string; action: "created" | "updated" | "skipped"; designId: string; error?: string; warnings?: string[] };
@@ -169,7 +170,10 @@ function BatchImportContent() {
     setImporting(true);
     setImportResults(null);
     const results: ImportRowResult[] = [];
-    const defaultColors = [{ hex: "#000000", name: "", role: "ink" as const }];
+    const defaultColors = [
+      { hex: "#111111", name: "Off Black", role: "standard_off_black" as const },
+      { hex: "#F5F5F5", name: "Off White", role: "standard_off_white" as const },
+    ];
     const leagues = taxonomyLeagues ?? [];
     const entities = taxonomyEntities ?? [];
     const designFamilies = taxonomyDesignFamilies ?? [];
@@ -237,7 +241,12 @@ function BatchImportContent() {
         } else {
           const teamId = resolveTeamId(parsed.team) ?? BATCH_IMPORT_TEAM_ID;
           const name = suggestedDesignName(parsed);
-          const { designId: newId } = await createDesign({ name, teamId, colors: defaultColors });
+          const { designId: newId } = await createDesign({
+            name,
+            teamId,
+            designType: "custom_one_off",
+            colors: defaultColors,
+          });
           designId = newId;
           for (const { file, ext } of rowFiles) {
             const storagePath = `designs/${designId}/${ext}/${file.name}`;
@@ -361,9 +370,9 @@ function BatchImportContent() {
           results.push({ baseKey, productId: "", action: "created", error: "Design not found" });
           continue;
         }
-        const design = designSnap.data() as DesignDoc & { files?: { png?: { downloadUrl?: string }; pdf?: { downloadUrl?: string } } };
-        const designPngUrl = design.files?.png?.downloadUrl ?? null;
-        const designPdfUrl = design.files?.pdf?.downloadUrl ?? null;
+        const design = { id: designSnap.id, ...designSnap.data() } as DesignDoc;
+        const designPngUrl = getDesignPreviewUrl(design) ?? null;
+        const designPdfUrl = resolveDesignAssets(design).pdf;
         if (!designPngUrl) {
           results.push({ baseKey, productId: "", action: "created", error: "Design missing PNG" });
           continue;
@@ -373,6 +382,7 @@ function BatchImportContent() {
         const q = query(productsRef, where("productIdentityKey", "==", identityKey));
         const existingSnap = await getDocs(q);
         const existingProduct = existingSnap.empty ? null : existingSnap.docs[0];
+        // For master blanks (schema v2), images/color should come from variant; this batch path uses root for legacy compatibility.
         const blankFrontUrl = blank.images?.front?.downloadUrl ?? "";
         const blankBackUrl = blank.images?.back?.downloadUrl ?? "";
 
@@ -382,6 +392,9 @@ function BatchImportContent() {
           `family:${parsed.designFamily.toLowerCase()}`,
           `variant:${parsed.variant.toLowerCase()}`,
         ];
+        if (design.designSeries && String(design.designSeries).trim()) {
+          tags.push(`series:${String(design.designSeries).trim().toLowerCase()}`);
+        }
         const renderSideConfig = (designId: string, designUrl: string, blankUrl: string, placementKey: string) => ({
           designAssetId: designId,
           designAssetUrl: designUrl,
@@ -421,11 +434,12 @@ function BatchImportContent() {
             baseProductKey: `DESIGN_${result.designId}_BLANK_${selectedBlankId}`,
             productIdentityKey: identityKey,
             generatedFromImportKey: baseKey,
-            colorway: { name: blank.colorName ?? "Default", hex: blank.colorHex ?? null },
+            colorway: { name: blank.colorName ?? "Default", hex: blank.colorHex ?? null }, // Legacy: for v2 master blanks, color should come from selected variant
             blankId: selectedBlankId,
             designId: result.designId,
             designIdFront: side === "FRONT" ? result.designId : null,
             designIdBack: side === "BACK" ? result.designId : null,
+            designSeries: design.designSeries ?? null,
             status: productStatus === "approved" ? "active" : "draft",
             tags,
             renderSetup,
