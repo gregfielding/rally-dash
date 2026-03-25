@@ -148,12 +148,20 @@ export interface RpTaxonomyDesignFamily {
   updatedAt?: Timestamp;
 }
 
-/** Optional display names resolved from taxonomy (e.g. for UI labels). */
+/**
+ * Optional display names + canonical codes mirrored from the product row (for UI labels).
+ * Codes (`teamId`, `themeCode`, `designFamily`) align with `rp_taxonomy_*` `code` fields.
+ */
 export interface RpTaxonomyDisplay {
   sportName?: string;
   leagueName?: string;
   teamName?: string;
   themeName?: string;
+  teamId?: string | null;
+  /** Alternate entity code key (some pipelines store entity here). */
+  teamCode?: string | null;
+  themeCode?: string | null;
+  designFamily?: string | null;
 }
 
 export interface Product {
@@ -788,23 +796,90 @@ export interface RpProductSceneRenderSlot {
 }
 
 /**
- * Lifestyle-style renders from flat mockups. MVP: `hanger` only.
+ * Lifestyle-style renders from flat mockups. `hanger` is the first shipped key; additional keys align with
+ * `generateProductSceneRender` `sceneKey` and `rp_blanks.generationDefaults.defaultSceneRenderKey`.
  */
 export interface RpProductSceneRendersMvp {
   hanger?: RpProductSceneRenderSlot | null;
+  [sceneKey: string]: RpProductSceneRenderSlot | null | undefined;
+}
+
+/** Phase-1 parent/variant model: top-level sellable product vs color variant under parent. */
+export type RpProductKind = "parent" | "variant";
+
+/**
+ * Cached variant row on parent (`variantSummary`) — not canonical for media; variants subcollection is.
+ */
+export interface RpProductVariantSummary {
+  variantId: string;
+  blankVariantId: string;
+  colorName: string;
+  colorHex?: string | null;
+  isDefault: boolean;
+}
+
+/** Parent-only cache for list/cards; variant `media` remains source of truth for PDP. */
+export interface RpProductDisplayMediaCache {
+  heroUrl?: string;
+  thumbUrl?: string;
+  /**
+   * Denormalized hint: which `rp_hero_templates` id produced `heroUrl` once hero pipeline exists (dormant until then).
+   * Cache only — not authoritative. Does not replace conceptual ownership / precedence on live documents.
+   */
+  heroTemplateId?: string | null;
 }
 
 export interface RpProduct {
   id?: string; // productId
+  /**
+   * App route segment (`/products/:slug`). Defaults to `handle` unless intentionally overridden.
+   * `handle` is the canonical storefront URL key (Shopify handle).
+   */
   slug: string; // for route /products/:slug
   name: string; // e.g. "San Francisco Giants Classic Black"
   description?: string;
 
+  /** Phase 1: `parent` = multi-variant product; omit on legacy single-SKU docs. */
+  productKind?: RpProductKind;
+  /** Bump when parent document shape changes. */
+  schemaVersion?: number;
+  /** Dedupe: league_team_design_blank (no variant segment). */
+  parentProductIdentityKey?: string | null;
+  teamId?: string | null;
+  /** Denormalized admin/debug; canonical source: design_teams + designs. */
+  teamName?: string | null;
+  designName?: string | null;
+  blankStyleCode?: string | null;
+  blankStyleName?: string | null;
+  /** Firestore id of default variant doc; phase 1: same as `heroVariantId`. */
+  defaultVariantId?: string | null;
+  /** Phase 1: must equal `defaultVariantId`. */
+  heroVariantId?: string | null;
+  variantSummary?: RpProductVariantSummary[];
+  variantCount?: number;
+  /** Cache only — not authoritative for PDP imagery. */
+  displayMedia?: RpProductDisplayMediaCache | null;
+
+  /**
+   * Rare explicit hero template override on the parent (future hero pipeline).
+   * Conceptual layer: Product. Precedence + fields: `lib/hero/resolveHeroTemplate.ts`. Variant-owned `media` stays canonical for PDP imagery.
+   */
+  heroTemplateId?: string | null;
+
+  /**
+   * Denormalized from `rp_blanks.garmentSizes` for UI / Shopify preview. Canonical source: the blank.
+   * Set on parent create and refreshed with merchandising. Does not create size variants (Color × Size is future work).
+   */
+  availableSizes?: RPBlankGarmentSizeCode[] | null;
+
   // Spec alignment (RALLY_FIRESTORE_AND_PRODUCT_PAGE_MAPPING): merchandising + Shopify
   title?: string; // display title; fallback: name
+  /** Canonical storefront URL key (Shopify handle); slug defaults to this unless overridden. */
   handle?: string; // URL handle; fallback: slug
   descriptionHtml?: string;
   descriptionText?: string;
+  /** Plain-text listing / card blurb; fully resolved at create (no template tokens). */
+  shortDescription?: string | null;
   seo?: { title?: string; description?: string };
   collectionKeys?: string[];
   brand?: string;
@@ -840,7 +915,8 @@ export interface RpProduct {
   designVersionUsed?: number | null;
   /** Traceability: importKey of the design row(s) this product was generated from (e.g. MLB_WILL_DROP_FOR_GIANTS_BACK_LIGHT). Set on create/update from batch import. */
   generatedFromImportKey?: string | null;
-  colorway: {
+  /** Legacy / single-SKU docs; parents may omit or use a neutral placeholder. */
+  colorway?: {
     name: string; // "Black"
     hex?: string; // "#000000"
   };
@@ -866,8 +942,9 @@ export interface RpProduct {
   mockupUrl?: string; // URL of generated mockup image (e.g. /products/{productId}/mockup.png)
 
   /**
-   * UI-only state (e.g. which modal is open). Do not use for persisted render configuration.
-   * Canonical render config lives in renderSetup.front / renderSetup.back.
+   * **Ephemeral UI state** (modals, transient picker URLs). Do not treat as persisted source of truth.
+   * Persisted asset selection belongs in `renderSetup`; placement geometry defaults on the blank (`rp_blanks.placements[]`);
+   * optional SKU-specific placement in `placementOverrides`.
    */
   renderConfig?: {
     renderSide?: "front" | "back";
@@ -881,9 +958,12 @@ export interface RpProduct {
   };
 
   /**
-   * Per-side **asset selection** (blank/design URLs) and **legacy** placement/blend fields.
-   * **Placement geometry defaults are owned by `rp_blanks.placements[]`;** use `placementOverrides` for explicit SKU overrides.
-   * @deprecated For new work: store overrides in `placementOverrides` / `renderOverrides` only; avoid duplicating blank defaults here.
+   * Per-side **asset selection** (blank/design URLs, `placementKey`) and **verification** metadata.
+   *
+   * **Hierarchy (see `lib/products/resolveProductRenderProfile.ts`):**
+   * - Blank `placements[]` + `renderDefaults` + variant `renderOverrides` = inherited defaults.
+   * - Product **`placementOverrides`** / **`renderOverrides`** = canonical structured overrides (prefer for new writes).
+   * - **`placementOverride`** / **`blendMode`** / **`blendOpacity`** on each side = **legacy** overrides; still read by the resolver for backward compatibility.
    */
   renderSetup?: {
     front?: {
@@ -916,6 +996,20 @@ export interface RpProduct {
     lastVerifiedAt?: Timestamp | null;
     lastVerifiedBy?: string | null;
   };
+
+  /**
+   * Optional structured **placement** overrides per garment side (SKU-specific).
+   * Omitted sides / omitted fields inherit from the blank placement row for `renderSetup.{side}.placementKey`.
+   * Prefer this over `renderSetup.*.placementOverride` for new persistence.
+   */
+  placementOverrides?: RpProductPlacementOverrides | null;
+
+  /**
+   * Optional structured **render (blend)** overrides per side.
+   * Applied after blank zone `renderZoneDefaults` and the color variant’s `renderOverrides`;
+   * wins over legacy `renderSetup.*.blendMode` / `blendOpacity` when set.
+   */
+  renderOverrides?: RpProductRenderOverrides | null;
 
   // AI Links (core)
   ai: {
@@ -991,6 +1085,54 @@ export interface RpProduct {
   // Inspiration Library
   inspirationIds?: string[];
 
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  createdBy: string;
+  updatedBy: string;
+}
+
+/**
+ * Variant document: `rp_products/{parentProductId}/variants/{variantId}`.
+ * Shopper-visible color-specific imagery lives here only (phase 1).
+ */
+export interface RpProductVariant {
+  id?: string;
+  productKind: "variant";
+  schemaVersion: number;
+  parentProductId: string;
+  /** Business identity: league_team_design_blank_variant (optional cross-reference). */
+  variantIdentityKey?: string | null;
+  blankVariantId: string;
+  designId: string;
+  blankId: string;
+  optionValues: { color?: string };
+  colorName: string;
+  colorHex?: string | null;
+  /** Nullable at create; required before Shopify sync readiness. */
+  sku?: string | null;
+  status: "active" | "archived";
+  shopify?: {
+    variantId?: string | null;
+    status?: "not_synced" | "queued" | "synced" | "error";
+    lastSyncAt?: Timestamp;
+    lastSyncError?: string;
+  };
+  mockupUrl?: string | null;
+  media?: RpProduct["media"];
+  flatRenders?: RpProductFlatRendersMvp | null;
+  sceneRenders?: RpProductSceneRendersMvp | null;
+  designIdFront?: string | null;
+  designIdBack?: string | null;
+  renderSetup?: RpProduct["renderSetup"];
+  renderConfig?: RpProduct["renderConfig"];
+  placementOverrides?: RpProductPlacementOverrides | null;
+  renderOverrides?: RpProductRenderOverrides | null;
+  pricing?: RpProduct["pricing"];
+  shipping?: RpProduct["shipping"];
+  blankVersionUsed?: number | null;
+  designVersionUsed?: number | null;
+  ai?: RpProduct["ai"];
+  counters?: RpProduct["counters"];
   createdAt: Timestamp;
   updatedAt: Timestamp;
   createdBy: string;
@@ -1176,6 +1318,67 @@ export interface RpScenePreset {
   updatedBy: string;
 }
 
+/**
+ * Reusable hero image templates (AI + deterministic). Collection: `rp_hero_templates/{templateId}`.
+ * Structural foundation only — dormant until hero generation is activated; fields are for future pipeline + eligibility.
+ * Conceptual ownership of *which* template applies: Blank (baseline) → Team (brand) → Design (campaign) → Product (rare explicit); see `lib/hero/resolveHeroTemplate.ts`.
+ */
+export type RpHeroTemplateCategory =
+  | "studio_clean"
+  | "flat_lay"
+  | "hanger"
+  | "folded"
+  | "lifestyle"
+  | "model";
+
+/**
+ * How the template is satisfied: catalog product render, deterministic scene composite, or on-model.
+ * `scene_only` = deterministic scene composite (e.g. hanger) without full AI product pipeline.
+ */
+export type RpHeroTemplateGenerationMode = "product_only" | "scene_only" | "on_model";
+
+/** How identity is chosen when the template needs a model. Extend as needed. */
+export type RpHeroIdentityPolicy = "inherit_default" | "explicit" | "none" | string;
+
+/** Cropping / safe-area hints for hero output. */
+export type RpHeroCropPolicy = "center" | "bottom_weighted" | "top_weighted" | "face_safe" | string;
+
+export interface RpHeroTemplate {
+  /** Firestore document id; usually equals `templateId`. */
+  id?: string;
+  /** Same as document id when stored in Firestore. */
+  templateId: string;
+  name: string;
+  slug: string;
+  isActive: boolean;
+  schemaVersion: number;
+  category: RpHeroTemplateCategory;
+  generationMode: RpHeroTemplateGenerationMode;
+  /** When `generationMode` includes deterministic scene step; aligns with `generateProductSceneRender` keys. */
+  sceneRenderKey?: string | null;
+  /** Optional link to `rp_scene_presets` for AI paths. */
+  presetId?: string | null;
+  identityPolicy?: RpHeroIdentityPolicy | null;
+  explicitIdentityId?: string | null;
+  /** e.g. "1:1", "4:5" */
+  aspectRatio?: string | null;
+  cropPolicy?: RpHeroCropPolicy | null;
+  allowedBlankStyleCodes?: string[] | null;
+  excludedBlankStyleCodes?: string[] | null;
+  allowedProductCategories?: RpProductCategory[] | null;
+  allowedLeagueCodes?: string[] | null;
+  allowedTeamIds?: string[] | null;
+  preferredView?: "front" | "back" | null;
+  requiresRenderedProductImage?: boolean;
+  requiresModelPipeline?: boolean;
+  promptTemplate?: string | null;
+  notes?: string | null;
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  createdBy: string;
+  updatedBy: string;
+}
+
 // 1.4 Generation Job (rp_generation_jobs/{jobId})
 export type RpJobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled" | "processing" | "completed";
 
@@ -1310,7 +1513,13 @@ export type RpAssetStatus = "draft" | "approved" | "published" | "rejected";
 
 export interface RpProductAsset {
   id?: string; // assetId
+  /** Parent `rp_products` id (same as `productId` for legacy; use for multi-variant products). */
   productId: string;
+  /** When set, ties asset to a color line under the parent product. */
+  parentProductId?: string;
+  blankVariantId?: string;
+  /** `rp_products/{parent}/variants/{variantDocId}` */
+  variantDocId?: string;
   jobId?: string; // NEW: reference to generation job
   designId?: string;
   presetId?: string;
@@ -1363,6 +1572,10 @@ export interface RpProductAsset {
 
   // Spec: hero slot assignment (product Detail Media section)
   heroSlot?: "hero_front" | "hero_back";
+  /** Garment side for packshots / mockups */
+  view?: "front" | "back";
+  /** Pipeline role for labels in the Assets tab (e.g. hero, front, back, blended) */
+  assetRole?: string;
 
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -1483,6 +1696,13 @@ export type RPBlankStatus = "draft" | "active" | "archived";
 /** Drives which Design asset the renderer uses (lightPng vs darkPng). Derive from colorName if missing. */
 export type RPBlankColorFamily = "light" | "dark";
 
+/**
+ * Letter sizes for apparel (blank-level). Phase 1: configure on `rp_blanks` only.
+ * Future: Shopify product variants can combine **Color** (from blank color variants) × **Size** (from this list)
+ * without renaming this field.
+ */
+export type RPBlankGarmentSizeCode = "XS" | "S" | "M" | "L" | "XL";
+
 export interface RPBlankShopifyDefaults {
   productType?: string | null;
   /** Shopify brand (display); prefer over vendor for new docs */
@@ -1491,6 +1711,11 @@ export interface RPBlankShopifyDefaults {
   vendor?: string | null;
   productCategory?: string | null;
   collectionHandles?: string[] | null;
+  /**
+   * Shopify option name for the size dimension when sync creates multi-option variants (e.g. Color × Size).
+   * Default at sync time: `"Size"` if unset. Does not create extra product rows in phase 1.
+   */
+  sizeOptionName?: string | null;
 }
 
 export interface RPBlankDefaultPricing {
@@ -1663,6 +1888,7 @@ export interface RPPlacementMaskConfig {
  * **Blank `placements[]` is canonical;** omit or null here to inherit blank defaults.
  * Presence = intentional deviation for this SKU only.
  */
+/** One side of `RpProduct.placementOverrides` — merged by `resolveEffectivePlacement`. */
 export interface RpProductPlacementOverrideSlice {
   defaultX?: number;
   defaultY?: number;
@@ -1670,21 +1896,24 @@ export interface RpProductPlacementOverrideSlice {
   safeArea?: { x?: number; y?: number; w?: number; h?: number };
 }
 
+/** `RpProduct.placementOverrides` — structured alternative to legacy `renderSetup.*.placementOverride`. */
 export interface RpProductPlacementOverrides {
   front?: RpProductPlacementOverrideSlice | null;
   back?: RpProductPlacementOverrideSlice | null;
 }
 
 /**
- * Optional product-level render (blend) override per side.
- * **Blank zone `renderZoneDefaults` + variant `renderOverrides` are canonical** unless overridden here.
+ * One side of `RpProduct.renderOverrides` — merged by `resolveEffectiveRenderSettings`
+ * after blank zone defaults and variant `renderOverrides`; ahead of legacy `renderSetup.*` blend fields.
  */
 export interface RpProductRenderOverrideSlice {
   blendMode?: string | null;
   blendOpacity?: number | null;
+  /** Optional UX hint; engines may ignore if they only read blendMode/blendOpacity. */
   renderStylePreset?: string | null;
 }
 
+/** `RpProduct.renderOverrides` — structured alternative to legacy `renderSetup.*.blendMode` / `blendOpacity`. */
 export interface RpProductRenderOverrides {
   front?: RpProductRenderOverrideSlice | null;
   back?: RpProductRenderOverrideSlice | null;
@@ -1757,6 +1986,12 @@ export interface RPBlank {
   // —— Master model: color variants ——
   variants?: RPBlankVariant[] | null;
 
+  /**
+   * Which garment sizes this style carries (master blank). Canonical for future **Size** Shopify option;
+   * generation still uses color-only `rp_products` variants until Color × Size is enabled app-wide.
+   */
+  garmentSizes?: RPBlankGarmentSizeCode[] | null;
+
   // —— Legacy only: single color + images at root (omit when using variants) ——
   colorName?: RPBlankColorName | string;
   colorHex?: string;
@@ -1809,6 +2044,31 @@ export interface RPBlank {
    * Available garment colors are defined only on `variants[]`, not here.
    */
   eligibility?: RPBlankEligibility | null;
+
+  /**
+   * Garment-format generation defaults (canonical over product-level strategy).
+   * Product page resolves: blank → team → design → central config.
+   */
+  generationDefaults?: RPBlankGenerationDefaults | null;
+}
+
+/** Blank-owned defaults for scene/preset resolution on the Product page. */
+export interface RPBlankGenerationDefaults {
+  /** Which side mockups / primary composite should prefer when not overridden. */
+  primaryView?: "front" | "back" | null;
+  productOnlyPresetId?: string | null;
+  onModelPresetId?: string | null;
+  allowedSceneTypes?: RpSceneType[] | null;
+  /** Deterministic scene composite key (e.g. hanger) for `generateProductSceneRender`. */
+  defaultSceneRenderKey?: string | null;
+  /**
+   * Future hero pipeline: allowlisted template ids for this blank (garment/format).
+   * When set, only these ids are eligible unless overridden upstream.
+   * **Do not use array order as a stable default** — `resolveHeroTemplateId` may use `[0]` only as a temporary stub until real selection rules exist.
+   */
+  allowedHeroTemplateIds?: string[] | null;
+  /** Baseline / default-capability hero template for this garment format when upstream layers do not override. */
+  preferredHeroTemplateId?: string | null;
 }
 
 // Legacy type aliases for backward compatibility
@@ -1852,7 +2112,35 @@ export interface DesignTeamColor {
   pantone?: string | null;
 }
 
-// Team document (teams/{teamId})
+/**
+ * One blank’s row in a team’s **Product Matrix** (explicit catalog allowlist).
+ * Stored under `DesignTeam.productCatalogMatrix[blankId]`.
+ * @see RALLY_TEAM_PRODUCT_MATRIX_SPEC.md
+ */
+export interface TeamCatalogBlankEntry {
+  /**
+   * When false, the blank is hidden from team-scaled generation for this team (keeps history without deleting variant picks).
+   * Default: treat as true when omitted.
+   */
+  enabled?: boolean | null;
+  /**
+   * Allowlisted `rp_blanks.variants[].variantId` values for this master blank.
+   * Empty array = blank offered but no colors approved yet (generation should skip or warn).
+   */
+  approvedVariantIds: string[];
+  updatedAt?: Timestamp | null;
+  updatedBy?: RPUserRef | string | null;
+}
+
+/** Team-level brand continuity for generation (default identity, on-model preset). */
+export interface DesignTeamGenerationDefaults {
+  defaultIdentityId?: string | null;
+  defaultOnModelPresetId?: string | null;
+  /** Future hero pipeline: brand-level preferred `rp_hero_templates` id (conceptual layer: Team). */
+  preferredHeroTemplateId?: string | null;
+}
+
+// Team document (design_teams/{teamId})
 export interface DesignTeam {
   id: string;                       // 'sf_giants'
   /** Full display name, e.g. "San Francisco Giants" */
@@ -1894,6 +2182,12 @@ export interface DesignTeam {
   /** Mirror of leagueId for templates/filters (e.g. MLB, NFL). */
   leagueCode?: string | null;
   /**
+   * Default model + on-model preset for generation when design does not override.
+   * Product page resolves: blank → **team** → design → config.
+   */
+  generationDefaults?: DesignTeamGenerationDefaults | null;
+
+  /**
    * MLB: hand-verified brand colors from `mlbVerifiedBrandColors.json` when `"verified"`.
    * Other leagues may omit or use future statuses (e.g. pending).
    */
@@ -1923,6 +2217,13 @@ export interface DesignTeam {
    * Default seed uses `[]`; do not bulk-import trademarked slogans without `type` + legal review.
    */
   fanPhrases?: DesignTeamFanPhrase[] | null;
+  /**
+   * **Team Product Matrix** — explicit catalog: which blanks and which variant SKUs this team may use
+   * for scalable generation (`Generate Team Products` and related flows).
+   * Keys are `rp_blanks.blankId`. Omitted blank = not in the team’s approved catalog for bulk flows.
+   * Orthogonal to `RPBlank.eligibility` (broad engine rules); bulk generation should require matrix membership.
+   */
+  productCatalogMatrix?: Record<string, TeamCatalogBlankEntry> | null;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -2008,8 +2309,31 @@ export interface DesignPlacementDefault {
   rotationDeg?: number;             // default 0
 }
 
+/** One garment side (front or back): light vs dark garment + production files. */
+export interface DesignGarmentSideFiles {
+  lightPng?: DesignFile;
+  darkPng?: DesignFile;
+  lightSvg?: DesignFile;
+  darkSvg?: DesignFile;
+  lightPdf?: DesignFile;
+  darkPdf?: DesignFile;
+}
+
+/** Light/dark garment URLs for a single print side (not ink colors). */
+export interface DesignGarmentSideAssetUrls {
+  lightPng?: string | null;
+  darkPng?: string | null;
+  lightSvg?: string | null;
+  darkSvg?: string | null;
+  lightPdf?: string | null;
+  darkPdf?: string | null;
+}
+
 /** Asset slots for reusable artwork (URLs live on DesignFile.downloadUrl) */
 export interface DesignFilesMap {
+  /** Side-aware files (preferred). When set, use with `supportedSides` / generation. */
+  front?: DesignGarmentSideFiles;
+  back?: DesignGarmentSideFiles;
   /** Light garment overlay PNG */
   lightPng?: DesignFile;
   /** Dark garment overlay PNG */
@@ -2041,24 +2365,27 @@ export interface DesignFilesMap {
 
 /**
  * Canonical asset URLs for rendering (light vs dark garment, not ink).
- * Prefer these for engine logic: e.g. garment.colorFamily === "dark" → assets.darkPng.
- * Kept in sync with `files` on write; readers may fall back to files.*.downloadUrl.
+ * Prefer `front` / `back` for side-aware designs; legacy flat fields remain for migration.
+ * Kept in sync with `files` on write; readers merge via `resolveDesignAssets` / `resolveDesignSideAssets`.
  */
 export interface DesignAssetsUrls {
-  lightPng: string | null;
-  darkPng: string | null;
-  lightSvg: string | null;
-  darkSvg: string | null;
+  front?: DesignGarmentSideAssetUrls | null;
+  back?: DesignGarmentSideAssetUrls | null;
+  /** @deprecated Legacy flat; migrate to front/back. When only legacy exists, readers map to a default side. */
+  lightPng?: string | null;
+  darkPng?: string | null;
+  lightSvg?: string | null;
+  darkSvg?: string | null;
   /**
    * @deprecated Aggregated / legacy single slot; prefer `lightSvg` + `darkSvg`.
    */
-  svg: string | null;
-  lightPdf: string | null;
-  darkPdf: string | null;
+  svg?: string | null;
+  lightPdf?: string | null;
+  darkPdf?: string | null;
   /**
    * @deprecated Aggregated / legacy single slot; prefer `lightPdf` + `darkPdf`.
    */
-  pdf: string | null;
+  pdf?: string | null;
 }
 
 // Design document (designs/{designId})
@@ -2102,8 +2429,12 @@ export interface DesignDoc {
   teamCode?: string | null;         // e.g. 'GIANTS'
   themeCode?: string | null;        // e.g. 'FUNNY_BASEBALL' for generic/humor designs
   taxonomy?: { sportName?: string; leagueName?: string; teamName?: string; themeName?: string } | null;
-  supportedSides?: string[];        // e.g. ['back']
-  variant?: string;                 // e.g. 'LIGHT'
+  /**
+   * Which garment sides this artwork may print on (front / back). Authoritative for generation
+   * when set (e.g. batch import derives from which side keys have assets). Firestore field name unchanged.
+   */
+  supportedSides?: string[];        // e.g. ['back'] or ['front','back']
+  variant?: string;                 // e.g. 'LIGHT' (batch garment tone; legacy)
 
   /**
    * Canonical download URLs for asset variants (garment context, not ink).
@@ -2145,6 +2476,21 @@ export interface DesignDoc {
   updatedAt: Timestamp;
   createdByUid: string;
   updatedByUid: string;
+
+  /**
+   * Optional campaign overrides for generation (preset / identity / hero template).
+   * Conceptual layer: Design — resolved after blank + team defaults; see `lib/hero/resolveHeroTemplate.ts` for hero precedence.
+   */
+  generationOverrides?: DesignGenerationOverrides | null;
+}
+
+/** Design-level overrides for Product page generation resolution. */
+export interface DesignGenerationOverrides {
+  productOnlyPresetId?: string | null;
+  onModelPresetId?: string | null;
+  identityId?: string | null;
+  /** Future hero pipeline: campaign-level `rp_hero_templates` id (conceptual layer: Design). */
+  heroTemplateId?: string | null;
 }
 
 // Design link (designs/{designId}/links/{linkId})

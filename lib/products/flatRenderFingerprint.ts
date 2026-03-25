@@ -7,10 +7,10 @@
  */
 
 import type { DesignDoc, RPBlank, RPBlankVariant, RPPlacement, RpProduct } from "@/lib/types/firestore";
-import { getEffectiveColorFamily } from "@/lib/blanks/colorFamily";
 import { getVariantById, isMasterBlank } from "@/lib/blanks";
 import { normalizeSimpleControls8394, derivePlacementEngineFields8394 } from "@/lib/blanks/simpleRenderControls8394";
-import { resolveDesignAssets } from "@/lib/designs/designHelpers";
+import { pickDesignPngUrlForVariant } from "@/lib/designs/designHelpers";
+export { pickDesignPngUrlForVariant };
 import { getBlankVersionValue, getDesignVersionValue } from "@/lib/products/staleness";
 import { DEFAULT_GARMENT_SAFE_AREA } from "@/lib/render/designArtboardSpec";
 import {
@@ -133,18 +133,6 @@ export function get8394DesignTreatmentFromPlacement(placementRow: RPPlacement | 
     contrastPercent: d.contrastPercent,
     realism: n.realism,
   };
-}
-
-export function pickDesignPngUrlForVariant(
-  design: DesignDoc,
-  variant: RPBlankVariant
-): { url: string | null; ref: "light" | "dark" } {
-  const fam = getEffectiveColorFamily(variant.colorFamily, variant.colorName);
-  const u = resolveDesignAssets(design);
-  if (fam === "dark") {
-    return { url: u.darkPng ?? u.lightPng, ref: u.darkPng ? "dark" : "light" };
-  }
-  return { url: u.lightPng ?? u.darkPng, ref: u.lightPng ? "light" : "dark" };
 }
 
 export function getVariantBackImageUrl(blank: RPBlank, variant: RPBlankVariant): string | null {

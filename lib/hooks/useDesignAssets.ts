@@ -23,6 +23,7 @@ import {
   DesignDesignType,
   type DesignThemeValue,
 } from "@/lib/types/firestore";
+import type { DesignFileKind } from "@/lib/designs/designAssetKinds";
 
 // ============================================================================
 // Types
@@ -77,16 +78,7 @@ export interface UpdateDesignInput {
 
 export interface UpdateDesignFileInput {
   designId: string;
-  kind:
-    | "png"
-    | "pdf"
-    | "svg"
-    | "lightPng"
-    | "darkPng"
-    | "lightSvg"
-    | "darkSvg"
-    | "lightPdf"
-    | "darkPdf";
+  kind: DesignFileKind;
   storagePath: string;
   downloadUrl: string;
   fileName: string;

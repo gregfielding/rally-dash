@@ -16,6 +16,7 @@ import type {
   RPPlacementId,
   RpProduct,
   RpProductPlacementOverrideSlice,
+  RpProductRenderOverrideSlice,
 } from "@/lib/types/firestore";
 import { DEFAULT_GARMENT_SAFE_AREA } from "@/lib/render/designArtboardSpec";
 import { normalizeSimpleControls8394, derivePlacementEngineFields8394 } from "@/lib/blanks/simpleRenderControls8394";
@@ -199,7 +200,7 @@ export function resolveEffectiveRenderSettings(
 
   let source: PlacementResolutionSource = "blank";
 
-  const ro = product?.renderOverrides?.[side];
+  const ro: RpProductRenderOverrideSlice | null | undefined = product?.renderOverrides?.[side];
   if (ro && (ro.blendMode != null || ro.blendOpacity != null)) {
     if (ro.blendMode != null && String(ro.blendMode).trim()) {
       modeRaw = ro.blendMode;

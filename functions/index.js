@@ -26,8 +26,9 @@ const db = admin.firestore();
 const storage = admin.storage();
 
 const shopifySync = require("./shopifySync");
-const { generateProductTags } = require("./lib/productTags");
-const { resolveBlankTemplates } = require("./lib/resolveBlankTemplates");
+const { resolveBlankTemplates, stripUnresolvedTemplateArtifacts } = require("./lib/resolveBlankTemplates");
+const merchandisingAtCreate = require("./lib/merchandisingAtCreate");
+const runCreateProductFromDesignBlankCore = require("./lib/runCreateProductFromDesignBlankCore");
 const { createRegisterGenerateProductFlatRenders } = require("./lib/productFlatRenderMvp");
 const { createRegisterGenerateProductSceneRender } = require("./lib/productSceneRenderMvp");
 const { normalizeColorsForFirestore } = require("./lib/standardPrintInks");
@@ -1609,7 +1610,8 @@ function resolvePromptTemplate(template, context) {
 }
 
 /**
- * Create a new product
+ * Legacy single-doc product creation — **disabled**.
+ * All new products must use `createProductFromDesignBlank` (parent + variants).
  */
 exports.createProduct = functions.https.onCall(async (data, context) => {
   if (!context.auth) {
@@ -1618,106 +1620,72 @@ exports.createProduct = functions.https.onCall(async (data, context) => {
       "User must be authenticated"
     );
   }
-
-  const {
-    name,
-    description,
-    category,
-    baseProductKey,
-    colorway,
-    supplier,
-    ai,
-    tags,
-    blankId, // Optional: reference to rp_blanks
-  } = data || {};
-
-  if (!name || !category || !baseProductKey || !colorway?.name) {
-    throw new functions.https.HttpsError(
-      "invalid-argument",
-      "name, category, baseProductKey, and colorway.name are required"
-    );
-  }
-
-  // If blankId is provided, verify it exists
-  if (blankId) {
-    const blankRef = db.collection("rp_blanks").doc(blankId);
-    const blankSnap = await blankRef.get();
-    if (!blankSnap.exists) {
-      throw new functions.https.HttpsError("not-found", `Blank not found: ${blankId}`);
-    }
-  }
-
-  console.log("[createProduct] Creating product:", { name, baseProductKey, blankId });
-
-  // Generate slug
-  const slug = generateSlug(name);
-  
-  // Check if slug already exists
-  const existing = await db
-    .collection("rp_products")
-    .where("slug", "==", slug)
-    .get();
-  
-  if (!existing.empty) {
-    throw new functions.https.HttpsError(
-      "already-exists",
-      `Product with slug "${slug}" already exists`
-    );
-  }
-
-  const now = admin.firestore.FieldValue.serverTimestamp();
-  const userId = context.auth.uid;
-
-  const productData = {
-    slug,
-    name,
-    description: description || null,
-    category,
-    baseProductKey,
-    colorway: {
-      name: colorway.name,
-      hex: colorway.hex || null,
-    },
-    supplier: supplier || null,
-    blankId: blankId || null, // Reference to rp_blanks
-    ai: {
-      productArtifactId: ai?.productArtifactId || null,
-      productTrigger: ai?.productTrigger || null,
-      productRecommendedScale: ai?.productRecommendedScale || null,
-      blankTemplateId: ai?.blankTemplateId || null, // Deprecated: use blankId instead
-    },
-    status: "draft",
-    tags: tags || [],
-    counters: {
-      assetsTotal: 0,
-      assetsApproved: 0,
-      assetsPublished: 0,
-    },
-    createdAt: now,
-    updatedAt: now,
-    createdBy: userId,
-    updatedBy: userId,
-  };
-
-  // Filter out undefined values
-  const sanitized = Object.fromEntries(
-    Object.entries(productData).filter(([_, value]) => value !== undefined)
+  console.warn("[createProduct] Blocked legacy call from uid:", context.auth.uid);
+  throw new functions.https.HttpsError(
+    "failed-precondition",
+    "Legacy product creation is disabled. Use Products → Create from Design + Blank or Generate Team Products to create a parent product and color variants."
   );
-
-  const productRef = await db.collection("rp_products").add(sanitized);
-
-  console.log("[createProduct] Created product:", productRef.id);
-
-  return {
-    ok: true,
-    productId: productRef.id,
-    slug,
-  };
 });
 
 /**
+ * Initialize renderSetup so mockup generation does not require manual "Set design".
+ * LA Apparel 8394: catalog print is back-only — front is blank only, back carries the design.
+ */
+function buildInitialRenderSetupForProduct({ design, blank, variantRow, designId }) {
+  const designPngUrl = designPngUrlForProcessing(design);
+  const frontBlankUrl =
+    (variantRow.images && variantRow.images.front && variantRow.images.front.downloadUrl) ||
+    (blank.images && blank.images.front && blank.images.front.downloadUrl) ||
+    null;
+  const backBlankUrl =
+    (variantRow.images && variantRow.images.back && variantRow.images.back.downloadUrl) ||
+    (blank.images && blank.images.back && blank.images.back.downloadUrl) ||
+    null;
+  const styleCode = String(blank.styleCode || "").trim();
+  const is8394BackOnly = styleCode === "8394";
+
+  if (!designPngUrl) {
+    return {
+      designIdFront: null,
+      designIdBack: designId,
+      renderSetup: null,
+      renderConfig: null,
+    };
+  }
+
+  return {
+    designIdFront: is8394BackOnly ? null : designId,
+    designIdBack: designId,
+    renderSetup: {
+      defaults: {
+        blankId: blank.blankId,
+        designIdFront: is8394BackOnly ? null : designId,
+        designIdBack: designId,
+      },
+      front: {
+        blankImageUrl: frontBlankUrl,
+        designAssetId: is8394BackOnly ? null : designId,
+        designAssetUrl: is8394BackOnly ? null : designPngUrl,
+        placementKey: "front_center",
+      },
+      back: {
+        blankImageUrl: backBlankUrl,
+        designAssetId: designId,
+        designAssetUrl: designPngUrl,
+        placementKey: "back_center",
+      },
+    },
+    renderConfig: {
+      renderSide: is8394BackOnly ? "back" : "front",
+      selectedBlankId: blank.blankId,
+    },
+  };
+}
+
+/**
  * Create a product from Design + Blank (product-first workflow).
- * Creates minimal rp_products record; mockup is generated via createMockJob with productId.
+ * Phase 1: one parent `rp_products` row per team+design+blank; color variants live in
+ * `rp_products/{parentId}/variants/{variantId}`. Legacy single-doc products use `productIdentityKey` only.
  */
 exports.createProductFromDesignBlank = functions.https.onCall(async (data, context) => {
   if (!context.auth) {
@@ -1732,33 +1700,168 @@ exports.createProductFromDesignBlank = functions.https.onCall(async (data, conte
     throw new functions.https.HttpsError("invalid-argument", "blankId is required");
   }
 
+  return runCreateProductFromDesignBlankCore({
+    db,
+    admin,
+    functions,
+    designPngUrlForProcessing,
+    buildInitialRenderSetupForProduct,
+    resolveBlankVariantForProduct,
+    buildProductIdentityKey,
+    buildParentProductIdentityKey,
+    MASTER_BLANK_SCHEMA_VERSION,
+    sanitizeForFirestore,
+    deriveAvailableSizesFromBlank,
+    merchandisingAtCreate,
+    resolveBlankTemplates,
+    designId,
+    blankId,
+    blankVariantId,
+    userId: context.auth.uid,
+  });
+});
+
+/**
+ * Create many color variants for one design + blank in a **single** function invocation.
+ * Ensures one parent `rp_products` doc and N subdocs under `variants/` (no per-call cold starts;
+ * parent is visible to subsequent iterations). Prefer this for Generate Team Products.
+ */
+exports.createProductVariantsFromDesignBlank = functions.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
+  }
+
+  const { designId, blankId, blankVariantIds } = data || {};
+  if (!designId || typeof designId !== "string") {
+    throw new functions.https.HttpsError("invalid-argument", "designId is required");
+  }
+  if (!blankId || typeof blankId !== "string") {
+    throw new functions.https.HttpsError("invalid-argument", "blankId is required");
+  }
+  if (!Array.isArray(blankVariantIds) || blankVariantIds.length === 0) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      "blankVariantIds must be a non-empty array of variant ids"
+    );
+  }
+  if (blankVariantIds.length > 48) {
+    throw new functions.https.HttpsError("invalid-argument", "Too many variants (max 48 per request)");
+  }
+
+  const uid = context.auth.uid;
+  const uniqueIds = [...new Set(blankVariantIds.map((x) => String(x || "").trim()).filter(Boolean))];
+  if (uniqueIds.length === 0) {
+    throw new functions.https.HttpsError("invalid-argument", "No valid blankVariantIds after dedupe");
+  }
+
+  const results = [];
+  const errors = [];
+  let lastProductId = null;
+  let lastSlug = null;
+
+  for (const blankVariantId of uniqueIds) {
+    try {
+      const out = await runCreateProductFromDesignBlankCore({
+        db,
+        admin,
+        functions,
+        designPngUrlForProcessing,
+        buildInitialRenderSetupForProduct,
+        resolveBlankVariantForProduct,
+        buildProductIdentityKey,
+        buildParentProductIdentityKey,
+        MASTER_BLANK_SCHEMA_VERSION,
+        sanitizeForFirestore,
+        deriveAvailableSizesFromBlank,
+        merchandisingAtCreate,
+        resolveBlankTemplates,
+        designId,
+        blankId,
+        blankVariantId,
+        userId: uid,
+      });
+      lastProductId = out.productId;
+      lastSlug = out.slug;
+      results.push({
+        blankVariantId,
+        variantFirestoreId: out.variantId,
+        productId: out.productId,
+        slug: out.slug,
+        created: true,
+      });
+    } catch (e) {
+      if (e instanceof functions.https.HttpsError && e.code === "already-exists") {
+        const det = e.details && typeof e.details === "object" ? e.details : {};
+        const pid = det.productId || lastProductId;
+        const slug = det.slug || lastSlug;
+        if (pid) lastProductId = pid;
+        if (slug) lastSlug = slug;
+        results.push({
+          blankVariantId,
+          created: false,
+          skipped: true,
+          productId: pid || null,
+          slug: slug || null,
+          message: e.message,
+        });
+      } else {
+        const msg = e instanceof Error ? e.message : String(e);
+        errors.push({ blankVariantId, message: msg });
+      }
+    }
+  }
+
+  if (results.length === 0 && errors.length > 0) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      errors.map((x) => `${x.blankVariantId}: ${x.message}`).join(" | ")
+    );
+  }
+
+  return {
+    ok: true,
+    productId: lastProductId,
+    slug: lastSlug,
+    results,
+    errors: errors.length ? errors : undefined,
+  };
+});
+
+/**
+ * Recompute merchandising fields from linked design + blank + team (same rules as createProductFromDesignBlank).
+ * Use to repair legacy products or after taxonomy/design updates.
+ */
+exports.refreshProductMerchandisingFromSources = functions.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
+  }
+  const { productId } = data || {};
+  if (!productId || typeof productId !== "string") {
+    throw new functions.https.HttpsError("invalid-argument", "productId is required");
+  }
+
+  const productRef = db.collection("rp_products").doc(productId);
+  const productSnap = await productRef.get();
+  if (!productSnap.exists) {
+    throw new functions.https.HttpsError("not-found", "Product not found");
+  }
+  const product = productSnap.data();
+  const designId = product.designId;
+  const blankId = product.blankId;
+  if (!designId || !blankId) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "Product needs designId and blankId to refresh merchandising"
+    );
+  }
+
   const designSnap = await db.collection("designs").doc(designId).get();
-  if (!designSnap.exists) {
-    throw new functions.https.HttpsError("not-found", `Design ${designId} not found`);
+  const blankSnap = await db.collection("rp_blanks").doc(blankId).get();
+  if (!designSnap.exists || !blankSnap.exists) {
+    throw new functions.https.HttpsError("not-found", "Design or blank not found");
   }
   const design = designSnap.data();
-
-  if (!designPngUrlForProcessing(design)) {
-    throw new functions.https.HttpsError(
-      "failed-precondition",
-      "Design missing PNG overlay. Upload light/dark PNGs (or legacy PNG) in Design Detail → Files before creating a product."
-    );
-  }
-
-  const blankSnap = await db.collection("rp_blanks").doc(blankId).get();
-  if (!blankSnap.exists) {
-    throw new functions.https.HttpsError("not-found", `Blank ${blankId} not found`);
-  }
   const blank = blankSnap.data();
-
-  if (blank.schemaVersion === MASTER_BLANK_SCHEMA_VERSION && (!blank.variants || blank.variants.length === 0)) {
-    throw new functions.https.HttpsError(
-      "failed-precondition",
-      "Master blank has no variants; add at least one color variant before creating a product."
-    );
-  }
-
-  const variantRow = resolveBlankVariantForProduct(blank, blankVariantId);
 
   let team = null;
   if (design.teamId) {
@@ -1767,63 +1870,47 @@ exports.createProductFromDesignBlank = functions.https.onCall(async (data, conte
       const teamData = teamSnap.data();
       team = {
         id: teamSnap.id,
+        name: teamData.name ?? null,
         teamCode: teamData.teamCode ?? null,
         city: teamData.city ?? null,
         teamName: teamData.teamName ?? null,
         league: teamData.league ?? null,
         leagueId: teamData.leagueId ?? null,
+        leagueCode: teamData.leagueCode ?? null,
         stadiumName: teamData.stadiumName ?? null,
         teamSaying: teamData.teamSaying ?? null,
         fanPhrase: teamData.fanPhrase ?? null,
+        slug: teamData.slug ?? null,
       };
     }
   }
 
-  // productIdentityKey: canonical source = DesignTeam.teamCode if present, else DesignTeam.id (design.teamId)
-  const leagueCodeRaw = design.leagueCode || (team && (team.leagueId || team.league)) || "";
-  const teamCodeRaw = design.teamCode || (team && (team.teamCode || team.id)) || design.teamId || "";
-  const variantIdOrLegacy =
-    blank.schemaVersion === MASTER_BLANK_SCHEMA_VERSION && variantRow.variantId
-      ? variantRow.variantId
-      : "legacy";
-  const productIdentityKey = buildProductIdentityKey({
-    leagueCode: leagueCodeRaw,
-    teamCode: teamCodeRaw,
-    designId,
-    blankId,
-    blankVariantIdOrLegacy: variantIdOrLegacy,
-  });
+  const isParent = product.productKind === "parent";
 
-  const blankVersionUsed =
-    blank.version != null
-      ? blank.version
-      : blank.updatedAt && typeof blank.updatedAt.toMillis === "function"
-        ? blank.updatedAt.toMillis()
-        : null;
-  const designVersionUsed =
-    design.updatedAt && typeof design.updatedAt.toMillis === "function"
-      ? design.updatedAt.toMillis()
-      : null;
+  const teamNameFull = merchandisingAtCreate.buildTeamDisplayName(team, design);
+  const designShortName = merchandisingAtCreate.designTypeToStorefrontShort(design.designType);
+  const designName = merchandisingAtCreate.buildDesignNameForTemplates(design, teamNameFull, designShortName);
+  const teamName =
+    (team && team.teamName && String(team.teamName).trim()) ||
+    teamNameFull ||
+    "Design";
+  const designThemeLabel = merchandisingAtCreate.designTypeToLabel(design.designType);
+  const designThemeSlug = merchandisingAtCreate.designTypeToThemeSlug(design.designType);
 
-  const colorNameForProduct = variantRow.colorName || "";
+  const blankVariantId = product.blankVariantId;
+  const variantRow = !isParent ? resolveBlankVariantForProduct(blank, blankVariantId) : null;
+  const colorNameForProduct = variantRow ? variantRow.colorName || "" : "";
 
-  const { displayTags, normalizedTags } = generateProductTags({
-    team,
-    design: {
-      designType: design.designType ?? null,
-      designSeries: design.designSeries ?? null,
-    },
-    blank: {
-      garmentCategory: blank.garmentCategory || blank.category,
-      colorName: colorNameForProduct,
-    },
-  });
-
-  const teamName = design.teamNameCache || design.name || "Design";
-  const designName = design.name || "Design";
+  const designSeriesStr =
+    design.designSeries != null && String(design.designSeries).trim()
+      ? String(design.designSeries).trim()
+      : "";
   const templateContext = {
     teamName,
+    teamNameFull,
     designName,
+    designShortName,
+    designSeries: designSeriesStr,
     colorName: colorNameForProduct,
     garmentStyle: blank.garmentStyle || blank.styleName || blank.styleCode || "",
     category: blank.shopifyDefaults?.productType ?? blank.category ?? blank.garmentCategory ?? "",
@@ -1834,102 +1921,90 @@ exports.createProductFromDesignBlank = functions.https.onCall(async (data, conte
     stadiumName: team?.stadiumName ?? "",
     teamSaying: team?.teamSaying ?? "",
     fanPhrase: team?.fanPhrase ?? "",
+    designThemeLabel,
+    designTheme: design.designType ?? "",
+    designThemeSlug,
+    designStyle: designThemeLabel,
+    teamCity: team?.city ?? "",
   };
-  const resolved = resolveBlankTemplates(blank, templateContext);
 
-  const useResolvedTitle = resolved.title && resolved.title.trim();
-  const useResolvedTags = Array.isArray(resolved.tags) && resolved.tags.length > 0;
-  const styleOrColor =
-    colorNameForProduct || (blank.styleName && blank.styleName.split(/\s+/)[0]) || blank.styleName || "Cotton";
-  const name = useResolvedTitle || `${teamName} ${styleOrColor} Panty`;
-  const productTags = useResolvedTags ? resolved.tags : displayTags;
-  const productTagsNormalized = useResolvedTags
-    ? productTags.map((t) => String(t).trim().toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "").replace(/-+/g, "-").replace(/^-|-$/g, "").slice(0, 128))
-    : normalizedTags;
+  let bundle;
+  if (isParent) {
+    const templateContextParent = { ...templateContext, colorName: "" };
+    const resolvedParent = resolveBlankTemplates(blank, templateContextParent);
+    bundle = merchandisingAtCreate.buildResolvedMerchandisingBundleForParent({
+      team,
+      design,
+      blank,
+      resolvedBlankDescription: resolvedParent.description,
+    });
+  } else {
+    const resolved = resolveBlankTemplates(blank, templateContext);
+    bundle = merchandisingAtCreate.buildResolvedMerchandisingBundle({
+      team,
+      design,
+      blank,
+      colorNameForProduct,
+      resolvedBlankDescription: resolved.description,
+    });
+  }
 
-  let slug = generateSlug(name);
-  const existing = await db.collection("rp_products").where("slug", "==", slug).get();
-  if (!existing.empty) {
+  let slug = bundle.handleSlug;
+  const dup = await db.collection("rp_products").where("slug", "==", slug).get();
+  if (!dup.empty && dup.docs[0].id !== productId) {
     slug = `${slug}-${Date.now().toString(36)}`;
   }
+  const handle = slug;
 
   const now = admin.firestore.FieldValue.serverTimestamp();
   const userId = context.auth.uid;
-  const firstColor = design.colors && design.colors[0];
 
-  const dp = blank.defaultPricing || {};
-  const retail = dp.retailPrice != null ? dp.retailPrice : dp.basePrice;
-
-  const isV2Master = blank.schemaVersion === MASTER_BLANK_SCHEMA_VERSION;
-  const productData = {
+  const refreshPayload = {
     slug,
-    name,
-    title: useResolvedTitle || name,
-    description: resolved.description && resolved.description.trim() ? resolved.description.trim() : null,
-    category: "panties",
-    productType: blank.shopifyDefaults?.productType ?? undefined,
-    brand: blank.shopifyDefaults?.brand ?? blank.shopifyDefaults?.vendor ?? undefined,
-    collectionKeys: Array.isArray(blank.shopifyDefaults?.collectionHandles) ? blank.shopifyDefaults.collectionHandles : undefined,
-    baseProductKey: `DESIGN_${designId}_BLANK_${blankId}`,
-    productIdentityKey,
-    blankVersionUsed,
-    designVersionUsed,
-    colorway: {
-      name: firstColor?.name || colorNameForProduct || "Default",
-      hex: firstColor?.hex || variantRow.colorHex || (isV2Master ? null : blank.colorHex) || null,
-    },
-    blankId,
-    blankVariantId:
-      isV2Master ? variantRow.variantId : blankVariantId || null,
-    designId,
-    designSeries: design.designSeries ?? null,
-    mockupUrl: null,
-    ai: {
-      productArtifactId: null,
-      productTrigger: null,
-      productRecommendedScale: null,
-      blankTemplateId: null,
-    },
-    status: "draft",
-    tags: productTags,
-    tagsNormalized: productTagsNormalized,
-    pricing:
-      blank.defaultPricing &&
-      (retail != null ||
-        dp.basePrice != null ||
-        dp.compareAtPrice != null ||
-        (dp.currencyCode && String(dp.currencyCode).trim()))
-        ? {
-            basePrice: retail ?? dp.basePrice ?? undefined,
-            compareAtPrice: dp.compareAtPrice ?? undefined,
-            currencyCode: (dp.currencyCode && String(dp.currencyCode).trim()) || "USD",
-          }
-        : undefined,
-    shipping:
-      blank.defaultShipping &&
-      (blank.defaultShipping.defaultWeightGrams != null || blank.defaultShipping.requiresShipping != null)
-        ? {
-            defaultWeightGrams: blank.defaultShipping.defaultWeightGrams ?? undefined,
-            requiresShipping: blank.defaultShipping.requiresShipping ?? true,
-          }
-        : undefined,
-    // Placement + blend: inherit from blank + variant at render time (no duplication on create).
-    counters: { assetsTotal: 0, assetsApproved: 0, assetsPublished: 0 },
-    createdAt: now,
+    handle,
+    name: bundle.displayTitle,
+    title: bundle.displayTitle,
+    description: bundle.descriptionText || null,
+    descriptionHtml: bundle.descriptionHtml || null,
+    descriptionText: bundle.descriptionText || null,
+    shortDescription: bundle.shortDescription || null,
+    seo: bundle.seo
+      ? {
+          title: bundle.seo.title ?? null,
+          description: bundle.seo.description ?? null,
+        }
+      : undefined,
+    tags: bundle.tags,
+    tagsNormalized: bundle.tagsNormalized,
+    collectionKeys: bundle.collectionKeys?.length ? bundle.collectionKeys : null,
+    sportCode: bundle.tax.sportCode ?? null,
+    leagueCode: bundle.tax.leagueCode ?? null,
+    teamCode:
+      bundle.tax.teamCode ??
+      (team && team.teamCode && String(team.teamCode).trim()
+        ? String(team.teamCode).trim().toUpperCase()
+        : null) ??
+      (design.teamCode && String(design.teamCode).trim()
+        ? String(design.teamCode).trim().toUpperCase()
+        : null),
+    themeCode: bundle.tax.themeCode ?? null,
+    designFamily: bundle.tax.designFamily ?? null,
+    taxonomy: bundle.tax.taxonomy ?? null,
     updatedAt: now,
-    createdBy: userId,
     updatedBy: userId,
   };
+  if (isParent) {
+    refreshPayload.teamName = team?.name ?? design.teamNameCache ?? null;
+    refreshPayload.designName = design.name ?? null;
+    refreshPayload.designSeries = design.designSeries ?? null;
+    refreshPayload.blankStyleCode = blank.styleCode ?? null;
+    refreshPayload.blankStyleName = blank.styleName || blank.garmentStyle || null;
+    refreshPayload.availableSizes = deriveAvailableSizesFromBlank(blank);
+  }
 
-  // Firestore rejects undefined at any depth; productData often has optional nested fields as undefined.
-  const productRef = await db.collection("rp_products").add(sanitizeForFirestore(productData));
-  console.log("[createProductFromDesignBlank] Created product:", productRef.id, slug);
+  await productRef.update(sanitizeForFirestore(refreshPayload));
 
-  return {
-    ok: true,
-    productId: productRef.id,
-    slug,
-  };
+  return { ok: true, productId, slug };
 });
 
 /**
@@ -2083,19 +2158,10 @@ exports.createBulkGenerationJob = functions.https.onCall(async (data, context) =
 });
 
 /**
- * Find or create a product for designId + blankId (idempotent for bulk).
+ * Find or create a **parent** product for designId + blankId (idempotent for bulk).
+ * Matches createProductFromDesignBlank: prefers parentProductIdentityKey; creates parent + first active variant if missing.
  */
 async function findOrCreateProductForBulk(designId, blankId, userId) {
-  const existing = await db.collection("rp_products")
-    .where("designId", "==", designId)
-    .where("blankId", "==", blankId)
-    .limit(1)
-    .get();
-
-  if (!existing.empty) {
-    return { productId: existing.docs[0].id };
-  }
-
   const designSnap = await db.collection("designs").doc(designId).get();
   const blankSnap = await db.collection("rp_blanks").doc(blankId).get();
   if (!designSnap.exists || !blankSnap.exists) {
@@ -2104,44 +2170,92 @@ async function findOrCreateProductForBulk(designId, blankId, userId) {
   const design = designSnap.data();
   const blank = blankSnap.data();
 
-  const teamName = design.teamNameCache || design.name || "Design";
-  // For v2 master blanks, color should come from variant; this bulk path has no variant—uses root as fallback.
-  const styleOrColor = blank.colorName || (blank.styleName && blank.styleName.split(/\s+/)[0]) || blank.styleName || "Cotton";
-  const name = `${teamName} ${styleOrColor} Panty`;
-  let slug = generateSlug(name);
-  const slugExists = await db.collection("rp_products").where("slug", "==", slug).get();
-  if (!slugExists.empty) {
-    slug = `${slug}-${Date.now().toString(36)}`;
+  let team = null;
+  if (design.teamId) {
+    const teamSnap = await db.collection("design_teams").doc(design.teamId).get();
+    if (teamSnap.exists) {
+      const teamData = teamSnap.data();
+      team = {
+        id: teamSnap.id,
+        name: teamData.name ?? null,
+        teamCode: teamData.teamCode ?? null,
+        city: teamData.city ?? null,
+        teamName: teamData.teamName ?? null,
+        league: teamData.league ?? null,
+        leagueId: teamData.leagueId ?? null,
+        leagueCode: teamData.leagueCode ?? null,
+        stadiumName: teamData.stadiumName ?? null,
+        teamSaying: teamData.teamSaying ?? null,
+        fanPhrase: teamData.fanPhrase ?? null,
+        slug: teamData.slug ?? null,
+      };
+    }
   }
 
-  const now = admin.firestore.FieldValue.serverTimestamp();
-  const firstColor = design.colors && design.colors[0];
-  const productData = {
-    slug,
-    name,
-    description: null,
-    category: "panties",
-    baseProductKey: `DESIGN_${designId}_BLANK_${blankId}`,
-    colorway: {
-      name: firstColor?.name || blank.colorName || "Default",
-      hex: firstColor?.hex || blank.colorHex || null,
-    }, // Legacy/bulk: for v2 master blanks, use variant color when blankVariantId is available
-    blankId,
+  const leagueCodeRaw = design.leagueCode || (team && (team.leagueId || team.league)) || "";
+  const teamCodeRaw = design.teamCode || (team && (team.teamCode || team.id)) || design.teamId || "";
+  const parentProductIdentityKey = buildParentProductIdentityKey({
+    leagueCode: leagueCodeRaw,
+    teamCode: teamCodeRaw,
     designId,
-    designSeries: design.designSeries ?? null,
-    mockupUrl: null,
-    ai: { productArtifactId: null, productTrigger: null, productRecommendedScale: null, blankTemplateId: null },
-    status: "draft",
-    tags: [],
-    counters: { assetsTotal: 0, assetsApproved: 0, assetsPublished: 0 },
-    createdAt: now,
-    updatedAt: now,
-    createdBy: userId,
-    updatedBy: userId,
-  };
+    blankId,
+  });
 
-  const productRef = await db.collection("rp_products").add(productData);
-  return { productId: productRef.id };
+  const parentSnap = await db
+    .collection("rp_products")
+    .where("parentProductIdentityKey", "==", parentProductIdentityKey)
+    .limit(10)
+    .get();
+  const parentDoc = parentSnap.docs.find((d) => d.data().productKind === "parent");
+  if (parentDoc) {
+    return { productId: parentDoc.id };
+  }
+
+  const firstVariant =
+    blank.schemaVersion === MASTER_BLANK_SCHEMA_VERSION
+      ? (blank.variants || []).find((v) => v.isActive !== false)
+      : null;
+  const blankVariantId = firstVariant ? firstVariant.variantId : undefined;
+  if (blank.schemaVersion === MASTER_BLANK_SCHEMA_VERSION && !blankVariantId) {
+    throw new Error("Master blank needs at least one active variant before bulk can create a parent product.");
+  }
+
+  if (!designPngUrlForProcessing(design)) {
+    throw new Error(
+      "Design missing PNG overlay. Upload PNGs in Design Detail before running bulk generation for this design."
+    );
+  }
+
+  try {
+    const out = await runCreateProductFromDesignBlankCore({
+      db,
+      admin,
+      functions,
+      designPngUrlForProcessing,
+      buildInitialRenderSetupForProduct,
+      resolveBlankVariantForProduct,
+      buildProductIdentityKey,
+      buildParentProductIdentityKey,
+      MASTER_BLANK_SCHEMA_VERSION,
+      sanitizeForFirestore,
+      deriveAvailableSizesFromBlank,
+      merchandisingAtCreate,
+      resolveBlankTemplates,
+      designId,
+      blankId,
+      blankVariantId,
+      userId: userId || "system",
+    });
+    return { productId: out.productId };
+  } catch (e) {
+    if (e instanceof functions.https.HttpsError && e.code === "already-exists") {
+      const details = e.details;
+      if (details && details.productId) {
+        return { productId: details.productId };
+      }
+    }
+    throw e;
+  }
 }
 
 /**
@@ -2201,7 +2315,23 @@ exports.processBulkGenerationJobs = functions.pubsub
 
         const productSnap = await db.collection("rp_products").doc(productId).get();
         const product = productSnap.exists ? productSnap.data() : null;
-        const hasMockup = !!(product && product.mockupUrl);
+        let hasMockup = !!(product && product.mockupUrl);
+        if (
+          !hasMockup &&
+          product &&
+          product.productKind === "parent" &&
+          product.defaultVariantId &&
+          typeof product.defaultVariantId === "string"
+        ) {
+          const vSnap = await db
+            .collection("rp_products")
+            .doc(productId)
+            .collection("variants")
+            .doc(product.defaultVariantId)
+            .get();
+          const v = vSnap.exists ? vSnap.data() : null;
+          hasMockup = !!(v && v.mockupUrl);
+        }
 
         if (hasMockup && presetId && genJobsCreatedThisRun < BULK_MAX_GENERATION_JOBS_PER_RUN) {
           await itemRef.update({
@@ -2251,8 +2381,10 @@ exports.processBulkGenerationJobs = functions.pubsub
             const blankSnap = await db.collection("rp_blanks").doc(blankId).get();
             const design = designSnap.exists ? designSnap.data() : {};
             const blank = blankSnap.exists ? blankSnap.data() : {};
-            const viewImage = blank?.images?.front;
-            const placementId = "front_center";
+            const styleCode = String(blank.styleCode || "").trim();
+            const is8394BackOnly = styleCode === "8394";
+            const placementId = is8394BackOnly ? "back_center" : "front_center";
+            const viewImage = is8394BackOnly ? blank?.images?.back : blank?.images?.front;
             let placement = DEFAULT_MOCK_PLACEMENT;
             const blankPlacement = blank?.placements?.find(p => p.placementId === placementId);
             if (blankPlacement) {
@@ -2284,10 +2416,14 @@ exports.processBulkGenerationJobs = functions.pubsub
             const mockRef = await db.collection("rp_mock_jobs").add({
               designId,
               blankId,
-              view: "front",
-              placementId: "front_center",
+              view: is8394BackOnly ? "back" : "front",
+              placementId,
               quality: "draft",
               productId,
+              productVariantId:
+                product && product.productKind === "parent" && product.defaultVariantId
+                  ? product.defaultVariantId
+                  : null,
               input: {
                 blankImageUrl: viewImage?.downloadUrl || null,
                 designPngUrl: designPngUrlForProcessing(design) || null,
@@ -4863,6 +4999,56 @@ function buildProductIdentityKey(params) {
   return [league, team, design, blank, variant].filter(Boolean).join("_");
 }
 
+/** Parent dedupe: league_team_design_blank (4 segments). */
+function buildParentProductIdentityKey(params) {
+  const norm = (s) => {
+    if (s == null || typeof s !== "string") return "";
+    return String(s)
+      .trim()
+      .toUpperCase()
+      .replace(/\s+/g, "_")
+      .replace(/[^A-Z0-9_-]/g, "")
+      .slice(0, 128) || "";
+  };
+  const league = norm(params.leagueCode) || "LEAGUE";
+  const team = norm(params.teamCode) || "TEAM";
+  const design = norm(params.designId) || "";
+  const blank = norm(params.blankId) || "";
+  return [league, team, design, blank].filter(Boolean).join("_");
+}
+
+/**
+ * Copy `rp_blanks.garmentSizes` onto parent `rp_products` for UI/preview (canonical: blank).
+ */
+function deriveAvailableSizesFromBlank(blank) {
+  const order = ["XS", "S", "M", "L", "XL"];
+  const allowed = new Set(order);
+  const raw = blank && blank.garmentSizes;
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const picked = new Set();
+  for (const s of raw) {
+    if (typeof s === "string" && allowed.has(s)) picked.add(s);
+  }
+  const out = [];
+  for (const code of order) {
+    if (picked.has(code)) out.push(code);
+  }
+  return out.length ? out : null;
+}
+
+/** Parent storefront cache: 8394 is back-print — hero prefers blended back; thumb can be blank front. */
+function pickParentDisplayMediaFromVariantMedia(media, productMockUrl, blankStyleCode) {
+  const m = media || {};
+  const backFirst = String(blankStyleCode || "").trim() === "8394";
+  const heroUrl = backFirst
+    ? m.heroBack || m.heroFront || productMockUrl
+    : m.heroFront || m.heroBack || productMockUrl;
+  const thumbUrl = backFirst
+    ? m.heroFront || m.heroBack || productMockUrl
+    : m.heroBack || m.heroFront || heroUrl;
+  return { heroUrl, thumbUrl };
+}
+
 /** Resolve variant row for product generation; legacy blanks use synthetic variant */
 function resolveBlankVariantForProduct(blank, blankVariantId) {
   if (blank.schemaVersion === MASTER_BLANK_SCHEMA_VERSION && blank.variants && blank.variants.length > 0) {
@@ -5307,6 +5493,7 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
     renderProfileNotes,
     supportedRenderViews: supportedRenderViewsInput,
     preferredFlatLook8394: preferredFlatLook8394Input,
+    garmentSizes: garmentSizesInput,
   } = data;
 
   if (!blankId || typeof blankId !== "string") {
@@ -5407,6 +5594,7 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
             vendor: shopifyDefaults.vendor ?? shopifyDefaults.brand ?? null,
             productCategory: shopifyDefaults.productCategory ?? null,
             collectionHandles: Array.isArray(shopifyDefaults.collectionHandles) ? shopifyDefaults.collectionHandles : null,
+            sizeOptionName: shopifyDefaults.sizeOptionName ?? null,
           };
   }
   if (titleTemplate !== undefined) updateData.titleTemplate = titleTemplate == null ? null : titleTemplate;
@@ -5608,6 +5796,24 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
   if (supplierInput !== undefined) updateData.supplier = supplierInput;
   if (supplierUrlInput !== undefined) updateData.supplierUrl = supplierUrlInput;
 
+  const GARMENT_SIZE_CODES_ORDER = ["XS", "S", "M", "L", "XL"];
+  const GARMENT_SIZE_SET = new Set(GARMENT_SIZE_CODES_ORDER);
+  if (garmentSizesInput !== undefined) {
+    if (garmentSizesInput === null) {
+      updateData.garmentSizes = null;
+    } else if (Array.isArray(garmentSizesInput)) {
+      const picked = new Set();
+      for (const s of garmentSizesInput) {
+        if (typeof s === "string" && GARMENT_SIZE_SET.has(s)) picked.add(s);
+      }
+      const out = [];
+      for (const code of GARMENT_SIZE_CODES_ORDER) {
+        if (picked.has(code)) out.push(code);
+      }
+      updateData.garmentSizes = out.length ? out : null;
+    }
+  }
+
   if (eligibilityInput !== undefined) {
     updateData.eligibility =
       eligibilityInput == null
@@ -5655,6 +5861,7 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
     "defaultPricing",
     "defaultShipping",
     "variants",
+    "garmentSizes",
   ];
   const shouldBumpVersion = versionBumpKeys.some((k) => updateData[k] !== undefined);
   if (shouldBumpVersion) {
@@ -5759,6 +5966,21 @@ const DESIGN_THEME_LEGACY = new Set(["wordmark", "script", "other", "badge"]);
 function isAllowedDesignTheme(v) {
   return typeof v === "string" && (DESIGN_THEME_CANONICAL.has(v) || DESIGN_THEME_LEGACY.has(v));
 }
+const DESIGN_SIDE_KIND_TO_NESTED = {
+  frontLightPng: ["front", "lightPng"],
+  frontDarkPng: ["front", "darkPng"],
+  backLightPng: ["back", "lightPng"],
+  backDarkPng: ["back", "darkPng"],
+  frontLightSvg: ["front", "lightSvg"],
+  frontDarkSvg: ["front", "darkSvg"],
+  backLightSvg: ["back", "lightSvg"],
+  backDarkSvg: ["back", "darkSvg"],
+  frontLightPdf: ["front", "lightPdf"],
+  frontDarkPdf: ["front", "darkPdf"],
+  backLightPdf: ["back", "lightPdf"],
+  backDarkPdf: ["back", "darkPdf"],
+};
+
 const DESIGN_FILE_KINDS = new Set([
   "png",
   "pdf",
@@ -5769,47 +5991,87 @@ const DESIGN_FILE_KINDS = new Set([
   "darkSvg",
   "lightPdf",
   "darkPdf",
+  ...Object.keys(DESIGN_SIDE_KIND_TO_NESTED),
 ]);
 
-/** Canonical asset URLs on design (garment variants); mirrors client resolveDesignAssets */
+function sideHasNestedPng(files, side) {
+  const s = files && files[side];
+  if (!s) return false;
+  return !!(s.lightPng && s.lightPng.downloadUrl) || !!(s.darkPng && s.darkPng.downloadUrl);
+}
+
+function resolveDefaultSide(files, supportedSides) {
+  const ss = (supportedSides || []).map(s => String(s).trim().toLowerCase());
+  if (ss.length === 1 && ss[0] === "front") return "front";
+  if (ss.length === 1 && ss[0] === "back") return "back";
+  if (sideHasNestedPng(files, "back") && !sideHasNestedPng(files, "front")) return "back";
+  if (sideHasNestedPng(files, "front") && !sideHasNestedPng(files, "back")) return "front";
+  return "back";
+}
+
+function buildSideAssetsFromFiles(sideFiles) {
+  if (!sideFiles) return null;
+  const sf = sideFiles;
+  const o = {
+    lightPng: sf.lightPng && sf.lightPng.downloadUrl ? sf.lightPng.downloadUrl : null,
+    darkPng: sf.darkPng && sf.darkPng.downloadUrl ? sf.darkPng.downloadUrl : null,
+    lightSvg: sf.lightSvg && sf.lightSvg.downloadUrl ? sf.lightSvg.downloadUrl : null,
+    darkSvg: sf.darkSvg && sf.darkSvg.downloadUrl ? sf.darkSvg.downloadUrl : null,
+    lightPdf: sf.lightPdf && sf.lightPdf.downloadUrl ? sf.lightPdf.downloadUrl : null,
+    darkPdf: sf.darkPdf && sf.darkPdf.downloadUrl ? sf.darkPdf.downloadUrl : null,
+  };
+  return Object.values(o).some(Boolean) ? o : null;
+}
+
+/** Canonical asset URLs on design; mirrors client `resolveDesignAssets` (default print side + legacy flat). */
 function resolveDesignAssetUrls(data) {
   const a = data.assets || {};
   const f = data.files || {};
-  const lightSvg =
-    a.lightSvg || (f.lightSvg && f.lightSvg.downloadUrl) || (f.svg && f.svg.downloadUrl) || null;
-  const darkSvg = a.darkSvg || (f.darkSvg && f.darkSvg.downloadUrl) || null;
-  const lightPdf =
-    a.lightPdf || (f.lightPdf && f.lightPdf.downloadUrl) || (f.pdf && f.pdf.downloadUrl) || null;
-  const darkPdf = a.darkPdf || (f.darkPdf && f.darkPdf.downloadUrl) || null;
-  return {
+  const side = resolveDefaultSide(f, data.supportedSides);
+  const nsA = a[side] || {};
+  const nsF = f[side] || {};
+  const mergeSlot = slot => nsA[slot] || (nsF[slot] && nsF[slot].downloadUrl) || null;
+  const leg = {
     lightPng: a.lightPng || (f.lightPng && f.lightPng.downloadUrl) || (f.png && f.png.downloadUrl) || null,
     darkPng: a.darkPng || (f.darkPng && f.darkPng.downloadUrl) || null,
+    lightSvg:
+      a.lightSvg || (f.lightSvg && f.lightSvg.downloadUrl) || (f.svg && f.svg.downloadUrl) || null,
+    darkSvg: a.darkSvg || (f.darkSvg && f.darkSvg.downloadUrl) || null,
+    lightPdf: a.lightPdf || (f.lightPdf && f.lightPdf.downloadUrl) || (f.pdf && f.pdf.downloadUrl) || null,
+    darkPdf: a.darkPdf || (f.darkPdf && f.darkPdf.downloadUrl) || null,
+  };
+  const lightPng = mergeSlot("lightPng") || leg.lightPng;
+  const darkPng = mergeSlot("darkPng") || leg.darkPng;
+  const lightSvg = mergeSlot("lightSvg") || leg.lightSvg;
+  const darkSvg = mergeSlot("darkSvg") || leg.darkSvg;
+  const lightPdf = mergeSlot("lightPdf") || leg.lightPdf;
+  const darkPdf = mergeSlot("darkPdf") || leg.darkPdf;
+  return {
+    lightPng,
+    darkPng,
     lightSvg,
     darkSvg,
     svg:
       a.svg ||
       (f.svg && f.svg.downloadUrl) ||
-      (f.lightSvg && f.lightSvg.downloadUrl) ||
-      (f.darkSvg && f.darkSvg.downloadUrl) ||
+      lightSvg ||
+      darkSvg ||
       null,
     lightPdf,
     darkPdf,
-    pdf:
-      a.pdf ||
-      (f.pdf && f.pdf.downloadUrl) ||
-      (f.lightPdf && f.lightPdf.downloadUrl) ||
-      (f.darkPdf && f.darkPdf.downloadUrl) ||
-      null,
+    pdf: a.pdf || (f.pdf && f.pdf.downloadUrl) || lightPdf || darkPdf || null,
   };
 }
 
-/** Derive assets map from files (for denormalized writes) */
+/** Derive assets map from files (legacy flat + optional front/back). */
 function buildAssetsFromFiles(files) {
   const f = files || {};
   const lightSvg = (f.lightSvg && f.lightSvg.downloadUrl) || (f.svg && f.svg.downloadUrl) || null;
   const darkSvg = (f.darkSvg && f.darkSvg.downloadUrl) || null;
   const lightPdf = (f.lightPdf && f.lightPdf.downloadUrl) || (f.pdf && f.pdf.downloadUrl) || null;
   const darkPdf = (f.darkPdf && f.darkPdf.downloadUrl) || null;
+  const front = buildSideAssetsFromFiles(f.front);
+  const back = buildSideAssetsFromFiles(f.back);
   return {
     lightPng: (f.lightPng && f.lightPng.downloadUrl) || (f.png && f.png.downloadUrl) || null,
     darkPng: (f.darkPng && f.darkPng.downloadUrl) || null,
@@ -5819,17 +6081,54 @@ function buildAssetsFromFiles(files) {
     lightPdf,
     darkPdf,
     pdf: (f.pdf && f.pdf.downloadUrl) || lightPdf || darkPdf || null,
+    front: front || null,
+    back: back || null,
   };
+}
+
+function anySideHasPngSlot(files, assets, slot) {
+  for (const s of ["front", "back"]) {
+    const u = (assets[s] && assets[s][slot]) || (files[s] && files[s][slot] && files[s][slot].downloadUrl);
+    if (u) return true;
+  }
+  return false;
+}
+
+/** Merge one uploaded file into `files` (flat legacy or nested `front` / `back`). */
+function mergeDesignFiles(currentFiles, kind, fileEntry) {
+  const nested = DESIGN_SIDE_KIND_TO_NESTED[kind];
+  const base = { ...(currentFiles || {}) };
+  if (nested) {
+    const [sec, slot] = nested;
+    return {
+      ...base,
+      [sec]: {
+        ...(base[sec] || {}),
+        [slot]: fileEntry,
+      },
+    };
+  }
+  return { ...base, [kind]: fileEntry };
+}
+
+function isRasterPngKind(kind) {
+  return kind === "png" || kind === "lightPng" || kind === "darkPng" || /LightPng$/.test(kind) || /DarkPng$/.test(kind);
+}
+
+function isSvgFamilyKind(kind) {
+  return kind === "svg" || kind === "lightSvg" || kind === "darkSvg" || /Svg$/.test(kind);
 }
 
 /** Merge file flags for designs/{id}.files + assets */
 function computeDesignPngFlags(files, assets) {
   const u = resolveDesignAssetUrls({ files: files || {}, assets: assets || {} });
   const f = files || {};
-  const hasLightPng = !!u.lightPng;
-  const hasDarkPng = !!u.darkPng;
+  const a = assets || {};
+  const hasLightPng =
+    !!u.lightPng || anySideHasPngSlot(f, a, "lightPng") || !!(f.png && f.png.downloadUrl);
+  const hasDarkPng = !!u.darkPng || anySideHasPngSlot(f, a, "darkPng");
   const hasLegacyPng = !!(f.png && f.png.downloadUrl) && !(f.lightPng && f.lightPng.downloadUrl);
-  const hasPng = !!(u.lightPng || u.darkPng);
+  const hasPng = hasLightPng || hasDarkPng;
   return { hasLightPng, hasDarkPng, hasLegacyPng, hasPng };
 }
 
@@ -6249,7 +6548,7 @@ exports.updateDesignFile = functions.https.onCall(async (data, context) => {
   if (!kind || !DESIGN_FILE_KINDS.has(kind)) {
     throw new functions.https.HttpsError(
       "invalid-argument",
-      "kind must be a supported design file kind (png, lightPng, darkPng, svg, lightSvg, darkSvg, pdf, lightPdf, darkPdf)"
+      "kind must be a supported design file kind (includes side-aware: frontLightPng, backDarkPng, …)"
     );
   }
 
@@ -6266,8 +6565,8 @@ exports.updateDesignFile = functions.https.onCall(async (data, context) => {
 
   const now = admin.firestore.FieldValue.serverTimestamp();
 
-  const isRasterPng = kind === "png" || kind === "lightPng" || kind === "darkPng";
-  const isSvgFamily = kind === "svg" || kind === "lightSvg" || kind === "darkSvg";
+  const isRasterPng = isRasterPngKind(kind);
+  const isSvgFamily = isSvgFamilyKind(kind);
   const fileKindForDoc = isRasterPng ? "png" : isSvgFamily ? "svg" : "pdf";
 
   const fileData = {
@@ -6286,48 +6585,39 @@ exports.updateDesignFile = functions.https.onCall(async (data, context) => {
     uploadedByUid: userId,
   };
 
-  const fieldKey =
-    kind === "lightPng"
-      ? "lightPng"
-      : kind === "darkPng"
-        ? "darkPng"
-        : kind === "lightSvg"
-          ? "lightSvg"
-          : kind === "darkSvg"
-            ? "darkSvg"
-            : kind === "lightPdf"
-              ? "lightPdf"
-              : kind === "darkPdf"
-                ? "darkPdf"
-                : kind;
+  const fileEntry = { ...fileData, downloadUrl };
 
-  const updateData = {
-    [`files.${fieldKey}`]: fileData,
-    updatedAt: now,
-    updatedByUid: userId,
-  };
-
-  // Update completion flags
   const currentData = designSnap.data();
-  const mergedFiles = {
-    ...(currentData.files || {}),
-    [fieldKey]: { ...fileData, downloadUrl },
-  };
+  const mergedFiles = mergeDesignFiles(currentData.files || {}, kind, fileEntry);
 
   const mergedAssets = buildAssetsFromFiles(mergedFiles);
-  updateData.assets = mergedAssets;
 
   const hasSvg = !!(
     mergedFiles.svg ||
     mergedFiles.lightSvg ||
-    mergedFiles.darkSvg
+    mergedFiles.darkSvg ||
+    mergedFiles.front?.lightSvg ||
+    mergedFiles.front?.darkSvg ||
+    mergedFiles.back?.lightSvg ||
+    mergedFiles.back?.darkSvg
   );
   const hasPdf = !!(
     mergedFiles.pdf ||
     mergedFiles.lightPdf ||
-    mergedFiles.darkPdf
+    mergedFiles.darkPdf ||
+    mergedFiles.front?.lightPdf ||
+    mergedFiles.front?.darkPdf ||
+    mergedFiles.back?.lightPdf ||
+    mergedFiles.back?.darkPdf
   );
   const { hasLightPng, hasDarkPng, hasPng } = computeDesignPngFlags(mergedFiles, mergedAssets);
+
+  const updateData = {
+    files: mergedFiles,
+    assets: mergedAssets,
+    updatedAt: now,
+    updatedByUid: userId,
+  };
 
   updateData.hasSvg = hasSvg;
   updateData.hasLightPng = hasLightPng;
@@ -6658,7 +6948,19 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
 
   const { resolveEffectivePlacement } = require("./lib/resolveProductRenderProfile");
 
-  const { designId, blankId, view = "front", placementId: inputPlacementId, quality = "draft", productId, heroSlot, blankImageUrl: inputBlankUrl, designPngUrl: inputDesignUrl, placementOverride: inputPlacementOverride } = data;
+  const {
+    designId,
+    blankId,
+    view = "front",
+    placementId: inputPlacementId,
+    quality = "draft",
+    productId,
+    productVariantId,
+    heroSlot,
+    blankImageUrl: inputBlankUrl,
+    designPngUrl: inputDesignUrl,
+    placementOverride: inputPlacementOverride,
+  } = data;
 
   // Validate required fields
   if (!designId || typeof designId !== "string") {
@@ -6761,7 +7063,20 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
     try {
       const prodSnap = await db.collection("rp_products").doc(productId).get();
       if (prodSnap.exists) {
-        const eff = resolveEffectivePlacement(prodSnap.data(), blank, view);
+        const prodData = prodSnap.data();
+        let placementSource = prodData;
+        if (prodData.productKind === "parent" && productVariantId && typeof productVariantId === "string") {
+          const vSnap = await db
+            .collection("rp_products")
+            .doc(productId)
+            .collection("variants")
+            .doc(productVariantId)
+            .get();
+          if (vSnap.exists) {
+            placementSource = vSnap.data();
+          }
+        }
+        const eff = resolveEffectivePlacement(placementSource, blank, view);
         if (eff) {
           placement.x = eff.defaultX;
           placement.y = eff.defaultY;
@@ -6792,6 +7107,7 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
     placementId,
     quality,
     productId: productId || null,
+    productVariantId: productVariantId || null,
     heroSlot: (heroSlot === "hero_front" || heroSlot === "hero_back") ? heroSlot : null,
     input: {
       blankImageUrl,
@@ -7049,7 +7365,15 @@ exports.onMockJobCreated = functions
       let mockupBufferForProduct = draftBuffer;
       let mockupDownloadUrlForProduct = downloadUrl;
       if (job.productId) {
-        const productMockPath = `products/${job.productId}/mockup.png`;
+        const parentId = job.productId;
+        const productVariantId =
+          job.productVariantId && typeof job.productVariantId === "string" ? job.productVariantId : null;
+        const productRef = db.collection("rp_products").doc(parentId);
+        const variantRef = productVariantId ? productRef.collection("variants").doc(productVariantId) : null;
+        const pathPrefix = productVariantId
+          ? `products/${parentId}/variants/${productVariantId}`
+          : `products/${parentId}`;
+        const productMockPath = `${pathPrefix}/mockup.png`;
         const productMockFile = bucket.file(productMockPath);
         await productMockFile.save(draftBuffer, {
           contentType: "image/png",
@@ -7057,13 +7381,23 @@ exports.onMockJobCreated = functions
         });
         await productMockFile.makePublic();
         const productMockUrl = `https://storage.googleapis.com/${bucket.name}/${productMockPath}`;
-        const productRef = db.collection("rp_products").doc(job.productId);
-        const currentProduct = (await productRef.get()).data() || {};
-        const media = { ...(currentProduct.media || {}), heroFront: currentProduct.media?.heroFront, heroBack: currentProduct.media?.heroBack, gallery: currentProduct.media?.gallery || [] };
+        const targetRef = variantRef || productRef;
+        const currentProduct = (await targetRef.get()).data() || {};
+        const media = {
+          ...(currentProduct.media || {}),
+          heroFront: currentProduct.media?.heroFront,
+          heroBack: currentProduct.media?.heroBack,
+          gallery: currentProduct.media?.gallery || [],
+        };
+
+        let blankVariantIdForAsset = null;
+        if (variantRef) {
+          blankVariantIdForAsset = currentProduct.blankVariantId || null;
+        }
 
         // Phase 4: If heroSlot is set, create product asset and set product.media.heroFront/heroBack
         if (job.heroSlot === "hero_front" || job.heroSlot === "hero_back") {
-          const assetPath = `products/${job.productId}/hero/${job.view}/${Date.now()}.png`;
+          const assetPath = `${pathPrefix}/hero/${job.view}/${Date.now()}.png`;
           const heroFile = bucket.file(assetPath);
           await heroFile.save(draftBuffer, {
             contentType: "image/png",
@@ -7073,7 +7407,10 @@ exports.onMockJobCreated = functions
           const heroUrl = `https://storage.googleapis.com/${bucket.name}/${assetPath}`;
           const now = admin.firestore.FieldValue.serverTimestamp();
           const assetData = {
-            productId: job.productId,
+            productId: parentId,
+            parentProductId: parentId,
+            variantDocId: productVariantId || null,
+            blankVariantId: blankVariantIdForAsset,
             jobId,
             designId: job.designId,
             blankId: job.blankId,
@@ -7098,14 +7435,67 @@ exports.onMockJobCreated = functions
           if (job.heroSlot === "hero_front") media.heroFront = heroUrl;
           if (job.heroSlot === "hero_back") media.heroBack = heroUrl;
           console.log("[onMockJobCreated] Created hero asset and set product.media." + (job.heroSlot === "hero_front" ? "heroFront" : "heroBack"));
+        } else {
+          if (job.view === "back") {
+            media.heroBack = productMockUrl;
+          } else {
+            media.heroFront = productMockUrl;
+          }
+          const ts = admin.firestore.FieldValue.serverTimestamp();
+          const galleryAssetData = {
+            productId: parentId,
+            parentProductId: parentId,
+            variantDocId: productVariantId || null,
+            blankVariantId: blankVariantIdForAsset,
+            jobId,
+            designId: job.designId,
+            blankId: job.blankId,
+            assetType: "productPackshot",
+            presetMode: "productOnly",
+            status: "approved",
+            storagePath: productMockPath,
+            publicUrl: productMockUrl,
+            downloadUrl: productMockUrl,
+            width: draftMeta.width,
+            height: draftMeta.height,
+            view: job.view || "back",
+            assetRole: "blended",
+            createdAt: ts,
+            updatedAt: ts,
+            createdBy: job.createdByUid,
+            updatedBy: job.createdByUid,
+          };
+          await db.collection("rp_product_assets").add(sanitizeForFirestore(galleryAssetData));
+          console.log(
+            "[onMockJobCreated] Created rp_product_assets row (blended) for product",
+            parentId,
+            productVariantId || ""
+          );
         }
 
-        await productRef.update({
+        await targetRef.update({
           mockupUrl: productMockUrl,
           media,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           updatedBy: job.createdByUid,
         });
+        if (variantRef) {
+          const parentSnap = await productRef.get();
+          const pdata = parentSnap.data() || {};
+          const hid = pdata.heroVariantId || pdata.defaultVariantId;
+          if (hid && hid === productVariantId) {
+            const { heroUrl, thumbUrl } = pickParentDisplayMediaFromVariantMedia(
+              media,
+              productMockUrl,
+              pdata.blankStyleCode
+            );
+            await productRef.update({
+              displayMedia: { heroUrl, thumbUrl },
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              updatedBy: job.createdByUid,
+            });
+          }
+        }
         console.log("[onMockJobCreated] Saved product mockup:", productMockPath);
         // Unblock bulk job items waiting for this product's mock (two-layer architecture)
         const awaitingItems = await db.collection("rp_bulk_generation_job_items")
@@ -7351,7 +7741,13 @@ exports.onMockJobCreated = functions
 
             // Overwrite product mockup with final image when job is linked to a product
             if (job.productId) {
-              const productMockPath = `products/${job.productId}/mockup.png`;
+              const parentIdFinal = job.productId;
+              const vidFinal =
+                job.productVariantId && typeof job.productVariantId === "string" ? job.productVariantId : null;
+              const pathPrefixFinal = vidFinal
+                ? `products/${parentIdFinal}/variants/${vidFinal}`
+                : `products/${parentIdFinal}`;
+              const productMockPath = `${pathPrefixFinal}/mockup.png`;
               const productMockFile = bucket.file(productMockPath);
               await productMockFile.save(finalBuffer, {
                 contentType: "image/png",
@@ -7359,11 +7755,58 @@ exports.onMockJobCreated = functions
               });
               await productMockFile.makePublic();
               const productMockUrl = `https://storage.googleapis.com/${bucket.name}/${productMockPath}`;
-              await db.collection("rp_products").doc(job.productId).update({
+              const productRefFinal = db.collection("rp_products").doc(parentIdFinal);
+              const targetRefFinal = vidFinal
+                ? productRefFinal.collection("variants").doc(vidFinal)
+                : productRefFinal;
+              const snapFinal = await targetRefFinal.get();
+              const curFinal = snapFinal.data() || {};
+              const mediaFinal = { ...(curFinal.media || {}) };
+              if (job.view === "back") {
+                mediaFinal.heroBack = productMockUrl;
+              } else {
+                mediaFinal.heroFront = productMockUrl;
+              }
+              await targetRefFinal.update({
                 mockupUrl: productMockUrl,
+                media: mediaFinal,
                 updatedAt: admin.firestore.FieldValue.serverTimestamp(),
                 updatedBy: job.createdByUid,
               });
+              if (vidFinal) {
+                const pdataF = (await productRefFinal.get()).data() || {};
+                const hid = pdataF.heroVariantId || pdataF.defaultVariantId;
+                if (hid && hid === vidFinal) {
+                  const { heroUrl, thumbUrl } = pickParentDisplayMediaFromVariantMedia(
+                    mediaFinal,
+                    productMockUrl,
+                    pdataF.blankStyleCode
+                  );
+                  await productRefFinal.update({
+                    displayMedia: { heroUrl, thumbUrl },
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    updatedBy: job.createdByUid,
+                  });
+                }
+              }
+              try {
+                const galSnap = await db.collection("rp_product_assets").where("jobId", "==", jobId).limit(10).get();
+                const updTs = admin.firestore.FieldValue.serverTimestamp();
+                await Promise.all(
+                  galSnap.docs.map((d) =>
+                    d.ref.update({
+                      downloadUrl: productMockUrl,
+                      publicUrl: productMockUrl,
+                      storagePath: productMockPath,
+                      width: finalMeta.width,
+                      height: finalMeta.height,
+                      updatedAt: updTs,
+                    })
+                  )
+                );
+              } catch (galErr) {
+                console.warn("[onMockJobCreated] Could not update gallery asset after final:", galErr && galErr.message);
+              }
               console.log("[onMockJobCreated] Updated product mockup with final:", productMockPath);
               // Unblock bulk job items waiting for this product's mock (two-layer architecture)
               const awaitingItemsFinal = await db.collection("rp_bulk_generation_job_items")

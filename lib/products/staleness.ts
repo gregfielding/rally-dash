@@ -42,6 +42,20 @@ export function buildProductIdentityKey(params: {
   return [league, team, design, blank, variant].filter(Boolean).join("_");
 }
 
+/** Parent product dedupe: team + design + blank (no color/variant segment). */
+export function buildParentProductIdentityKey(params: {
+  leagueCode: string | null | undefined;
+  teamCode: string | null | undefined;
+  designId: string;
+  blankId: string;
+}): string {
+  const league = normalizeKeySegment(params.leagueCode) || "LEAGUE";
+  const team = normalizeKeySegment(params.teamCode) || "TEAM";
+  const design = normalizeKeySegment(params.designId) || "";
+  const blank = normalizeKeySegment(params.blankId) || "";
+  return [league, team, design, blank].filter(Boolean).join("_");
+}
+
 /** Get numeric "version" from a blank for comparison: version if set, else updatedAt ms. */
 export function getBlankVersionValue(blank: {
   version?: number | null;

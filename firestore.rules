@@ -194,10 +194,14 @@ service cloud.firestore {
     // rp_generation_jobs, rp_product_assets
     // --------------------------------------------------------------------
 
-    // rp_products/{productId}
+    // rp_products/{productId} and color variants subcollection
     match /rp_products/{productId} {
       allow read: if isAdmin();
       allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+      match /variants/{variantId} {
+        allow read: if isAdmin();
+        allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+      }
     }
 
     // rp_product_designs/{designId}
@@ -208,6 +212,12 @@ service cloud.firestore {
 
     // rp_scene_presets/{presetId}
     match /rp_scene_presets/{presetId} {
+      allow read: if isAdmin() && (hasRole('ops') || hasRole('admin') || hasRole('editor'));
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
+    // rp_hero_templates/{templateId} — hero template registry (structural; pipeline not active yet)
+    match /rp_hero_templates/{templateId} {
       allow read: if isAdmin() && (hasRole('ops') || hasRole('admin') || hasRole('editor'));
       allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
     }
@@ -374,7 +384,9 @@ service cloud.firestore {
     // Note: Separate from existing teams collection to avoid conflicts
     match /design_teams/{teamId} {
       allow read: if isAdmin();
-      allow create, update, delete: if isAdmin() && hasRole('admin');
+      allow create, delete: if isAdmin() && hasRole('admin');
+      // Editors/ops may update team rows (e.g. productCatalogMatrix) without full admin.
+      allow update: if isAdmin() && (hasRole('admin') || hasRole('editor') || hasRole('ops'));
     }
 
     // print_packs/{packId} - Exported design packages

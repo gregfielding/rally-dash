@@ -178,6 +178,8 @@ const THEMES = [
   { code: "BACHELORETTE", name: "Bachelorette", sportCode: "LIFESTYLE", themeType: "lifestyle" },
   { code: "RACE_DAY", name: "Race Day", sportCode: "RACING", themeType: "topical" },
   { code: "OPENING_DAY", name: "Opening Day", sportCode: "BASEBALL", themeType: "topical" },
+  /** Pro team number / “City 69” style storefront theme */
+  { code: "CITY_69", name: "69", sportCode: "BASEBALL", leagueCode: "MLB", themeType: "team_brand" },
   { code: "PLAYOFFS", name: "Playoffs", sportCode: null, leagueCode: null, themeType: "topical" },
   // Olympic (popular disciplines)
   { code: "OLYMPIC_SWIMMING", name: "Olympic Swimming", sportCode: "OLYMPIC_SPORTS", themeType: "topical" },
@@ -212,6 +214,7 @@ const DESIGN_FAMILIES = [
   "GAME_DAY_GIRL",
   "PITCH_SLAP",
   "CHECKERED_FLAG_SERIES",
+  "TEAM_NUMBER",
 ].map((code, i) => ({
   code,
   name: codeToName(code),

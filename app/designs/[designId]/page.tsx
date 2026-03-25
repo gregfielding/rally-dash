@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import ProtectedRoute from "@/components/ProtectedRoute";
@@ -31,10 +31,12 @@ import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { storage } from "@/lib/firebase/config";
 import {
   DesignColor,
+  DesignFile,
   DesignStatus,
   HEX_COLOR_REGEX,
   RpMockAsset,
   RPBlank,
+  type DesignDoc,
   type DesignThemeValue,
 } from "@/lib/types/firestore";
 import { DESIGN_THEME_OPTIONS, designThemeLabel, isCanonicalDesignTheme } from "@/lib/designs/designThemes";
@@ -42,6 +44,7 @@ import {
   computeDesignCompleteness,
   designHasUsablePng,
   resolveDesignAssets,
+  resolveDesignSideAssets,
   designGarmentAssetBadges,
   getDesignPrintSidesMode,
   type DesignPrintSidesMode,
@@ -50,6 +53,62 @@ import { isMasterBlank, countActiveVariants } from "@/lib/blanks";
 import { useProductsByDesignIndex } from "@/lib/hooks/useProductsByDesign";
 import { formatCmyk, resolveDesignInkPaletteForDisplay } from "@/lib/print/standardPrintInks";
 import { normalizeDesignSeriesInput } from "@/lib/designs/normalizeDesignSeries";
+import {
+  designUploadStoragePath,
+  fileKindDocCategory,
+  type DesignFileKind,
+} from "@/lib/designs/designAssetKinds";
+import type { UpdateDesignFileInput } from "@/lib/hooks/useDesignAssets";
+
+type SideSlot = "lightPng" | "darkPng" | "lightSvg" | "darkSvg" | "lightPdf" | "darkPdf";
+
+const FILES_TAB_SLOTS: { slot: SideSlot; short: string; format: "png" | "svg" | "pdf" }[] = [
+  { slot: "lightPng", short: "Light PNG", format: "png" },
+  { slot: "darkPng", short: "Dark PNG", format: "png" },
+  { slot: "lightSvg", short: "Light SVG", format: "svg" },
+  { slot: "darkSvg", short: "Dark SVG", format: "svg" },
+  { slot: "lightPdf", short: "Light PDF", format: "pdf" },
+  { slot: "darkPdf", short: "Dark PDF", format: "pdf" },
+];
+
+const KIND_FOR_SIDE_SLOT: Record<"front" | "back", Record<SideSlot, DesignFileKind>> = {
+  front: {
+    lightPng: "frontLightPng",
+    darkPng: "frontDarkPng",
+    lightSvg: "frontLightSvg",
+    darkSvg: "frontDarkSvg",
+    lightPdf: "frontLightPdf",
+    darkPdf: "frontDarkPdf",
+  },
+  back: {
+    lightPng: "backLightPng",
+    darkPng: "backDarkPng",
+    lightSvg: "backLightSvg",
+    darkSvg: "backDarkSvg",
+    lightPdf: "backLightPdf",
+    darkPdf: "backDarkPdf",
+  },
+};
+
+function nestedDesignFile(design: DesignDoc, side: "front" | "back", slot: SideSlot): DesignFile | undefined {
+  return design.files?.[side]?.[slot];
+}
+
+function hasLegacyFlatDesignFiles(design: DesignDoc): boolean {
+  const f = design.files;
+  if (!f) return false;
+  return !!(
+    f.lightPng ||
+    f.darkPng ||
+    f.png ||
+    f.lightSvg ||
+    f.svg ||
+    f.darkSvg ||
+    f.lightPdf ||
+    f.darkPdf ||
+    f.pdf
+  );
+}
 
 function DesignDetailContent() {
   const params = useParams();
@@ -157,17 +216,12 @@ function DesignDetailContent() {
   // Toast state
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
 
-  // Upload state
-  const [uploadingKind, setUploadingKind] = useState<
-    | "lightPng"
-    | "darkPng"
-    | "png"
-    | "lightPdf"
-    | "darkPdf"
-    | "lightSvg"
-    | "darkSvg"
-    | null
-  >(null);
+  /** Tracks which asset slot is uploading (legacy + side-aware kinds). */
+  const [uploadingKind, setUploadingKind] = useState<string | null>(null);
+  const pickKindRef = useRef<DesignFileKind | null>(null);
+  const overviewPngInputRef = useRef<HTMLInputElement>(null);
+  const overviewSvgInputRef = useRef<HTMLInputElement>(null);
+  const overviewPdfInputRef = useRef<HTMLInputElement>(null);
   const lightPngInputRef = useRef<HTMLInputElement>(null);
   const darkPngInputRef = useRef<HTMLInputElement>(null);
   const pngInputRef = useRef<HTMLInputElement>(null);
@@ -181,7 +235,8 @@ function DesignDetailContent() {
   const [editedColors, setEditedColors] = useState<DesignColor[]>([]);
   const [colorError, setColorError] = useState<string | null>(null);
   const [isSavingColors, setIsSavingColors] = useState(false);
-  const [editDesignType, setEditDesignType] = useState<DesignThemeValue>("city_69");
+  /** Mirrors `DesignDoc.designType` — empty until design loads (no implicit default). */
+  const [editDesignType, setEditDesignType] = useState<DesignThemeValue | "">("");
   const [editDesignSeries, setEditDesignSeries] = useState("");
   const [internalNotesEdit, setInternalNotesEdit] = useState("");
   /** Controls product Render Setup: which sides show this artwork when only `designId` is set. */
@@ -196,7 +251,7 @@ function DesignDetailContent() {
       setTaxTeamCode(design.teamCode ?? null);
       setTaxThemeCode(design.themeCode ?? null);
       setTaxDesignFamily(design.designFamily ?? null);
-      setEditDesignType(design.designType ?? "city_69");
+      setEditDesignType(design.designType ?? "");
       setEditDesignSeries(design.designSeries ?? "");
       setInternalNotesEdit(design.internalNotes || design.description || "");
       setEditPrintSides(getDesignPrintSidesMode(design));
@@ -213,6 +268,7 @@ function DesignDetailContent() {
     design?.internalNotes,
     design?.description,
     design?.supportedSides,
+    design?.placementDefaults,
   ]);
 
   const showToast = (message: string, type: "success" | "error") => {
@@ -559,6 +615,110 @@ function DesignDetailContent() {
     }
   };
 
+  const triggerOverviewPick = (kind: DesignFileKind) => {
+    pickKindRef.current = kind;
+    const cat = fileKindDocCategory(kind);
+    if (cat === "png") overviewPngInputRef.current?.click();
+    else if (cat === "svg") overviewSvgInputRef.current?.click();
+    else overviewPdfInputRef.current?.click();
+  };
+
+  const commitDesignFileUpload = async (file: File, kind: DesignFileKind) => {
+    if (!design?.id || !storage) return;
+    const cat = fileKindDocCategory(kind);
+    if (cat === "png") {
+      if (!file.type.startsWith("image/png") && !file.type.startsWith("image/")) {
+        showToast("Please upload a PNG image", "error");
+        return;
+      }
+      if (file.size > 25 * 1024 * 1024) {
+        showToast("PNG must be under 25MB", "error");
+        return;
+      }
+    } else if (cat === "svg") {
+      if (file.type !== "image/svg+xml" && !file.name.toLowerCase().endsWith(".svg")) {
+        showToast("Please upload an SVG file", "error");
+        return;
+      }
+      if (file.size > 5 * 1024 * 1024) {
+        showToast("SVG must be under 5MB", "error");
+        return;
+      }
+    } else {
+      if (file.type !== "application/pdf") {
+        showToast("Please upload a PDF file", "error");
+        return;
+      }
+      if (file.size > 50 * 1024 * 1024) {
+        showToast("PDF must be under 50MB", "error");
+        return;
+      }
+    }
+
+    setUploadingKind(kind);
+    try {
+      const storagePath = designUploadStoragePath(design.id, kind, file.name);
+      const storageRef = ref(storage, storagePath);
+      await uploadBytes(storageRef, file);
+      const downloadUrl = await getDownloadURL(storageRef);
+      let widthPx: number | undefined;
+      let heightPx: number | undefined;
+      if (cat === "png") {
+        const img = new Image();
+        await new Promise<void>((resolve, reject) => {
+          img.onload = () => resolve();
+          img.onerror = reject;
+          img.src = URL.createObjectURL(file);
+        });
+        widthPx = img.width;
+        heightPx = img.height;
+      }
+      const payload: UpdateDesignFileInput = {
+        designId: design.id,
+        kind,
+        storagePath,
+        downloadUrl,
+        fileName: file.name,
+        contentType:
+          file.type ||
+          (cat === "png" ? "image/png" : cat === "svg" ? "image/svg+xml" : "application/pdf"),
+        sizeBytes: file.size,
+        ...(widthPx != null && { widthPx, heightPx }),
+      };
+      await updateFile(payload);
+      showToast("File uploaded", "success");
+      mutate();
+    } catch (err: unknown) {
+      console.error("[DesignDetail] Upload failed:", err);
+      showToast("Failed to upload", "error");
+    } finally {
+      setUploadingKind(null);
+      pickKindRef.current = null;
+      if (overviewPngInputRef.current) overviewPngInputRef.current.value = "";
+      if (overviewSvgInputRef.current) overviewSvgInputRef.current.value = "";
+      if (overviewPdfInputRef.current) overviewPdfInputRef.current.value = "";
+    }
+  };
+
+  const handleOverviewPngChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    const kind = pickKindRef.current;
+    if (!file || !kind) return;
+    await commitDesignFileUpload(file, kind);
+  };
+  const handleOverviewSvgChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    const kind = pickKindRef.current;
+    if (!file || !kind) return;
+    await commitDesignFileUpload(file, kind);
+  };
+  const handleOverviewPdfChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    const kind = pickKindRef.current;
+    if (!file || !kind) return;
+    await commitDesignFileUpload(file, kind);
+  };
+
   const startEditingColors = () => {
     setEditedColors([...design!.colors]);
     setIsEditingColors(true);
@@ -575,7 +735,7 @@ function DesignDetailContent() {
     try {
       await updateDesign({
         designId: design.id,
-        designType: editDesignType,
+        designType: editDesignType || null,
         designSeries: normalizeDesignSeriesInput(editDesignSeries),
         internalNotes: internalNotesEdit.trim() || null,
         supportedSides:
@@ -592,6 +752,26 @@ function DesignDetailContent() {
       showToast("Failed to save", "error");
     } finally {
       setSavingMeta(false);
+    }
+  };
+
+  /** Same `supportedSides` as Overview → Edit; quick access from Files tab. */
+  const handleQuickPrintSidesChange = async (e: React.ChangeEvent<HTMLSelectElement>) => {
+    if (!design?.id) return;
+    const v = e.target.value as DesignPrintSidesMode;
+    const prev = editPrintSides;
+    setEditPrintSides(v);
+    try {
+      await updateDesign({
+        designId: design.id,
+        supportedSides: v === "both" ? null : v === "front" ? ["front"] : ["back"],
+      });
+      showToast("Print sides updated", "success");
+      mutate();
+    } catch (err: unknown) {
+      console.error("[DesignDetail] Print sides update failed:", err);
+      showToast("Could not update print sides", "error");
+      setEditPrintSides(prev);
     }
   };
 
@@ -719,6 +899,35 @@ function DesignDetailContent() {
     }
   };
 
+  /** Prefer fields stored on `designs/{id}` (taxonomy snapshot, codes, caches); team catalog is last resort. */
+  const linkedTeam = useMemo(
+    () => (design?.teamId ? teams.find((t) => t.id === design.teamId) : undefined),
+    [design?.teamId, teams]
+  );
+
+  const leagueDisplayLabel = useMemo(() => {
+    if (!design) return "—";
+    const fromTax = design.taxonomy?.leagueName?.trim();
+    if (fromTax) return fromTax;
+    const fromCode = taxonomyLeagues?.find((l) => l.code === design.leagueCode)?.name?.trim();
+    if (fromCode) return fromCode;
+    const lid = design.leagueId?.trim();
+    if (lid) return lid;
+    const fromTeam = linkedTeam?.league ?? linkedTeam?.leagueId ?? linkedTeam?.leagueCode;
+    if (fromTeam) return String(fromTeam);
+    if (design.leagueCode) return design.leagueCode;
+    return "—";
+  }, [design, taxonomyLeagues, linkedTeam]);
+
+  const teamDisplayLabel = useMemo(() => {
+    if (!design) return "—";
+    const fromTax = design.taxonomy?.teamName?.trim();
+    if (fromTax) return fromTax;
+    const cache = design.teamNameCache?.trim();
+    if (cache) return cache;
+    return design.teamId || "—";
+  }, [design]);
+
   if (isLoading) {
     return (
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">
@@ -742,6 +951,8 @@ function DesignDetailContent() {
 
   const completeness = computeDesignCompleteness(design);
   const assetUrls = resolveDesignAssets(design);
+  const frontAssets = resolveDesignSideAssets(design, "front");
+  const backAssets = resolveDesignSideAssets(design, "back");
   const garmentBadges = designGarmentAssetBadges(design);
 
   return (
@@ -795,6 +1006,27 @@ function DesignDetailContent() {
         accept="image/svg+xml,.svg"
         className="hidden"
         onChange={handleDarkSvgUpload}
+      />
+      <input
+        ref={overviewPngInputRef}
+        type="file"
+        accept="image/png,image/*"
+        className="hidden"
+        onChange={handleOverviewPngChange}
+      />
+      <input
+        ref={overviewSvgInputRef}
+        type="file"
+        accept="image/svg+xml,.svg"
+        className="hidden"
+        onChange={handleOverviewSvgChange}
+      />
+      <input
+        ref={overviewPdfInputRef}
+        type="file"
+        accept="application/pdf"
+        className="hidden"
+        onChange={handleOverviewPdfChange}
       />
 
       {/* Toast notification */}
@@ -854,13 +1086,9 @@ function DesignDetailContent() {
                 )}
               </div>
               <p className="text-sm text-gray-600 mt-1">
-                <span className="font-medium text-gray-800">
-                  {design.leagueId?.trim() ||
-                    teams.find((t) => t.id === design.teamId)?.league ||
-                    "—"}
-                </span>
+                <span className="font-medium text-gray-800">{leagueDisplayLabel}</span>
                 {" · "}
-                {design.teamNameCache || design.teamId}
+                {teamDisplayLabel}
               </p>
               <p className="text-sm text-gray-600 mt-1">
                 <span className="font-medium text-gray-700">Series:</span>{" "}
@@ -885,19 +1113,15 @@ function DesignDetailContent() {
           {/* Quick stats */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-6 pt-6 border-t border-gray-200">
             <div>
-              <div className="text-sm text-gray-500">League</div>
-              <div className="font-medium">
-                {design.leagueId?.trim() ||
-                  teams.find((t) => t.id === design.teamId)?.league ||
-                  "—"}
-              </div>
+              <div className="text-sm font-medium text-gray-600">League</div>
+              <div className="font-semibold text-gray-900 mt-0.5">{leagueDisplayLabel}</div>
             </div>
             <div>
-              <div className="text-sm text-gray-500">Team</div>
-              <div className="font-medium">{design.teamNameCache || design.teamId}</div>
+              <div className="text-sm font-medium text-gray-600">Team</div>
+              <div className="font-semibold text-gray-900 mt-0.5">{teamDisplayLabel}</div>
             </div>
             <div>
-              <div className="text-sm text-gray-500">Garment assets</div>
+              <div className="text-sm font-medium text-gray-600">Garment assets</div>
               <div className="flex flex-wrap gap-1 mt-1">
                 <span
                   className={`text-xs px-2 py-0.5 rounded font-medium ${
@@ -916,11 +1140,11 @@ function DesignDetailContent() {
               </div>
             </div>
             <div>
-              <div className="text-sm text-gray-500">Used on products</div>
-              <div className="text-sm font-medium">
+              <div className="text-sm font-medium text-gray-600">Used on products</div>
+              <div className="text-sm font-semibold text-gray-900 mt-0.5">
                 {linkedProducts.length} live link{linkedProducts.length !== 1 ? "s" : ""}
               </div>
-              <p className="text-xs text-gray-400 mt-0.5">
+              <p className="text-xs text-gray-600 mt-0.5">
                 Blank links: {design.linkedBlankVariantCount} (separate from products)
               </p>
             </div>
@@ -954,45 +1178,189 @@ function DesignDetailContent() {
                 <div>
                   <h3 className="text-sm font-semibold text-gray-900 mb-3">Assets</h3>
                   <p className="text-xs text-gray-500 mb-4">
-                    Two garment variants: use <strong>Light Garment</strong> on light blanks (white, grey, …) and{" "}
-                    <strong>Dark Garment</strong> on dark blanks (black, navy, …). The renderer picks by garment color
-                    family — not a design-level light/dark mode.
+                    Organized by <strong>print side</strong> (front / back) and <strong>garment tone</strong> (light vs dark
+                    garment for the overlay). The renderer picks light vs dark PNG by blank color family. Use the{" "}
+                    <span className="font-mono">Files</span> tab for legacy flat slots or bulk replace.
                   </p>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="rounded-lg border-2 border-amber-200 bg-amber-50/50 p-3">
-                      <h4 className="text-sm font-medium text-amber-900 mb-2">Light Garment PNG</h4>
-                      <p className="text-xs text-amber-800 mb-3">Overlay for light-colored garments.</p>
-                      <div className="bg-white rounded-lg p-4 flex items-center justify-center min-h-[200px] border border-amber-100">
-                        {assetUrls.lightPng ? (
-                          <img
-                            src={assetUrls.lightPng}
-                            alt="Light garment"
-                            className="max-w-full max-h-[220px] object-contain"
-                          />
-                        ) : (
-                          <p className="text-gray-500 text-sm">Not uploaded</p>
-                        )}
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    {(
+                      [
+                        {
+                          title: "Front",
+                          u: frontAssets,
+                          pngL: "frontLightPng" as const,
+                          pngD: "frontDarkPng" as const,
+                          svgL: "frontLightSvg" as const,
+                          svgD: "frontDarkSvg" as const,
+                          pdfL: "frontLightPdf" as const,
+                          pdfD: "frontDarkPdf" as const,
+                        },
+                        {
+                          title: "Back",
+                          u: backAssets,
+                          pngL: "backLightPng" as const,
+                          pngD: "backDarkPng" as const,
+                          svgL: "backLightSvg" as const,
+                          svgD: "backDarkSvg" as const,
+                          pdfL: "backLightPdf" as const,
+                          pdfD: "backDarkPdf" as const,
+                        },
+                      ] as const
+                    ).map((row) => (
+                      <div
+                        key={row.title}
+                        className="rounded-lg border border-gray-200 bg-white p-4 space-y-4 shadow-sm"
+                      >
+                        <h4 className="text-sm font-semibold text-gray-900 border-b border-gray-100 pb-2">{row.title}</h4>
+                        <div>
+                          <p className="text-[11px] text-gray-500 mb-2">PNG</p>
+                          <div className="grid grid-cols-2 gap-2">
+                            <div className="rounded border border-amber-100 bg-amber-50/40 p-2">
+                              <p className="text-[10px] font-medium text-amber-900 mb-1">Light</p>
+                              <div className="bg-white rounded min-h-[120px] flex items-center justify-center border border-amber-100/80">
+                                {row.u.lightPng ? (
+                                  <img
+                                    src={row.u.lightPng}
+                                    alt=""
+                                    className="max-w-full max-h-[120px] object-contain"
+                                  />
+                                ) : (
+                                  <span className="text-[10px] text-gray-400">—</span>
+                                )}
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => triggerOverviewPick(row.pngL)}
+                                disabled={uploadingKind === row.pngL}
+                                className="mt-1 w-full text-[10px] py-1 rounded bg-amber-700 text-white hover:bg-amber-800 disabled:opacity-50"
+                              >
+                                {uploadingKind === row.pngL ? "…" : "Upload"}
+                              </button>
+                            </div>
+                            <div className="rounded border border-slate-200 bg-slate-50/60 p-2">
+                              <p className="text-[10px] font-medium text-slate-800 mb-1">Dark</p>
+                              <div className="bg-slate-100 rounded min-h-[120px] flex items-center justify-center border border-slate-200/80">
+                                {row.u.darkPng ? (
+                                  <img
+                                    src={row.u.darkPng}
+                                    alt=""
+                                    className="max-w-full max-h-[120px] object-contain"
+                                  />
+                                ) : (
+                                  <span className="text-[10px] text-gray-400">—</span>
+                                )}
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => triggerOverviewPick(row.pngD)}
+                                disabled={uploadingKind === row.pngD}
+                                className="mt-1 w-full text-[10px] py-1 rounded bg-slate-700 text-white hover:bg-slate-800 disabled:opacity-50"
+                              >
+                                {uploadingKind === row.pngD ? "…" : "Upload"}
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                        <div>
+                          <p className="text-[11px] text-gray-500 mb-2">SVG</p>
+                          <div className="flex flex-wrap gap-2 text-xs">
+                            {row.u.lightSvg ? (
+                              <a
+                                href={row.u.lightSvg}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-blue-600 hover:underline"
+                              >
+                                Light
+                              </a>
+                            ) : (
+                              <span className="text-gray-400">Light —</span>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => triggerOverviewPick(row.svgL)}
+                              className="text-blue-600 hover:underline"
+                            >
+                              {uploadingKind === row.svgL ? "…" : "↑ Light"}
+                            </button>
+                            <span className="text-gray-300">|</span>
+                            {row.u.darkSvg ? (
+                              <a
+                                href={row.u.darkSvg}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-blue-600 hover:underline"
+                              >
+                                Dark
+                              </a>
+                            ) : (
+                              <span className="text-gray-400">Dark —</span>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => triggerOverviewPick(row.svgD)}
+                              className="text-blue-600 hover:underline"
+                            >
+                              {uploadingKind === row.svgD ? "…" : "↑ Dark"}
+                            </button>
+                          </div>
+                        </div>
+                        <div>
+                          <p className="text-[11px] text-gray-500 mb-2">PDF</p>
+                          <div className="flex flex-wrap gap-2 text-xs items-center">
+                            {row.u.lightPdf ? (
+                              <a
+                                href={row.u.lightPdf}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-blue-600 hover:underline"
+                              >
+                                Light
+                              </a>
+                            ) : (
+                              <span className="text-gray-400">Light —</span>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => triggerOverviewPick(row.pdfL)}
+                              className="text-blue-600 hover:underline"
+                            >
+                              {uploadingKind === row.pdfL ? "…" : "↑ Light"}
+                            </button>
+                            <span className="text-gray-300">|</span>
+                            {row.u.darkPdf ? (
+                              <a
+                                href={row.u.darkPdf}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-blue-600 hover:underline"
+                              >
+                                Dark
+                              </a>
+                            ) : (
+                              <span className="text-gray-400">Dark —</span>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => triggerOverviewPick(row.pdfD)}
+                              className="text-blue-600 hover:underline"
+                            >
+                              {uploadingKind === row.pdfD ? "…" : "↑ Dark"}
+                            </button>
+                          </div>
+                        </div>
                       </div>
-                    </div>
-                    <div className="rounded-lg border-2 border-slate-700 bg-slate-900/5 p-3">
-                      <h4 className="text-sm font-medium text-slate-900 mb-2">Dark Garment PNG</h4>
-                      <p className="text-xs text-slate-600 mb-3">Overlay for dark-colored garments.</p>
-                      <div className="bg-slate-100 rounded-lg p-4 flex items-center justify-center min-h-[200px] border border-slate-200">
-                        {assetUrls.darkPng ? (
-                          <img
-                            src={assetUrls.darkPng}
-                            alt="Dark garment"
-                            className="max-w-full max-h-[220px] object-contain"
-                          />
-                        ) : (
-                          <p className="text-gray-500 text-sm">Not uploaded</p>
-                        )}
-                      </div>
-                    </div>
+                    ))}
                   </div>
+                  <p className="text-[11px] text-gray-500 mt-4">
+                    Default preview above uses the design’s primary print side (from{" "}
+                    <span className="font-mono">supportedSides</span> + assets). Legacy single-pair files still map here
+                    when side-specific URLs are missing.
+                  </p>
                 </div>
 
-                <div className="flex flex-wrap gap-3 text-sm">
+                <div className="flex flex-wrap gap-3 text-sm text-gray-600">
+                  <span className="text-xs font-medium text-gray-500">Default side (summary):</span>
                   {assetUrls.lightSvg && (
                     <a
                       href={assetUrls.lightSvg}
@@ -1000,7 +1368,7 @@ function DesignDetailContent() {
                       rel="noopener noreferrer"
                       className="text-blue-600 hover:underline"
                     >
-                      Light garment SVG
+                      Light SVG
                     </a>
                   )}
                   {assetUrls.darkSvg && (
@@ -1010,7 +1378,7 @@ function DesignDetailContent() {
                       rel="noopener noreferrer"
                       className="text-blue-600 hover:underline"
                     >
-                      Dark garment SVG
+                      Dark SVG
                     </a>
                   )}
                   {assetUrls.lightPdf && (
@@ -1020,7 +1388,7 @@ function DesignDetailContent() {
                       rel="noopener noreferrer"
                       className="text-blue-600 hover:underline"
                     >
-                      Light garment PDF
+                      Light PDF
                     </a>
                   )}
                   {assetUrls.darkPdf && (
@@ -1030,7 +1398,7 @@ function DesignDetailContent() {
                       rel="noopener noreferrer"
                       className="text-blue-600 hover:underline"
                     >
-                      Dark garment PDF
+                      Dark PDF
                     </a>
                   )}
                 </div>
@@ -1092,18 +1460,27 @@ function DesignDetailContent() {
 
                 <div className="border border-gray-200 rounded-lg p-4 space-y-3">
                   <h3 className="text-sm font-medium text-gray-700">Edit</h3>
+                  <p className="text-[11px] text-[#737373] mb-2">
+                    Firestore: <span className="font-mono">designType</span> (theme),{" "}
+                    <span className="font-mono">designSeries</span>, <span className="font-mono">supportedSides</span>{" "}
+                    (print sides). Loaded from the saved design document — no implicit defaults.
+                  </p>
                   <label className="block text-xs text-gray-600">Design theme</label>
                   <p className="text-[11px] text-[#737373] mb-1">
-                    Concept / campaign (library, filters, batch). Not visual style — a separate Style field may come later.
+                    Theme = campaign / concept (library, filters, automation). Stored as{" "}
+                    <span className="font-mono">designType</span>. Not the same as taxonomy “Theme” below.
                   </p>
                   <select
                     value={editDesignType}
-                    onChange={(e) => setEditDesignType(e.target.value as DesignThemeValue)}
+                    onChange={(e) =>
+                      setEditDesignType((e.target.value || "") as DesignThemeValue | "")
+                    }
                     className="w-full max-w-md border border-gray-300 rounded px-2 py-1.5 text-sm bg-white text-gray-900"
                   >
+                    <option value="">— Not set —</option>
                     {editDesignType && !isCanonicalDesignTheme(editDesignType) ? (
                       <option value={editDesignType}>
-                        {designThemeLabel(editDesignType)} (legacy — pick a new theme below)
+                        {designThemeLabel(editDesignType)} (legacy — pick a canonical theme)
                       </option>
                     ) : null}
                     {DESIGN_THEME_OPTIONS.map((t) => (
@@ -1114,7 +1491,9 @@ function DesignDetailContent() {
                   </select>
                   <label className="block text-xs text-gray-600 mt-3">Design series (optional)</label>
                   <p className="text-[11px] text-[#737373] mb-1">
-                    Campaign / grouping slug (snake_case). Complements theme; leave empty for one-offs.
+                    Series = grouping / slug (snake_case, e.g. <span className="font-mono">69</span> or{" "}
+                    <span className="font-mono">will_drop_for</span>). Stored as <span className="font-mono">designSeries</span>
+                    ; complements theme.
                   </p>
                   <input
                     type="text"
@@ -1126,8 +1505,10 @@ function DesignDetailContent() {
                   />
                   <label className="block text-xs text-gray-600 mt-3">Print sides (garment)</label>
                   <p className="text-[11px] text-[#737373] mb-1">
-                    Back-only art stays off the front on the product page and in mockups. Batch imports set this automatically;
-                    use <strong>Back only</strong> for city-number backs, etc.
+                    Garment placement behavior for this artwork: which sides may receive the print when only{" "}
+                    <span className="font-mono">designId</span> is set. Stored as <span className="font-mono">supportedSides</span>{" "}
+                    (<span className="font-mono">front</span>/<span className="font-mono">back</span>); if unset, we infer from{" "}
+                    <span className="font-mono">placementDefaults</span>. Product-level placement overrides live on the product.
                   </p>
                   <select
                     value={editPrintSides}
@@ -1278,306 +1659,417 @@ function DesignDetailContent() {
             {/* Files Tab: SVG + PNG + PDF + colors + validations */}
             {activeTab === "files" && (
               <div className="space-y-6">
-                <p className="text-sm text-gray-600">
-                  <strong>Light Garment</strong> and <strong>Dark Garment</strong> PNG overlays (transparent) for rendering by
-                  blank color family. Optional vector/PDF masters mirror the same split (legacy single{" "}
-                  <code className="text-xs bg-gray-100 px-1 rounded">files.svg</code> /{" "}
-                  <code className="text-xs bg-gray-100 px-1 rounded">files.pdf</code> show under light garment until you
-                  replace). Max: SVG 5MB, PNG 25MB, PDF 50MB.
+                <p className="text-sm text-gray-700">
+                  Artwork is stored <strong className="text-gray-900">per print side</strong> (front / back) and{" "}
+                  <strong className="text-gray-900">per garment tone</strong> (light / dark). Use transparent PNG overlays for
+                  mockups; optional SVG/PDF masters follow the same layout. Max: SVG 5MB, PNG 25MB, PDF 50MB.
                 </p>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                  {/* Light garment SVG */}
-                  <div className="border border-gray-200 rounded-lg p-4">
-                    <h3 className="font-medium mb-1">Light garment SVG</h3>
-                    <p className="text-xs text-gray-500 mb-3">Vector for light blanks (includes legacy single SVG).</p>
-                    <div className="bg-gray-50 rounded-lg p-6 flex flex-col items-center justify-center min-h-[200px]">
-                      {(design.files?.lightSvg?.downloadUrl || design.files?.svg?.downloadUrl) ? (
-                        <>
-                          <img
-                            src={design.files.lightSvg?.downloadUrl ?? design.files.svg!.downloadUrl}
-                            alt="Light SVG preview"
-                            className="max-w-full max-h-[150px] object-contain mb-3"
-                          />
-                          <div className="text-xs text-gray-500 text-center">
-                            <p>{design.files.lightSvg?.fileName ?? design.files.svg?.fileName}</p>
-                            <p>{formatBytes(design.files.lightSvg?.sizeBytes ?? design.files.svg?.sizeBytes ?? 0)}</p>
-                          </div>
-                          <a
-                            href={design.files.lightSvg?.downloadUrl ?? design.files.svg!.downloadUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="mt-2 text-sm text-blue-600 hover:underline"
-                          >
-                            Download
-                          </a>
-                        </>
-                      ) : (
-                        <div className="text-center text-gray-400">
-                          <svg className="w-12 h-12 mx-auto mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
-                          </svg>
-                          <p>No light SVG</p>
-                        </div>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => lightSvgInputRef.current?.click()}
-                      disabled={uploadingKind === "lightSvg"}
-                      className="mt-3 w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
-                    >
-                      {uploadingKind === "lightSvg"
-                        ? "Uploading..."
-                        : design.files?.lightSvg || design.files?.svg
-                          ? "Replace light SVG"
-                          : "Upload light SVG"}
-                    </button>
-                  </div>
-
-                  {/* Dark garment SVG */}
-                  <div className="border border-gray-200 rounded-lg p-4">
-                    <h3 className="font-medium mb-1">Dark garment SVG</h3>
-                    <p className="text-xs text-gray-500 mb-3">Vector for dark blanks.</p>
-                    <div className="bg-gray-50 rounded-lg p-6 flex flex-col items-center justify-center min-h-[200px]">
-                      {design.files?.darkSvg?.downloadUrl ? (
-                        <>
-                          <img
-                            src={design.files.darkSvg.downloadUrl}
-                            alt="Dark SVG preview"
-                            className="max-w-full max-h-[150px] object-contain mb-3"
-                          />
-                          <div className="text-xs text-gray-500 text-center">
-                            <p>{design.files.darkSvg.fileName}</p>
-                            <p>{formatBytes(design.files.darkSvg.sizeBytes)}</p>
-                          </div>
-                          <a
-                            href={design.files.darkSvg.downloadUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="mt-2 text-sm text-blue-600 hover:underline"
-                          >
-                            Download
-                          </a>
-                        </>
-                      ) : (
-                        <div className="text-center text-gray-400">
-                          <svg className="w-12 h-12 mx-auto mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
-                          </svg>
-                          <p>No dark SVG</p>
-                        </div>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => darkSvgInputRef.current?.click()}
-                      disabled={uploadingKind === "darkSvg"}
-                      className="mt-3 w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
-                    >
-                      {uploadingKind === "darkSvg"
-                        ? "Uploading..."
-                        : design.files?.darkSvg
-                          ? "Replace dark SVG"
-                          : "Upload dark SVG"}
-                    </button>
-                  </div>
-
-                  {/* Light Garment PNG */}
-                  <div className="border border-gray-200 rounded-lg p-4">
-                    <h3 className="font-medium mb-1">Light Garment PNG</h3>
-                    <p className="text-xs text-gray-500 mb-3">For light-colored garments (white, grey, etc.)</p>
-                    <div className="bg-gray-50 rounded-lg p-6 flex flex-col items-center justify-center min-h-[200px]">
-                      {design.files?.lightPng?.downloadUrl ? (
-                        <>
-                          <img
-                            src={design.files.lightPng.downloadUrl}
-                            alt="Light PNG"
-                            className="max-w-full max-h-[150px] object-contain mb-3"
-                          />
-                          <div className="text-xs text-gray-500 text-center">
-                            <p>{design.files.lightPng.fileName}</p>
-                            <p>{formatBytes(design.files.lightPng.sizeBytes)}</p>
-                          </div>
-                        </>
-                      ) : (
-                        <div className="text-center text-gray-400 text-sm">No light PNG</div>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => lightPngInputRef.current?.click()}
-                      disabled={uploadingKind === "lightPng"}
-                      className="mt-3 w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
-                    >
-                      {uploadingKind === "lightPng"
-                        ? "Uploading..."
-                        : design.files?.lightPng
-                          ? "Replace"
-                          : "Upload Light Garment PNG"}
-                    </button>
-                  </div>
-
-                  {/* Dark Garment PNG */}
-                  <div className="border border-gray-200 rounded-lg p-4">
-                    <h3 className="font-medium mb-1">Dark Garment PNG</h3>
-                    <p className="text-xs text-gray-500 mb-3">For dark-colored garments (black, navy, etc.)</p>
-                    <div className="bg-gray-50 rounded-lg p-6 flex flex-col items-center justify-center min-h-[200px]">
-                      {design.files?.darkPng?.downloadUrl ? (
-                        <>
-                          <img
-                            src={design.files.darkPng.downloadUrl}
-                            alt="Dark PNG"
-                            className="max-w-full max-h-[150px] object-contain mb-3"
-                          />
-                          <div className="text-xs text-gray-500 text-center">
-                            <p>{design.files.darkPng.fileName}</p>
-                            <p>{formatBytes(design.files.darkPng.sizeBytes)}</p>
-                          </div>
-                        </>
-                      ) : (
-                        <div className="text-center text-gray-400 text-sm">No dark PNG</div>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => darkPngInputRef.current?.click()}
-                      disabled={uploadingKind === "darkPng"}
-                      className="mt-3 w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
-                    >
-                      {uploadingKind === "darkPng"
-                        ? "Uploading..."
-                        : design.files?.darkPng
-                          ? "Replace"
-                          : "Upload Dark Garment PNG"}
-                    </button>
-                  </div>
-
-                  {/* Legacy single PNG (older records) */}
-                  <div className="border border-dashed border-amber-300 rounded-lg p-4 bg-amber-50/50">
-                    <h3 className="font-medium mb-3 text-amber-900">Legacy PNG (optional)</h3>
-                    <p className="text-xs text-amber-800 mb-2">
-                      Older designs used a single <code className="font-mono">files.png</code> — mapped to{" "}
-                      <strong>Light Garment</strong> only until you add a Dark Garment PNG.
+                <div className="rounded-xl border border-gray-200 bg-gray-50/80 p-4 flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
+                  <div className="min-w-0 flex-1">
+                    <label className="block text-sm font-semibold text-gray-900">Print sides (garment)</label>
+                    <p className="text-xs text-gray-600 mt-1">
+                      Same as Overview → Edit. When paths are not side-specific (legacy flat files below),{" "}
+                      <span className="font-mono text-gray-800">supportedSides</span> tells the engine which garment side(s)
+                      receive the print.
                     </p>
-                    <div className="bg-white rounded-lg p-4 flex flex-col items-center justify-center min-h-[120px]">
-                      {design.files?.png?.downloadUrl ? (
-                        <>
-                          <img
-                            src={design.files.png.downloadUrl}
-                            alt="Legacy"
-                            className="max-w-full max-h-[100px] object-contain mb-2"
-                          />
-                          <p className="text-xs text-gray-500">{design.files.png.fileName}</p>
-                        </>
-                      ) : (
-                        <p className="text-xs text-gray-400">None</p>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => pngInputRef.current?.click()}
-                      disabled={uploadingKind === "png"}
-                      className="mt-3 w-full px-4 py-2 bg-amber-700 text-white rounded-lg hover:bg-amber-800 disabled:opacity-50 text-sm"
-                    >
-                      {uploadingKind === "png" ? "Uploading..." : design.files?.png ? "Replace legacy PNG" : "Set legacy PNG"}
-                    </button>
                   </div>
-
-                  {/* Light garment PDF */}
-                  <div className="border border-gray-200 rounded-lg p-4">
-                    <h3 className="font-medium mb-1">Light garment PDF</h3>
-                    <p className="text-xs text-gray-500 mb-3">Print-ready for light blanks (includes legacy single PDF).</p>
-                    <div className="bg-gray-50 rounded-lg p-6 flex flex-col items-center justify-center min-h-[200px]">
-                      {(design.files?.lightPdf?.downloadUrl || design.files?.pdf?.downloadUrl) ? (
-                        <>
-                          <svg className="w-16 h-16 text-red-500 mb-3" fill="currentColor" viewBox="0 0 24 24">
-                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm-1 2l5 5h-5V4zM6 20V4h6v6h6v10H6z"/>
-                            <path d="M8 12h8v2H8zm0 4h5v2H8z"/>
-                          </svg>
-                          <div className="text-xs text-gray-500 text-center">
-                            <p>{design.files.lightPdf?.fileName ?? design.files.pdf?.fileName}</p>
-                            <p>{formatBytes(design.files.lightPdf?.sizeBytes ?? design.files.pdf?.sizeBytes ?? 0)}</p>
-                          </div>
-                          <a
-                            href={design.files.lightPdf?.downloadUrl ?? design.files.pdf!.downloadUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="mt-2 text-sm text-blue-600 hover:underline"
-                          >
-                            View PDF
-                          </a>
-                        </>
-                      ) : (
-                        <div className="text-center text-gray-400">
-                          <svg className="w-12 h-12 mx-auto mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                          </svg>
-                          <p>No light PDF</p>
-                        </div>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => lightPdfInputRef.current?.click()}
-                      disabled={uploadingKind === "lightPdf"}
-                      className="mt-3 w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
-                    >
-                      {uploadingKind === "lightPdf"
-                        ? "Uploading..."
-                        : design.files?.lightPdf || design.files?.pdf
-                          ? "Replace light PDF"
-                          : "Upload light PDF"}
-                    </button>
-                  </div>
-
-                  {/* Dark garment PDF */}
-                  <div className="border border-gray-200 rounded-lg p-4">
-                    <h3 className="font-medium mb-1">Dark garment PDF</h3>
-                    <p className="text-xs text-gray-500 mb-3">Print-ready for dark blanks.</p>
-                    <div className="bg-gray-50 rounded-lg p-6 flex flex-col items-center justify-center min-h-[200px]">
-                      {design.files?.darkPdf?.downloadUrl ? (
-                        <>
-                          <svg className="w-16 h-16 text-red-500 mb-3" fill="currentColor" viewBox="0 0 24 24">
-                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm-1 2l5 5h-5V4zM6 20V4h6v6h6v10H6z"/>
-                            <path d="M8 12h8v2H8zm0 4h5v2H8z"/>
-                          </svg>
-                          <div className="text-xs text-gray-500 text-center">
-                            <p>{design.files.darkPdf.fileName}</p>
-                            <p>{formatBytes(design.files.darkPdf.sizeBytes)}</p>
-                          </div>
-                          <a
-                            href={design.files.darkPdf.downloadUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="mt-2 text-sm text-blue-600 hover:underline"
-                          >
-                            View PDF
-                          </a>
-                        </>
-                      ) : (
-                        <div className="text-center text-gray-400">
-                          <svg className="w-12 h-12 mx-auto mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                          </svg>
-                          <p>No dark PDF</p>
-                        </div>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => darkPdfInputRef.current?.click()}
-                      disabled={uploadingKind === "darkPdf"}
-                      className="mt-3 w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
-                    >
-                      {uploadingKind === "darkPdf"
-                        ? "Uploading..."
-                        : design.files?.darkPdf
-                          ? "Replace dark PDF"
-                          : "Upload dark PDF"}
-                    </button>
-                  </div>
+                  <select
+                    value={editPrintSides}
+                    onChange={handleQuickPrintSidesChange}
+                    className="shrink-0 w-full sm:w-56 border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white text-gray-900"
+                  >
+                    <option value="both">Both front and back</option>
+                    <option value="front">Front only</option>
+                    <option value="back">Back only</option>
+                  </select>
                 </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  {(["front", "back"] as const).map((paneSide) => (
+                    <div
+                      key={paneSide}
+                      className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm space-y-4"
+                    >
+                      <div className="flex items-center gap-2 border-b border-gray-100 pb-3">
+                        <h3 className="text-lg font-bold text-gray-900 capitalize">{paneSide}</h3>
+                        <span className="text-xs font-medium text-gray-700 px-2 py-0.5 rounded-full bg-gray-100">
+                          Print side
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        {FILES_TAB_SLOTS.map(({ slot, short, format }) => {
+                          const kind = KIND_FOR_SIDE_SLOT[paneSide][slot];
+                          const file = nestedDesignFile(design, paneSide, slot);
+                          const busy = uploadingKind === kind;
+                          const title = `${paneSide === "front" ? "Front" : "Back"} · ${short}`;
+                          const toneHint = slot.startsWith("light") ? "light garment" : "dark garment";
+                          const blurb =
+                            format === "png"
+                              ? `PNG overlay (${toneHint}) on this side.`
+                              : format === "svg"
+                                ? `Vector (${toneHint}) on this side.`
+                                : `Print PDF (${toneHint}) on this side.`;
+                          return (
+                            <div key={slot} className="border border-gray-200 rounded-lg p-3 flex flex-col">
+                              <h4 className="text-sm font-semibold text-gray-900">{title}</h4>
+                              <p className="text-xs text-gray-600 mb-2">{blurb}</p>
+                              <div className="bg-gray-50 rounded-lg p-4 flex flex-col items-center justify-center min-h-[160px] flex-1">
+                                {format === "png" && file?.downloadUrl ? (
+                                  <>
+                                    <img
+                                      src={file.downloadUrl}
+                                      alt=""
+                                      className="max-w-full max-h-[120px] object-contain mb-2"
+                                    />
+                                    <div className="text-xs text-gray-600 text-center">
+                                      <p className="font-medium text-gray-800">{file.fileName}</p>
+                                      <p>{formatBytes(file.sizeBytes)}</p>
+                                    </div>
+                                  </>
+                                ) : format === "svg" && file?.downloadUrl ? (
+                                  <>
+                                    <img
+                                      src={file.downloadUrl}
+                                      alt=""
+                                      className="max-w-full max-h-[120px] object-contain mb-2"
+                                    />
+                                    <div className="text-xs text-gray-600 text-center">
+                                      <p className="font-medium text-gray-800">{file.fileName}</p>
+                                      <p>{formatBytes(file.sizeBytes)}</p>
+                                    </div>
+                                    <a
+                                      href={file.downloadUrl}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="mt-1 text-sm text-blue-700 font-medium hover:underline"
+                                    >
+                                      Open
+                                    </a>
+                                  </>
+                                ) : format === "pdf" && file?.downloadUrl ? (
+                                  <>
+                                    <svg
+                                      className="w-14 h-14 text-red-500 mb-2"
+                                      fill="currentColor"
+                                      viewBox="0 0 24 24"
+                                      aria-hidden
+                                    >
+                                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm-1 2l5 5h-5V4zM6 20V4h6v6h6v10H6z" />
+                                      <path d="M8 12h8v2H8zm0 4h5v2H8z" />
+                                    </svg>
+                                    <div className="text-xs text-gray-600 text-center">
+                                      <p className="font-medium text-gray-800">{file.fileName}</p>
+                                      <p>{formatBytes(file.sizeBytes)}</p>
+                                    </div>
+                                    <a
+                                      href={file.downloadUrl}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="mt-1 text-sm text-blue-700 font-medium hover:underline"
+                                    >
+                                      View PDF
+                                    </a>
+                                  </>
+                                ) : (
+                                  <div className="text-center text-gray-400 text-sm">No file</div>
+                                )}
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => triggerOverviewPick(kind)}
+                                disabled={busy}
+                                className="mt-3 w-full px-3 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                              >
+                                {busy ? "Uploading…" : file ? "Replace" : "Upload"}
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                {hasLegacyFlatDesignFiles(design) && (
+                  <div className="rounded-xl border border-dashed border-amber-300 bg-amber-50/60 p-4 space-y-3">
+                    <div>
+                      <h3 className="text-base font-semibold text-amber-950">Legacy flat files (root paths)</h3>
+                      <p className="text-xs text-amber-900 mt-1">
+                        These live on the old <span className="font-mono">files.lightPng</span>,{" "}
+                        <span className="font-mono">files.svg</span>, etc. shape. The <strong>Print sides</strong> control
+                        above sets <span className="font-mono">supportedSides</span> so rendering knows which garment side(s)
+                        apply when artwork is not split into <span className="font-mono">front</span> /{" "}
+                        <span className="font-mono">back</span>.
+                      </p>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                      {/* Light garment SVG */}
+                      <div className="border border-amber-200/80 rounded-lg p-3 bg-white/90">
+                        <h4 className="text-sm font-semibold text-gray-900 mb-1">Light garment SVG</h4>
+                        <p className="text-xs text-gray-600 mb-2">Includes legacy single SVG.</p>
+                        <div className="bg-gray-50 rounded-lg p-4 flex flex-col items-center justify-center min-h-[140px]">
+                          {(design.files?.lightSvg?.downloadUrl || design.files?.svg?.downloadUrl) ? (
+                            <>
+                              <img
+                                src={design.files.lightSvg?.downloadUrl ?? design.files.svg!.downloadUrl}
+                                alt=""
+                                className="max-w-full max-h-[100px] object-contain mb-2"
+                              />
+                              <div className="text-xs text-gray-600 text-center">
+                                <p>{design.files.lightSvg?.fileName ?? design.files.svg?.fileName}</p>
+                                <p>{formatBytes(design.files.lightSvg?.sizeBytes ?? design.files.svg?.sizeBytes ?? 0)}</p>
+                              </div>
+                              <a
+                                href={design.files.lightSvg?.downloadUrl ?? design.files.svg!.downloadUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="mt-1 text-sm text-blue-700 hover:underline"
+                              >
+                                Open
+                              </a>
+                            </>
+                          ) : (
+                            <div className="text-center text-gray-400 text-sm">No light SVG</div>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => lightSvgInputRef.current?.click()}
+                          disabled={uploadingKind === "lightSvg"}
+                          className="mt-2 w-full px-3 py-2 bg-amber-800 text-white text-sm rounded-lg hover:bg-amber-900 disabled:opacity-50"
+                        >
+                          {uploadingKind === "lightSvg"
+                            ? "Uploading…"
+                            : design.files?.lightSvg || design.files?.svg
+                              ? "Replace light SVG"
+                              : "Upload light SVG"}
+                        </button>
+                      </div>
+
+                      <div className="border border-amber-200/80 rounded-lg p-3 bg-white/90">
+                        <h4 className="text-sm font-semibold text-gray-900 mb-1">Dark garment SVG</h4>
+                        <p className="text-xs text-gray-600 mb-2">Vector for dark blanks.</p>
+                        <div className="bg-gray-50 rounded-lg p-4 flex flex-col items-center justify-center min-h-[140px]">
+                          {design.files?.darkSvg?.downloadUrl ? (
+                            <>
+                              <img
+                                src={design.files.darkSvg.downloadUrl}
+                                alt=""
+                                className="max-w-full max-h-[100px] object-contain mb-2"
+                              />
+                              <div className="text-xs text-gray-600 text-center">
+                                <p>{design.files.darkSvg.fileName}</p>
+                                <p>{formatBytes(design.files.darkSvg.sizeBytes)}</p>
+                              </div>
+                              <a
+                                href={design.files.darkSvg.downloadUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="mt-1 text-sm text-blue-700 hover:underline"
+                              >
+                                Open
+                              </a>
+                            </>
+                          ) : (
+                            <div className="text-center text-gray-400 text-sm">No dark SVG</div>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => darkSvgInputRef.current?.click()}
+                          disabled={uploadingKind === "darkSvg"}
+                          className="mt-2 w-full px-3 py-2 bg-amber-800 text-white text-sm rounded-lg hover:bg-amber-900 disabled:opacity-50"
+                        >
+                          {uploadingKind === "darkSvg"
+                            ? "Uploading…"
+                            : design.files?.darkSvg
+                              ? "Replace dark SVG"
+                              : "Upload dark SVG"}
+                        </button>
+                      </div>
+
+                      <div className="border border-amber-200/80 rounded-lg p-3 bg-white/90">
+                        <h4 className="text-sm font-semibold text-gray-900 mb-1">Light garment PNG</h4>
+                        <p className="text-xs text-gray-600 mb-2">Light-colored garments.</p>
+                        <div className="bg-gray-50 rounded-lg p-4 flex flex-col items-center justify-center min-h-[140px]">
+                          {design.files?.lightPng?.downloadUrl ? (
+                            <>
+                              <img
+                                src={design.files.lightPng.downloadUrl}
+                                alt=""
+                                className="max-w-full max-h-[100px] object-contain mb-2"
+                              />
+                              <div className="text-xs text-gray-600 text-center">
+                                <p>{design.files.lightPng.fileName}</p>
+                                <p>{formatBytes(design.files.lightPng.sizeBytes)}</p>
+                              </div>
+                            </>
+                          ) : (
+                            <div className="text-center text-gray-400 text-sm">No light PNG</div>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => lightPngInputRef.current?.click()}
+                          disabled={uploadingKind === "lightPng"}
+                          className="mt-2 w-full px-3 py-2 bg-amber-800 text-white text-sm rounded-lg hover:bg-amber-900 disabled:opacity-50"
+                        >
+                          {uploadingKind === "lightPng"
+                            ? "Uploading…"
+                            : design.files?.lightPng
+                              ? "Replace"
+                              : "Upload light PNG"}
+                        </button>
+                      </div>
+
+                      <div className="border border-amber-200/80 rounded-lg p-3 bg-white/90">
+                        <h4 className="text-sm font-semibold text-gray-900 mb-1">Dark garment PNG</h4>
+                        <p className="text-xs text-gray-600 mb-2">Dark-colored garments.</p>
+                        <div className="bg-gray-50 rounded-lg p-4 flex flex-col items-center justify-center min-h-[140px]">
+                          {design.files?.darkPng?.downloadUrl ? (
+                            <>
+                              <img
+                                src={design.files.darkPng.downloadUrl}
+                                alt=""
+                                className="max-w-full max-h-[100px] object-contain mb-2"
+                              />
+                              <div className="text-xs text-gray-600 text-center">
+                                <p>{design.files.darkPng.fileName}</p>
+                                <p>{formatBytes(design.files.darkPng.sizeBytes)}</p>
+                              </div>
+                            </>
+                          ) : (
+                            <div className="text-center text-gray-400 text-sm">No dark PNG</div>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => darkPngInputRef.current?.click()}
+                          disabled={uploadingKind === "darkPng"}
+                          className="mt-2 w-full px-3 py-2 bg-amber-800 text-white text-sm rounded-lg hover:bg-amber-900 disabled:opacity-50"
+                        >
+                          {uploadingKind === "darkPng"
+                            ? "Uploading…"
+                            : design.files?.darkPng
+                              ? "Replace"
+                              : "Upload dark PNG"}
+                        </button>
+                      </div>
+
+                      <div className="border border-amber-200/80 rounded-lg p-3 bg-white/90">
+                        <h4 className="text-sm font-semibold text-gray-900 mb-1">Legacy single PNG</h4>
+                        <p className="text-xs text-gray-600 mb-2">
+                          Older <span className="font-mono">files.png</span>; treated as light garment until dark PNG exists.
+                        </p>
+                        <div className="bg-gray-50 rounded-lg p-4 flex flex-col items-center justify-center min-h-[120px]">
+                          {design.files?.png?.downloadUrl ? (
+                            <>
+                              <img
+                                src={design.files.png.downloadUrl}
+                                alt=""
+                                className="max-w-full max-h-[90px] object-contain mb-2"
+                              />
+                              <p className="text-xs text-gray-600">{design.files.png.fileName}</p>
+                            </>
+                          ) : (
+                            <div className="text-center text-gray-400 text-sm">None</div>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => pngInputRef.current?.click()}
+                          disabled={uploadingKind === "png"}
+                          className="mt-2 w-full px-3 py-2 bg-amber-800 text-white text-sm rounded-lg hover:bg-amber-900 disabled:opacity-50"
+                        >
+                          {uploadingKind === "png" ? "Uploading…" : design.files?.png ? "Replace legacy PNG" : "Set legacy PNG"}
+                        </button>
+                      </div>
+
+                      <div className="border border-amber-200/80 rounded-lg p-3 bg-white/90">
+                        <h4 className="text-sm font-semibold text-gray-900 mb-1">Light garment PDF</h4>
+                        <p className="text-xs text-gray-600 mb-2">Includes legacy single PDF.</p>
+                        <div className="bg-gray-50 rounded-lg p-4 flex flex-col items-center justify-center min-h-[140px]">
+                          {(design.files?.lightPdf?.downloadUrl || design.files?.pdf?.downloadUrl) ? (
+                            <>
+                              <svg className="w-12 h-12 text-red-500 mb-2" fill="currentColor" viewBox="0 0 24 24">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm-1 2l5 5h-5V4zM6 20V4h6v6h6v10H6z" />
+                                <path d="M8 12h8v2H8zm0 4h5v2H8z" />
+                              </svg>
+                              <div className="text-xs text-gray-600 text-center">
+                                <p>{design.files.lightPdf?.fileName ?? design.files.pdf?.fileName}</p>
+                                <p>{formatBytes(design.files.lightPdf?.sizeBytes ?? design.files.pdf?.sizeBytes ?? 0)}</p>
+                              </div>
+                              <a
+                                href={design.files.lightPdf?.downloadUrl ?? design.files.pdf!.downloadUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="mt-1 text-sm text-blue-700 hover:underline"
+                              >
+                                View PDF
+                              </a>
+                            </>
+                          ) : (
+                            <div className="text-center text-gray-400 text-sm">No light PDF</div>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => lightPdfInputRef.current?.click()}
+                          disabled={uploadingKind === "lightPdf"}
+                          className="mt-2 w-full px-3 py-2 bg-amber-800 text-white text-sm rounded-lg hover:bg-amber-900 disabled:opacity-50"
+                        >
+                          {uploadingKind === "lightPdf"
+                            ? "Uploading…"
+                            : design.files?.lightPdf || design.files?.pdf
+                              ? "Replace light PDF"
+                              : "Upload light PDF"}
+                        </button>
+                      </div>
+
+                      <div className="border border-amber-200/80 rounded-lg p-3 bg-white/90">
+                        <h4 className="text-sm font-semibold text-gray-900 mb-1">Dark garment PDF</h4>
+                        <p className="text-xs text-gray-600 mb-2">Print-ready for dark blanks.</p>
+                        <div className="bg-gray-50 rounded-lg p-4 flex flex-col items-center justify-center min-h-[140px]">
+                          {design.files?.darkPdf?.downloadUrl ? (
+                            <>
+                              <svg className="w-12 h-12 text-red-500 mb-2" fill="currentColor" viewBox="0 0 24 24">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm-1 2l5 5h-5V4zM6 20V4h6v6h6v10H6z" />
+                                <path d="M8 12h8v2H8zm0 4h5v2H8z" />
+                              </svg>
+                              <div className="text-xs text-gray-600 text-center">
+                                <p>{design.files.darkPdf.fileName}</p>
+                                <p>{formatBytes(design.files.darkPdf.sizeBytes)}</p>
+                              </div>
+                              <a
+                                href={design.files.darkPdf.downloadUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="mt-1 text-sm text-blue-700 hover:underline"
+                              >
+                                View PDF
+                              </a>
+                            </>
+                          ) : (
+                            <div className="text-center text-gray-400 text-sm">No dark PDF</div>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => darkPdfInputRef.current?.click()}
+                          disabled={uploadingKind === "darkPdf"}
+                          className="mt-2 w-full px-3 py-2 bg-amber-800 text-white text-sm rounded-lg hover:bg-amber-900 disabled:opacity-50"
+                        >
+                          {uploadingKind === "darkPdf"
+                            ? "Uploading…"
+                            : design.files?.darkPdf
+                              ? "Replace dark PDF"
+                              : "Upload dark PDF"}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 {/* Colors section (inline in Files tab) */}
                 <div className="border-t border-gray-200 pt-6 mt-6">

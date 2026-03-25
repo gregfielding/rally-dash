@@ -204,6 +204,8 @@ export interface CreateMockJobInput {
   quality: "draft" | "final";
   /** When set, mockup is saved to /products/{productId}/mockup.png and product.mockupUrl is updated */
   productId?: string;
+  /** Parent product flow: write mockup + media to `rp_products/{productId}/variants/{productVariantId}` */
+  productVariantId?: string;
   /** Phase 4: when set with productId, creates rp_product_asset and sets product.media.heroFront/heroBack */
   heroSlot?: "hero_front" | "hero_back";
   /** Explicit image URLs (RALLY_PHASE1_RENDER_SETUP_UI). When set, renderer uses these instead of resolving from blank/design. */

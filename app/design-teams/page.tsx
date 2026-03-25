@@ -1,11 +1,14 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import Modal from "@/components/Modal";
+import TeamProductMatrixPanel from "@/components/design-teams/TeamProductMatrixPanel";
 import { useDesignTeams } from "@/lib/hooks/useDesignAssets";
 import type { DesignTeam, DesignTeamColor } from "@/lib/types/firestore";
+
+type TeamDetailTab = "overview" | "colors" | "products";
 
 function formatCmyk(c: DesignTeamColor["cmyk"] | null | undefined): string {
   if (!c) return "—";
@@ -31,6 +34,11 @@ function DesignTeamsRosterContent() {
   const [leagueFilter, setLeagueFilter] = useState("");
   const [search, setSearch] = useState("");
   const [detailTeam, setDetailTeam] = useState<DesignTeam | null>(null);
+  const [detailTab, setDetailTab] = useState<TeamDetailTab>("overview");
+
+  useEffect(() => {
+    if (detailTeam) setDetailTab("overview");
+  }, [detailTeam?.id]);
 
   const leagues = useMemo(() => {
     const s = new Set<string>();
@@ -260,86 +268,137 @@ function DesignTeamsRosterContent() {
         size="large"
       >
         {detailTeam && (
-          <div className="text-sm text-gray-800 space-y-4 max-h-[70vh] overflow-y-auto pr-1">
-            <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2">
-              <dt className="text-gray-500 text-xs">Firestore id</dt>
-              <dd className="font-mono text-xs">{detailTeam.id}</dd>
-              <dt className="text-gray-500 text-xs">teamCode</dt>
-              <dd className="font-mono text-xs">{detailTeam.teamCode ?? "—"}</dd>
-              <dt className="text-gray-500 text-xs">League</dt>
-              <dd>{detailTeam.league || detailTeam.leagueId || detailTeam.leagueCode || "—"}</dd>
-              <dt className="text-gray-500 text-xs">City / state</dt>
-              <dd>{[detailTeam.city, detailTeam.state].filter(Boolean).join(", ") || "—"}</dd>
-              <dt className="text-gray-500 text-xs">Stadium</dt>
-              <dd>{detailTeam.stadiumName ?? "—"}</dd>
-              <dt className="text-gray-500 text-xs">Team saying</dt>
-              <dd>{detailTeam.teamSaying ?? "—"}</dd>
-              <dt className="text-gray-500 text-xs">Fan phrase</dt>
-              <dd>{detailTeam.fanPhrase ?? "—"}</dd>
-              <dt className="text-gray-500 text-xs">Mascot</dt>
-              <dd>{detailTeam.mascot ?? "—"}</dd>
-              <dt className="text-gray-500 text-xs">Rivals (codes)</dt>
-              <dd>{(detailTeam.rivals || []).join(", ") || "—"}</dd>
-              <dt className="text-gray-500 text-xs">Tags</dt>
-              <dd className="text-xs">{(detailTeam.tags || []).join(", ") || "—"}</dd>
-              <dt className="text-gray-500 text-xs">Region</dt>
-              <dd className="text-xs">{(detailTeam.region || []).join(", ") || "—"}</dd>
-              <dt className="text-gray-500 text-xs">Hashtags</dt>
-              <dd className="text-xs">{(detailTeam.hashtags || []).join(", ") || "—"}</dd>
-            </dl>
-            <div>
-              <h3 className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-2">
-                Brand colors
-              </h3>
-              {detailTeam.teamColors && detailTeam.teamColors.length > 0 ? (
-                <ul className="space-y-2">
-                  {detailTeam.teamColors.map((c, i) => (
-                    <li
-                      key={i}
-                      className="flex gap-3 items-start border border-gray-100 rounded-md p-2 bg-gray-50"
-                    >
-                      <span
-                        className="h-10 w-10 rounded border border-gray-200 shrink-0 mt-0.5"
-                        style={{ backgroundColor: c.hex }}
-                      />
-                      <div>
-                        <div className="font-medium">
-                          {c.role}
-                          {c.name ? ` · ${c.name}` : ""}
-                        </div>
-                        <div className="font-mono text-xs text-gray-700">{c.hex}</div>
-                        <div className="text-xs text-gray-500">{formatCmyk(c.cmyk)}</div>
-                        {c.pantone && (
-                          <div className="text-xs text-gray-500">Pantone: {c.pantone}</div>
-                        )}
-                      </div>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="text-gray-500 text-xs">
-                  primary: {detailTeam.primaryColorHex ?? "—"} · secondary:{" "}
-                  {detailTeam.secondaryColorHex ?? "—"}
-                </p>
+          <div className="text-sm text-gray-800 flex flex-col max-h-[75vh] min-h-0">
+            <div className="flex gap-1 border-b border-gray-200 pb-2 mb-3 shrink-0">
+              {(
+                [
+                  ["overview", "Overview"],
+                  ["colors", "Colors / metadata"],
+                  ["products", "Product catalog"],
+                ] as const
+              ).map(([id, label]) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setDetailTab(id)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                    detailTab === id
+                      ? "bg-gray-900 text-white"
+                      : "text-gray-600 hover:bg-gray-100"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <div className="overflow-y-auto pr-1 flex-1 min-h-0 space-y-4">
+              {detailTab === "overview" && (
+                <>
+                  <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2">
+                    <dt className="text-gray-500 text-xs">Firestore id</dt>
+                    <dd className="font-mono text-xs">{detailTeam.id}</dd>
+                    <dt className="text-gray-500 text-xs">teamCode</dt>
+                    <dd className="font-mono text-xs">{detailTeam.teamCode ?? "—"}</dd>
+                    <dt className="text-gray-500 text-xs">League</dt>
+                    <dd>{detailTeam.league || detailTeam.leagueId || detailTeam.leagueCode || "—"}</dd>
+                    <dt className="text-gray-500 text-xs">City / state</dt>
+                    <dd>{[detailTeam.city, detailTeam.state].filter(Boolean).join(", ") || "—"}</dd>
+                    <dt className="text-gray-500 text-xs">Stadium</dt>
+                    <dd>{detailTeam.stadiumName ?? "—"}</dd>
+                    <dt className="text-gray-500 text-xs">Team saying</dt>
+                    <dd>{detailTeam.teamSaying ?? "—"}</dd>
+                    <dt className="text-gray-500 text-xs">Fan phrase</dt>
+                    <dd>{detailTeam.fanPhrase ?? "—"}</dd>
+                    <dt className="text-gray-500 text-xs">Mascot</dt>
+                    <dd>{detailTeam.mascot ?? "—"}</dd>
+                    <dt className="text-gray-500 text-xs">Rivals (codes)</dt>
+                    <dd>{(detailTeam.rivals || []).join(", ") || "—"}</dd>
+                    <dt className="text-gray-500 text-xs">Tags</dt>
+                    <dd className="text-xs">{(detailTeam.tags || []).join(", ") || "—"}</dd>
+                    <dt className="text-gray-500 text-xs">Region</dt>
+                    <dd className="text-xs">{(detailTeam.region || []).join(", ") || "—"}</dd>
+                    <dt className="text-gray-500 text-xs">Hashtags</dt>
+                    <dd className="text-xs">{(detailTeam.hashtags || []).join(", ") || "—"}</dd>
+                  </dl>
+                  {detailTeam.fanPhrases && detailTeam.fanPhrases.length > 0 && (
+                    <div>
+                      <h3 className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-2">
+                        Fan phrases (curated)
+                      </h3>
+                      <ul className="text-xs space-y-1 list-disc pl-4">
+                        {detailTeam.fanPhrases.map((fp, i) => (
+                          <li key={i}>
+                            {fp.text}{" "}
+                            <span className="text-gray-400">
+                              ({fp.type}, verified: {String(fp.verified)})
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </>
+              )}
+              {detailTab === "colors" && (
+                <div>
+                  <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 mb-4">
+                    <dt className="text-gray-500 text-xs">Color families</dt>
+                    <dd className="text-xs">
+                      {(detailTeam.colorFamilies || []).length
+                        ? (detailTeam.colorFamilies || []).join(", ")
+                        : "—"}
+                    </dd>
+                    <dt className="text-gray-500 text-xs">Color verification</dt>
+                    <dd className="text-xs">{detailTeam.colorVerificationStatus ?? "—"}</dd>
+                    <dt className="text-gray-500 text-xs">Print verification</dt>
+                    <dd className="text-xs">{detailTeam.printVerificationStatus ?? "—"}</dd>
+                  </dl>
+                  <h3 className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-2">
+                    Brand colors
+                  </h3>
+                  {detailTeam.teamColors && detailTeam.teamColors.length > 0 ? (
+                    <ul className="space-y-2">
+                      {detailTeam.teamColors.map((c, i) => (
+                        <li
+                          key={i}
+                          className="flex gap-3 items-start border border-gray-100 rounded-md p-2 bg-gray-50"
+                        >
+                          <span
+                            className="h-10 w-10 rounded border border-gray-200 shrink-0 mt-0.5"
+                            style={{ backgroundColor: c.hex }}
+                          />
+                          <div>
+                            <div className="font-medium">
+                              {c.role}
+                              {c.name ? ` · ${c.name}` : ""}
+                            </div>
+                            <div className="font-mono text-xs text-gray-700">{c.hex}</div>
+                            <div className="text-xs text-gray-500">{formatCmyk(c.cmyk)}</div>
+                            {c.pantone && (
+                              <div className="text-xs text-gray-500">Pantone: {c.pantone}</div>
+                            )}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="text-gray-500 text-xs">
+                      primary: {detailTeam.primaryColorHex ?? "—"} · secondary:{" "}
+                      {detailTeam.secondaryColorHex ?? "—"}
+                    </p>
+                  )}
+                </div>
+              )}
+              {detailTab === "products" && (
+                <TeamProductMatrixPanel
+                  team={detailTeam}
+                  onSaved={(next) => {
+                    setDetailTeam((t) => (t && t.id === detailTeam.id ? { ...t, productCatalogMatrix: next } : t));
+                    mutate();
+                  }}
+                />
               )}
             </div>
-            {detailTeam.fanPhrases && detailTeam.fanPhrases.length > 0 && (
-              <div>
-                <h3 className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-2">
-                  Fan phrases (curated)
-                </h3>
-                <ul className="text-xs space-y-1 list-disc pl-4">
-                  {detailTeam.fanPhrases.map((fp, i) => (
-                    <li key={i}>
-                      {fp.text}{" "}
-                      <span className="text-gray-400">
-                        ({fp.type}, verified: {String(fp.verified)})
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
           </div>
         )}
       </Modal>

@@ -46,18 +46,61 @@ function getEffectiveColorFamily(colorFamily, colorName) {
   return deriveColorFamilyFromName(colorName);
 }
 
-function resolveDesignAssetUrls(data) {
-  const a = data.assets || {};
-  const f = data.files || {};
-  return {
-    lightPng: a.lightPng || (f.lightPng && f.lightPng.downloadUrl) || (f.png && f.png.downloadUrl) || null,
-    darkPng: a.darkPng || (f.darkPng && f.darkPng.downloadUrl) || null,
-  };
+function sideHasNestedPng(files, assets, side) {
+  const a = assets && assets[side];
+  const f = files && files[side];
+  return !!(
+    (a && (a.lightPng || a.darkPng)) ||
+    (f && f.lightPng && f.lightPng.downloadUrl) ||
+    (f && f.darkPng && f.darkPng.downloadUrl)
+  );
+}
+
+/** Matches client `hasAnySideAwareAssets` — any nested side has raster URLs. */
+function hasAnySideAwarePngAssets(design) {
+  const f = design.files || {};
+  const a = design.assets || {};
+  return sideHasNestedPng(f, a, "front") || sideHasNestedPng(f, a, "back");
+}
+
+/** Matches client `legacyFlatTargetsSide` for flat render (back placement). */
+function legacyFlatTargetsSide(design, side) {
+  const a = design.assets || {};
+  const f = design.files || {};
+  const legL = a.lightPng || (f.lightPng && f.lightPng.downloadUrl) || (f.png && f.png.downloadUrl) || null;
+  const legD = a.darkPng || (f.darkPng && f.darkPng.downloadUrl) || null;
+  const hasLegacy = !!(legL || legD);
+  if (!hasLegacy || hasAnySideAwarePngAssets(design)) return false;
+  const ss = (design.supportedSides || []).map((s) => String(s).trim().toLowerCase());
+  if (ss.length === 1) {
+    if (ss[0] === "front") return side === "front";
+    if (ss[0] === "back") return side === "back";
+  }
+  return side === "back";
+}
+
+/**
+ * PNG URLs for **back** placement (8394 MVP). Matches `resolveDesignSideAssets(design, "back")`.
+ */
+function resolveBackSidePngUrls(design) {
+  const a = design.assets || {};
+  const f = design.files || {};
+  const nsA = a.back || {};
+  const nsF = f.back || {};
+  let lightPng = nsA.lightPng || (nsF.lightPng && nsF.lightPng.downloadUrl) || null;
+  let darkPng = nsA.darkPng || (nsF.darkPng && nsF.darkPng.downloadUrl) || null;
+  const legL = a.lightPng || (f.lightPng && f.lightPng.downloadUrl) || (f.png && f.png.downloadUrl) || null;
+  const legD = a.darkPng || (f.darkPng && f.darkPng.downloadUrl) || null;
+  if (legacyFlatTargetsSide(design, "back")) {
+    lightPng = lightPng != null && lightPng !== "" ? lightPng : legL;
+    darkPng = darkPng != null && darkPng !== "" ? darkPng : legD;
+  }
+  return { lightPng, darkPng };
 }
 
 function pickDesignPngForVariant(design, variant) {
   const fam = getEffectiveColorFamily(variant.colorFamily, variant.colorName);
-  const u = resolveDesignAssetUrls(design);
+  const u = resolveBackSidePngUrls(design);
   if (fam === "dark") {
     const url = u.darkPng || u.lightPng;
     return { url, ref: u.darkPng ? "dark" : "light" };
@@ -210,7 +253,7 @@ async function cropDesignToArtworkBounds(designBuffer, sharp) {
   const h = meta.height;
   if (!w || !h) return { buffer: designBuffer, width: w || 1, height: h || 1 };
 
-  const raw = await sharp(designBuffer).ensureAlpha().raw().toBuffer({ depth: 8 });
+  const raw = await sharp(designBuffer).ensureAlpha().raw().toBuffer({ depth: 8, resolveWithObject: false });
 
   let minX = w;
   let minY = h;

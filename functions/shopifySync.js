@@ -39,7 +39,15 @@ function readinessCheck(product) {
   if (!product.blankId?.trim()) missing.push("Blank");
   if (typeof product.pricing?.basePrice !== "number" || product.pricing.basePrice < 0) missing.push("Price");
   if (typeof product.shipping?.defaultWeightGrams !== "number" || product.shipping.defaultWeightGrams < 0) missing.push("Weight");
-  if (!product.media?.heroFront?.trim()) missing.push("Hero front");
+  const style = String(product.blankStyleCode || "").trim();
+  const is8394 = style === "8394";
+  if (is8394) {
+    const hasFront = !!product.media?.heroFront?.trim();
+    const hasBack = !!product.media?.heroBack?.trim();
+    if (!hasFront && !hasBack) missing.push("Hero (8394: back blended and/or blank front)");
+  } else if (!product.media?.heroFront?.trim()) {
+    missing.push("Hero front");
+  }
   return { ready: missing.length === 0, missing };
 }
 
@@ -97,7 +105,7 @@ async function runProductSync(product, store, accessToken) {
     });
   }
   if (files.length === 0) {
-    throw new Error("At least one hero image (heroFront) is required");
+    throw new Error("At least one hero image (heroFront or heroBack) is required");
   }
 
   const price = String(Number(product.pricing?.basePrice ?? 0).toFixed(2));

@@ -4,34 +4,7 @@ import { useCallback } from "react";
 import { httpsCallable } from "firebase/functions";
 import { functions } from "@/lib/firebase/config";
 import { useSWRConfig } from "swr";
-import {
-  RpProductCategory,
-  RpProductStatus,
-} from "@/lib/types/firestore";
-
-export interface CreateProductInput {
-  name: string;
-  description?: string;
-  category: RpProductCategory;
-  baseProductKey: string;
-  colorway: {
-    name: string;
-    hex?: string;
-  };
-  supplier?: {
-    supplierName?: string;
-    supplierSku?: string;
-    styleCode?: string;
-  };
-  blankId?: string; // Reference to rp_blanks - physical garment template
-  ai?: {
-    productArtifactId?: string;
-    productTrigger?: string;
-    productRecommendedScale?: number;
-    blankTemplateId?: string; // Deprecated: use blankId instead
-  };
-  tags?: string[];
-}
+import { RpProductStatus } from "@/lib/types/firestore";
 
 export interface GenerateProductAssetsInput {
   productId: string;
@@ -60,34 +33,6 @@ export interface GenerateProductAssetsInput {
 }
 
 /**
- * Hook for creating products
- */
-export function useCreateProduct() {
-  const { mutate } = useSWRConfig();
-
-  const createProduct = useCallback(
-    async (input: CreateProductInput) => {
-      if (!functions) {
-        throw new Error("Cloud Functions not initialized");
-      }
-
-      console.log("[useCreateProduct] Creating product:", input);
-
-      const createProductFn = httpsCallable(functions, "createProduct");
-      const result = await createProductFn(input);
-
-      // Invalidate products cache
-      await mutate("rp_products", undefined, { revalidate: true });
-
-      return result.data as { ok: boolean; productId: string; slug: string };
-    },
-    [mutate]
-  );
-
-  return { createProduct };
-}
-
-/**
  * Create a product from Design + Blank, then optionally trigger mockup generation.
  * Returns { productId, slug } so caller can call createMockJob with productId.
  */
@@ -102,12 +47,73 @@ export function useCreateProductFromDesignBlank() {
       const fn = httpsCallable(functions, "createProductFromDesignBlank");
       const result = await fn(input);
       await mutate("rp_products", undefined, { revalidate: true });
-      return result.data as { ok: boolean; productId: string; slug: string };
+      return result.data as { ok: boolean; productId: string; slug: string; variantId?: string };
     },
     [mutate]
   );
 
   return { createProductFromDesignBlank };
+}
+
+/**
+ * One Cloud Function call: parent + many variants (team catalog / bulk color adds).
+ * Prefer over looping `createProductFromDesignBlank` so the parent is created once server-side.
+ */
+export function useCreateProductVariantsFromDesignBlank() {
+  const { mutate } = useSWRConfig();
+
+  const createProductVariantsFromDesignBlank = useCallback(
+    async (input: { designId: string; blankId: string; blankVariantIds: string[] }) => {
+      if (!functions) {
+        throw new Error("Cloud Functions not initialized");
+      }
+      const fn = httpsCallable(functions, "createProductVariantsFromDesignBlank");
+      const result = await fn(input);
+      await mutate("rp_products", undefined, { revalidate: true });
+      return result.data as {
+        ok: boolean;
+        productId: string | null;
+        slug: string | null;
+        results: Array<{
+          blankVariantId: string;
+          variantFirestoreId?: string;
+          productId?: string | null;
+          slug?: string | null;
+          created?: boolean;
+          skipped?: boolean;
+          message?: string;
+        }>;
+        errors?: Array<{ blankVariantId: string; message: string }>;
+      };
+    },
+    [mutate]
+  );
+
+  return { createProductVariantsFromDesignBlank };
+}
+
+/** Re-run server-side merchandising resolution (same as create) for an existing product. */
+export function useRefreshProductMerchandisingFromSources() {
+  const { mutate } = useSWRConfig();
+
+  const refreshProductMerchandisingFromSources = useCallback(
+    async (input: { productId: string }) => {
+      if (!functions) {
+        throw new Error("Cloud Functions not initialized");
+      }
+      const fn = httpsCallable(functions, "refreshProductMerchandisingFromSources");
+      const result = await fn(input);
+      await mutate(
+        (key) => typeof key === "string" && key.startsWith("rp_product"),
+        undefined,
+        { revalidate: true }
+      );
+      return result.data as { ok: boolean; productId: string; slug: string };
+    },
+    [mutate]
+  );
+
+  return { refreshProductMerchandisingFromSources };
 }
 
 /**
@@ -185,7 +191,7 @@ export function useGenerateProductSceneRender() {
   const { mutate } = useSWRConfig();
 
   const generateProductSceneRender = useCallback(
-    async (input: { productId: string; sceneKey?: "hanger" }) => {
+    async (input: { productId: string; sceneKey?: string }) => {
       if (!functions) {
         throw new Error("Cloud Functions not initialized");
       }

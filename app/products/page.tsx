@@ -6,9 +6,10 @@ import ProtectedRoute from "@/components/ProtectedRoute";
 import { TableSkeleton } from "@/components/Skeleton";
 import Modal from "@/components/Modal";
 import { useProducts } from "@/lib/hooks/useRPProducts";
-import { useCreateProduct, useCreateProductFromDesignBlank } from "@/lib/hooks/useRPProductMutations";
+import { useCreateProductFromDesignBlank } from "@/lib/hooks/useRPProductMutations";
 import { useBatchGeneration } from "@/lib/hooks/useBatchGeneration";
-import { useDesigns } from "@/lib/hooks/useDesignAssets";
+import { useDesigns, useDesignTeams } from "@/lib/hooks/useDesignAssets";
+import GenerateTeamProductsModal from "@/components/products/GenerateTeamProductsModal";
 import { useBlanks } from "@/lib/hooks/useBlanks";
 import { useCreateMockJob } from "@/lib/hooks/useMockAssets";
 import { useScenePresets as useRPScenePresets } from "@/lib/hooks/useRPScenePresets";
@@ -45,9 +46,8 @@ function ProductsContent() {
   const [categoryFilter, setCategoryFilter] = useState<RpProductCategory | "all">("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [moreActionsOpen, setMoreActionsOpen] = useState(false);
-  const [isCreateOpen, setIsCreateOpen] = useState(false);
-  const [creating, setCreating] = useState(false);
-  const [createError, setCreateError] = useState<string | null>(null);
+  /** When true, list includes legacy top-level per-color docs (not parent rows). Default: parent products only. */
+  const [showLegacyTopLevel, setShowLegacyTopLevel] = useState(false);
   const [isBatchOpen, setIsBatchOpen] = useState(false);
   const [batchGenerating, setBatchGenerating] = useState(false);
   const [batchError, setBatchError] = useState<string | null>(null);
@@ -55,6 +55,7 @@ function ProductsContent() {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [bulkDeleting, setBulkDeleting] = useState(false);
 
+  const [isGenTeamProductsOpen, setIsGenTeamProductsOpen] = useState(false);
   const [isDesignBlankOpen, setIsDesignBlankOpen] = useState(false);
   const [designBlankDesignId, setDesignBlankDesignId] = useState("");
   const [designBlankBlankId, setDesignBlankBlankId] = useState("");
@@ -69,22 +70,13 @@ function ProductsContent() {
   const [batchSize, setBatchSize] = useState<"square" | "portrait" | "landscape">("square");
   const [batchName, setBatchName] = useState("");
 
-  // Form state
-  const [newName, setNewName] = useState("");
-  const [newDescription, setNewDescription] = useState("");
-  const [newCategory, setNewCategory] = useState<RpProductCategory>("panties");
-  const [newBaseProductKey, setNewBaseProductKey] = useState("");
-  const [newColorwayName, setNewColorwayName] = useState("");
-  const [newColorwayHex, setNewColorwayHex] = useState("");
-  const [newProductTrigger, setNewProductTrigger] = useState("");
-
-  const { createProduct } = useCreateProduct();
   const { createProductFromDesignBlank } = useCreateProductFromDesignBlank();
   const { createJob: createMockJob } = useCreateMockJob();
   const { batchGenerate } = useBatchGeneration();
   const { presets } = useRPScenePresets({ isActive: true });
   const { designs } = useDesigns();
-  // Load all blanks for the Create from Design + Blank modal (no status filter so dropdown works without requiring composite index)
+  const { teams: designTeams } = useDesignTeams();
+  // Load all blanks for the one-off create modal (no status filter so dropdown works without requiring composite index)
   const { blanks } = useBlanks();
 
   const selectedDesignBlank = useMemo(
@@ -95,6 +87,11 @@ function ProductsContent() {
     if (!selectedDesignBlank || !isMasterBlank(selectedDesignBlank)) return [];
     return getBlankVariants(selectedDesignBlank).filter((v) => v.isActive !== false);
   }, [selectedDesignBlank]);
+
+  const designBlankSelectedDesign = useMemo(
+    () => (designBlankDesignId ? designs.find((d) => d.id === designBlankDesignId) : undefined),
+    [designs, designBlankDesignId]
+  );
 
   useEffect(() => {
     if (!selectedDesignBlank || !isMasterBlank(selectedDesignBlank)) {
@@ -117,7 +114,12 @@ function ProductsContent() {
   });
 
   const filters = useMemo(() => {
-    const f: any = {};
+    const f: {
+      status?: RpProductStatus;
+      category?: RpProductCategory;
+      search?: string;
+      parentsOnly?: boolean;
+    } = {};
     if (statusFilter !== "all") {
       f.status = statusFilter;
     }
@@ -127,62 +129,11 @@ function ProductsContent() {
     if (searchQuery.trim()) {
       f.search = searchQuery.trim();
     }
+    f.parentsOnly = !showLegacyTopLevel;
     return f;
-  }, [statusFilter, categoryFilter, searchQuery]);
+  }, [statusFilter, categoryFilter, searchQuery, showLegacyTopLevel]);
 
   const { products, loading, error, refetch } = useProducts(filters);
-
-  const handleOpenCreate = () => {
-    setIsCreateOpen(true);
-    setCreateError(null);
-    setNewName("");
-    setNewDescription("");
-    setNewCategory("panties");
-    setNewBaseProductKey("");
-    setNewColorwayName("");
-    setNewColorwayHex("");
-    setNewProductTrigger("");
-  };
-
-  const handleCreateSubmit = async (e: FormEvent) => {
-    e.preventDefault();
-    setCreateError(null);
-
-    if (!newName.trim() || !newBaseProductKey.trim() || !newColorwayName.trim()) {
-      setCreateError("Name, base product key, and colorway name are required.");
-      return;
-    }
-
-    try {
-      setCreating(true);
-      const result = await createProduct({
-        name: newName.trim(),
-        description: newDescription.trim() || undefined,
-        category: newCategory,
-        baseProductKey: newBaseProductKey.trim(),
-        colorway: {
-          name: newColorwayName.trim(),
-          hex: newColorwayHex.trim() || undefined,
-        },
-        ai: newProductTrigger.trim()
-          ? {
-              productTrigger: newProductTrigger.trim(),
-              productRecommendedScale: 0.9,
-            }
-          : undefined,
-      });
-
-      await refetch();
-      setIsCreateOpen(false);
-      // Navigate to new product
-      window.location.href = `/products/${result.slug}`;
-    } catch (err: any) {
-      console.error("[ProductsContent] Failed to create product:", err);
-      setCreateError(err?.message || "Failed to create product.");
-    } finally {
-      setCreating(false);
-    }
-  };
 
   const handleCreateFromDesignBlank = async (e: FormEvent) => {
     e.preventDefault();
@@ -207,12 +158,16 @@ function ProductsContent() {
         blankVariantId:
           selBlank && isMasterBlank(selBlank) && designBlankVariantId ? designBlankVariantId : undefined,
       });
+      const is8394BackOnly = String(selBlank?.styleCode || "").trim() === "8394";
       const jobId = await createMockJob({
         designId: designBlankDesignId,
         blankId: designBlankBlankId,
-        view: "front",
+        view: is8394BackOnly ? "back" : "front",
+        placementId: is8394BackOnly ? "back_center" : "front_center",
         quality: "draft",
         productId: result.productId,
+        productVariantId: result.variantId,
+        heroSlot: is8394BackOnly ? "hero_back" : "hero_front",
       });
       if (jobId) {
         setIsDesignBlankOpen(false);
@@ -257,28 +212,23 @@ function ProductsContent() {
         <div>
           <h1 className="text-3xl font-bold text-gray-900">Products</h1>
           <p className="text-sm text-gray-600 mt-1">
-            Manage products, designs, and generated assets
+            Create products from team matrix defaults, then generate assets for created products
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <button
-            onClick={handleOpenCreate}
-            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium"
+            type="button"
+            onClick={() => setIsGenTeamProductsOpen(true)}
+            className="px-4 py-2 bg-violet-700 text-white rounded-lg hover:bg-violet-800 text-sm font-medium"
           >
-            Create Product
-          </button>
-          <button
-            onClick={() => setIsDesignBlankOpen(true)}
-            className="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 text-sm font-medium"
-          >
-            Create from Design + Blank
+            Generate Team Products
           </button>
           <button
             onClick={() => setIsBatchOpen(true)}
             className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm font-medium"
             disabled={products.length === 0}
           >
-            Batch Generate
+            Batch Generate Assets
           </button>
           <div className="relative">
             <button
@@ -296,19 +246,40 @@ function ProductsContent() {
                   onClick={() => setMoreActionsOpen(false)}
                 />
                 <div className="absolute right-0 top-full z-50 mt-1 w-56 rounded-lg border border-gray-200 bg-white py-1 shadow-lg">
-                  <Link
-                    href="/products/bulk"
-                    className="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-50"
-                    onClick={() => setMoreActionsOpen(false)}
+                  <div className="px-4 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+                    Product creation (advanced)
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMoreActionsOpen(false);
+                      setIsDesignBlankOpen(true);
+                    }}
+                    className="block w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-50"
                   >
-                    Bulk Generate
-                  </Link>
+                    Create One-off Product
+                  </button>
+
+                  <div className="px-4 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+                    Asset generation
+                  </div>
                   <Link
                     href="/products/batch-hero"
                     className="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-50"
                     onClick={() => setMoreActionsOpen(false)}
                   >
                     Batch Hero Render
+                  </Link>
+
+                  <div className="px-4 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wide text-gray-500">
+                    Ops / admin
+                  </div>
+                  <Link
+                    href="/products/bulk"
+                    className="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-50"
+                    onClick={() => setMoreActionsOpen(false)}
+                  >
+                    Bulk Product Jobs
                   </Link>
                   <button
                     type="button"
@@ -344,139 +315,7 @@ function ProductsContent() {
         </div>
       </div>
 
-      {/* Create Product Modal */}
-      <Modal isOpen={isCreateOpen} onClose={() => setIsCreateOpen(false)} title="Create Product">
-        <form onSubmit={handleCreateSubmit} className="space-y-4">
-          {createError && (
-            <div className="bg-red-50 border border-red-200 rounded p-3 text-red-700 text-sm">
-              {createError}
-            </div>
-          )}
-
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Product Name *
-            </label>
-            <input
-              type="text"
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              required
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-              placeholder="San Francisco Giants Classic Black"
-            />
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Description
-            </label>
-            <textarea
-              value={newDescription}
-              onChange={(e) => setNewDescription(e.target.value)}
-              rows={2}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-              placeholder="Optional description"
-            />
-          </div>
-
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Category *
-              </label>
-              <select
-                value={newCategory}
-                onChange={(e) => setNewCategory(e.target.value as RpProductCategory)}
-                required
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
-              >
-                <option value="panties">Panties</option>
-                <option value="bralette">Bralette</option>
-                <option value="tank">Tank</option>
-                <option value="tee">Tee</option>
-                <option value="other">Other</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Base Product Key *
-              </label>
-              <input
-                type="text"
-                value={newBaseProductKey}
-                onChange={(e) => setNewBaseProductKey(e.target.value)}
-                required
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 font-mono"
-                placeholder="SFGIANTS_PANTY_1"
-              />
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Colorway Name *
-              </label>
-              <input
-                type="text"
-                value={newColorwayName}
-                onChange={(e) => setNewColorwayName(e.target.value)}
-                required
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                placeholder="Black"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Colorway Hex
-              </label>
-              <input
-                type="text"
-                value={newColorwayHex}
-                onChange={(e) => setNewColorwayHex(e.target.value)}
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-                placeholder="#000000"
-              />
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Product Trigger (LoRA)
-            </label>
-            <input
-              type="text"
-              value={newProductTrigger}
-              onChange={(e) => setNewProductTrigger(e.target.value)}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 font-mono"
-              placeholder="rp_sfg_panty_1"
-            />
-            <p className="text-xs text-gray-500 mt-1">
-              Optional: LoRA trigger phrase for this product
-            </p>
-          </div>
-
-          <div className="flex justify-end gap-3 pt-4 border-t">
-            <button
-              type="button"
-              onClick={() => setIsCreateOpen(false)}
-              className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={creating}
-              className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50"
-            >
-              {creating ? "Creating..." : "Create Product"}
-            </button>
-          </div>
-        </form>
-      </Modal>
-
-      {/* Create from Design + Blank Modal */}
+      {/* One-off product create modal */}
       <Modal
         isOpen={isDesignBlankOpen}
         onClose={() => {
@@ -486,11 +325,11 @@ function ProductsContent() {
           setDesignBlankBlankId("");
           setDesignBlankVariantId("");
         }}
-        title="Create Product from Design + Blank"
+        title="Create One-off Product"
       >
         <form onSubmit={handleCreateFromDesignBlank} className="space-y-4">
           <p className="text-sm text-gray-600">
-            Select a design and a blank. A product will be created and a mockup will be generated automatically.
+            Advanced/QA path: select one design + blank to create a single parent product entry, then kick off an initial mockup job.
           </p>
           {designBlankError && (
             <div className="bg-red-50 border border-red-200 rounded p-3 text-red-700 text-sm">
@@ -514,6 +353,15 @@ function ProductsContent() {
                 </option>
               ))}
             </select>
+            {designBlankSelectedDesign && (
+              <p className="mt-2 text-xs text-gray-600 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
+                <span className="font-medium text-gray-800">Team (from design):</span>{" "}
+                {designBlankSelectedDesign.teamNameCache?.trim() ||
+                  (designBlankSelectedDesign.teamId
+                    ? `Linked team id: ${designBlankSelectedDesign.teamId}`
+                    : "No team on this design — fine for one-offs; link a team for catalog alignment.")}
+              </p>
+            )}
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -583,6 +431,14 @@ function ProductsContent() {
         </form>
       </Modal>
 
+      <GenerateTeamProductsModal
+        isOpen={isGenTeamProductsOpen}
+        onClose={() => setIsGenTeamProductsOpen(false)}
+        designs={designs}
+        teams={designTeams}
+        onProductsChanged={() => void refetch()}
+      />
+
       {/* Filters */}
       <div className="bg-white rounded-lg shadow p-4">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -631,6 +487,20 @@ function ProductsContent() {
             </select>
           </div>
         </div>
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <label className="inline-flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+            <input
+              type="checkbox"
+              className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+              checked={showLegacyTopLevel}
+              onChange={(e) => setShowLegacyTopLevel(e.target.checked)}
+            />
+            <span>Show legacy top-level products (pre–parent-model per-color docs)</span>
+          </label>
+          {!showLegacyTopLevel && (
+            <span className="text-xs text-gray-500">Listing parent products only — one row per team + design + blank.</span>
+          )}
+        </div>
       </div>
 
       {/* Products Table */}
@@ -641,7 +511,7 @@ function ProductsContent() {
             <p className="text-sm text-gray-400 mt-2">
               {searchQuery || statusFilter !== "all" || categoryFilter !== "all"
                 ? "Try adjusting your filters."
-                : "Create your first product to get started."}
+                : "Use Generate Team Products for standard creation or Create One-off Product for QA/advanced cases. Legacy-only view is off — enable it above if you need old per-color rows."}
             </p>
           </div>
         ) : (
@@ -693,10 +563,17 @@ function ProductsContent() {
                             href={`/products/${product.slug}`}
                             className="text-sm font-medium text-blue-600 hover:text-blue-800"
                           >
-                            {product.name}
+                            {product.title ?? product.name}
                           </Link>
+                          {product.productKind !== "parent" && (
+                            <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-100 text-amber-900 uppercase tracking-wide">
+                              Legacy
+                            </span>
+                          )}
                           <p className="text-xs text-gray-500 mt-1">
-                            {product.colorway.name}
+                            {product.productKind === "parent" && product.variantCount != null
+                              ? `${product.variantCount} color${product.variantCount === 1 ? "" : "s"}`
+                              : product.colorway?.name ?? "—"}
                           </p>
                         </div>
                       </div>
@@ -766,7 +643,7 @@ function ProductsContent() {
         )}
       </div>
 
-      {/* Batch Generate Modal */}
+      {/* Batch Generate Assets modal */}
       <Modal isOpen={isBatchOpen} onClose={() => setIsBatchOpen(false)} title="Batch Generate Assets">
         <form
           onSubmit={async (e) => {

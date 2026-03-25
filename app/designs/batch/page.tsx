@@ -180,7 +180,7 @@ function BatchImportContent() {
 
     for (const [baseKey, row] of grouped.entries()) {
       const { parsed, files: rowFiles } = row;
-      const sideLower = parsed.side.toLowerCase();
+      const supportedSides = [...row.sides].sort();
       const existing = existingByImportKey.get(baseKey);
       let designId: string;
 
@@ -204,9 +204,14 @@ function BatchImportContent() {
           ...(resolved.designFamily != null && { designFamily: resolved.designFamily }),
         };
 
+        const importThemePayload = {
+          designType: parsed.designFamily === "city_69" ? ("city_69" as const) : ("custom_one_off" as const),
+          ...(parsed.designFamily === "city_69" ? { designSeries: "69" } : {}),
+        };
+
         if (existing?.id) {
           designId = existing.id;
-          for (const { file, ext } of rowFiles) {
+          for (const { file, ext, kind } of rowFiles) {
             const storagePath = `designs/${designId}/${ext}/${file.name}`;
             const storageRef = ref(storage, storagePath);
             await uploadBytes(storageRef, file);
@@ -214,7 +219,7 @@ function BatchImportContent() {
             const isPng = ext === "png";
             await updateFile({
               designId,
-              kind: ext as "png" | "svg" | "pdf",
+              kind,
               storagePath,
               downloadUrl,
               fileName: file.name,
@@ -227,8 +232,9 @@ function BatchImportContent() {
           await updateDoc(designRef, {
             importKey: baseKey,
             ...taxonomyPayload,
-            supportedSides: [sideLower],
-            variant: parsed.variant,
+            ...importThemePayload,
+            supportedSides,
+            variant: parsed.garmentTone,
             updatedAt: new Date(),
             updatedByUid: uid,
           });
@@ -244,11 +250,12 @@ function BatchImportContent() {
           const { designId: newId } = await createDesign({
             name,
             teamId,
-            designType: "custom_one_off",
+            designType: importThemePayload.designType,
             colors: defaultColors,
+            ...(importThemePayload.designSeries != null ? { designSeries: importThemePayload.designSeries } : {}),
           });
           designId = newId;
-          for (const { file, ext } of rowFiles) {
+          for (const { file, ext, kind } of rowFiles) {
             const storagePath = `designs/${designId}/${ext}/${file.name}`;
             const storageRef = ref(storage, storagePath);
             await uploadBytes(storageRef, file);
@@ -256,7 +263,7 @@ function BatchImportContent() {
             const isPng = ext === "png";
             await updateFile({
               designId,
-              kind: ext as "png" | "svg" | "pdf",
+              kind,
               storagePath,
               downloadUrl,
               fileName: file.name,
@@ -269,8 +276,9 @@ function BatchImportContent() {
           await updateDoc(designRef, {
             importKey: baseKey,
             ...taxonomyPayload,
-            supportedSides: [sideLower],
-            variant: parsed.variant,
+            ...importThemePayload,
+            supportedSides,
+            variant: parsed.garmentTone,
             updatedAt: new Date(),
             updatedByUid: uid,
           });

@@ -7,7 +7,7 @@
  *   SCENE_HANGER_CREWNECK_SHADOW_URL      (optional, full-scene PNG with alpha)
  *   SCENE_HANGER_CREWNECK_MASK_URL        (reserved; not applied in MVP)
  *
- * Writes product.sceneRenders.hanger on rp_products/{productId}.
+ * Writes `product.sceneRenders[sceneKey]` on rp_products/{productId}. Only registered keys run; others return unimplemented.
  */
 
 const functions = require("firebase-functions");
@@ -66,6 +66,28 @@ function blankStyleAllowed(template, styleCode) {
   return list.includes(String(styleCode || "").trim());
 }
 
+/** Registered deterministic scene composites. Add keys here and mirror `IMPLEMENTED_SCENE_RENDER_KEYS` in the dashboard. */
+function resolveSceneCompositeTemplate(sceneKey) {
+  if (sceneKey === "hanger") {
+    const template = resolveHangerCrewneckTemplate();
+    if (!template) {
+      return {
+        error: new functions.https.HttpsError(
+          "failed-precondition",
+          "Scene template not configured: set SCENE_HANGER_CREWNECK_BACKGROUND_URL on the function environment"
+        ),
+      };
+    }
+    return { template };
+  }
+  return {
+    error: new functions.https.HttpsError(
+      "unimplemented",
+      `Scene key "${sceneKey}" has no registered template. Implemented: hanger`
+    ),
+  };
+}
+
 /**
  * @param {{ admin: import("firebase-admin"); db: FirebaseFirestore.Firestore; storage: import("@google-cloud/storage").Bucket; fetch: typeof fetch }} deps
  */
@@ -82,18 +104,15 @@ function createRegisterGenerateProductSceneRender({ admin, db, storage, fetch: f
         throw new functions.https.HttpsError("invalid-argument", "productId is required");
       }
 
-      const sceneKey = (data && data.sceneKey) || "hanger";
-      if (sceneKey !== "hanger") {
-        throw new functions.https.HttpsError("invalid-argument", "Only sceneKey 'hanger' is supported in MVP");
-      }
+      const rawKey = data && data.sceneKey;
+      const sceneKey =
+        typeof rawKey === "string" && rawKey.trim() ? rawKey.trim() : "hanger";
 
-      const template = resolveHangerCrewneckTemplate();
-      if (!template) {
-        throw new functions.https.HttpsError(
-          "failed-precondition",
-          "Scene template not configured: set SCENE_HANGER_CREWNECK_BACKGROUND_URL on the function environment"
-        );
+      const resolvedTemplate = resolveSceneCompositeTemplate(sceneKey);
+      if (resolvedTemplate.error) {
+        throw resolvedTemplate.error;
       }
+      const { template } = resolvedTemplate;
 
       const productRef = db.collection("rp_products").doc(productId);
       const productSnap = await productRef.get();
@@ -177,7 +196,8 @@ function createRegisterGenerateProductSceneRender({ admin, db, storage, fetch: f
 
       const bucket = storage.bucket();
       const ts = Date.now();
-      const storagePath = `rp_products/${productId}/scene_renders/${ts}_hanger.png`;
+      const safeSegment = String(sceneKey).replace(/[^a-zA-Z0-9_-]/g, "_") || "scene";
+      const storagePath = `rp_products/${productId}/scene_renders/${ts}_${safeSegment}.png`;
       const url = await savePngAndReadableUrl(bucket, storagePath, outBuf);
       const now = admin.firestore.FieldValue.serverTimestamp();
 
@@ -192,7 +212,7 @@ function createRegisterGenerateProductSceneRender({ admin, db, storage, fetch: f
       };
 
       await productRef.update({
-        sceneRenders: { ...prevScenes, hanger: slot },
+        sceneRenders: { ...prevScenes, [sceneKey]: slot },
         updatedAt: now,
         updatedBy: context.auth.uid,
       });
@@ -200,7 +220,7 @@ function createRegisterGenerateProductSceneRender({ admin, db, storage, fetch: f
       return {
         ok: true,
         productId,
-        sceneKey: "hanger",
+        sceneKey,
         url,
         sourceFlatView: flatSource.view,
       };

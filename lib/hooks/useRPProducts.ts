@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo } from "react";
+import { useMemo } from "react";
 import useSWR from "swr";
 import {
   collection,
@@ -9,6 +9,7 @@ import {
   getDocs,
   orderBy,
   query,
+  QueryDocumentSnapshot,
   where,
 } from "firebase/firestore";
 import { db } from "@/lib/firebase/config";
@@ -16,6 +17,7 @@ import {
   RpProduct,
   RpProductStatus,
   RpProductCategory,
+  RpProductVariant,
 } from "@/lib/types/firestore";
 
 export interface UseProductsFilters {
@@ -24,6 +26,11 @@ export interface UseProductsFilters {
   baseProductKey?: string;
   search?: string; // client-side search for now
   limit?: number;
+  /**
+   * When explicitly `true`, only top-level docs with `productKind === "parent"` (excludes legacy per-color docs).
+   * Omit or `false` to list all top-level `rp_products` rows (e.g. dashboard / publish). The Products page passes `true` by default.
+   */
+  parentsOnly?: boolean;
 }
 
 async function fetchRPProducts(filters?: UseProductsFilters): Promise<RpProduct[]> {
@@ -53,19 +60,32 @@ async function fetchRPProducts(filters?: UseProductsFilters): Promise<RpProduct[
   }
 
   const snapshot = await getDocs(q);
-  let products = snapshot.docs.map((d) => ({ id: d.id, ...(d.data() as RpProduct) }));
+  // Document id must win over any stored `id` field on the snapshot payload.
+  let products = snapshot.docs.map((d) => ({ ...(d.data() as RpProduct), id: d.id }));
+
+  // Opt-in: parent products only (Products list default). Other callers omit this to see legacy rows when needed.
+  if (filters?.parentsOnly === true) {
+    products = products.filter((p) => p.productKind === "parent");
+  }
 
   // Client-side search (if provided)
   if (filters?.search) {
     const searchLower = filters.search.toLowerCase();
-    products = products.filter(
-      (p) =>
-        p.name.toLowerCase().includes(searchLower) ||
-        p.slug.toLowerCase().includes(searchLower) ||
-        p.baseProductKey.toLowerCase().includes(searchLower) ||
-        p.colorway.name.toLowerCase().includes(searchLower) ||
-        p.description?.toLowerCase().includes(searchLower)
-    );
+    products = products.filter((p) => {
+      const hay = [
+        p.title,
+        p.name,
+        p.slug,
+        p.baseProductKey,
+        p.colorway?.name,
+        p.description,
+        p.handle,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return hay.includes(searchLower);
+    });
   }
 
   // Apply limit
@@ -76,32 +96,54 @@ async function fetchRPProducts(filters?: UseProductsFilters): Promise<RpProduct[
   return products;
 }
 
+function mapProductDoc(d: QueryDocumentSnapshot): RpProduct {
+  return { ...(d.data() as RpProduct), id: d.id };
+}
+
+/** Prefer parent doc when multiple rows match (e.g. duplicate slug/handle). */
+function pickProductDoc(docs: QueryDocumentSnapshot[]): QueryDocumentSnapshot {
+  if (docs.length === 1) return docs[0]!;
+  const parents = docs.filter((d) => (d.data() as RpProduct).productKind === "parent");
+  return parents[0] ?? docs[0]!;
+}
+
 async function fetchRPProductBySlug(slug: string): Promise<RpProduct | null> {
   if (!db) throw new Error("Database not initialized");
   if (!slug) return null;
 
   const decodedSlug = decodeURIComponent(slug);
   const base = collection(db, "rp_products");
-  
-  // Query by slug only (slug should be unique, so no need for orderBy)
-  // Try both encoded and decoded versions
-  try {
-    // First try with decoded slug
-    let q = query(base, where("slug", "==", decodedSlug));
-    let snapshot = await getDocs(q);
 
-    if (snapshot.empty && slug !== decodedSlug) {
-      q = query(base, where("slug", "==", slug));
-      snapshot = await getDocs(q);
+  try {
+    const tryQueries = [
+      query(base, where("slug", "==", decodedSlug)),
+      ...(slug !== decodedSlug ? [query(base, where("slug", "==", slug))] : []),
+      query(base, where("handle", "==", decodedSlug)),
+      ...(decodedSlug !== slug ? [query(base, where("handle", "==", slug))] : []),
+    ];
+
+    for (const q of tryQueries) {
+      const snapshot = await getDocs(q);
+      if (!snapshot.empty) {
+        const picked = pickProductDoc(snapshot.docs);
+        const out = mapProductDoc(picked);
+        if (process.env.NODE_ENV === "development") {
+          console.info("[fetchRPProductBySlug] resolved", {
+            routeSlug: slug,
+            docId: out.id,
+            productKind: out.productKind,
+            slugField: out.slug,
+            handleField: out.handle,
+            matchCount: snapshot.docs.length,
+          });
+        }
+        return out;
+      }
     }
 
-    if (snapshot.empty) return null;
-
-    const doc = snapshot.docs[0];
-    return { id: doc.id, ...(doc.data() as RpProduct) };
-  } catch (error: any) {
+    return null;
+  } catch (error: unknown) {
     console.error("[fetchRPProductBySlug] Error fetching product:", error);
-    // If query fails (e.g., missing index), return null
     return null;
   }
 }
@@ -157,6 +199,29 @@ export function useProductBySlug(slug: string | undefined) {
   };
 }
 
+/** Variants subcollection: `rp_products/{parentId}/variants` */
+export async function fetchProductVariants(parentProductId: string): Promise<RpProductVariant[]> {
+  if (!db) return [];
+  const snap = await getDocs(collection(db, "rp_products", parentProductId, "variants"));
+  const rows = snap.docs.map((d) => ({ ...(d.data() as RpProductVariant), id: d.id }));
+  return rows.sort((a, b) => (a.colorName || "").localeCompare(b.colorName || "", undefined, { sensitivity: "base" }));
+}
+
+export function useProductVariants(parentProductId: string | undefined) {
+  const key = parentProductId ? `rp_product_variants:${parentProductId}` : null;
+  const { data, error, isLoading, mutate } = useSWR<RpProductVariant[]>(
+    key,
+    () => fetchProductVariants(parentProductId!),
+    { revalidateOnFocus: false, dedupingInterval: 3000 }
+  );
+  return {
+    variants: data || [],
+    loading: isLoading,
+    error: error?.message || null,
+    refetch: mutate,
+  };
+}
+
 /**
  * Hook to fetch a single product by ID
  */
@@ -168,7 +233,7 @@ export function useProduct(productId: string | undefined) {
       const docRef = doc(db, "rp_products", productId);
       const docSnap = await getDoc(docRef);
       if (!docSnap.exists()) return null;
-      return { id: docSnap.id, ...(docSnap.data() as RpProduct) };
+      return { ...(docSnap.data() as RpProduct), id: docSnap.id };
     },
     {
       revalidateOnFocus: false,

@@ -1,18 +1,21 @@
-import type { DesignDoc } from "@/lib/types/firestore";
+import type { DesignDoc, DesignGarmentSideAssetUrls, RPBlankVariant } from "@/lib/types/firestore";
+import { getEffectiveColorFamily } from "@/lib/blanks/colorFamily";
 
-/** Resolve URLs from canonical `assets` or legacy `files.*.downloadUrl`. Legacy single `files.png` maps to light garment only. */
-export function resolveDesignAssets(design: DesignDoc | null | undefined): {
+export type GarmentSide = "front" | "back";
+
+type FlatAssetUrls = {
   lightPng: string | null;
   darkPng: string | null;
   lightSvg: string | null;
   darkSvg: string | null;
-  /** Any vector URL (legacy single slot or either variant) */
   svg: string | null;
   lightPdf: string | null;
   darkPdf: string | null;
-  /** Any PDF URL (legacy or either variant) */
   pdf: string | null;
-} {
+};
+
+/** Legacy flat URLs only (no side-aware nesting). */
+function resolveLegacyFlatAssetUrls(design: DesignDoc | null | undefined): FlatAssetUrls {
   if (!design) {
     return {
       lightPng: null,
@@ -25,21 +28,20 @@ export function resolveDesignAssets(design: DesignDoc | null | undefined): {
       pdf: null,
     };
   }
-  const a = design.assets;
+  const a = design.assets || {};
   const f = design.files || {};
   const lightSvg =
-    a?.lightSvg ?? f.lightSvg?.downloadUrl ?? f.svg?.downloadUrl ?? null;
-  const darkSvg = a?.darkSvg ?? f.darkSvg?.downloadUrl ?? null;
-  const lightPdf =
-    a?.lightPdf ?? f.lightPdf?.downloadUrl ?? f.pdf?.downloadUrl ?? null;
-  const darkPdf = a?.darkPdf ?? f.darkPdf?.downloadUrl ?? null;
+    a.lightSvg ?? f.lightSvg?.downloadUrl ?? f.svg?.downloadUrl ?? null;
+  const darkSvg = a.darkSvg ?? f.darkSvg?.downloadUrl ?? null;
+  const lightPdf = a.lightPdf ?? f.lightPdf?.downloadUrl ?? f.pdf?.downloadUrl ?? null;
+  const darkPdf = a.darkPdf ?? f.darkPdf?.downloadUrl ?? null;
   return {
-    lightPng: a?.lightPng ?? f.lightPng?.downloadUrl ?? f.png?.downloadUrl ?? null,
-    darkPng: a?.darkPng ?? f.darkPng?.downloadUrl ?? null,
+    lightPng: a.lightPng ?? f.lightPng?.downloadUrl ?? f.png?.downloadUrl ?? null,
+    darkPng: a.darkPng ?? f.darkPng?.downloadUrl ?? null,
     lightSvg,
     darkSvg,
     svg:
-      a?.svg ??
+      a.svg ??
       f.svg?.downloadUrl ??
       f.lightSvg?.downloadUrl ??
       f.darkSvg?.downloadUrl ??
@@ -47,7 +49,7 @@ export function resolveDesignAssets(design: DesignDoc | null | undefined): {
     lightPdf,
     darkPdf,
     pdf:
-      a?.pdf ??
+      a.pdf ??
       f.pdf?.downloadUrl ??
       f.lightPdf?.downloadUrl ??
       f.darkPdf?.downloadUrl ??
@@ -55,53 +57,140 @@ export function resolveDesignAssets(design: DesignDoc | null | undefined): {
   };
 }
 
-/** Light garment PNG URL (includes legacy single-PNG as light-only). */
-export function getDesignAssetLightPngUrl(design: DesignDoc | null | undefined): string | null {
-  return resolveDesignAssets(design).lightPng;
+function sideHasNestedPng(design: DesignDoc, side: GarmentSide): boolean {
+  const a = design.assets?.[side];
+  const f = design.files?.[side];
+  return !!(a?.lightPng || a?.darkPng || f?.lightPng?.downloadUrl || f?.darkPng?.downloadUrl);
 }
 
-/** Dark garment PNG URL. */
-export function getDesignAssetDarkPngUrl(design: DesignDoc | null | undefined): string | null {
-  return resolveDesignAssets(design).darkPng;
+function hasAnySideAwareAssets(design: DesignDoc): boolean {
+  return sideHasNestedPng(design, "front") || sideHasNestedPng(design, "back");
 }
 
 /**
- * Preview image: prefer light garment asset, then dark, then SVG.
- * @deprecated Use resolveDesignAssets for explicit variant selection.
+ * When legacy flat `assets.lightPng` / `darkPng` exist but no nested side URLs, map them to a side.
+ * Rule: `supportedSides` only → that side; otherwise **back** (typical apparel default).
  */
-export function getDesignPreviewUrl(design: DesignDoc | null | undefined): string | undefined {
-  const u = resolveDesignAssets(design);
-  return (
-    u.lightPng ||
-    u.darkPng ||
-    u.lightSvg ||
-    u.darkSvg ||
-    u.svg ||
-    undefined
-  );
+function legacyFlatTargetsSide(design: DesignDoc, side: GarmentSide): boolean {
+  const flat = resolveLegacyFlatAssetUrls(design);
+  const hasLegacy = !!(flat.lightPng || flat.darkPng);
+  if (!hasLegacy || hasAnySideAwareAssets(design)) return false;
+
+  const ss = design.supportedSides?.map((s) => String(s).trim().toLowerCase()) ?? [];
+  if (ss.length === 1) {
+    if (ss[0] === "front") return side === "front";
+    if (ss[0] === "back") return side === "back";
+  }
+  return side === "back";
 }
 
-/** True if any usable PNG exists for legacy flows (preview / batch). */
+/**
+ * Resolved URLs for one print side (front or back), merging nested `assets`/`files` with legacy flat fallbacks.
+ */
+export function resolveDesignSideAssets(
+  design: DesignDoc | null | undefined,
+  side: GarmentSide
+): FlatAssetUrls {
+  if (!design) {
+    return resolveLegacyFlatAssetUrls(null);
+  }
+  const a = design.assets?.[side];
+  const f = design.files?.[side];
+  const pick = (slot: keyof DesignGarmentSideAssetUrls): string | null =>
+    (a?.[slot] as string | null | undefined) ??
+    (f?.[slot as keyof typeof f] as { downloadUrl?: string } | undefined)?.downloadUrl ??
+    null;
+
+  let lightPng = pick("lightPng");
+  let darkPng = pick("darkPng");
+  let lightSvg = pick("lightSvg");
+  let darkSvg = pick("darkSvg");
+  let lightPdf = pick("lightPdf");
+  let darkPdf = pick("darkPdf");
+
+  const flat = resolveLegacyFlatAssetUrls(design);
+  if (legacyFlatTargetsSide(design, side)) {
+    lightPng = lightPng ?? flat.lightPng;
+    darkPng = darkPng ?? flat.darkPng;
+    lightSvg = lightSvg ?? flat.lightSvg;
+    darkSvg = darkSvg ?? flat.darkSvg;
+    lightPdf = lightPdf ?? flat.lightPdf;
+    darkPdf = darkPdf ?? flat.darkPdf;
+  }
+
+  const svg =
+    lightSvg || darkSvg || flat.svg
+      ? lightSvg || darkSvg || flat.svg
+      : null;
+  const pdf =
+    lightPdf || darkPdf || flat.pdf
+      ? lightPdf || darkPdf || flat.pdf
+      : null;
+
+  return {
+    lightPng,
+    darkPng,
+    lightSvg,
+    darkSvg,
+    svg,
+    lightPdf,
+    darkPdf,
+    pdf,
+  };
+}
+
+/** Default side for legacy single-pair designs and overview previews. */
+export function getDefaultDesignAssetSide(design: DesignDoc | null | undefined): GarmentSide {
+  if (!design) return "back";
+  const ss = design.supportedSides?.map((s) => String(s).trim().toLowerCase()) ?? [];
+  if (ss.length === 1 && ss[0] === "front") return "front";
+  if (ss.length === 1 && ss[0] === "back") return "back";
+  if (sideHasNestedPng(design, "back") && !sideHasNestedPng(design, "front")) return "back";
+  if (sideHasNestedPng(design, "front") && !sideHasNestedPng(design, "back")) return "front";
+  return "back";
+}
+
+/**
+ * Flattened garment URLs for the design’s **default print side** (backward compatible with pre–side-aware docs).
+ * Prefer `resolveDesignSideAssets` when you know front vs back (e.g. product placement).
+ */
+export function resolveDesignAssets(design: DesignDoc | null | undefined): FlatAssetUrls {
+  if (!design) return resolveLegacyFlatAssetUrls(null);
+  return resolveDesignSideAssets(design, getDefaultDesignAssetSide(design));
+}
+
+/** True if any side (or legacy flat) has a usable PNG for previews / batch gates. */
 export function designHasUsablePng(design: DesignDoc | null | undefined): boolean {
-  const u = resolveDesignAssets(design);
-  return !!(u.lightPng || u.darkPng);
+  if (!design) return false;
+  const f = resolveDesignSideAssets(design, "front");
+  const b = resolveDesignSideAssets(design, "back");
+  return !!(f.lightPng || f.darkPng || b.lightPng || b.darkPng);
 }
 
-/** Both light and dark garment PNGs present (complete pipeline). */
+/** Both light and dark garment PNGs for the **default** side. */
 export function designHasLightAndDarkPng(design: DesignDoc | null | undefined): boolean {
   const u = resolveDesignAssets(design);
   return !!(u.lightPng && u.darkPng);
 }
 
+function derivePrintSidesFromAssetPresence(design: DesignDoc): DesignPrintSidesMode | null {
+  const hasF =
+    !!(resolveDesignSideAssets(design, "front").lightPng || resolveDesignSideAssets(design, "front").darkPng);
+  const hasB =
+    !!(resolveDesignSideAssets(design, "back").lightPng || resolveDesignSideAssets(design, "back").darkPng);
+  if (hasF && hasB) return "both";
+  if (hasB && !hasF) return "back";
+  if (hasF && !hasB) return "front";
+  return null;
+}
+
 /**
- * Whether this design's raster artwork should apply on the given garment side (preview, render setup, mockup).
- * - Uses `supportedSides` when set (e.g. batch import: `['back']` for back-only art).
- * - Otherwise infers from `placementDefaults`: if only front_* or only back_* ids appear, restricts to that side.
- * - If both front and back appear in defaults (e.g. front_center + back_center), treats as both sides (legacy).
+ * Whether this design’s raster artwork should apply on the given garment side.
+ * Uses `supportedSides` when set; otherwise asset presence; then placement defaults.
  */
 export function designSupportsGarmentSide(
   design: DesignDoc | null | undefined,
-  side: "front" | "back"
+  side: GarmentSide
 ): boolean {
   if (!design) return false;
   const ss = design.supportedSides;
@@ -110,6 +199,11 @@ export function designSupportsGarmentSide(
     if (side === "front") return norm.includes("front");
     return norm.includes("back");
   }
+
+  const derived = derivePrintSidesFromAssetPresence(design);
+  if (derived === "front") return side === "front";
+  if (derived === "back") return side === "back";
+  if (derived === "both") return true;
 
   const defs = design.placementDefaults ?? [];
   if (defs.length > 0) {
@@ -124,28 +218,44 @@ export function designSupportsGarmentSide(
   return true;
 }
 
-/** How the design doc encodes `supportedSides` for editors (Design Detail → Print sides). */
+/**
+ * How the design doc maps to the Design page “Print sides” control.
+ * Firestore field: **`supportedSides`** (string array: `front`, `back`). When unset / empty, derived from which
+ * side keys have assets (`assets.front` / `assets.back`), then placement defaults.
+ */
 export type DesignPrintSidesMode = "both" | "front" | "back";
 
 export function getDesignPrintSidesMode(design: DesignDoc | null | undefined): DesignPrintSidesMode {
   if (!design) return "both";
   const ss = design.supportedSides;
-  if (!Array.isArray(ss) || ss.length === 0) return "both";
-  const norm = ss.map((s) => String(s).trim().toLowerCase());
-  const hasF = norm.includes("front");
-  const hasB = norm.includes("back");
-  if (hasF && hasB) return "both";
-  if (hasB && !hasF) return "back";
-  if (hasF && !hasB) return "front";
+  if (Array.isArray(ss) && ss.length > 0) {
+    const norm = ss.map((s) => String(s).trim().toLowerCase());
+    const hasF = norm.includes("front");
+    const hasB = norm.includes("back");
+    if (hasF && hasB) return "both";
+    if (hasB && !hasF) return "back";
+    if (hasF && !hasB) return "front";
+    return "both";
+  }
+
+  const fromAssets = derivePrintSidesFromAssetPresence(design);
+  if (fromAssets) return fromAssets;
+
+  const defs = design.placementDefaults ?? [];
+  if (defs.length > 0) {
+    const ids = defs.map((d) => String(d.placementId || "").toLowerCase());
+    const hasFront = ids.some((id) => id.includes("front"));
+    const hasBack = ids.some((id) => id.includes("back"));
+    if (hasFront && hasBack) return "both";
+    if (hasBack && !hasFront) return "back";
+    if (hasFront && !hasBack) return "front";
+  }
+
   return "both";
 }
 
 export type CompletenessLevel = "complete" | "partial" | "missing";
 
-/**
- * Complete only when: name, team, design theme (`designType` field), light garment PNG, dark garment PNG.
- * Legacy single PNG → counts as light only; dark missing → incomplete.
- */
 export function computeDesignCompleteness(design: DesignDoc): {
   level: CompletenessLevel;
   label: string;
@@ -166,8 +276,8 @@ export function computeDesignCompleteness(design: DesignDoc): {
   if (!hasName) missing.push("name");
   if (!hasTeam) missing.push("team");
   if (!hasType) missing.push("design type");
-  if (!hasLight) missing.push("light garment PNG");
-  if (!hasDark) missing.push("dark garment PNG");
+  if (!hasLight) missing.push("light garment PNG (default side)");
+  if (!hasDark) missing.push("dark garment PNG (default side)");
 
   const partial = hasName || hasTeam || hasType || hasLight || hasDark;
 
@@ -211,50 +321,81 @@ export function designAssetsInventory(design: DesignDoc): {
   };
 }
 
-/** @deprecated Prefer designGarmentAssetBadges */
-export function designAssetsLabel(design: DesignDoc): string {
-  const a = designAssetsInventory(design);
-  const yn = (ok: boolean) => (ok ? "✓" : "—");
-  return `Light ${yn(a.light)} · Dark ${yn(a.dark)} · SVG ${yn(a.svg)} · PDF ${yn(a.pdf)}`;
-}
-
-/** Badges for Designs Library table: Light Garment / Dark Garment */
 export function designGarmentAssetBadges(design: DesignDoc): { light: boolean; dark: boolean } {
   const u = resolveDesignAssets(design);
   return { light: !!u.lightPng, dark: !!u.darkPng };
 }
 
 /**
- * Renderer hook: pick garment-variant URL (not ink). Align with your blank `colorFamily` / `garment.colorFamily`.
- * Example: `colorFamily === "dark"` → dark garment overlay.
+ * Preview image: prefer default side light PNG, then dark, then SVGs.
+ * @deprecated Prefer `resolveDesignSideAssets` when side is known.
  */
+export function getDesignPreviewUrl(design: DesignDoc | null | undefined): string | undefined {
+  const u = resolveDesignAssets(design);
+  return (
+    u.lightPng ||
+    u.darkPng ||
+    u.lightSvg ||
+    u.darkSvg ||
+    u.svg ||
+    undefined
+  );
+}
+
+/** Light garment PNG URL for default side (includes legacy single-PNG as light-only). */
+export function getDesignAssetLightPngUrl(design: DesignDoc | null | undefined): string | null {
+  return resolveDesignAssets(design).lightPng;
+}
+
+export function getDesignAssetDarkPngUrl(design: DesignDoc | null | undefined): string | null {
+  return resolveDesignAssets(design).darkPng;
+}
+
+/**
+ * Pick raster URL for a blank variant’s garment color family on a **specific print side**
+ * (e.g. `back` for 8394 flat render MVP).
+ */
+export function pickDesignPngUrlForVariant(
+  design: DesignDoc,
+  variant: Pick<RPBlankVariant, "colorFamily" | "colorName">,
+  placementSide: GarmentSide = "back"
+): { url: string | null; ref: "light" | "dark" } {
+  const fam = getEffectiveColorFamily(variant.colorFamily, variant.colorName);
+  const u = resolveDesignSideAssets(design, placementSide);
+  if (fam === "dark") {
+    return { url: u.darkPng ?? u.lightPng, ref: u.darkPng ? "dark" : "light" };
+  }
+  return { url: u.lightPng ?? u.darkPng, ref: u.lightPng ? "light" : "dark" };
+}
+
 export function pickDesignAssetUrlForGarment(
   design: DesignDoc | null | undefined,
-  garmentColorFamily: string | null | undefined
+  garmentColorFamily: string | null | undefined,
+  placementSide: GarmentSide = "back"
 ): string | null {
-  const u = resolveDesignAssets(design);
+  const u = resolveDesignSideAssets(design, placementSide);
   if (garmentColorFamily === "dark") return u.darkPng;
   return u.lightPng;
 }
 
-/** Print-ready PDF by garment color family; falls back to legacy single `pdf` / other variant. */
 export function pickDesignPdfUrlForGarment(
   design: DesignDoc | null | undefined,
-  garmentColorFamily: string | null | undefined
+  garmentColorFamily: string | null | undefined,
+  placementSide: GarmentSide = "back"
 ): string | null {
-  const u = resolveDesignAssets(design);
+  const u = resolveDesignSideAssets(design, placementSide);
   if (garmentColorFamily === "dark") {
     return u.darkPdf ?? u.lightPdf ?? u.pdf ?? null;
   }
   return u.lightPdf ?? u.darkPdf ?? u.pdf ?? null;
 }
 
-/** Production SVG by garment color family; falls back to legacy single `svg` / other variant. */
 export function pickDesignSvgUrlForGarment(
   design: DesignDoc | null | undefined,
-  garmentColorFamily: string | null | undefined
+  garmentColorFamily: string | null | undefined,
+  placementSide: GarmentSide = "back"
 ): string | null {
-  const u = resolveDesignAssets(design);
+  const u = resolveDesignSideAssets(design, placementSide);
   if (garmentColorFamily === "dark") {
     return u.darkSvg ?? u.lightSvg ?? u.svg ?? null;
   }

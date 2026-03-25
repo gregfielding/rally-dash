@@ -17,6 +17,7 @@ import {
   RPBlank,
   RPBlankStyleCode,
   RPBlankColorName,
+  RPBlankGarmentSizeCode,
   RPBlankStatus,
   RPBlankGarmentCategory,
   RPBlankColorFamily,
@@ -244,6 +245,10 @@ export interface UpdateBlankInput {
   schemaVersion?: number | null;
   /** Team/catalog eligibility (master blank); colors live on variants only */
   eligibility?: RPBlankEligibility | null;
+  /**
+   * Style-level garment sizes (XS–XL phase 1). Future Shopify sync: inherited **Size** option alongside **Color**.
+   */
+  garmentSizes?: RPBlankGarmentSizeCode[] | null;
 }
 
 /**

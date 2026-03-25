@@ -8,9 +8,17 @@ import { useBlank, useUpdateBlank, useDeleteBlank, COLOR_REGISTRY, type UpdateBl
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { storage, db } from "@/lib/firebase/config";
 import { collection, doc, getDoc, getDocs, query, setDoc, serverTimestamp, where } from "firebase/firestore";
-import { RPBlank, RPImageRef, RPBlankMask, RPBlankColorFamily, RpProduct, RPBlankRenderDefaults } from "@/lib/types/firestore";
+import {
+  RPBlank,
+  RPImageRef,
+  RPBlankMask,
+  RPBlankColorFamily,
+  RpProduct,
+  RPBlankRenderDefaults,
+  type RPBlankGarmentSizeCode,
+} from "@/lib/types/firestore";
 import { useAuth } from "@/lib/providers/AuthProvider";
-import { getEffectiveColorFamily, isMasterBlank, getEffectiveCategory, countActiveVariants } from "@/lib/blanks";
+import { getEffectiveColorFamily, isMasterBlank, getEffectiveCategory, countActiveVariants, GARMENT_SIZE_CODES_ORDER, normalizeGarmentSizes } from "@/lib/blanks";
 import { BlankVariantsManager } from "./BlankVariantsManager";
 import { BlankRenderProfileEditor } from "./BlankRenderProfileEditor";
 import { BlankEligibilityTab } from "./BlankEligibilityTab";
@@ -115,16 +123,102 @@ function RenderDefaultsForm({
   );
 }
 
+function GarmentSizesSection({ blank, updateBlank, refetchBlank, showToast }: { blank: RPBlank; updateBlank: (i: UpdateBlankInput) => Promise<unknown>; refetchBlank: () => void; showToast: (m: string, t: "success" | "error") => void }) {
+  const initial = normalizeGarmentSizes(blank.garmentSizes) ?? [];
+  const [selected, setSelected] = useState<Set<RPBlankGarmentSizeCode>>(() => new Set(initial));
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setSelected(new Set(normalizeGarmentSizes(blank.garmentSizes) ?? []));
+  }, [blank.blankId, blank.garmentSizes]);
+
+  const toggle = (code: RPBlankGarmentSizeCode) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(code)) next.delete(code);
+      else next.add(code);
+      return next;
+    });
+  };
+
+  return (
+    <div className="space-y-4 max-w-2xl border border-gray-200 rounded-lg p-4 bg-gray-50/50">
+      <div>
+        <h3 className="text-sm font-semibold text-gray-900">Garment sizes (style)</h3>
+        <p className="text-sm text-gray-600 mt-1">
+          Sizes belong to the blank, not individual generated products. Phase 1: choose which of XS–XL this style offers.
+          Products still use color-only variants for now; later, Shopify can list <strong className="font-medium">Color</strong> ×{" "}
+          <strong className="font-medium">Size</strong> using this list for the size axis.
+        </p>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {GARMENT_SIZE_CODES_ORDER.map((code) => (
+          <label
+            key={code}
+            className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm cursor-pointer ${
+              selected.has(code) ? "border-blue-500 bg-blue-50 text-blue-900" : "border-gray-200 bg-white text-gray-700"
+            }`}
+          >
+            <input
+              type="checkbox"
+              className="rounded border-gray-300"
+              checked={selected.has(code)}
+              onChange={() => toggle(code)}
+            />
+            {code}
+          </label>
+        ))}
+      </div>
+      <button
+        type="button"
+        disabled={saving}
+        onClick={async () => {
+          setSaving(true);
+          try {
+            const payload = normalizeGarmentSizes(Array.from(selected));
+            await updateBlank({ blankId: blank.blankId, garmentSizes: payload });
+            refetchBlank();
+            showToast("Garment sizes saved", "success");
+          } catch {
+            showToast("Failed to save sizes", "error");
+          } finally {
+            setSaving(false);
+          }
+        }}
+        className="px-4 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50"
+      >
+        {saving ? "Saving…" : "Save sizes"}
+      </button>
+    </div>
+  );
+}
+
 function ShopifyDefaultsSection({ blank, updateBlank, refetchBlank, showToast }: { blank: RPBlank; updateBlank: (i: UpdateBlankInput) => Promise<unknown>; refetchBlank: () => void; showToast: (m: string, t: "success" | "error") => void }) {
   const sd = blank.shopifyDefaults;
   const [productType, setProductType] = useState(sd?.productType ?? "");
   const [brand, setBrand] = useState(sd?.brand ?? sd?.vendor ?? "");
   const [productCategory, setProductCategory] = useState(sd?.productCategory ?? "");
   const [collectionHandles, setCollectionHandles] = useState((sd?.collectionHandles ?? []).join(", "));
+  const [sizeOptionName, setSizeOptionName] = useState(sd?.sizeOptionName ?? "");
   const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    setSizeOptionName(blank.shopifyDefaults?.sizeOptionName ?? "");
+  }, [blank.blankId, blank.shopifyDefaults?.sizeOptionName]);
   return (
     <div className="space-y-4 max-w-lg">
       <p className="text-sm text-gray-700">Shopify merchandising defaults (style-level). Supplier/sourcing is not duplicated here—use Sourcing.</p>
+      <div>
+        <label className="block text-sm font-medium text-gray-800 mb-1">Size option name (Shopify)</label>
+        <p className="text-xs text-gray-500 mb-1">
+          When variants become Color × Size, this is the Shopify option label for the size dimension (default at sync: <span className="font-mono">Size</span>).
+        </p>
+        <input
+          value={sizeOptionName}
+          onChange={(e) => setSizeOptionName(e.target.value)}
+          className={BLANK_FIELD}
+          placeholder="Size"
+        />
+      </div>
       <div>
         <label className="block text-sm font-medium text-gray-800 mb-1">Product type</label>
         <input value={productType} onChange={(e) => setProductType(e.target.value)} className={BLANK_FIELD} placeholder="e.g. Panties" />
@@ -155,6 +249,7 @@ function ShopifyDefaultsSection({ blank, updateBlank, refetchBlank, showToast }:
                 vendor: brand.trim() || null,
                 productCategory: productCategory.trim() || null,
                 collectionHandles: collectionHandles.trim() ? collectionHandles.split(",").map((h) => h.trim()).filter(Boolean) : null,
+                sizeOptionName: sizeOptionName.trim() || null,
               },
             });
             refetchBlank();
@@ -1550,9 +1645,12 @@ function BlankDetailContent() {
               </div>
             )}
 
-            {/* Shopify Defaults Tab */}
+            {/* Shopify Defaults Tab (sizes + storefront defaults) */}
             {activeTab === "shopify" && (
-              <ShopifyDefaultsSection blank={blank} updateBlank={updateBlank} refetchBlank={refetchBlank} showToast={showToast} />
+              <div className="space-y-8">
+                <GarmentSizesSection blank={blank} updateBlank={updateBlank} refetchBlank={refetchBlank} showToast={showToast} />
+                <ShopifyDefaultsSection blank={blank} updateBlank={updateBlank} refetchBlank={refetchBlank} showToast={showToast} />
+              </div>
             )}
             {/* Templates Tab */}
             {activeTab === "templates" && (

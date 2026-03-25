@@ -24,6 +24,7 @@ export {
 } from "./simpleRenderControls8394";
 export {
   resolveBlankTemplates,
+  stripUnresolvedTemplateArtifacts,
   type BlankTemplateContext,
   type ResolvedBlankTemplates,
 } from "./templateTokens";
@@ -37,3 +38,4 @@ export {
   type EligibleTeamsResult,
   type TeamColorFamilyOption,
 } from "./eligibility";
+export { GARMENT_SIZE_CODES_ORDER, normalizeGarmentSizes } from "./garmentSizes";

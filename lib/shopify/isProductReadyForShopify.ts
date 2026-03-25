@@ -27,8 +27,9 @@ export type ShopifyReadinessResult = {
 
 /**
  * Determines if a product has the minimum required data for Shopify sync.
- * Required: title, handle, blankId, price, weight, heroFront.
- * Recommended (warn only): heroBack, productType, tags, printPdfFront, printPdfBack.
+ * Required: title, handle, blankId, price, weight, and at least one hero image.
+ * For blankStyleCode 8394 (back-print panty), heroBack and/or heroFront suffices (back blended + optional blank front).
+ * Recommended (warn only): second hero side, productType, tags, printPdfFront, printPdfBack.
  */
 export function isProductReadyForShopify(product: RpProduct | null | undefined): ShopifyReadinessResult {
   const missing: string[] = [];
@@ -48,7 +49,18 @@ export function isProductReadyForShopify(product: RpProduct | null | undefined):
   if (typeof product.shipping?.defaultWeightGrams !== "number" || product.shipping.defaultWeightGrams < 0) {
     missing.push(REQUIRED_LABELS.weight);
   }
-  if (!product.media?.heroFront?.trim()) missing.push(REQUIRED_LABELS.heroFront);
+
+  const blankStyle = String(product.blankStyleCode || "").trim();
+  const is8394BackPrimary = blankStyle === "8394";
+  if (is8394BackPrimary) {
+    const hasHeroBack = !!product.media?.heroBack?.trim();
+    const hasHeroFront = !!product.media?.heroFront?.trim();
+    if (!hasHeroBack && !hasHeroFront) {
+      missing.push("Hero back or hero front (8394 is back-print; use back blended or blank front)");
+    }
+  } else if (!product.media?.heroFront?.trim()) {
+    missing.push(REQUIRED_LABELS.heroFront);
+  }
 
   // Recommended (warn, do not block)
   if (!product.media?.heroBack?.trim()) warnings.push(RECOMMENDED_LABELS.heroBack);

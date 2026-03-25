@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback, FormEvent } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
-import { addDoc, collection, deleteDoc, doc, getDocs, query, serverTimestamp, updateDoc, where, writeBatch } from "firebase/firestore";
+import { addDoc, collection, deleteDoc, doc, getDoc, getDocs, query, serverTimestamp, updateDoc, where, writeBatch } from "firebase/firestore";
 import { db } from "@/lib/firebase/config";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import { useProductBySlug, useProducts } from "@/lib/hooks/useRPProducts";
@@ -16,6 +16,7 @@ import {
   useGenerateProductAssets,
   useGenerateProductFlatRenders,
   useGenerateProductSceneRender,
+  useRefreshProductMerchandisingFromSources,
 } from "@/lib/hooks/useRPProductMutations";
 import { useCreateMockJob, useWatchMockJob } from "@/lib/hooks/useMockAssets";
 import { useIdentities } from "@/lib/hooks/useIdentities";
@@ -59,6 +60,9 @@ import {
   RpConceptStatus,
   type DesignDoc,
   type RPBlank,
+  type RPBlankGarmentSizeCode,
+  type RpGenerationType,
+  type RpScenePreset,
 } from "@/lib/types/firestore";
 import {
   hasProductPlacementOverride,
@@ -69,6 +73,34 @@ import { pickFlatBlendedUrlForScene } from "@/lib/scenes/sceneRenderHelpers";
 import { isProductReadyForShopify } from "@/lib/shopify/isProductReadyForShopify";
 import { buildShopifyTags } from "@/lib/shopify/buildShopifyTags";
 import { formatCmyk, resolveRpInkColorsWithStandard } from "@/lib/print/standardPrintInks";
+import {
+  FALLBACK_SCENE_PRESET_IDS,
+  DEFAULT_SCENE_RENDER_KEY,
+  IMPLEMENTED_SCENE_RENDER_KEYS,
+} from "@/lib/generation/generationDefaultsConfig";
+import {
+  resolveProductGeneration,
+  inferGenerationTypeFromPreset,
+} from "@/lib/generation/resolveProductGeneration";
+import { useDesignTeam } from "@/lib/hooks/useDesignTeam";
+import ResolvedGenerationSummary from "@/components/products/ResolvedGenerationSummary";
+
+/**
+ * Parent row for multi-color products. Some docs omit `productKind` but have variantCount / variantSummary.
+ */
+function isParentProductRow(
+  p: Pick<RpProduct, "productKind" | "variantCount" | "variantSummary"> | null | undefined
+): boolean {
+  if (!p) return false;
+  if (p.productKind === "parent") return true;
+  const pk = String(p.productKind ?? "")
+    .trim()
+    .toLowerCase();
+  if (pk === "parent") return true;
+  if ((p.variantCount ?? 0) > 0) return true;
+  if (p.variantSummary && p.variantSummary.length > 0) return true;
+  return false;
+}
 
 // Assets Tab Component with Collections
 function AssetsTab({
@@ -1712,26 +1744,231 @@ function DesignsTabContent({
 }
 
 function ProductDetailContent() {
+  type ProductVariantRow = {
+    id: string;
+    colorName?: string | null;
+    blankVariantId?: string | null;
+    mockupUrl?: string | null;
+    media?: { heroFront?: string | null; heroBack?: string | null } | null;
+  };
+
   const params = useParams();
   const router = useRouter();
   const slug = (params?.slug as string) || "";
   const [activeTab, setActiveTab] = useState<
-    "overview" | "content" | "assets" | "shopify" | "history"
-  >("overview");
+    "product" | "images" | "shopifyPreview" | "order" | "metrics"
+  >("product");
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const mockupPollCancelledRef = useRef(false);
   const [experimentId, setExperimentId] = useState("");
   const [variantId, setVariantId] = useState("");
+  /** Images tab: which color variant we’re focused on (parent products). */
+  const [imagesTabVariantId, setImagesTabVariantId] = useState<string>("");
+  /** Bumps to re-run variant subcollection fetch after mock/flat writes (parent products). */
+  const [variantReloadTick, setVariantReloadTick] = useState(0);
   // Two-stage pipeline: Product Images (Stage 1) vs Model Images (Stage 2)
   const [generateMode, setGenerateMode] = useState<"product" | "model">("product");
 
   const { product, loading: productLoading, error: productError, refetch: refetchProduct } = useProductBySlug(slug);
+  const productRef = useRef(product);
+  productRef.current = product;
+  const imagesTabVariantIdRef = useRef(imagesTabVariantId);
+  imagesTabVariantIdRef.current = imagesTabVariantId;
+
+  const [productVariants, setProductVariants] = useState<ProductVariantRow[]>([]);
+  const [productVariantsLoading, setProductVariantsLoading] = useState(false);
+
+  const treatsAsParentProduct = useMemo(() => isParentProductRow(product), [
+    product?.id,
+    product?.productKind,
+    product?.variantCount,
+    product?.variantSummary,
+  ]);
 
   useEffect(() => {
     if (productError) {
       console.error("[ProductDetailContent] Error loading product:", productError);
     }
   }, [productError]);
+
+  useEffect(() => {
+    if (!product) return;
+    console.info("[ProductDetail][variants-debug] render snapshot", {
+      routeSlug: slug,
+      parentDocId: product.id,
+      productKind: product.productKind,
+      treatsAsParentProduct,
+      variantCountField: product.variantCount,
+      variantSummaryLen: product.variantSummary?.length ?? 0,
+      productVariantsLoading,
+      effectiveVariantsUiLen: productVariants.length,
+      imagesTabVariantId: imagesTabVariantId || null,
+    });
+  }, [
+    slug,
+    product?.id,
+    product?.productKind,
+    product?.variantCount,
+    product?.variantSummary,
+    treatsAsParentProduct,
+    productVariantsLoading,
+    productVariants.length,
+    imagesTabVariantId,
+  ]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!db || !product?.id || !treatsAsParentProduct) {
+        if (!cancelled) {
+          setProductVariants([]);
+          setProductVariantsLoading(false);
+        }
+        if (product?.id && !treatsAsParentProduct) {
+          console.info("[ProductDetail][variants-debug] skip subcollection load", {
+            parentDocId: product.id,
+            productKind: product.productKind,
+            variantCount: product.variantCount,
+            variantSummaryLen: product.variantSummary?.length ?? 0,
+            reason: "not classified as parent (check productKind vs variantCount/variantSummary)",
+          });
+        }
+        return;
+      }
+      const parentId = product.id;
+      const variantsPath = `rp_products/${parentId}/variants`;
+      setProductVariantsLoading(true);
+      try {
+        const snap = await getDocs(collection(db, "rp_products", parentId, "variants"));
+        let rows: ProductVariantRow[] = snap.docs
+          .map((d) => {
+            const v = d.data() as {
+              colorName?: string | null;
+              blankVariantId?: string | null;
+              mockupUrl?: string | null;
+              media?: { heroFront?: string | null; heroBack?: string | null } | null;
+            };
+            return {
+              id: d.id,
+              colorName: v.colorName ?? null,
+              blankVariantId: v.blankVariantId ?? null,
+              mockupUrl: v.mockupUrl ?? null,
+              media: v.media ?? null,
+            } as ProductVariantRow;
+          })
+          .sort((a, b) =>
+            String(a.colorName || "").localeCompare(String(b.colorName || ""), undefined, { sensitivity: "base" })
+          );
+
+        if (rows.length === 0 && product.variantSummary && product.variantSummary.length > 0) {
+          rows = product.variantSummary.map((s) => ({
+            id: s.variantId,
+            colorName: s.colorName ?? null,
+            blankVariantId: s.blankVariantId ?? null,
+            mockupUrl: null,
+            media: null,
+          }));
+        }
+
+        console.info("[ProductDetail][variants-debug] subcollection result", {
+          parentDocId: parentId,
+          queriedPath: variantsPath,
+          subcollectionDocCount: snap.docs.length,
+          variantCountField: product.variantCount,
+          variantSummaryLen: product.variantSummary?.length ?? 0,
+          effectiveRowCountAfterMerge: rows.length,
+        });
+
+        if (!cancelled) setProductVariants(rows);
+      } catch (err) {
+        console.error("[ProductDetail] Failed to load variants:", err);
+        const fallback =
+          product.variantSummary?.map((s) => ({
+            id: s.variantId,
+            colorName: s.colorName ?? null,
+            blankVariantId: s.blankVariantId ?? null,
+            mockupUrl: null,
+            media: null,
+          })) ?? [];
+        if (!cancelled) setProductVariants(fallback);
+      } finally {
+        if (!cancelled) setProductVariantsLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [product?.id, treatsAsParentProduct, product?.variantCount, product?.variantSummary, variantReloadTick]);
+
+  useEffect(() => {
+    if (!treatsAsParentProduct || !product) {
+      setImagesTabVariantId("");
+      return;
+    }
+    const def = product.defaultVariantId || "";
+    setImagesTabVariantId((prev) => {
+      if (prev && productVariants.some((v) => v.id === prev)) return prev;
+      if (def && productVariants.some((v) => v.id === def)) return def;
+      return productVariants[0]?.id || "";
+    });
+  }, [product?.id, treatsAsParentProduct, product?.defaultVariantId, productVariants]);
+
+  const shopifyPreviewVariantDoc = useMemo(
+    () => productVariants.find((v) => v.id === imagesTabVariantId),
+    [productVariants, imagesTabVariantId]
+  );
+
+  /** Legacy single-doc mockup on parent, or color-variant mockup on variant row. */
+  const hasMockupForGenerateUi = useMemo(() => {
+    if (!product) return false;
+    if (treatsAsParentProduct) {
+      const v = shopifyPreviewVariantDoc;
+      return !!(
+        v?.mockupUrl ||
+        v?.media?.heroFront ||
+        v?.media?.heroBack
+      );
+    }
+    return !!product.mockupUrl;
+  }, [product, shopifyPreviewVariantDoc, treatsAsParentProduct]);
+
+  /** URL for “master composite” preview: variant row for parents, else parent.mockupUrl. */
+  const masterCompositeMockupUrl = useMemo(() => {
+    if (!product) return null;
+    if (treatsAsParentProduct && shopifyPreviewVariantDoc) {
+      const v = shopifyPreviewVariantDoc;
+      return v.mockupUrl || v.media?.heroBack || v.media?.heroFront || null;
+    }
+    return product.mockupUrl ?? null;
+  }, [product, shopifyPreviewVariantDoc, treatsAsParentProduct]);
+
+  const shopifyPreviewGalleryUrls = useMemo(() => {
+    if (!product) return [] as string[];
+    const v = shopifyPreviewVariantDoc;
+    const out: string[] = [];
+    const add = (u?: string | null) => {
+      if (u && typeof u === "string" && u.trim() && !out.includes(u.trim())) out.push(u.trim());
+    };
+    const backFirst = String(product.blankStyleCode || "").trim() === "8394";
+    if (treatsAsParentProduct && v) {
+      const m = v.media || {};
+      if (backFirst) {
+        add(m.heroBack);
+        add(m.heroFront);
+      } else {
+        add(m.heroFront);
+        add(m.heroBack);
+      }
+      add(v.mockupUrl);
+    }
+    add(product.displayMedia?.heroUrl);
+    add(product.displayMedia?.thumbUrl);
+    add(product.media?.heroFront);
+    add(product.media?.heroBack);
+    add(product.mockupUrl);
+    return out;
+  }, [product, shopifyPreviewVariantDoc, treatsAsParentProduct]);
+
   const { designs, loading: designsLoading, refetch: refetchDesigns } = useProductDesigns(
     product?.id ? { productId: product.id } : null
   );
@@ -1747,13 +1984,30 @@ function ProductDetailContent() {
     return getRelatedProducts(product, candidateProducts, 8);
   }, [product, candidateProducts]);
 
-  // Hardcoded presets for now (Firestore query issue)
-  // Fallback hardcoded presets with supportedModes (if fetchedPresets fails). Run seed-scene-presets.js for Ecommerce Flat.
+  /** Bootstrap presets when Firestore query fails — IDs from `lib/generation/generationDefaultsConfig`. */
   const hardcodedPresets = [
-    { id: "vVygHYFuqMoNhD4yYQWN", name: "Ecommerce White", sceneType: "ecommerce", mode: "productOnly" as const, supportedModes: ["product_only", "on_model"] },
-    { id: "6PSbRuuBHXltiTQ4Ms21", name: "Studio Editorial", sceneType: "studio", supportedModes: ["on_model"] },
-    { id: "uX9mvPDuuFrSPCmhpWFA", name: "Lifestyle Outdoor", sceneType: "lifestyle", supportedModes: ["on_model"] },
-  ];
+    {
+      id: FALLBACK_SCENE_PRESET_IDS.productOnly,
+      name: "Ecommerce White (fallback)",
+      sceneType: "ecommerce",
+      mode: "productOnly" as const,
+      supportedModes: ["product_only", "on_model"] as RpGenerationType[],
+    },
+    {
+      id: FALLBACK_SCENE_PRESET_IDS.onModel,
+      name: "Studio Editorial (fallback)",
+      sceneType: "studio",
+      mode: "onModel" as const,
+      supportedModes: ["on_model"] as RpGenerationType[],
+    },
+    {
+      id: FALLBACK_SCENE_PRESET_IDS.lifestyleOnModel,
+      name: "Lifestyle Outdoor (fallback)",
+      sceneType: "lifestyle",
+      mode: "onModel" as const,
+      supportedModes: ["on_model"] as RpGenerationType[],
+    },
+  ] as unknown as RpScenePreset[];
   const { presets: fetchedPresets, loading: presetsLoading } = useScenePresets({ isActive: true });
   
   // Generate form state
@@ -1774,12 +2028,14 @@ function ProductDetailContent() {
   const [imageSize, setImageSize] = useState<"square" | "portrait" | "landscape">("square");
   
   // Use fetched presets if available, otherwise fall back to hardcoded
-  const allPresets = fetchedPresets.length > 0 ? fetchedPresets : hardcodedPresets;
+  const allPresets: RpScenePreset[] = fetchedPresets.length > 0 ? fetchedPresets : hardcodedPresets;
   
   // Get selected preset to determine mode
   const selectedPreset = allPresets.find(p => p.id === selectedPresetId);
-  const presetMode = (selectedPreset && "mode" in selectedPreset && selectedPreset.mode) || 
-    (selectedPreset?.supportedModes?.includes("product_only") ? "productOnly" : "onModel");
+  const supportedModes = selectedPreset?.supportedModes as RpGenerationType[] | undefined;
+  const presetMode =
+    (selectedPreset && "mode" in selectedPreset && selectedPreset.mode) ||
+    (supportedModes?.includes("product_only") ? "productOnly" : "onModel");
   const isProductOnly = presetMode === "productOnly";
   const isOnModel = presetMode === "onModel";
   
@@ -1788,6 +2044,7 @@ function ProductDetailContent() {
   const { generateProductAssets } = useGenerateProductAssets();
   const { generateProductFlatRenders } = useGenerateProductFlatRenders();
   const { generateProductSceneRender } = useGenerateProductSceneRender();
+  const { refreshProductMerchandisingFromSources } = useRefreshProductMerchandisingFromSources();
   const { createJob: createMockJob } = useCreateMockJob();
   const [lastMockJobId, setLastMockJobId] = useState<string | null>(null);
   const { job: mockJob } = useWatchMockJob(lastMockJobId);
@@ -1803,6 +2060,18 @@ function ProductDetailContent() {
   const flatRenderDesignId =
     (product?.designIdBack && product.designIdBack.trim()) || product?.designId || null;
   const { design: designForFlatRender, isLoading: designFlatLoading } = useDesign(flatRenderDesignId);
+
+  const { team: designTeam, loading: designTeamLoading } = useDesignTeam(product?.teamId ?? undefined);
+  const resolved = useMemo(
+    () => resolveProductGeneration({ blank: currentBlank ?? null, team: designTeam, design: designFront ?? null }),
+    [currentBlank, designTeam, designFront]
+  );
+
+  const resolvedSceneRenderKey = useMemo(
+    () => resolved.sceneRenderKey.value ?? DEFAULT_SCENE_RENDER_KEY,
+    [resolved.sceneRenderKey.value]
+  );
+  const sceneCompositeImplemented = IMPLEMENTED_SCENE_RENDER_KEYS.has(resolvedSceneRenderKey);
 
   useEffect(() => {
     let cancelled = false;
@@ -1926,29 +2195,65 @@ function ProductDetailContent() {
   // UI-only: which view to generate in Generate tab (renderer still chooses config by view)
   const [generateView, setGenerateView] = useState<"front" | "back">("front");
 
+  useEffect(() => {
+    if (!resolved) return;
+    setGenerateView(resolved.primaryView.value);
+  }, [product?.blankId, resolved?.primaryView.value]);
+
   // Merchandising form state (spec-aligned fields); synced from product when product loads
   const [merchandising, setMerchandising] = useState({
     title: "",
     handle: "",
-    descriptionHtml: "",
+    /** Editable plain text — not `descriptionHtml`. */
+    descriptionText: "",
     seoTitle: "",
     seoDescription: "",
     tagsStr: "",
     collectionKeysStr: "",
   });
   const [savingMerchandising, setSavingMerchandising] = useState(false);
+  const [refreshingFromSources, setRefreshingFromSources] = useState(false);
   useEffect(() => {
     if (!product) return;
     setMerchandising({
       title: product.title ?? product.name ?? "",
       handle: product.handle ?? product.slug ?? "",
-      descriptionHtml: product.descriptionHtml ?? product.description ?? "",
+      descriptionText: product.descriptionText != null ? String(product.descriptionText) : "",
       seoTitle: product.seo?.title ?? "",
       seoDescription: product.seo?.description ?? "",
       tagsStr: (product.tags ?? []).join(", "),
       collectionKeysStr: (product.collectionKeys ?? []).join(", "),
     });
-  }, [product?.id, product?.title, product?.name, product?.handle, product?.slug, product?.descriptionHtml, product?.description, product?.seo?.title, product?.seo?.description, product?.tags, product?.collectionKeys]);
+  }, [
+    product?.id,
+    product?.title,
+    product?.name,
+    product?.handle,
+    product?.slug,
+    product?.descriptionText,
+    product?.seo?.title,
+    product?.seo?.description,
+    product?.tags,
+    product?.collectionKeys,
+  ]);
+
+  const handleRefreshFromSources = async () => {
+    if (!product?.id || !treatsAsParentProduct) return;
+    setRefreshingFromSources(true);
+    try {
+      await refreshProductMerchandisingFromSources({ productId: product.id });
+      await refetchProduct();
+      showToast("Refreshed from sources", "success");
+    } catch (err: unknown) {
+      const msg =
+        err && typeof err === "object" && "message" in err
+          ? String((err as { message?: string }).message)
+          : "Failed to refresh from sources";
+      showToast(msg, "error");
+    } finally {
+      setRefreshingFromSources(false);
+    }
+  };
 
   // Taxonomy form state (product-level)
   const [taxSportCode, setTaxSportCode] = useState<string | null>(null);
@@ -1959,12 +2264,22 @@ function ProductDetailContent() {
   const [isSavingTaxonomy, setIsSavingTaxonomy] = useState(false);
   useEffect(() => {
     if (!product) return;
+    const tx = product.taxonomy;
+    const entityCode = tx?.teamId ?? tx?.teamCode ?? product.teamCode ?? null;
     setTaxSportCode(product.sportCode ?? null);
     setTaxLeagueCode(product.leagueCode ?? null);
-    setTaxTeamCode(product.teamCode ?? null);
-    setTaxThemeCode(product.themeCode ?? null);
-    setTaxDesignFamily(product.designFamily ?? null);
-  }, [product?.id, product?.sportCode, product?.leagueCode, product?.teamCode, product?.themeCode, product?.designFamily]);
+    setTaxTeamCode(entityCode);
+    setTaxThemeCode(tx?.themeCode ?? product.themeCode ?? null);
+    setTaxDesignFamily(product.designFamily ?? tx?.designFamily ?? null);
+  }, [
+    product?.id,
+    product?.sportCode,
+    product?.leagueCode,
+    product?.teamCode,
+    product?.themeCode,
+    product?.designFamily,
+    product?.taxonomy,
+  ]);
   const { sports: taxonomySports } = useTaxonomySports();
   const { leagues: taxonomyLeagues } = useTaxonomyLeagues(taxSportCode ?? undefined);
   const { entities: taxonomyEntities } = useTaxonomyEntities({
@@ -1988,12 +2303,20 @@ function ProductDetailContent() {
     setIsSavingTaxonomy(true);
     try {
       const productRef = doc(db, "rp_products", product.id);
+      const prevTx = product.taxonomy ?? {};
       await updateDoc(productRef, {
         sportCode: taxSportCode ?? null,
         leagueCode: taxLeagueCode ?? null,
         teamCode: taxTeamCode ?? null,
         themeCode: taxThemeCode ?? null,
         designFamily: taxDesignFamily ?? null,
+        taxonomy: {
+          ...prevTx,
+          teamId: taxTeamCode ?? null,
+          teamCode: taxTeamCode ?? null,
+          themeCode: taxThemeCode ?? null,
+          designFamily: taxDesignFamily ?? null,
+        },
         updatedAt: new Date(),
         updatedBy: product.updatedBy ?? "",
       });
@@ -2016,6 +2339,19 @@ function ProductDetailContent() {
   });
   const [savingProduction, setSavingProduction] = useState(false);
   const [syncingToShopify, setSyncingToShopify] = useState(false);
+  const [shopifyPreviewImageIdx, setShopifyPreviewImageIdx] = useState(0);
+  /** Shopify preview: size control only; not persisted (no size variants yet). */
+  const [previewSelectedSize, setPreviewSelectedSize] = useState<RPBlankGarmentSizeCode | "">("");
+  useEffect(() => {
+    const sizes = product?.availableSizes;
+    if (sizes && sizes.length > 0) setPreviewSelectedSize(sizes[0]);
+    else setPreviewSelectedSize("");
+  }, [product?.id, product?.availableSizes]);
+
+  useEffect(() => {
+    setShopifyPreviewImageIdx(0);
+  }, [product?.id, imagesTabVariantId, shopifyPreviewGalleryUrls.join("|")]);
+
   useEffect(() => {
     if (!product) return;
     const p = product.production;
@@ -2036,20 +2372,37 @@ function ProductDetailContent() {
     }
   }, [mockJob?.status, mockJob]);
 
-  // When mock job succeeds, refetch product so we get new updatedAt (and cache-busted mockup image loads)
+  // When mock job succeeds, refetch parent + variant rows (mockup writes to variant doc for parent products)
   useEffect(() => {
     if (mockJob?.status === "succeeded") {
+      console.info("[ProductDetail] mock job succeeded (watch)", {
+        jobId: lastMockJobId,
+        parentId: product?.id,
+        variantId: imagesTabVariantIdRef.current,
+      });
       setLastMockJobId(null);
-      refetchProduct();
-      const t = setTimeout(() => refetchProduct(), 2000);
+      void refetchProduct();
+      setVariantReloadTick((t) => t + 1);
+      const t = setTimeout(() => {
+        void refetchProduct();
+        setVariantReloadTick((x) => x + 1);
+      }, 2000);
       return () => clearTimeout(t);
     }
-  }, [mockJob?.status, refetchProduct]);
+  }, [mockJob?.status, mockJob, refetchProduct, lastMockJobId, product?.id]);
 
-  // Clear mock job id once we have a mockup (e.g. refetch or another tab)
+  // Clear mock job id once parent or selected variant shows a mockup (poll + other tabs)
   useEffect(() => {
-    if (product?.mockupUrl && lastMockJobId) setLastMockJobId(null);
-  }, [product?.mockupUrl, lastMockJobId]);
+    if (!lastMockJobId) return;
+    if (treatsAsParentProduct && imagesTabVariantId) {
+      const v = productVariants.find((x) => x.id === imagesTabVariantId);
+      if (v?.mockupUrl || v?.media?.heroFront || v?.media?.heroBack) {
+        setLastMockJobId(null);
+      }
+    } else if (product?.mockupUrl) {
+      setLastMockJobId(null);
+    }
+  }, [lastMockJobId, product?.mockupUrl, treatsAsParentProduct, imagesTabVariantId, productVariants]);
 
   // Resolve blank for a side (for fallback when renderSetup is missing)
   const blankIdForFallback = product?.renderConfig?.selectedBlankId || product?.blankId;
@@ -2067,10 +2420,16 @@ function ProductDetailContent() {
   ).trim();
   /** LA Apparel 8394 bikini: catalog print is back-only (no front graphic). */
   const is8394BackPrintOnlyBlank = resolvedBlankStyleCode === "8394";
-  /** Master blanks store front/back URLs on the variant row, not on blank.images. */
+  /** Master blanks store front/back URLs on the variant row, not on blank.images.
+   * Parent products: use the Images-tab color’s blankVariantId so light/dark design PNGs match the selected garment. */
   const variantForRenderSetup =
-    currentBlank && product?.blankVariantId
-      ? getVariantById(currentBlank, product.blankVariantId)
+    currentBlank && product
+      ? treatsAsParentProduct && shopifyPreviewVariantDoc?.blankVariantId
+        ? getVariantById(currentBlank, shopifyPreviewVariantDoc.blankVariantId) ??
+          (product.blankVariantId ? getVariantById(currentBlank, product.blankVariantId) : null)
+        : product.blankVariantId
+          ? getVariantById(currentBlank, product.blankVariantId)
+          : null
       : null;
   const fallbackFrontBlankUrl =
     (variantForRenderSetup?.images?.front as { downloadUrl?: string } | null)?.downloadUrl ??
@@ -2341,8 +2700,16 @@ function ProductDetailContent() {
     if (!product?.id) return;
     setGeneratingSceneRender(true);
     try {
-      await generateProductSceneRender({ productId: product.id, sceneKey: "hanger" });
-      showToast("Hanger scene render saved on product (non-AI composite).", "success");
+      await generateProductSceneRender({
+        productId: product.id,
+        sceneKey: resolvedSceneRenderKey,
+      });
+      showToast(
+        resolvedSceneRenderKey === DEFAULT_SCENE_RENDER_KEY
+          ? "Hanger scene render saved on product (non-AI composite)."
+          : `Scene render (${resolvedSceneRenderKey}) saved on product (non-AI composite).`,
+        "success"
+      );
       await refetchProduct();
     } catch (err: unknown) {
       const msg =
@@ -2406,15 +2773,176 @@ function ProductDetailContent() {
     return () => window.removeEventListener("keydown", handleEsc);
   }, [lightboxImage, closeLightbox]);
 
+  const runGenerateFlow = async (
+    payload: {
+      presetId: string;
+      generationType: "product_only" | "on_model";
+      identityId?: string;
+      faceScale: number;
+      bodyScale: number;
+      productScale: number;
+      imageCount: number;
+      imageSize: "square" | "portrait" | "landscape";
+      experimentId?: string;
+      faceArtifactId?: string;
+      bodyArtifactId?: string;
+    },
+    options?: { resetAdvancedForm?: boolean }
+  ) => {
+    if (!product?.id) return;
+    const preset = allPresets.find((p) => p.id === payload.presetId);
+    const isOnModelRun = payload.generationType === "on_model";
+    const variantIdForJob =
+      isParentProductRow(product) && imagesTabVariantId
+        ? imagesTabVariantId
+        : variantId.trim() || undefined;
+
+    await generateProductAssets({
+      productId: product.id,
+      generationType: payload.generationType,
+      identityId: isOnModelRun ? payload.identityId : undefined,
+      presetId: payload.presetId,
+      artifacts: isOnModelRun
+        ? {
+            faceArtifactId:
+              preset && "allowFaceArtifact" in preset && preset.allowFaceArtifact !== false
+                ? payload.faceArtifactId
+                : undefined,
+            faceScale: payload.faceScale,
+            bodyArtifactId:
+              preset && "allowBodyArtifact" in preset && preset.allowBodyArtifact !== false
+                ? payload.bodyArtifactId
+                : undefined,
+            bodyScale: payload.bodyScale,
+            productArtifactId:
+              preset && "allowProductArtifact" in preset && preset.allowProductArtifact !== false
+                ? product.ai?.productArtifactId || undefined
+                : undefined,
+            productScale: payload.productScale,
+          }
+        : {
+            productArtifactId:
+              preset && "allowProductArtifact" in preset && preset.allowProductArtifact !== false
+                ? product.ai?.productArtifactId || undefined
+                : undefined,
+            productScale: payload.productScale,
+          },
+      imageCount: payload.imageCount,
+      imageSize: payload.imageSize,
+      experimentId: payload.experimentId,
+      variantId: variantIdForJob,
+    });
+
+    showToast(
+      `✅ Generation started! Assets will appear in the Images tab when ready (usually 20-30 seconds).`,
+      "success"
+    );
+
+    if (options?.resetAdvancedForm !== false) {
+      setSelectedPresetId("");
+      if (payload.generationType === "on_model") {
+        setSelectedIdentityId("");
+        setSelectedFaceArtifactId("");
+        setSelectedBodyArtifactId("");
+      }
+    }
+
+    await refetchJobs();
+    setActiveTab("images");
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    let pollAttempts = 0;
+    const maxPollAttempts = 24;
+    const pollMs = 5000;
+    pollIntervalRef.current = setInterval(async () => {
+      pollAttempts++;
+      await refetchJobs();
+      await refetchAssets();
+      if (pollAttempts >= maxPollAttempts && pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+        showToast(`✅ Generation completed! Check the Images tab.`, "success");
+      }
+    }, pollMs);
+  };
+
+  const handleGenerateWithDefaults = async () => {
+    if (!product?.id || !resolved) {
+      setGenerateError("Missing product or resolved defaults.");
+      return;
+    }
+    if (!hasMockupForGenerateUi) {
+      setGenerateError("Generate a mockup first (Product Images stage). For parent products, pick a color variant on the Images tab.");
+      return;
+    }
+    const presetId =
+      generateMode === "product" ? resolved.productOnlyPresetId.value : resolved.onModelPresetId.value;
+    if (!presetId) {
+      setGenerateError("No resolved preset id.");
+      return;
+    }
+    const preset = allPresets.find((p) => p.id === presetId) as RpScenePreset | undefined;
+    const genType = inferGenerationTypeFromPreset(preset);
+    if (
+      genType === "on_model" &&
+      preset &&
+      ("requireIdentity" in preset ? preset.requireIdentity !== false : true) &&
+      !resolved.defaultIdentityId.value
+    ) {
+      setGenerateError(
+        "No default identity — set team.generationDefaults.defaultIdentityId or use Advanced overrides."
+      );
+      return;
+    }
+
+    setGenerateError(null);
+    setGenerating(true);
+    try {
+      await runGenerateFlow(
+        {
+          presetId,
+          generationType: genType,
+          identityId: genType === "on_model" ? resolved.defaultIdentityId.value || undefined : undefined,
+          faceScale: preset?.defaultFaceScale ?? 0.8,
+          bodyScale: preset?.defaultBodyScale ?? 0.6,
+          productScale: preset?.defaultProductScale ?? product.ai?.productRecommendedScale ?? 0.9,
+          imageCount: preset?.defaultImageCount ?? preset?.defaults?.imageCount ?? 4,
+          imageSize: preset?.defaults?.imageSize ?? "square",
+          experimentId: undefined,
+          faceArtifactId: undefined,
+          bodyArtifactId: undefined,
+        },
+        { resetAdvancedForm: false }
+      );
+    } catch (err: unknown) {
+      console.error("[ProductDetail] Failed to generate (defaults):", err);
+      setGenerateError(err instanceof Error ? err.message : "Failed to generate assets");
+    } finally {
+      setGenerating(false);
+    }
+  };
+
   const handleGenerate = async (e: FormEvent) => {
     e.preventDefault();
     if (!product?.id || !selectedPresetId) {
       setGenerateError("Preset is required");
       return;
     }
+    if (!hasMockupForGenerateUi) {
+      setGenerateError(
+        "Generate a mockup first (Images tab → Generate mockup). For parent products, pick a color variant so the mockup attaches to that variant."
+      );
+      return;
+    }
 
-    // On-model requires identity (check preset.requireIdentity)
-    if (isOnModel && selectedPreset && ("requireIdentity" in selectedPreset ? selectedPreset.requireIdentity !== false : true) && !selectedIdentityId) {
+    if (
+      isOnModel &&
+      selectedPreset &&
+      ("requireIdentity" in selectedPreset ? selectedPreset.requireIdentity !== false : true) &&
+      !selectedIdentityId
+    ) {
       setGenerateError("Identity is required for this preset");
       return;
     }
@@ -2423,69 +2951,23 @@ function ProductDetailContent() {
     setGenerating(true);
 
     try {
-      await generateProductAssets({
-        productId: product.id,
-        generationType, // For backward compatibility
-        identityId: isOnModel ? selectedIdentityId : undefined,
+      const genType = inferGenerationTypeFromPreset(selectedPreset);
+      await runGenerateFlow({
         presetId: selectedPresetId,
-        artifacts: isOnModel ? {
-          faceArtifactId: (selectedPreset && "allowFaceArtifact" in selectedPreset ? selectedPreset.allowFaceArtifact !== false : true) ? (selectedFaceArtifactId || undefined) : undefined,
-          faceScale,
-          bodyArtifactId: (selectedPreset && "allowBodyArtifact" in selectedPreset ? selectedPreset.allowBodyArtifact !== false : true) ? (selectedBodyArtifactId || undefined) : undefined,
-          bodyScale,
-          productArtifactId: (selectedPreset && "allowProductArtifact" in selectedPreset ? selectedPreset.allowProductArtifact !== false : true) ? (product.ai?.productArtifactId || undefined) : undefined,
-          productScale,
-        } : {
-          productArtifactId: (selectedPreset && "allowProductArtifact" in selectedPreset ? selectedPreset.allowProductArtifact !== false : true) ? (product.ai?.productArtifactId || undefined) : undefined,
-          productScale,
-        },
+        generationType: genType,
+        identityId: genType === "on_model" ? selectedIdentityId : undefined,
+        faceScale,
+        bodyScale,
+        productScale,
         imageCount,
         imageSize,
         experimentId: experimentId.trim() || undefined,
-        variantId: variantId.trim() || undefined,
+        faceArtifactId: selectedFaceArtifactId || undefined,
+        bodyArtifactId: selectedBodyArtifactId || undefined,
       });
-
-      // Show success message
-      showToast(`✅ Generation started! Assets will appear in the Assets tab when ready (usually 20-30 seconds).`, "success");
-
-      // Reset form (preserve generationType)
-      setSelectedPresetId("");
-      if (generationType === "on_model") {
-        setSelectedIdentityId("");
-        setSelectedFaceArtifactId("");
-        setSelectedBodyArtifactId("");
-      }
-
-      // Refetch jobs immediately
-      await refetchJobs();
-      
-      // Switch to Assets tab immediately to show progress
-      setActiveTab("assets");
-      
-      // Clear any existing polling interval
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current);
-        pollIntervalRef.current = null;
-      }
-      
-      // Poll for assets - generation takes ~20-30 seconds. Poll every 5s, stop after 2 min or on unmount.
-      let pollAttempts = 0;
-      const maxPollAttempts = 24; // 24 * 5s = 2 minutes
-      const pollMs = 5000;
-
-      pollIntervalRef.current = setInterval(async () => {
-        pollAttempts++;
-        await refetchJobs();
-        await refetchAssets();
-        if (pollAttempts >= maxPollAttempts && pollIntervalRef.current) {
-          clearInterval(pollIntervalRef.current);
-          pollIntervalRef.current = null;
-          showToast(`✅ Generation completed! Check the Assets tab.`, "success");
-        }
-      }, pollMs);
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error("[ProductDetail] Failed to generate:", err);
-      setGenerateError(err?.message || "Failed to generate assets");
+      setGenerateError(err instanceof Error ? err.message : "Failed to generate assets");
     } finally {
       setGenerating(false);
     }
@@ -2494,9 +2976,17 @@ function ProductDetailContent() {
   const [mockupGenerating, setMockupGenerating] = useState(false);
   const handleGenerateMockup = async () => {
     const view = generateView;
+    const p = productRef.current;
+    const variantIdForJob = isParentProductRow(p) ? imagesTabVariantIdRef.current : "";
     const config = view === "front" ? effectiveFrontConfig : effectiveBackConfig;
-    if (!product?.id || !product.blankId) {
+    if (!p?.id || !p.blankId) {
       setGenerateError("Product must have a blank (create from Design + Blank first).");
+      return;
+    }
+    if (isParentProductRow(p) && !variantIdForJob) {
+      setGenerateError(
+        "Select a color variant on the Images tab (or wait for variants to load). Parent mockups are saved on the variant document."
+      );
       return;
     }
     if (!config.designAssetId) {
@@ -2510,12 +3000,13 @@ function ProductDetailContent() {
     setGenerateError(null);
     setMockupGenerating(true);
     try {
-      const jobId = await createMockJob({
+      const payload = {
         designId: config.designAssetId,
-        blankId: product.blankId,
+        blankId: p.blankId,
         view,
-        quality: "final",
-        productId: product.id,
+        quality: "final" as const,
+        productId: p.id,
+        productVariantId: isParentProductRow(p) ? variantIdForJob : undefined,
         blankImageUrl: config.blankImageUrl,
         designPngUrl: config.designAssetUrl,
         placementId: (config.placementKey as "front_center" | "back_center") || (view === "front" ? "front_center" : "back_center"),
@@ -2524,28 +3015,66 @@ function ProductDetailContent() {
           y: config.placementOverride?.y ?? 0.5,
           scale: config.placementOverride?.scale ?? 0.6,
         },
+      };
+      console.info("[ProductDetail] createMockJob (callable)", {
+        parentId: p.id,
+        productVariantId: payload.productVariantId ?? null,
+        view,
+        designId: payload.designId,
+        blankId: payload.blankId,
       });
+      const jobId = await createMockJob(payload);
       if (jobId) {
+        console.info("[ProductDetail] createMockJob queued", { jobId, parentId: p.id, productVariantId: payload.productVariantId ?? null, view });
         setLastMockJobId(jobId);
         setGenerateError(null);
         showToast("Mockup generation started. It will appear when ready (usually 30–60 seconds).", "success");
         refetchJobs();
         mockupPollCancelledRef.current = false;
-        const pollProduct = async (attempt = 0) => {
-          if (mockupPollCancelledRef.current || attempt >= 24) return;
-          await new Promise((r) => setTimeout(r, 5000));
+        const pollMockup = async (attempt = 0) => {
           if (mockupPollCancelledRef.current) return;
-          const updated = await refetchProduct();
-          if (updated?.mockupUrl) {
-            setLastMockJobId(null);
+          if (attempt >= 24) {
+            console.warn("[ProductDetail] mockup poll: max attempts (24), stop");
             return;
           }
-          pollProduct(attempt + 1);
+          await new Promise((r) => setTimeout(r, 5000));
+          if (mockupPollCancelledRef.current) return;
+          const freshParent = await refetchProduct();
+          const cur = productRef.current;
+          const vid = isParentProductRow(cur) ? imagesTabVariantIdRef.current : null;
+          if (cur && isParentProductRow(cur) && vid && db && cur.id) {
+            const vref = doc(db, "rp_products", cur.id, "variants", vid);
+            const vsnap = await getDoc(vref);
+            const vd = vsnap.data() as
+              | { mockupUrl?: string | null; media?: { heroFront?: string | null; heroBack?: string | null } }
+              | undefined;
+            const hasVariantAsset = !!(vd?.mockupUrl || vd?.media?.heroFront || vd?.media?.heroBack);
+            if (hasVariantAsset) {
+              console.info("[ProductDetail] mockup poll: variant doc has mockup/media", {
+                firestorePath: vref.path,
+                mockupUrl: !!vd?.mockupUrl,
+                heroFront: !!vd?.media?.heroFront,
+                heroBack: !!vd?.media?.heroBack,
+              });
+              setVariantReloadTick((t) => t + 1);
+              setLastMockJobId(null);
+              return;
+            }
+          } else {
+            const parent = (freshParent ?? cur) as RpProduct | null | undefined;
+            if (parent?.mockupUrl) {
+              console.info("[ProductDetail] mockup poll: parent mockupUrl set", { parentId: cur?.id });
+              setVariantReloadTick((t) => t + 1);
+              setLastMockJobId(null);
+              return;
+            }
+          }
+          pollMockup(attempt + 1);
         };
-        pollProduct();
+        pollMockup();
       }
-    } catch (err: any) {
-      setGenerateError(err?.message || "Failed to start mockup generation");
+    } catch (err: unknown) {
+      setGenerateError(err instanceof Error ? err.message : "Failed to start mockup generation");
     } finally {
       setMockupGenerating(false);
     }
@@ -2577,11 +3106,11 @@ function ProductDetailContent() {
   }
 
   const tabs = [
-    { id: "overview", label: "Overview" },
-    { id: "content", label: "Content" },
-    { id: "assets", label: "Assets" },
-    { id: "shopify", label: "Shopify" },
-    { id: "history", label: "History" },
+    { id: "product", label: "Product" },
+    { id: "images", label: "Images" },
+    { id: "shopifyPreview", label: "Shopify preview" },
+    { id: "order", label: "Order / production" },
+    { id: "metrics", label: "Metrics" },
   ] as const;
 
   return (
@@ -2656,7 +3185,7 @@ function ProductDetailContent() {
             <span className="font-mono">/{(product.handle ?? product.slug)}</span>
           )}
           {" · "}
-          {product.baseProductKey} · {product.colorway.name}
+          {product.baseProductKey} · {product.colorway?.name ?? "—"}
         </p>
       </div>
 
@@ -2684,11 +3213,447 @@ function ProductDetailContent() {
 
       {/* Tab Content */}
       <div className="bg-white rounded-lg shadow p-6 text-gray-900">
-        {activeTab === "overview" && (
+        {activeTab === "product" && (
           <div className="space-y-6">
-            {/* Section B — Render Setup (product.renderSetup: front and back configs; no renderSide) */}
+            <p className="text-sm text-gray-500">
+              Descriptions, SEO, tags, collections, and taxonomy classification.
+            </p>
+
+            {treatsAsParentProduct && (
+              <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
+                <h2 className="text-lg font-semibold text-gray-900 mb-2">Sizes (from blank)</h2>
+                <p className="text-xs text-gray-500 mb-3">
+                  Derived from the linked blank for UI and preview. The blank is the source of truth — use{" "}
+                  <span className="font-medium">Refresh from sources</span> below after changing sizes on the blank.
+                  {product.blankId ? (
+                    <>
+                      {" "}
+                      <Link
+                        href={`/blanks/${encodeURIComponent(product.blankId)}?tab=shopify`}
+                        className="text-blue-600 hover:underline font-medium"
+                      >
+                        Edit blank sizes
+                      </Link>
+                    </>
+                  ) : null}
+                </p>
+                {product.availableSizes && product.availableSizes.length > 0 ? (
+                  <div className="flex flex-wrap gap-2">
+                    {product.availableSizes.map((s) => (
+                      <span
+                        key={s}
+                        className="inline-flex px-2.5 py-1 rounded-md bg-white border border-gray-200 text-sm font-medium text-gray-800"
+                      >
+                        {s}
+                      </span>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                    No sizes copied yet — configure garment sizes on the blank, then refresh merchandising.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* Merchandising */}
             <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
-              <h2 className="text-lg font-semibold text-gray-900 mb-3">Render Setup</h2>
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                <h2 className="text-lg font-semibold text-gray-900">Merchandising</h2>
+                {treatsAsParentProduct && (
+                  <button
+                    type="button"
+                    onClick={() => void handleRefreshFromSources()}
+                    disabled={refreshingFromSources}
+                    className="px-3 py-1.5 text-sm bg-white border border-gray-300 text-gray-800 rounded-lg hover:bg-gray-50 disabled:opacity-50"
+                  >
+                    {refreshingFromSources ? "Refreshing…" : "Refresh from sources"}
+                  </button>
+                )}
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Title</label>
+                  <input
+                    type="text"
+                    value={merchandising.title}
+                    onChange={(e) => setMerchandising((m) => ({ ...m, title: e.target.value }))}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                    placeholder="Product title"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Handle (URL slug)</label>
+                  <input
+                    type="text"
+                    value={merchandising.handle}
+                    onChange={(e) => setMerchandising((m) => ({ ...m, handle: e.target.value }))}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono"
+                    placeholder="product-handle"
+                  />
+                </div>
+                <div className="md:col-span-2">
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Description (plain text)</label>
+                  <textarea
+                    value={merchandising.descriptionText}
+                    onChange={(e) => setMerchandising((m) => ({ ...m, descriptionText: e.target.value }))}
+                    rows={3}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                    placeholder="Short plain-text description for internal editing and listings"
+                  />
+                  {product.descriptionHtml && (
+                    <p className="text-xs text-gray-500 mt-1">
+                      Storefront HTML is stored separately in <span className="font-mono">descriptionHtml</span> (see Shopify
+                      preview). This field does not edit that HTML.
+                    </p>
+                  )}
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">SEO Title</label>
+                  <input
+                    type="text"
+                    value={merchandising.seoTitle}
+                    onChange={(e) => setMerchandising((m) => ({ ...m, seoTitle: e.target.value }))}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                    placeholder="SEO title"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">SEO Description</label>
+                  <input
+                    type="text"
+                    value={merchandising.seoDescription}
+                    onChange={(e) => setMerchandising((m) => ({ ...m, seoDescription: e.target.value }))}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                    placeholder="SEO meta description"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Tags (comma-separated)</label>
+                  <input
+                    type="text"
+                    value={merchandising.tagsStr}
+                    onChange={(e) => setMerchandising((m) => ({ ...m, tagsStr: e.target.value }))}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                    placeholder="tag1, tag2"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Collection keys (comma-separated)</label>
+                  <input
+                    type="text"
+                    value={merchandising.collectionKeysStr}
+                    onChange={(e) => setMerchandising((m) => ({ ...m, collectionKeysStr: e.target.value }))}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                    placeholder="mlb, giants"
+                  />
+                </div>
+              </div>
+              <div className="mt-3">
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (!product?.id || !db) return;
+                    setSavingMerchandising(true);
+                    try {
+                      const productRef = doc(db, "rp_products", product.id);
+                      await updateDoc(productRef, {
+                        title: merchandising.title || null,
+                        handle: merchandising.handle || null,
+                        descriptionText: merchandising.descriptionText.trim() || null,
+                        seo: {
+                          title: merchandising.seoTitle || null,
+                          description: merchandising.seoDescription || null,
+                        },
+                        tags: merchandising.tagsStr ? merchandising.tagsStr.split(",").map((t) => t.trim()).filter(Boolean) : [],
+                        collectionKeys: merchandising.collectionKeysStr ? merchandising.collectionKeysStr.split(",").map((k) => k.trim()).filter(Boolean) : [],
+                        updatedAt: new Date(),
+                        updatedBy: product.updatedBy ?? "",
+                      });
+                      await refetchProduct();
+                      showToast("Merchandising saved", "success");
+                    } catch (err) {
+                      console.error(err);
+                      showToast("Failed to save merchandising", "error");
+                    } finally {
+                      setSavingMerchandising(false);
+                    }
+                  }}
+                  disabled={savingMerchandising}
+                  className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                >
+                  {savingMerchandising ? "Saving…" : "Save merchandising"}
+                </button>
+              </div>
+            </div>
+
+            {/* Taxonomy */}
+            <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
+              <h2 className="text-lg font-semibold text-gray-900 mb-3">Taxonomy</h2>
+              <p className="text-xs text-gray-500 mb-3">
+                Entity requires League; League requires Sport. Sport can be left empty only for purely thematic/lifestyle products (e.g. PANTY_DROP, PEPTIDES, COUNTRY_CLUB). College: use Sport = COLLEGE_SPORTS, League = NCAA, Entity = school code (e.g. COLORADO).
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Sport</label>
+                  <select
+                    value={taxSportCode ?? ""}
+                    onChange={(e) => {
+                      const v = e.target.value || null;
+                      setTaxSportCode(v);
+                      if (!v) setTaxLeagueCode(null);
+                      setTaxTeamCode(null);
+                      setTaxThemeCode(null);
+                    }}
+                    className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
+                  >
+                    <option value="">—</option>
+                    {(taxonomySports ?? []).map((s) => (
+                      <option key={s.id} value={s.code}>{s.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">League</label>
+                  <select
+                    value={taxLeagueCode ?? ""}
+                    onChange={(e) => {
+                      const v = e.target.value || null;
+                      setTaxLeagueCode(v);
+                      setTaxTeamCode(null);
+                    }}
+                    className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
+                  >
+                    <option value="">—</option>
+                    {(taxonomyLeagues ?? []).map((l) => (
+                      <option key={l.id} value={l.code}>{l.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Entity</label>
+                  <select
+                    value={taxTeamCode ?? ""}
+                    onChange={(e) => setTaxTeamCode(e.target.value || null)}
+                    className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
+                  >
+                    <option value="">—</option>
+                    {taxTeamCode && !taxonomyEntities.some((ent) => ent.code === taxTeamCode) ? (
+                      <option value={taxTeamCode}>{taxTeamCode} (on product)</option>
+                    ) : null}
+                    {(taxonomyEntities ?? []).map((ent) => (
+                      <option key={ent.id} value={ent.code}>{ent.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Theme</label>
+                  <select
+                    value={taxThemeCode ?? ""}
+                    onChange={(e) => setTaxThemeCode(e.target.value || null)}
+                    className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
+                  >
+                    <option value="">—</option>
+                    {taxThemeCode && !taxonomyThemes.some((t) => t.code === taxThemeCode) ? (
+                      <option value={taxThemeCode}>{taxThemeCode} (on product)</option>
+                    ) : null}
+                    {(taxonomyThemes ?? []).map((t) => (
+                      <option key={t.id} value={t.code}>{t.name}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Design Family</label>
+                  <select
+                    value={taxDesignFamily ?? ""}
+                    onChange={(e) => setTaxDesignFamily(e.target.value || null)}
+                    className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
+                  >
+                    <option value="">—</option>
+                    {taxDesignFamily && !taxonomyDesignFamilies.some((f) => f.code === taxDesignFamily) ? (
+                      <option value={taxDesignFamily}>{taxDesignFamily} (on product)</option>
+                    ) : null}
+                    {(taxonomyDesignFamilies ?? []).map((f) => (
+                      <option key={f.id} value={f.code}>{f.name}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              <div className="mt-3">
+                <button
+                  type="button"
+                  onClick={handleSaveProductTaxonomy}
+                  disabled={isSavingTaxonomy}
+                  className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                >
+                  {isSavingTaxonomy ? "Saving…" : "Save taxonomy"}
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <h2 className="text-lg font-semibold text-gray-900 mb-4">Product overview</h2>
+              <dl className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <dt className="text-sm font-medium text-gray-500">Status</dt>
+                  <dd className="mt-1 text-sm text-gray-900">
+                    <span
+                      className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
+                        product.status === "active"
+                          ? "bg-green-100 text-green-800"
+                          : product.status === "draft"
+                          ? "bg-gray-100 text-gray-800"
+                          : "bg-red-100 text-red-800"
+                      }`}
+                    >
+                      {product.status}
+                    </span>
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-sm font-medium text-gray-500">Category</dt>
+                  <dd className="mt-1 text-sm text-gray-900">{product.category}</dd>
+                </div>
+                <div>
+                  <dt className="text-sm font-medium text-gray-500">Base Product</dt>
+                  <dd className="mt-1 text-sm font-mono text-gray-900">{product.baseProductKey}</dd>
+                </div>
+                <div>
+                  <dt className="text-sm font-medium text-gray-500">Colorway</dt>
+                  <dd className="mt-1 text-sm text-gray-900">{product.colorway?.name ?? "—"}</dd>
+                </div>
+                {product.description && (
+                  <div className="md:col-span-2">
+                    <dt className="text-sm font-medium text-gray-500">Description</dt>
+                    <dd className="mt-1 text-sm text-gray-900">{product.description}</dd>
+                  </div>
+                )}
+                {product.ai.productTrigger && (
+                  <div>
+                    <dt className="text-sm font-medium text-gray-500">Product Trigger</dt>
+                    <dd className="mt-1 text-sm font-mono text-gray-900">{product.ai.productTrigger}</dd>
+                  </div>
+                )}
+                {product.ai.productRecommendedScale && (
+                  <div>
+                    <dt className="text-sm font-medium text-gray-500">Recommended Scale</dt>
+                    <dd className="mt-1 text-sm text-gray-900">{product.ai.productRecommendedScale}</dd>
+                  </div>
+                )}
+              </dl>
+            </div>
+
+            <div>
+              <h3 className="text-sm font-semibold text-gray-900 mb-2">Asset statistics</h3>
+              <div className="grid grid-cols-3 gap-4">
+                <div className="bg-gray-50 rounded-lg p-4">
+                  <div className="text-2xl font-bold text-gray-900">{product.counters?.assetsTotal || 0}</div>
+                  <div className="text-xs text-gray-500 mt-1">Total assets</div>
+                </div>
+                <div className="bg-green-50 rounded-lg p-4">
+                  <div className="text-2xl font-bold text-green-600">{product.counters?.assetsApproved || 0}</div>
+                  <div className="text-xs text-gray-500 mt-1">Approved</div>
+                </div>
+                <div className="bg-blue-50 rounded-lg p-4">
+                  <div className="text-2xl font-bold text-blue-600">{product.counters?.assetsPublished || 0}</div>
+                  <div className="text-xs text-gray-500 mt-1">Published</div>
+                </div>
+              </div>
+            </div>
+
+            {relatedProducts.length > 0 && (
+              <div>
+                <h3 className="text-sm font-semibold text-gray-900 mb-2">Related products</h3>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                  {relatedProducts.map(({ product: p, reasons }) => {
+                    const thumb = p.media?.heroFront ?? p.media?.heroBack ?? p.mockupUrl ?? p.heroAssetPath;
+                    const title = p.title ?? p.name;
+                    const descriptor = [p.colorway?.name, p.category, p.baseProductKey].filter(Boolean).join(" · ");
+                    return (
+                      <Link
+                        key={p.id ?? p.slug}
+                        href={`/products/${encodeURIComponent(p.slug)}`}
+                        className="block rounded-lg border border-gray-200 bg-gray-50/50 p-3 hover:border-blue-300 hover:bg-blue-50/50 transition-colors"
+                      >
+                        {thumb ? (
+                          <img src={thumb} alt="" className="w-full aspect-square object-cover rounded mb-2 bg-white" />
+                        ) : (
+                          <div className="w-full aspect-square rounded mb-2 bg-gray-200 flex items-center justify-center text-gray-400 text-xs">
+                            No image
+                          </div>
+                        )}
+                        <div className="text-sm font-medium text-gray-900 truncate" title={title}>
+                          {title}
+                        </div>
+                        {descriptor && (
+                          <div className="text-xs text-gray-500 truncate mt-0.5" title={descriptor}>
+                            {descriptor}
+                          </div>
+                        )}
+                        {reasons.length > 0 && (
+                          <div className="text-xs text-blue-600 mt-1 flex flex-wrap gap-x-1 gap-y-0.5" title={reasons.join(", ")}>
+                            {reasons.map((r) => (
+                              <span key={r}>· {r}</span>
+                            ))}
+                          </div>
+                        )}
+                      </Link>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {product?.id && (
+              <div className="border-t border-gray-200 pt-6">
+                <p className="text-sm text-gray-600 mb-4">
+                  Inspiration references (full library: <span className="font-medium">More → Inspirations</span>).
+                </p>
+                <InspirationTab product={product} productId={product.id} />
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTab === "images" && (
+          <div className="space-y-6">
+            {treatsAsParentProduct && (
+              <div className="rounded-lg border border-gray-200 bg-white p-4">
+                <h2 className="text-sm font-semibold text-gray-900 mb-1">Color variant</h2>
+                <p className="text-xs text-gray-500 mb-3">
+                  Pick which color you’re working on. Per-variant assets and mockups live on the variant document; gallery below is still product-level until variant-scoped assets are fully wired.
+                </p>
+                {productVariantsLoading ? (
+                  <p className="text-sm text-gray-500">Loading variants…</p>
+                ) : productVariants.length > 0 ? (
+                  <label className="block max-w-md">
+                    <span className="sr-only">Variant</span>
+                    <select
+                      value={imagesTabVariantId}
+                      onChange={(e) => setImagesTabVariantId(e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white"
+                    >
+                      {productVariants.map((v) => (
+                        <option key={v.id} value={v.id}>
+                          {v.colorName || v.blankVariantId || v.id}
+                          {v.blankVariantId ? ` · ${v.blankVariantId}` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : (
+                  <p className="text-sm text-amber-800">No variants under this product yet.</p>
+                )}
+              </div>
+            )}
+            {/* Advanced: Render Setup (product.renderSetup: front and back configs; no renderSide) */}
+            <details className="border border-gray-200 rounded-lg bg-gray-50/50 group">
+              <summary className="cursor-pointer list-none px-4 py-3 font-semibold text-gray-900 flex items-center justify-between">
+                <span>Advanced render setup</span>
+                <span className="text-xs font-normal text-gray-500 group-open:hidden">Blank, placement, front/back — expand to edit</span>
+              </summary>
+              <div className="px-4 pb-4 pt-0 border-t border-gray-100">
+              <h2 className="text-lg font-semibold text-gray-900 mb-3 sr-only">Render Setup</h2>
               {product?.blankId ? (
                 <div className="mb-3 rounded-lg border border-blue-200 bg-blue-50/90 px-3 py-2.5 text-sm text-gray-800">
                   <p className="font-semibold text-gray-900">Blank render profile (canonical)</p>
@@ -2937,9 +3902,10 @@ function ProductDetailContent() {
                   </div>
                 </div>
               </div>
-            </div>
+              </div>
+            </details>
 
-            {/* Section C — Media (hero slots; assign in Assets tab) */}
+            {/* Section C — Media (hero slots; assign under Gallery & heroes on Images tab) */}
             <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
               <h2 className="text-lg font-semibold text-gray-900 mb-3">Media</h2>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -2948,7 +3914,7 @@ function ProductDetailContent() {
                   {product.media?.heroFront ? (
                     <img src={product.media.heroFront} alt="Hero front" className="max-w-full h-32 object-contain border border-gray-200 rounded" />
                   ) : (
-                    <p className="text-sm text-gray-500">Not set. Use Assets tab to set as hero front.</p>
+                    <p className="text-sm text-gray-500">Not set. Use Images → Gallery & heroes to set as hero front.</p>
                   )}
                 </div>
                 <div>
@@ -2956,12 +3922,12 @@ function ProductDetailContent() {
                   {product.media?.heroBack ? (
                     <img src={product.media.heroBack} alt="Hero back" className="max-w-full h-32 object-contain border border-gray-200 rounded" />
                   ) : (
-                    <p className="text-sm text-gray-500">Not set. Use Assets tab to set as hero back.</p>
+                    <p className="text-sm text-gray-500">Not set. Use Images → Gallery & heroes to set as hero back.</p>
                   )}
                 </div>
               </div>
               {(!product.media?.heroFront || !product.media?.heroBack) && (
-                <p className="text-xs text-gray-500 mt-2">Blank + design mockup can be used as hero; assign in the Assets tab when available.</p>
+                <p className="text-xs text-gray-500 mt-2">Blank + design mockup can be used as hero; assign under Images → Gallery & heroes when available.</p>
               )}
             </div>
 
@@ -3220,34 +4186,66 @@ function ProductDetailContent() {
               </div>
             )}
 
-            {/* Scene render: deterministic template (non-AI lifestyle) — below flat mocks */}
+            {/* Scene render: deterministic template (non-AI) — below flat mocks */}
             {product?.id && (
               <div className="border-2 border-teal-200/90 rounded-xl p-5 bg-gradient-to-b from-teal-50/90 to-white shadow-sm">
                 <div className="flex flex-wrap items-start justify-between gap-4 mb-3">
                   <div>
-                    <h2 className="text-lg font-bold text-teal-950">Scene render · Hanger (lifestyle)</h2>
+                    <h2 className="text-lg font-bold text-teal-950">
+                      Scene render ·{" "}
+                      {resolvedSceneRenderKey === DEFAULT_SCENE_RENDER_KEY ? (
+                        <>Hanger (lifestyle)</>
+                      ) : (
+                        <span className="font-mono text-base">{resolvedSceneRenderKey}</span>
+                      )}
+                    </h2>
                     <p className="text-sm text-teal-900/85 mt-1 max-w-2xl">
-                      <strong>Non-AI</strong> composite: your <strong>Flat blended</strong> mockup is placed into a fixed{" "}
-                      <strong>hanger</strong> template ({HANGER_CREWNECK_SCENE_TEMPLATE.garmentType} layout). Uses{" "}
-                      <strong>front</strong> flat when present, otherwise <strong>back</strong>.
+                      <strong>Non-AI</strong> composite: your <strong>Flat blended</strong> mockup is placed into a fixed scene
+                      template. Uses <strong>front</strong> flat when present, otherwise <strong>back</strong>. Resolved key:{" "}
+                      <span className="font-mono">{resolvedSceneRenderKey}</span> (from blank.generationDefaults.defaultSceneRenderKey
+                      or default).
                     </p>
-                    <p className="text-xs text-teal-800/75 mt-2">
-                      Ops: set <code className="bg-teal-100/80 px-1 rounded">SCENE_HANGER_CREWNECK_BACKGROUND_URL</code> on
-                      Cloud Functions. Optional: <code className="bg-teal-100/80 px-1 rounded">SCENE_HANGER_CREWNECK_SHADOW_URL</code>.
-                    </p>
+                    {resolvedSceneRenderKey === DEFAULT_SCENE_RENDER_KEY ? (
+                      <p className="text-sm text-teal-900/85 mt-2 max-w-2xl">
+                        Hanger uses the {HANGER_CREWNECK_SCENE_TEMPLATE.garmentType} crewneck layout.
+                      </p>
+                    ) : null}
+                    {resolvedSceneRenderKey === DEFAULT_SCENE_RENDER_KEY ? (
+                      <p className="text-xs text-teal-800/75 mt-2">
+                        Ops: set <code className="bg-teal-100/80 px-1 rounded">SCENE_HANGER_CREWNECK_BACKGROUND_URL</code> on Cloud
+                        Functions. Optional: <code className="bg-teal-100/80 px-1 rounded">SCENE_HANGER_CREWNECK_SHADOW_URL</code>.
+                      </p>
+                    ) : null}
                   </div>
                   <button
                     type="button"
-                    disabled={!flatBlendedForScene || generatingSceneRender}
+                    disabled={!flatBlendedForScene || generatingSceneRender || !sceneCompositeImplemented}
+                    title={
+                      !sceneCompositeImplemented
+                        ? `Scene key "${resolvedSceneRenderKey}" is not implemented yet (${[...IMPLEMENTED_SCENE_RENDER_KEYS].join(", ")})`
+                        : undefined
+                    }
                     onClick={handleGenerateSceneRender}
                     className="px-4 py-2.5 text-sm font-semibold text-white bg-teal-600 rounded-lg hover:bg-teal-700 disabled:opacity-50 shrink-0 shadow"
                   >
-                    {generatingSceneRender ? "Compositing…" : "Generate hanger scene"}
+                    {generatingSceneRender
+                      ? "Compositing…"
+                      : resolvedSceneRenderKey === DEFAULT_SCENE_RENDER_KEY
+                        ? "Generate hanger scene"
+                        : `Generate ${resolvedSceneRenderKey} scene`}
                   </button>
                 </div>
+                {flatBlendedForScene && !sceneCompositeImplemented && (
+                  <p className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-4">
+                    Scene key <span className="font-mono">{resolvedSceneRenderKey}</span> is not implemented in Cloud Functions yet.
+                    Supported keys: <span className="font-mono">{[...IMPLEMENTED_SCENE_RENDER_KEYS].join(", ")}</span>. Adjust{" "}
+                    <span className="font-mono">rp_blanks.generationDefaults.defaultSceneRenderKey</span> or wait for a template
+                    for this key.
+                  </p>
+                )}
                 {!flatBlendedForScene && (
                   <p className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-4">
-                    Generate a <strong>fabric blend</strong> preview first (8394 section above), then run the hanger scene.
+                    Generate a <strong>fabric blend</strong> preview first (8394 section above), then run the scene composite.
                   </p>
                 )}
                 {flatBlendedForScene && (
@@ -3264,36 +4262,42 @@ function ProductDetailContent() {
                   </p>
                 )}
                 {(() => {
-                  const hanger = product.sceneRenders?.hanger;
+                  const sceneSlot = product.sceneRenders?.[resolvedSceneRenderKey];
                   const fmtTs = (ts: unknown) => {
                     if (ts && typeof (ts as { toDate?: () => Date }).toDate === "function") {
                       return (ts as { toDate: () => Date }).toDate().toLocaleString();
                     }
                     return "—";
                   };
+                  const genLabel =
+                    resolvedSceneRenderKey === DEFAULT_SCENE_RENDER_KEY ? "Generate hanger scene" : `Generate ${resolvedSceneRenderKey} scene`;
                   return (
                     <div className="rounded-xl border-2 border-teal-300/80 overflow-hidden bg-white shadow-md">
                       <div className="px-3 py-2 bg-teal-700 text-white text-center">
-                        <div className="text-sm font-bold tracking-wide">HANGER · LIFESTYLE (TEMPLATE)</div>
+                        <div className="text-sm font-bold tracking-wide">
+                          {resolvedSceneRenderKey === DEFAULT_SCENE_RENDER_KEY
+                            ? "HANGER · LIFESTYLE (TEMPLATE)"
+                            : `${resolvedSceneRenderKey.toUpperCase()} · SCENE (TEMPLATE)`}
+                        </div>
                         <div className="text-[11px] opacity-90 font-normal">Deterministic composite — not AI</div>
                       </div>
                       <div className="p-3">
-                        {!hanger?.url ? (
+                        {!sceneSlot?.url ? (
                           <div className="flex items-center justify-center min-h-[200px] rounded-lg bg-gray-50 border border-dashed border-gray-300 text-gray-600 text-sm font-medium text-center px-4">
-                            No scene render yet — click Generate hanger scene
+                            No scene render yet — {sceneCompositeImplemented ? `click ${genLabel}` : "implement this scene key or switch blank default"}
                           </div>
                         ) : (
                           <>
                             <div className="flex items-center justify-center bg-gray-50 rounded-lg border border-gray-100 min-h-[220px]">
                               <img
-                                src={hanger.url}
-                                alt="Hanger scene render"
+                                src={sceneSlot.url}
+                                alt={`Scene render (${resolvedSceneRenderKey})`}
                                 className="max-w-full max-h-[min(56vh,480px)] w-auto object-contain"
                               />
                             </div>
                             <p className="text-[10px] text-gray-500 mt-2 text-center">
-                              {fmtTs(hanger.generatedAt)} · scene <span className="font-mono">{hanger.sceneId}</span> · from{" "}
-                              {hanger.sourceFlatView} flat
+                              {fmtTs(sceneSlot.generatedAt)} · scene <span className="font-mono">{sceneSlot.sceneId}</span> · from{" "}
+                              {sceneSlot.sourceFlatView} flat
                             </p>
                           </>
                         )}
@@ -3301,132 +4305,6 @@ function ProductDetailContent() {
                     </div>
                   );
                 })()}
-              </div>
-            )}
-
-            <div>
-              <h2 className="text-lg font-semibold text-gray-900 mb-4">Product Overview</h2>
-              <dl className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <dt className="text-sm font-medium text-gray-500">Status</dt>
-                  <dd className="mt-1 text-sm text-gray-900">
-                    <span
-                      className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
-                        product.status === "active"
-                          ? "bg-green-100 text-green-800"
-                          : product.status === "draft"
-                          ? "bg-gray-100 text-gray-800"
-                          : "bg-red-100 text-red-800"
-                      }`}
-                    >
-                      {product.status}
-                    </span>
-                  </dd>
-                </div>
-                <div>
-                  <dt className="text-sm font-medium text-gray-500">Category</dt>
-                  <dd className="mt-1 text-sm text-gray-900">{product.category}</dd>
-                </div>
-                <div>
-                  <dt className="text-sm font-medium text-gray-500">Base Product</dt>
-                  <dd className="mt-1 text-sm font-mono text-gray-900">{product.baseProductKey}</dd>
-                </div>
-                <div>
-                  <dt className="text-sm font-medium text-gray-500">Colorway</dt>
-                  <dd className="mt-1 text-sm text-gray-900">{product.colorway.name}</dd>
-                </div>
-                {product.description && (
-                  <div className="md:col-span-2">
-                    <dt className="text-sm font-medium text-gray-500">Description</dt>
-                    <dd className="mt-1 text-sm text-gray-900">{product.description}</dd>
-                  </div>
-                )}
-                {product.ai.productTrigger && (
-                  <div>
-                    <dt className="text-sm font-medium text-gray-500">Product Trigger</dt>
-                    <dd className="mt-1 text-sm font-mono text-gray-900">{product.ai.productTrigger}</dd>
-                  </div>
-                )}
-                {product.ai.productRecommendedScale && (
-                  <div>
-                    <dt className="text-sm font-medium text-gray-500">Recommended Scale</dt>
-                    <dd className="mt-1 text-sm text-gray-900">{product.ai.productRecommendedScale}</dd>
-                  </div>
-                )}
-              </dl>
-            </div>
-
-            {/* Asset Counters */}
-            <div>
-              <h3 className="text-sm font-semibold text-gray-900 mb-2">Asset Statistics</h3>
-              <div className="grid grid-cols-3 gap-4">
-                <div className="bg-gray-50 rounded-lg p-4">
-                  <div className="text-2xl font-bold text-gray-900">
-                    {product.counters?.assetsTotal || 0}
-                  </div>
-                  <div className="text-xs text-gray-500 mt-1">Total Assets</div>
-                </div>
-                <div className="bg-green-50 rounded-lg p-4">
-                  <div className="text-2xl font-bold text-green-600">
-                    {product.counters?.assetsApproved || 0}
-                  </div>
-                  <div className="text-xs text-gray-500 mt-1">Approved</div>
-                </div>
-                <div className="bg-blue-50 rounded-lg p-4">
-                  <div className="text-2xl font-bold text-blue-600">
-                    {product.counters?.assetsPublished || 0}
-                  </div>
-                  <div className="text-xs text-gray-500 mt-1">Published</div>
-                </div>
-              </div>
-            </div>
-
-            {/* Related Products */}
-            {relatedProducts.length > 0 && (
-              <div>
-                <h3 className="text-sm font-semibold text-gray-900 mb-2">Related Products</h3>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-                  {relatedProducts.map(({ product: p, reasons }) => {
-                    const thumb =
-                      p.media?.heroFront ?? p.media?.heroBack ?? p.mockupUrl ?? p.heroAssetPath;
-                    const title = p.title ?? p.name;
-                    const descriptor = [p.colorway?.name, p.category, p.baseProductKey].filter(Boolean).join(" · ");
-                    return (
-                      <Link
-                        key={p.id ?? p.slug}
-                        href={`/products/${encodeURIComponent(p.slug)}`}
-                        className="block rounded-lg border border-gray-200 bg-gray-50/50 p-3 hover:border-blue-300 hover:bg-blue-50/50 transition-colors"
-                      >
-                        {thumb ? (
-                          <img
-                            src={thumb}
-                            alt=""
-                            className="w-full aspect-square object-cover rounded mb-2 bg-white"
-                          />
-                        ) : (
-                          <div className="w-full aspect-square rounded mb-2 bg-gray-200 flex items-center justify-center text-gray-400 text-xs">
-                            No image
-                          </div>
-                        )}
-                        <div className="text-sm font-medium text-gray-900 truncate" title={title}>
-                          {title}
-                        </div>
-                        {descriptor && (
-                          <div className="text-xs text-gray-500 truncate mt-0.5" title={descriptor}>
-                            {descriptor}
-                          </div>
-                        )}
-                        {reasons.length > 0 && (
-                          <div className="text-xs text-blue-600 mt-1 flex flex-wrap gap-x-1 gap-y-0.5" title={reasons.join(", ")}>
-                            {reasons.map((r) => (
-                              <span key={r}>· {r}</span>
-                            ))}
-                          </div>
-                        )}
-                      </Link>
-                    );
-                  })}
-                </div>
               </div>
             )}
 
@@ -3444,232 +4322,113 @@ function ProductDetailContent() {
           </div>
         )}
 
-        {activeTab === "content" && (
+        {activeTab === "shopifyPreview" && product && (
           <div className="space-y-6">
-            <p className="text-sm text-gray-500">
-              Descriptions, SEO, tags, collections, and taxonomy classification.
-            </p>
-            {/* Merchandising */}
-            <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
-              <h2 className="text-lg font-semibold text-gray-900 mb-3">Merchandising</h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Title</label>
-                  <input
-                    type="text"
-                    value={merchandising.title}
-                    onChange={(e) => setMerchandising((m) => ({ ...m, title: e.target.value }))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
-                    placeholder="Product title"
-                  />
+            {(() => {
+              const gallery = shopifyPreviewGalleryUrls;
+              const price = product.pricing?.basePrice;
+              const currency = product.pricing?.currencyCode ?? "USD";
+              const title = product.title ?? product.name ?? "Product";
+              const safeIdx = gallery.length ? Math.min(shopifyPreviewImageIdx, gallery.length - 1) : 0;
+              return (
+                <div className="border-2 border-dashed border-gray-300 rounded-xl p-6 bg-gradient-to-b from-slate-50 to-white">
+                  <h2 className="text-sm font-semibold text-gray-700 mb-4">Storefront preview (simulated)</h2>
+                  <p className="text-xs text-gray-500 mb-4 max-w-xl">
+                    Read-only mock of a Shopify product page. This does not connect to your live storefront.
+                    {treatsAsParentProduct && productVariants.length > 0 ? (
+                      <span className="block mt-2">
+                        Images prefer the <strong>color variant</strong> selected on the Images tab (same as below).
+                      </span>
+                    ) : null}
+                  </p>
+                  {treatsAsParentProduct && productVariants.length > 0 && (
+                    <div className="max-w-lg mx-auto mb-4">
+                      <label className="block text-xs font-medium text-gray-600 mb-1">Color (preview)</label>
+                      <select
+                        value={imagesTabVariantId}
+                        onChange={(e) => setImagesTabVariantId(e.target.value)}
+                        className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white"
+                      >
+                        {productVariants.map((v) => (
+                          <option key={v.id} value={v.id}>
+                            {v.colorName || v.blankVariantId || v.id}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+                  <div className="max-w-lg mx-auto bg-white rounded-lg shadow-md overflow-hidden border border-gray-200">
+                    <div className="aspect-square bg-gray-100 flex items-center justify-center">
+                      {gallery.length > 0 ? (
+                        <img src={gallery[safeIdx]} alt="" className="max-w-full max-h-full object-contain" />
+                      ) : (
+                        <span className="text-sm text-gray-400">No images yet — add heroes or a mockup on the Images tab</span>
+                      )}
+                    </div>
+                    {gallery.length > 1 && (
+                      <div className="flex gap-1 px-2 py-2 overflow-x-auto border-t border-gray-100">
+                        {gallery.map((u, i) => (
+                          <button
+                            key={u + i}
+                            type="button"
+                            onClick={() => setShopifyPreviewImageIdx(i)}
+                            className={`shrink-0 w-14 h-14 rounded border overflow-hidden ${
+                              i === safeIdx ? "ring-2 ring-blue-500" : "border-gray-200"
+                            }`}
+                          >
+                            <img src={u} alt="" className="w-full h-full object-cover" />
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    <div className="p-4 space-y-3">
+                      <h3 className="text-lg font-semibold text-gray-900">{title}</h3>
+                      <p className="text-xl font-medium text-gray-900">
+                        {price != null && Number.isFinite(price)
+                          ? new Intl.NumberFormat(undefined, { style: "currency", currency }).format(price)
+                          : "—"}
+                      </p>
+                      {product.availableSizes && product.availableSizes.length > 0 && (
+                        <div>
+                          <label className="block text-xs font-medium text-gray-500 mb-1">Size</label>
+                          <select
+                            value={previewSelectedSize || product.availableSizes[0]}
+                            onChange={(e) => setPreviewSelectedSize(e.target.value as RPBlankGarmentSizeCode)}
+                            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm bg-white"
+                          >
+                            {product.availableSizes.map((s) => (
+                              <option key={s} value={s}>
+                                {s}
+                              </option>
+                            ))}
+                          </select>
+                          <p className="text-xs text-gray-500 mt-1">
+                            Preview only — does not create inventory variants yet. Future: Color × Size.
+                          </p>
+                        </div>
+                      )}
+                      {product.descriptionHtml ? (
+                        <div
+                          className="prose prose-sm max-w-none text-gray-700 border-t border-gray-100 pt-3"
+                          dangerouslySetInnerHTML={{ __html: product.descriptionHtml }}
+                        />
+                      ) : product.description ? (
+                        <p className="text-sm text-gray-700 border-t border-gray-100 pt-3 whitespace-pre-wrap">
+                          {product.description}
+                        </p>
+                      ) : null}
+                      <button
+                        type="button"
+                        disabled
+                        className="w-full py-3 rounded-lg bg-gray-900 text-white text-sm font-medium opacity-60 cursor-not-allowed"
+                      >
+                        Add to cart (preview only)
+                      </button>
+                    </div>
+                  </div>
                 </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Handle (URL slug)</label>
-                  <input
-                    type="text"
-                    value={merchandising.handle}
-                    onChange={(e) => setMerchandising((m) => ({ ...m, handle: e.target.value }))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono"
-                    placeholder="product-handle"
-                  />
-                </div>
-                <div className="md:col-span-2">
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Description</label>
-                  <textarea
-                    value={merchandising.descriptionHtml}
-                    onChange={(e) => setMerchandising((m) => ({ ...m, descriptionHtml: e.target.value }))}
-                    rows={3}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
-                    placeholder="Product description (HTML or plain text)"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">SEO Title</label>
-                  <input
-                    type="text"
-                    value={merchandising.seoTitle}
-                    onChange={(e) => setMerchandising((m) => ({ ...m, seoTitle: e.target.value }))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
-                    placeholder="SEO title"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">SEO Description</label>
-                  <input
-                    type="text"
-                    value={merchandising.seoDescription}
-                    onChange={(e) => setMerchandising((m) => ({ ...m, seoDescription: e.target.value }))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
-                    placeholder="SEO meta description"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Tags (comma-separated)</label>
-                  <input
-                    type="text"
-                    value={merchandising.tagsStr}
-                    onChange={(e) => setMerchandising((m) => ({ ...m, tagsStr: e.target.value }))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
-                    placeholder="tag1, tag2"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Collection keys (comma-separated)</label>
-                  <input
-                    type="text"
-                    value={merchandising.collectionKeysStr}
-                    onChange={(e) => setMerchandising((m) => ({ ...m, collectionKeysStr: e.target.value }))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
-                    placeholder="mlb, giants"
-                  />
-                </div>
-              </div>
-              <div className="mt-3">
-                <button
-                  type="button"
-                  onClick={async () => {
-                    if (!product?.id || !db) return;
-                    setSavingMerchandising(true);
-                    try {
-                      const productRef = doc(db, "rp_products", product.id);
-                      await updateDoc(productRef, {
-                        title: merchandising.title || null,
-                        handle: merchandising.handle || null,
-                        descriptionHtml: merchandising.descriptionHtml || null,
-                        seo: {
-                          title: merchandising.seoTitle || null,
-                          description: merchandising.seoDescription || null,
-                        },
-                        tags: merchandising.tagsStr ? merchandising.tagsStr.split(",").map((t) => t.trim()).filter(Boolean) : [],
-                        collectionKeys: merchandising.collectionKeysStr ? merchandising.collectionKeysStr.split(",").map((k) => k.trim()).filter(Boolean) : [],
-                        updatedAt: new Date(),
-                        updatedBy: product.updatedBy ?? "",
-                      });
-                      await refetchProduct();
-                      showToast("Merchandising saved", "success");
-                    } catch (err) {
-                      console.error(err);
-                      showToast("Failed to save merchandising", "error");
-                    } finally {
-                      setSavingMerchandising(false);
-                    }
-                  }}
-                  disabled={savingMerchandising}
-                  className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
-                >
-                  {savingMerchandising ? "Saving…" : "Save merchandising"}
-                </button>
-              </div>
-            </div>
-
-            {/* Taxonomy */}
-            <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
-              <h2 className="text-lg font-semibold text-gray-900 mb-3">Taxonomy</h2>
-              <p className="text-xs text-gray-500 mb-3">
-                Entity requires League; League requires Sport. Sport can be left empty only for purely thematic/lifestyle products (e.g. PANTY_DROP, PEPTIDES, COUNTRY_CLUB). College: use Sport = COLLEGE_SPORTS, League = NCAA, Entity = school code (e.g. COLORADO).
-              </p>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Sport</label>
-                  <select
-                    value={taxSportCode ?? ""}
-                    onChange={(e) => {
-                      const v = e.target.value || null;
-                      setTaxSportCode(v);
-                      if (!v) setTaxLeagueCode(null);
-                      setTaxTeamCode(null);
-                      setTaxThemeCode(null);
-                    }}
-                    className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
-                  >
-                    <option value="">—</option>
-                    {(taxonomySports ?? []).map((s) => (
-                      <option key={s.id} value={s.code}>{s.name}</option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">League</label>
-                  <select
-                    value={taxLeagueCode ?? ""}
-                    onChange={(e) => {
-                      const v = e.target.value || null;
-                      setTaxLeagueCode(v);
-                      setTaxTeamCode(null);
-                    }}
-                    className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
-                  >
-                    <option value="">—</option>
-                    {(taxonomyLeagues ?? []).map((l) => (
-                      <option key={l.id} value={l.code}>{l.name}</option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Entity</label>
-                  <select
-                    value={taxTeamCode ?? ""}
-                    onChange={(e) => setTaxTeamCode(e.target.value || null)}
-                    className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
-                  >
-                    <option value="">—</option>
-                    {(taxonomyEntities ?? []).map((ent) => (
-                      <option key={ent.id} value={ent.code}>{ent.name}</option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Theme</label>
-                  <select
-                    value={taxThemeCode ?? ""}
-                    onChange={(e) => setTaxThemeCode(e.target.value || null)}
-                    className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
-                  >
-                    <option value="">—</option>
-                    {(taxonomyThemes ?? []).map((t) => (
-                      <option key={t.id} value={t.code}>{t.name}</option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Design Family</label>
-                  <select
-                    value={taxDesignFamily ?? ""}
-                    onChange={(e) => setTaxDesignFamily(e.target.value || null)}
-                    className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
-                  >
-                    <option value="">—</option>
-                    {(taxonomyDesignFamilies ?? []).map((f) => (
-                      <option key={f.id} value={f.code}>{f.name}</option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-              <div className="mt-3">
-                <button
-                  type="button"
-                  onClick={handleSaveProductTaxonomy}
-                  disabled={isSavingTaxonomy}
-                  className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
-                >
-                  {isSavingTaxonomy ? "Saving…" : "Save taxonomy"}
-                </button>
-              </div>
-            </div>
-
-            {product?.id && (
-              <div className="border-t border-gray-200 pt-6">
-                <p className="text-sm text-gray-600 mb-4">
-                  Inspiration references (full library: <span className="font-medium">More → Inspirations</span>).
-                </p>
-                <InspirationTab product={product} productId={product.id} />
-              </div>
-            )}
-          </div>
-        )}
-
-        {activeTab === "shopify" && product && (
-          <div className="space-y-6">
+              );
+            })()}
             {(() => {
               const { ready, missing, warnings } = isProductReadyForShopify(product);
               return (
@@ -3722,7 +4481,7 @@ function ProductDetailContent() {
                             ))}
                           </span>
                         ) : (
-                          <span className="text-gray-400 text-xs">No taxonomy tags (sport/league/team/theme/model). Set classification on the Content tab to drive Smart Collections.</span>
+                          <span className="text-gray-400 text-xs">No taxonomy tags (sport/league/team/theme/model). Set classification on the Product tab to drive Smart Collections.</span>
                         )}
                       </dd>
                     </div>
@@ -3797,7 +4556,7 @@ function ProductDetailContent() {
           </div>
         )}
 
-        {activeTab === "assets" && (
+        {activeTab === "images" && (
           <>
             <div className="space-y-8">
               <div>
@@ -3852,8 +4611,41 @@ function ProductDetailContent() {
             <div>
               <h2 className="text-lg font-semibold text-gray-900 mb-2">Generate</h2>
               <p className="text-sm text-gray-500 mb-4">
-                Two-stage pipeline: create product images first (Stage 1), then model images (Stage 2).
+                Review outputs above, then run generation using <strong>resolved defaults</strong> (Blank → Team → Design →
+                config) or expand <strong>Advanced overrides</strong> for a one-off run.
               </p>
+
+              <div className="space-y-3 mb-6">
+                <ResolvedGenerationSummary
+                  resolved={resolved}
+                  presets={allPresets}
+                  loading={blankLoading || designTeamLoading}
+                  defaultGenerateMode={generateMode}
+                />
+                <div className="flex flex-wrap items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => void handleGenerateWithDefaults()}
+                    disabled={
+                      generating ||
+                      !hasMockupForGenerateUi ||
+                      !resolved ||
+                      (generateMode === "product"
+                        ? !resolved.productOnlyPresetId.value
+                        : !resolved.onModelPresetId.value)
+                    }
+                    className="px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {generating
+                      ? "Starting…"
+                      : `Generate using defaults (${generateMode === "product" ? "product images" : "model images"})`}
+                  </button>
+                  <span className="text-xs text-gray-500 max-w-md">
+                    Uses resolved preset and scales from the preset document. On-model also uses team/design default
+                    identity when set.
+                  </span>
+                </div>
+              </div>
 
               {/* Product Images vs Model Images tabs */}
               <div className="flex border-b border-gray-200 mb-6">
@@ -3909,7 +4701,7 @@ function ProductDetailContent() {
                   {(designIdForFront || product?.designId) && product?.blankId && (
                     <div className="bg-white border border-gray-200 rounded-lg p-4 space-y-4">
                       <h3 className="text-sm font-semibold text-gray-900">Render Setup</h3>
-                      <p className="text-xs text-gray-500">Choose which view to generate. Config is from Overview → Render Setup (front/back).</p>
+                      <p className="text-xs text-gray-500">Choose which view to generate. Config is from Images → Render Setup (front/back).</p>
 
                       <div>
                         <label className="block text-sm font-medium text-gray-700 mb-1">Generate for view</label>
@@ -3973,7 +4765,7 @@ function ProductDetailContent() {
                                     </div>
                                   </>
                                 ) : (
-                                  <p className="text-xs text-amber-600">Set blank for {generateView} in Overview → Render Setup.</p>
+                                  <p className="text-xs text-amber-600">Set blank for {generateView} in Images → Render Setup.</p>
                                 )}
                               </div>
 
@@ -4031,7 +4823,7 @@ function ProductDetailContent() {
                               <div className="border border-gray-200 rounded-lg p-3 bg-gray-50">
                                 <div className="text-sm font-medium text-gray-700 mb-1">Placement — {generateView}</div>
                                 <p className="text-xs text-gray-500 mb-2">
-                                  Adjust in Overview → Render Setup, or here:
+                                  Adjust in Images → Render Setup, or here:
                                 </p>
                                 <button
                                   type="button"
@@ -4056,10 +4848,13 @@ function ProductDetailContent() {
                     </div>
                   )}
 
-                  {(designIdForFront || product?.designId) && product?.blankId && !product?.mockupUrl && (
+                  {(designIdForFront || product?.designId) && product?.blankId && !hasMockupForGenerateUi && (
                     <div className="bg-amber-50 border border-amber-200 rounded p-4 text-amber-800 text-sm space-y-2">
                       <p>Generate a mockup first — this is your <strong>master composite</strong> (blank + design). You can review it here, then use it for product scene images (hangar, flat lay, etc.).</p>
                       <p className="text-amber-700 font-medium">Uses <strong>{generateView}</strong> view from Render Setup above.</p>
+                      {treatsAsParentProduct && productVariants.length > 0 && !imagesTabVariantId ? (
+                        <p className="text-amber-900 font-medium">Select a color variant at the top of the Images tab so the mockup saves to that variant.</p>
+                      ) : null}
                       {lastMockJobId && mockJob?.status === "processing" && (
                         <p className="text-amber-800 font-medium">Creating mockup… (usually 30–60 seconds). Check Firebase Console → Functions logs if it takes longer.</p>
                       )}
@@ -4069,14 +4864,19 @@ function ProductDetailContent() {
                       <button
                         type="button"
                         onClick={handleGenerateMockup}
-                        disabled={mockupGenerating || !(generateView === "front" ? effectiveFrontConfig.blankImageUrl : effectiveBackConfig.blankImageUrl) || !(generateView === "front" ? effectiveFrontConfig.designAssetUrl : effectiveBackConfig.designAssetUrl)}
+                        disabled={
+                          mockupGenerating ||
+                          !(generateView === "front" ? effectiveFrontConfig.blankImageUrl : effectiveBackConfig.blankImageUrl) ||
+                          !(generateView === "front" ? effectiveFrontConfig.designAssetUrl : effectiveBackConfig.designAssetUrl) ||
+                          (treatsAsParentProduct && productVariants.length > 0 && !imagesTabVariantId)
+                        }
                         className="px-4 py-2 bg-amber-600 text-white text-sm rounded-lg hover:bg-amber-700 disabled:opacity-50"
                       >
                         {mockupGenerating ? "Starting…" : "Generate mockup"}
                       </button>
                     </div>
                   )}
-                  {(designIdForFront || product?.designId) && product?.blankId && product?.mockupUrl && (
+                  {(designIdForFront || product?.designId) && product?.blankId && hasMockupForGenerateUi && (
                     <div className="flex flex-wrap items-center gap-2 text-sm">
                       <p className="text-gray-600">
                         Using <strong>{generateView}</strong> view for new mockups. Switch view above if needed, then regenerate.
@@ -4084,7 +4884,12 @@ function ProductDetailContent() {
                       <button
                         type="button"
                         onClick={handleGenerateMockup}
-                        disabled={mockupGenerating || !(generateView === "front" ? effectiveFrontConfig.blankImageUrl : effectiveBackConfig.blankImageUrl) || !(generateView === "front" ? effectiveFrontConfig.designAssetUrl : effectiveBackConfig.designAssetUrl)}
+                        disabled={
+                          mockupGenerating ||
+                          !(generateView === "front" ? effectiveFrontConfig.blankImageUrl : effectiveBackConfig.blankImageUrl) ||
+                          !(generateView === "front" ? effectiveFrontConfig.designAssetUrl : effectiveBackConfig.designAssetUrl) ||
+                          (treatsAsParentProduct && productVariants.length > 0 && !imagesTabVariantId)
+                        }
                         className="px-3 py-1.5 text-sm bg-gray-200 text-gray-800 border border-gray-400 rounded-lg hover:bg-gray-300 disabled:opacity-50"
                       >
                         {mockupGenerating ? "Regenerating…" : "Regenerate mockup"}
@@ -4093,12 +4898,17 @@ function ProductDetailContent() {
                   )}
 
                   {/* Master composite: show mockup so user can review before generating product images */}
-                  {product?.mockupUrl && (() => {
-                    // Cache-bust so regenerated mockup (same URL, new file) loads instead of browser cache
+                  {masterCompositeMockupUrl && (() => {
                     const u = product.updatedAt as { toMillis?: () => number; seconds?: number; _seconds?: number } | undefined;
-                    const t = u?.toMillis?.() ?? u?.seconds ?? (u as { _seconds?: number })?._seconds ?? (typeof u === "number" ? u : "");
-                    const mockupDisplayUrl = `${product.mockupUrl}${t ? `?t=${t}` : ""}`;
-                    const imgKey = `mockup-${product.id}-${t || ""}`;
+                    const ts =
+                      variantReloadTick ||
+                      u?.toMillis?.() ??
+                      u?.seconds ??
+                      (u as { _seconds?: number })?._seconds ??
+                      (typeof u === "number" ? u : "");
+                    const sep = masterCompositeMockupUrl.includes("?") ? "&" : "?";
+                    const mockupDisplayUrl = `${masterCompositeMockupUrl}${sep}t=${ts}`;
+                    const imgKey = `mockup-${product.id}-${imagesTabVariantId || "root"}-${ts}`;
                     return (
                     <div className="bg-white border border-gray-200 rounded-lg p-4">
                       <h3 className="text-sm font-semibold text-gray-900 mb-2">Master composite — review before generating</h3>
@@ -4134,7 +4944,12 @@ function ProductDetailContent() {
                     );
                   })()}
 
-                  {product?.mockupUrl && (
+                  {hasMockupForGenerateUi && (
+                    <details className="rounded-lg border border-gray-200 bg-gray-50/80">
+                      <summary className="cursor-pointer select-none px-4 py-3 text-sm font-semibold text-gray-900 list-none [&::-webkit-details-marker]:hidden">
+                        Advanced overrides — product scene (preset, count, size)
+                      </summary>
+                      <div className="px-4 pb-4 pt-2 border-t border-gray-100">
                     <form onSubmit={handleGenerate} className="space-y-4">
                       <input type="hidden" name="generationType" value="product_only" />
                       <div>
@@ -4148,14 +4963,20 @@ function ProductDetailContent() {
                           <option value="">Select preset...</option>
                           {allPresets
                             .filter((p) => {
-                              const mode = ("mode" in p && p.mode) || (p.supportedModes?.includes("product_only") ? "productOnly" : "onModel");
+                              const modes = p.supportedModes as RpGenerationType[] | undefined;
+                              const mode =
+                                ("mode" in p && p.mode) || (modes?.includes("product_only") ? "productOnly" : "onModel");
                               return mode === "productOnly";
                             })
                             .map((preset) => (
                               <option key={preset.id} value={preset.id}>{preset.name}</option>
                             ))}
                         </select>
-                        {allPresets.filter((p) => ("mode" in p && p.mode === "productOnly") || p.supportedModes?.includes("product_only")).length === 0 && (
+                        {allPresets.filter(
+                          (p) =>
+                            ("mode" in p && p.mode === "productOnly") ||
+                            (p.supportedModes as RpGenerationType[] | undefined)?.includes("product_only")
+                        ).length === 0 && (
                           <p className="text-xs text-amber-600 mt-1">No product-only presets. Add one in Firestore (e.g. Ecommerce Flat) with mode: &quot;productOnly&quot;.</p>
                         )}
                       </div>
@@ -4189,12 +5010,22 @@ function ProductDetailContent() {
                       </p>
                       <button
                         type="submit"
-                        disabled={generating || !selectedPresetId || allPresets.filter((p) => ("mode" in p && p.mode === "productOnly") || p.supportedModes?.includes("product_only")).length === 0}
-                        className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 font-medium"
+                        disabled={
+                          generating ||
+                          !selectedPresetId ||
+                          allPresets.filter(
+                            (p) =>
+                              ("mode" in p && p.mode === "productOnly") ||
+                              (p.supportedModes as RpGenerationType[] | undefined)?.includes("product_only")
+                          ).length === 0
+                        }
+                        className="w-full px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 font-medium"
                       >
-                        {generating ? "Generating…" : `Generate ${imageCount} product image${imageCount > 1 ? "s" : ""}`}
+                        {generating ? "Generating…" : `Generate ${imageCount} product image${imageCount > 1 ? "s" : ""} (overrides)`}
                       </button>
                     </form>
+                      </div>
+                    </details>
                   )}
                 </div>
               )}
@@ -4202,11 +5033,16 @@ function ProductDetailContent() {
               {/* Stage 2: Model Images */}
               {generateMode === "model" && (
                 <>
-                  {!product?.mockupUrl && (
+                  {!hasMockupForGenerateUi && (
                     <div className="bg-amber-50 border border-amber-200 rounded p-4 text-amber-800 text-sm mb-4">
-                      <strong>Generate product images first.</strong> This product has no mockup — model images use the mockup as the product reference. Switch to <strong>Product Images</strong> and generate a mockup, or run &quot;Generate mockup&quot; if the product has a design + blank.
+                      <strong>Generate product images first.</strong> This product has no mockup — model images use the mockup as the product reference. Switch to <strong>Product Images</strong>, pick a color variant if applicable, and generate a mockup.
                     </div>
                   )}
+                  <details className="rounded-lg border border-gray-200 bg-gray-50/80 mb-6">
+                    <summary className="cursor-pointer select-none px-4 py-3 text-sm font-semibold text-gray-900 list-none [&::-webkit-details-marker]:hidden">
+                      Advanced overrides — on-model (preset, identity, scales, A/B)
+                    </summary>
+                    <div className="px-4 pb-4 pt-2 border-t border-gray-100">
                   <form onSubmit={handleGenerate} className="space-y-4 mb-6">
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div>
@@ -4222,7 +5058,9 @@ function ProductDetailContent() {
                           <option value="">Select preset...</option>
                           {allPresets
                             .filter((p) => {
-                              const mode = ("mode" in p && p.mode) || (p.supportedModes?.includes("product_only") ? "productOnly" : "onModel");
+                              const modes = p.supportedModes as RpGenerationType[] | undefined;
+                              const mode =
+                                ("mode" in p && p.mode) || (modes?.includes("product_only") ? "productOnly" : "onModel");
                               return mode === "onModel";
                             })
                             .map((preset) => (
@@ -4442,15 +5280,17 @@ function ProductDetailContent() {
                   type="submit"
                   disabled={
                     generating ||
-                    !product?.mockupUrl ||
+                    !hasMockupForGenerateUi ||
                     !selectedPresetId ||
                     (selectedPreset && ("requireIdentity" in selectedPreset ? selectedPreset.requireIdentity !== false : true) && !selectedIdentityId)
                   }
-                  className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium"
+                  className="w-full px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium"
                 >
-                  {generating ? "Generating..." : `Generate ${imageCount} Image${imageCount > 1 ? "s" : ""}`}
+                  {generating ? "Generating..." : `Generate ${imageCount} image${imageCount > 1 ? "s" : ""} (overrides)`}
                 </button>
               </form>
+                    </div>
+                  </details>
                 </>
               )}
 
@@ -4523,7 +5363,7 @@ function ProductDetailContent() {
           </>
         )}
 
-        {/* Render Setup modals — shared so they work from Overview or Generate tab */}
+        {/* Render Setup modals — shared across Images / Generate */}
         {(renderSetupModal === "placement_front" || renderSetupModal === "placement_back") && (
           <Modal
             isOpen
@@ -4735,7 +5575,7 @@ function ProductDetailContent() {
           </Modal>
         )}
 
-        {activeTab === "history" && (
+        {activeTab === "order" && (
           <div className="space-y-8">
             <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
               <h2 className="text-lg font-semibold text-gray-900 mb-3">Production</h2>
@@ -4815,6 +5655,25 @@ function ProductDetailContent() {
                 </button>
               </div>
             </div>
+          </div>
+        )}
+
+        {activeTab === "metrics" && (
+          <div className="space-y-8">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+              {[
+                { label: "Views", value: "—", hint: "Placeholder" },
+                { label: "Orders", value: "—", hint: "Placeholder" },
+                { label: "Conversion", value: "—", hint: "Placeholder" },
+                { label: "Variant performance", value: "—", hint: "Placeholder" },
+              ].map((row) => (
+                <div key={row.label} className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
+                  <h3 className="text-sm font-semibold text-gray-900">{row.label}</h3>
+                  <p className="text-2xl font-bold text-gray-800 mt-2">{row.value}</p>
+                  <p className="text-xs text-gray-500 mt-1">{row.hint}</p>
+                </div>
+              ))}
+            </div>
 
             <div>
               <h2 className="text-lg font-semibold text-gray-900 mb-3">Recent generation jobs</h2>
@@ -4856,62 +5715,55 @@ function ProductDetailContent() {
             </div>
 
             <div>
-            <h2 className="text-lg font-semibold text-gray-900 mb-4">Data maintenance</h2>
-            
-            {/* Data Maintenance Section */}
-            <div className="bg-white border border-gray-200 rounded-lg p-4 mb-4">
-              <h3 className="text-sm font-semibold text-gray-900 mb-2">Data Maintenance</h3>
-              <p className="text-sm text-gray-500 mb-3">
-                Recalculate asset counters if they appear out of sync with actual assets.
+              <h2 className="text-lg font-semibold text-gray-900 mb-4">Data maintenance</h2>
+              <div className="bg-white border border-gray-200 rounded-lg p-4 mb-4">
+                <h3 className="text-sm font-semibold text-gray-900 mb-2">Data Maintenance</h3>
+                <p className="text-sm text-gray-500 mb-3">
+                  Recalculate asset counters if they appear out of sync with actual assets.
+                </p>
+                <button
+                  onClick={async () => {
+                    if (!db || !product?.id) return;
+
+                    try {
+                      const assetsRef = collection(db, "rp_product_assets");
+                      const q = query(assetsRef, where("productId", "==", product.id));
+                      const snapshot = await getDocs(q);
+                      const actualCount = snapshot.docs.length;
+
+                      const approvedQuery = query(assetsRef, where("productId", "==", product.id), where("status", "==", "approved"));
+                      const approvedSnapshot = await getDocs(approvedQuery);
+                      const approvedCount = approvedSnapshot.docs.length;
+
+                      const publishedQuery = query(assetsRef, where("productId", "==", product.id), where("status", "==", "published"));
+                      const publishedSnapshot = await getDocs(publishedQuery);
+                      const publishedCount = publishedSnapshot.docs.length;
+
+                      const productRef = doc(db, "rp_products", product.id);
+                      await updateDoc(productRef, {
+                        "counters.assetsTotal": actualCount,
+                        "counters.assetsApproved": approvedCount,
+                        "counters.assetsPublished": publishedCount,
+                        updatedAt: new Date(),
+                      });
+
+                      showToast(`Counters updated: ${actualCount} total, ${approvedCount} approved, ${publishedCount} published`, "success");
+
+                      window.location.reload();
+                    } catch (error) {
+                      console.error("[Settings] Failed to recalculate counters:", error);
+                      showToast("Failed to recalculate counters", "error");
+                    }
+                  }}
+                  className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 text-sm"
+                >
+                  Recalculate Asset Counters
+                </button>
+              </div>
+
+              <p className="text-sm text-gray-500">
+                Additional product settings and configuration will be available here.
               </p>
-              <button
-                onClick={async () => {
-                  if (!db || !product?.id) return;
-                  
-                  try {
-                    // Count actual assets for this product
-                    const assetsRef = collection(db, "rp_product_assets");
-                    const q = query(assetsRef, where("productId", "==", product.id));
-                    const snapshot = await getDocs(q);
-                    const actualCount = snapshot.docs.length;
-                    
-                    // Count approved assets
-                    const approvedQuery = query(assetsRef, where("productId", "==", product.id), where("status", "==", "approved"));
-                    const approvedSnapshot = await getDocs(approvedQuery);
-                    const approvedCount = approvedSnapshot.docs.length;
-                    
-                    // Count published assets
-                    const publishedQuery = query(assetsRef, where("productId", "==", product.id), where("status", "==", "published"));
-                    const publishedSnapshot = await getDocs(publishedQuery);
-                    const publishedCount = publishedSnapshot.docs.length;
-                    
-                    // Update product counters
-                    const productRef = doc(db, "rp_products", product.id);
-                    await updateDoc(productRef, {
-                      "counters.assetsTotal": actualCount,
-                      "counters.assetsApproved": approvedCount,
-                      "counters.assetsPublished": publishedCount,
-                      updatedAt: new Date(),
-                    });
-                    
-                    showToast(`Counters updated: ${actualCount} total, ${approvedCount} approved, ${publishedCount} published`, "success");
-                    
-                    // Refresh product data
-                    window.location.reload();
-                  } catch (error) {
-                    console.error("[Settings] Failed to recalculate counters:", error);
-                    showToast("Failed to recalculate counters", "error");
-                  }
-                }}
-                className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 text-sm"
-              >
-                Recalculate Asset Counters
-              </button>
-            </div>
-            
-            <p className="text-sm text-gray-500">
-              Additional product settings and configuration will be available here.
-            </p>
             </div>
           </div>
         )}
