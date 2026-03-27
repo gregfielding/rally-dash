@@ -8,6 +8,10 @@
  * Launch defaults (documented): inventory not tracked (`inventoryItem.tracked: false`), policy CONTINUE,
  * taxable from Rally (default true), requiresShipping from Rally shipping (default true), weight on inventory item.
  * `fulfillment_service` is not set on ProductVariantSetInput; Shopify uses the store’s manual fulfillment default.
+ *
+ * Product media: v1 uses one featured image per variant (`primaryVariantImageUrlForShopify`). A future multi-image
+ * gallery should order variant-scoped `rp_product_assets` the same way as the dashboard:
+ * `lib/shopify/galleryAssetOrdering.ts` (approvalState → galleryRole → gallerySort).
  */
 
 const fetch = (...args) =>

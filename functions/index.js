@@ -2060,9 +2060,14 @@ const {
   BACKDROP_NEUTRAL_SCENE_KEY,
   processBackdropNeutralSceneJob,
 } = require("./lib/sceneRenderBackdropNeutralJob");
+const { FLATLAY_SCENE_KEYS, processFlatlaySceneJob } = require("./lib/sceneRenderFlatlayJobs");
 const { productMatchesSceneTemplate } = require("./lib/sceneTemplateEligibility");
 
-const SUPPORTED_SCENE_RENDER_KEYS = new Set([NEUTRAL_HANGER_SCENE_KEY, BACKDROP_NEUTRAL_SCENE_KEY]);
+const SUPPORTED_SCENE_RENDER_KEYS = new Set([
+  NEUTRAL_HANGER_SCENE_KEY,
+  BACKDROP_NEUTRAL_SCENE_KEY,
+  ...FLATLAY_SCENE_KEYS,
+]);
 
 /**
  * Queue a deterministic scene render job. Creates `rp_scene_render_jobs/{jobId}`; worker processes async.
@@ -2170,6 +2175,8 @@ exports.onSceneRenderJobCreated = functions
         out = await processNeutralHangerSceneJob(db, bucket, fetch, admin, jobId, job);
       } else if (job.sceneKey === BACKDROP_NEUTRAL_SCENE_KEY) {
         out = await processBackdropNeutralSceneJob(db, bucket, fetch, admin, jobId, job);
+      } else if (FLATLAY_SCENE_KEYS.has(job.sceneKey)) {
+        out = await processFlatlaySceneJob(db, bucket, fetch, admin, jobId, job);
       } else {
         throw new Error(`Unhandled sceneKey: ${job.sceneKey}`);
       }

@@ -3,6 +3,8 @@
  * - Sort keys: approvalState (approved / pending / rejected tiers), then galleryRole, then gallerySort.
  * - Storefront-style previews exclude rejected assets.
  * - Commerce heroes/flats stay first in PDP preview; deterministic scene URLs append in this order.
+ * - Typical `gallerySort` ladder for scenes: neutral_hanger 40, backdrop_neutral 50, flatlay_wood 52,
+ *   flatlay_boutique 54 (overridable per `rp_scene_templates` doc).
  */
 
 import type {

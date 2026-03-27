@@ -2223,6 +2223,13 @@ function ProductDetailContent() {
   const [retrying8394Assets, setRetrying8394Assets] = useState(false);
   const [queueingNeutralHangerScene, setQueueingNeutralHangerScene] = useState(false);
   const [queueingBackdropNeutralScene, setQueueingBackdropNeutralScene] = useState(false);
+  const [queueingFlatlayWoodScene, setQueueingFlatlayWoodScene] = useState(false);
+  const [queueingFlatlayBoutiqueScene, setQueueingFlatlayBoutiqueScene] = useState(false);
+  const sceneQueueBusy =
+    queueingNeutralHangerScene ||
+    queueingBackdropNeutralScene ||
+    queueingFlatlayWoodScene ||
+    queueingFlatlayBoutiqueScene;
   const { generateProductSceneRender } = useGenerateProductSceneRender();
   const { createSceneRenderJob } = useCreateSceneRenderJob();
   const { updateSceneAssetApproval } = useUpdateSceneAssetApproval();
@@ -5125,9 +5132,7 @@ function ProductDetailContent() {
                         <p className="text-xs text-gray-600">Tees, tanks, crewnecks (not panties).</p>
                         <button
                           type="button"
-                          disabled={
-                            queueingNeutralHangerScene || queueingBackdropNeutralScene || !product.id
-                          }
+                          disabled={sceneQueueBusy || !product.id}
                           className="px-3 py-1.5 text-xs font-medium rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
                           onClick={async () => {
                             if (!product.id || !imagesTabVariantId) return;
@@ -5234,9 +5239,7 @@ function ProductDetailContent() {
                         <p className="text-xs text-gray-600">Plain studio backdrop; works for panties and tops.</p>
                         <button
                           type="button"
-                          disabled={
-                            queueingBackdropNeutralScene || queueingNeutralHangerScene || !product.id
-                          }
+                          disabled={sceneQueueBusy || !product.id}
                           className="px-3 py-1.5 text-xs font-medium rounded-md bg-slate-700 text-white hover:bg-slate-800 disabled:opacity-50"
                           onClick={async () => {
                             if (!product.id || !imagesTabVariantId) return;
@@ -5329,6 +5332,220 @@ function ProductDetailContent() {
                           </div>
                         ) : (
                           <p className="text-xs text-gray-500">No backdrop_neutral output for this color yet.</p>
+                        )}
+                      </div>
+                    );
+                  })()}
+
+                  {(() => {
+                    const vRow = productVariants.find((x) => x.id === imagesTabVariantId);
+                    const slotWood = vRow?.sceneTemplateRenders?.flatlay_wood;
+                    return (
+                      <div className="space-y-3 border-t border-indigo-100/80 pt-4">
+                        <h4 className="text-xs font-semibold text-gray-800 uppercase tracking-wide">Flatlay wood</h4>
+                        <p className="text-xs text-gray-600">Wood-surface flat lay (panties, tops, bralettes).</p>
+                        <button
+                          type="button"
+                          disabled={sceneQueueBusy || !product.id}
+                          className="px-3 py-1.5 text-xs font-medium rounded-md bg-amber-800 text-white hover:bg-amber-900 disabled:opacity-50"
+                          onClick={async () => {
+                            if (!product.id || !imagesTabVariantId) return;
+                            setQueueingFlatlayWoodScene(true);
+                            try {
+                              await createSceneRenderJob({
+                                productId: product.id,
+                                productVariantId: imagesTabVariantId,
+                                sceneKey: "flatlay_wood",
+                              });
+                              showToast("Flatlay wood job queued. Variant list refreshes shortly.", "success");
+                              setTimeout(() => setVariantReloadTick((t) => t + 1), 6000);
+                            } catch (err) {
+                              console.error(err);
+                              showToast(err instanceof Error ? err.message : "Failed to queue scene job", "error");
+                            } finally {
+                              setQueueingFlatlayWoodScene(false);
+                            }
+                          }}
+                        >
+                          {queueingFlatlayWoodScene ? "Queuing…" : "Queue flatlay wood scene"}
+                        </button>
+                        {slotWood?.assetUrl ? (
+                          <div className="flex flex-wrap gap-4 items-start">
+                            <a
+                              href={slotWood.assetUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="block shrink-0"
+                            >
+                              {/* eslint-disable-next-line @next/next/no-img-element */}
+                              <img
+                                src={slotWood.assetUrl}
+                                alt="Flatlay wood"
+                                className="max-h-40 rounded border border-gray-200"
+                              />
+                            </a>
+                            <div className="text-xs text-gray-700 space-y-1 min-w-0">
+                              <p>
+                                Status: <span className="font-mono">{slotWood.status}</span> · Approval:{" "}
+                                <span className="font-mono">{slotWood.approvalState}</span>
+                              </p>
+                              {slotWood.assetId ? (
+                                <p className="font-mono text-[10px] break-all">asset: {slotWood.assetId}</p>
+                              ) : null}
+                              {slotWood.sourceAssetRef ? (
+                                <p className="text-gray-500">Source: {slotWood.sourceAssetRef}</p>
+                              ) : null}
+                              {slotWood.assetId ? (
+                                <div className="flex flex-wrap gap-2 pt-2">
+                                  <button
+                                    type="button"
+                                    className="px-2 py-1 text-xs rounded bg-white border border-gray-300 hover:bg-gray-50"
+                                    onClick={async () => {
+                                      try {
+                                        await updateSceneAssetApproval({
+                                          assetId: slotWood.assetId!,
+                                          approvalState: "approved",
+                                        });
+                                        showToast("Marked approved", "success");
+                                        setVariantReloadTick((t) => t + 1);
+                                      } catch (e) {
+                                        showToast(e instanceof Error ? e.message : "Update failed", "error");
+                                      }
+                                    }}
+                                  >
+                                    Approve
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="px-2 py-1 text-xs rounded bg-white border border-gray-300 hover:bg-gray-50"
+                                    onClick={async () => {
+                                      try {
+                                        await updateSceneAssetApproval({
+                                          assetId: slotWood.assetId!,
+                                          approvalState: "rejected",
+                                        });
+                                        showToast("Marked rejected", "success");
+                                        setVariantReloadTick((t) => t + 1);
+                                      } catch (e) {
+                                        showToast(e instanceof Error ? e.message : "Update failed", "error");
+                                      }
+                                    }}
+                                  >
+                                    Reject
+                                  </button>
+                                </div>
+                              ) : null}
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="text-xs text-gray-500">No flatlay_wood output for this color yet.</p>
+                        )}
+                      </div>
+                    );
+                  })()}
+
+                  {(() => {
+                    const vRow = productVariants.find((x) => x.id === imagesTabVariantId);
+                    const slotBoutique = vRow?.sceneTemplateRenders?.flatlay_boutique;
+                    return (
+                      <div className="space-y-3 border-t border-indigo-100/80 pt-4">
+                        <h4 className="text-xs font-semibold text-gray-800 uppercase tracking-wide">Flatlay boutique</h4>
+                        <p className="text-xs text-gray-600">Boutique-style flat lay (panties, bralettes, women’s tees).</p>
+                        <button
+                          type="button"
+                          disabled={sceneQueueBusy || !product.id}
+                          className="px-3 py-1.5 text-xs font-medium rounded-md bg-emerald-800 text-white hover:bg-emerald-900 disabled:opacity-50"
+                          onClick={async () => {
+                            if (!product.id || !imagesTabVariantId) return;
+                            setQueueingFlatlayBoutiqueScene(true);
+                            try {
+                              await createSceneRenderJob({
+                                productId: product.id,
+                                productVariantId: imagesTabVariantId,
+                                sceneKey: "flatlay_boutique",
+                              });
+                              showToast("Flatlay boutique job queued. Variant list refreshes shortly.", "success");
+                              setTimeout(() => setVariantReloadTick((t) => t + 1), 6000);
+                            } catch (err) {
+                              console.error(err);
+                              showToast(err instanceof Error ? err.message : "Failed to queue scene job", "error");
+                            } finally {
+                              setQueueingFlatlayBoutiqueScene(false);
+                            }
+                          }}
+                        >
+                          {queueingFlatlayBoutiqueScene ? "Queuing…" : "Queue flatlay boutique scene"}
+                        </button>
+                        {slotBoutique?.assetUrl ? (
+                          <div className="flex flex-wrap gap-4 items-start">
+                            <a
+                              href={slotBoutique.assetUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="block shrink-0"
+                            >
+                              {/* eslint-disable-next-line @next/next/no-img-element */}
+                              <img
+                                src={slotBoutique.assetUrl}
+                                alt="Flatlay boutique"
+                                className="max-h-40 rounded border border-gray-200"
+                              />
+                            </a>
+                            <div className="text-xs text-gray-700 space-y-1 min-w-0">
+                              <p>
+                                Status: <span className="font-mono">{slotBoutique.status}</span> · Approval:{" "}
+                                <span className="font-mono">{slotBoutique.approvalState}</span>
+                              </p>
+                              {slotBoutique.assetId ? (
+                                <p className="font-mono text-[10px] break-all">asset: {slotBoutique.assetId}</p>
+                              ) : null}
+                              {slotBoutique.sourceAssetRef ? (
+                                <p className="text-gray-500">Source: {slotBoutique.sourceAssetRef}</p>
+                              ) : null}
+                              {slotBoutique.assetId ? (
+                                <div className="flex flex-wrap gap-2 pt-2">
+                                  <button
+                                    type="button"
+                                    className="px-2 py-1 text-xs rounded bg-white border border-gray-300 hover:bg-gray-50"
+                                    onClick={async () => {
+                                      try {
+                                        await updateSceneAssetApproval({
+                                          assetId: slotBoutique.assetId!,
+                                          approvalState: "approved",
+                                        });
+                                        showToast("Marked approved", "success");
+                                        setVariantReloadTick((t) => t + 1);
+                                      } catch (e) {
+                                        showToast(e instanceof Error ? e.message : "Update failed", "error");
+                                      }
+                                    }}
+                                  >
+                                    Approve
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="px-2 py-1 text-xs rounded bg-white border border-gray-300 hover:bg-gray-50"
+                                    onClick={async () => {
+                                      try {
+                                        await updateSceneAssetApproval({
+                                          assetId: slotBoutique.assetId!,
+                                          approvalState: "rejected",
+                                        });
+                                        showToast("Marked rejected", "success");
+                                        setVariantReloadTick((t) => t + 1);
+                                      } catch (e) {
+                                        showToast(e instanceof Error ? e.message : "Update failed", "error");
+                                      }
+                                    }}
+                                  >
+                                    Reject
+                                  </button>
+                                </div>
+                              ) : null}
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="text-xs text-gray-500">No flatlay_boutique output for this color yet.</p>
                         )}
                       </div>
                     );
