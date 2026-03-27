@@ -33,13 +33,18 @@ export function buildProductIdentityKey(params: {
   designId: string;
   blankId: string;
   blankVariantIdOrLegacy: string;
+  /** Garment size (e.g. XS, M); omit for legacy single-variant keys. */
+  garmentSizeCode?: string | null;
 }): string {
   const league = normalizeKeySegment(params.leagueCode) || "LEAGUE";
   const team = normalizeKeySegment(params.teamCode) || "TEAM";
   const design = normalizeKeySegment(params.designId) || "";
   const blank = normalizeKeySegment(params.blankId) || "";
   const variant = normalizeKeySegment(params.blankVariantIdOrLegacy) || "legacy";
-  return [league, team, design, blank, variant].filter(Boolean).join("_");
+  const parts = [league, team, design, blank, variant].filter(Boolean);
+  const sizeSeg = normalizeKeySegment(params.garmentSizeCode ?? "");
+  if (sizeSeg) parts.push(sizeSeg);
+  return parts.join("_");
 }
 
 /** Parent product dedupe: team + design + blank (no color/variant segment). */

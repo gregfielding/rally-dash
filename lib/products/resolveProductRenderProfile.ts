@@ -2,9 +2,10 @@
  * Resolve effective placement / render settings for a product.
  *
  * **Hierarchy (canonical):**
- * 1. Blank `placements[]` + blank `renderDefaults` + variant `renderOverrides` = defaults
- * 2. Product `placementOverrides` / `renderOverrides` = optional SKU-specific overrides only
- * 3. Legacy `renderSetup.*.placementOverride` and `renderSetup.*.blendMode` = treated as overrides for backward compatibility
+ * 1. Blank `placements[]` row (+ blank `renderDefaults`)
+ * 2. Blank **color variant** `renderProfileOverrides.{front|back}` + variant `renderOverrides` (global blend hint)
+ * 3. Product `placementOverrides` / `renderOverrides` (wins over variant)
+ * 4. Legacy `renderSetup.*` placement + blend (backward compatibility)
  *
  * Design artwork does not own placement; design `placementDefaults` are advisory only (engines may consult separately).
  */
@@ -21,7 +22,7 @@ import type {
 import { DEFAULT_GARMENT_SAFE_AREA } from "@/lib/render/designArtboardSpec";
 import { normalizeSimpleControls8394, derivePlacementEngineFields8394 } from "@/lib/blanks/simpleRenderControls8394";
 
-export type PlacementResolutionSource = "blank" | "product_override" | "legacy_render_setup";
+export type PlacementResolutionSource = "blank" | "variant_override" | "product_override" | "legacy_render_setup";
 
 export type EffectivePlacement = {
   placementId: RPPlacementId;
@@ -114,19 +115,48 @@ function mergeSafeArea(
   };
 }
 
+function variantSideSlice(variant: RPBlankVariant | null | undefined, side: "front" | "back") {
+  const o = variant?.renderProfileOverrides;
+  if (!o) return null;
+  return side === "front" ? o.front : o.back;
+}
+
+/** Placement zone key: product wins, else variant per-side override, else default row picker. */
+export function resolvePlacementKeyForSide(
+  product: RpProduct | null | undefined,
+  variant: RPBlankVariant | null | undefined,
+  side: "front" | "back"
+): string | null {
+  const vk = variantSideSlice(variant, side)?.placementKey ?? null;
+  return (
+    (side === "front"
+      ? product?.renderSetup?.front?.placementKey
+      : product?.renderSetup?.back?.placementKey) ?? vk ?? null
+  );
+}
+
+function mergeSimple8394FromVariant(
+  placementRow: RPPlacement | null,
+  variant: RPBlankVariant | null | undefined,
+  side: "front" | "back"
+) {
+  if (side !== "back" || !placementRow?.simpleRenderControls8394) return placementRow?.simpleRenderControls8394 ?? null;
+  const partial = variantSideSlice(variant, "back")?.simpleRenderControls8394;
+  if (!partial) return placementRow.simpleRenderControls8394;
+  return { ...placementRow.simpleRenderControls8394, ...partial };
+}
+
 /**
  * Effective placement for mockups, previews, and fingerprints.
- * Order: structured `placementOverrides` → legacy `renderSetup.*.placementOverride` → blank row.
+ * Order: blank row → variant `renderProfileOverrides` → product `placementOverrides` → legacy `renderSetup`.
  */
 export function resolveEffectivePlacement(
   product: RpProduct | null | undefined,
   blank: RPBlank,
-  side: "front" | "back"
+  side: "front" | "back",
+  variant?: RPBlankVariant | null
 ): EffectivePlacement | null {
-  const placementKey =
-    (side === "front"
-      ? product?.renderSetup?.front?.placementKey
-      : product?.renderSetup?.back?.placementKey) ?? null;
+  const placementKey = resolvePlacementKeyForSide(product, variant ?? null, side);
   const row = getPlacementRowForSide(blank, side, placementKey);
   if (!row) return null;
 
@@ -137,26 +167,50 @@ export function resolveEffectivePlacement(
   const artboardBase =
     row.artboardBase != null && Number.isFinite(Number(row.artboardBase)) ? Number(row.artboardBase) : 0.5;
 
-  const structured = readStructuredPlacementOverride(product, side);
-  const legacy = readLegacyPlacementOverride(product, side);
-
-  let source: PlacementResolutionSource = "blank";
+  const vs = variantSideSlice(variant, side);
   let defaultX = baseX;
   let defaultY = baseY;
   let defaultScale = baseScale;
   let safeArea = { ...baseSafe };
+  let variantTouched = false;
+
+  if (vs) {
+    if (vs.defaultX != null) {
+      defaultX = vs.defaultX;
+      variantTouched = true;
+    }
+    if (vs.defaultY != null) {
+      defaultY = vs.defaultY;
+      variantTouched = true;
+    }
+    if (vs.defaultScale != null) {
+      defaultScale = vs.defaultScale;
+      variantTouched = true;
+    }
+    if (vs.safeArea && Object.keys(vs.safeArea).length > 0) {
+      safeArea = mergeSafeArea(safeArea, vs.safeArea);
+      variantTouched = true;
+    }
+  }
+
+  const structured = readStructuredPlacementOverride(product, side);
+  const legacy = readLegacyPlacementOverride(product, side);
+
+  let source: PlacementResolutionSource = "blank";
 
   if (structured) {
     if (structured.defaultX != null) defaultX = structured.defaultX;
     if (structured.defaultY != null) defaultY = structured.defaultY;
     if (structured.defaultScale != null) defaultScale = structured.defaultScale;
-    safeArea = mergeSafeArea(baseSafe, structured.safeArea);
+    safeArea = mergeSafeArea(safeArea, structured.safeArea);
     source = "product_override";
   } else if (legacy) {
     if (legacy.x != null) defaultX = legacy.x;
     if (legacy.y != null) defaultY = legacy.y;
     if (legacy.scale != null) defaultScale = legacy.scale;
     source = "legacy_render_setup";
+  } else if (variantTouched) {
+    source = "variant_override";
   }
 
   return {
@@ -171,7 +225,8 @@ export function resolveEffectivePlacement(
 }
 
 /**
- * Effective blend for a side: variant + zone + blank defaults, then product `renderOverrides`, then legacy `renderSetup.*`.
+ * Effective blend for a side: blank zone (+ merged 8394 simple with variant) → variant side `renderZoneDefaults`
+ * → variant global `renderOverrides` → product `renderOverrides` → legacy `renderSetup.*`.
  */
 export function resolveEffectiveRenderSettings(
   product: RpProduct | null | undefined,
@@ -181,13 +236,21 @@ export function resolveEffectiveRenderSettings(
   side: "front" | "back"
 ): EffectiveRenderSettings {
   const rd = blank.renderDefaults;
-  const vo = variant?.renderOverrides;
+  const mergedSimple = mergeSimple8394FromVariant(placementRow, variant, side);
   const derivedFromSimple =
-    placementRow?.simpleRenderControls8394 != null
-      ? derivePlacementEngineFields8394(placementRow.simpleRenderControls8394).renderZoneDefaults
-      : null;
-  const zd = derivedFromSimple ?? placementRow?.renderZoneDefaults;
+    mergedSimple != null ? derivePlacementEngineFields8394(mergedSimple).renderZoneDefaults : null;
+  let zd = derivedFromSimple ?? placementRow?.renderZoneDefaults ?? null;
+
+  const sideProf = variantSideSlice(variant, side);
+  if (sideProf?.renderZoneDefaults && (sideProf.renderZoneDefaults.blendMode != null || sideProf.renderZoneDefaults.blendOpacity != null)) {
+    zd = {
+      blendMode: sideProf.renderZoneDefaults.blendMode ?? zd?.blendMode ?? null,
+      blendOpacity: sideProf.renderZoneDefaults.blendOpacity ?? zd?.blendOpacity ?? null,
+    };
+  }
+
   const sideRd = side === "front" ? rd?.front : rd?.back;
+  const vo = variant?.renderOverrides;
 
   let modeRaw =
     vo?.blendMode ??
@@ -197,6 +260,14 @@ export function resolveEffectiveRenderSettings(
     "multiply";
   let opRaw =
     vo?.blendOpacity ?? zd?.blendOpacity ?? sideRd?.blendOpacity ?? rd?.blendOpacity ?? 1;
+
+  const simplePatch = sideProf?.simpleRenderControls8394;
+  const variantBlendTouched =
+    !!(simplePatch && Object.keys(simplePatch).length > 0) ||
+    !!(sideProf?.renderZoneDefaults &&
+      (sideProf.renderZoneDefaults.blendMode != null || sideProf.renderZoneDefaults.blendOpacity != null)) ||
+    vo?.blendMode != null ||
+    vo?.blendOpacity != null;
 
   let source: PlacementResolutionSource = "blank";
 
@@ -209,17 +280,19 @@ export function resolveEffectiveRenderSettings(
       opRaw = ro.blendOpacity;
     }
     source = "product_override";
-  }
-
-  const rsSide = side === "front" ? product?.renderSetup?.front : product?.renderSetup?.back;
-  if (source === "blank" && rsSide && (rsSide.blendMode != null || rsSide.blendOpacity != null)) {
-    if (rsSide.blendMode != null && String(rsSide.blendMode).trim()) {
-      modeRaw = rsSide.blendMode;
+  } else {
+    const rsSide = side === "front" ? product?.renderSetup?.front : product?.renderSetup?.back;
+    if (rsSide && (rsSide.blendMode != null || rsSide.blendOpacity != null)) {
+      if (rsSide.blendMode != null && String(rsSide.blendMode).trim()) {
+        modeRaw = rsSide.blendMode;
+      }
+      if (rsSide.blendOpacity != null && Number.isFinite(rsSide.blendOpacity)) {
+        opRaw = rsSide.blendOpacity;
+      }
+      source = "legacy_render_setup";
+    } else if (variantBlendTouched) {
+      source = "variant_override";
     }
-    if (rsSide.blendOpacity != null && Number.isFinite(rsSide.blendOpacity)) {
-      opRaw = rsSide.blendOpacity;
-    }
-    source = "legacy_render_setup";
   }
 
   const mode = typeof modeRaw === "string" && modeRaw.trim() ? modeRaw.trim() : "multiply";
@@ -229,11 +302,12 @@ export function resolveEffectiveRenderSettings(
   return { blendMode: mode, blendOpacity: opacity, source };
 }
 
-/** Fingerprint slice for flat render / stale checks — uses **resolved** placement (blank + product). */
+/** Fingerprint slice for flat render / stale checks — uses **resolved** placement (blank + variant + product). */
 export function getPlacementFingerprintSliceForProduct(
   blank: RPBlank,
   product: RpProduct | null | undefined,
-  side: "front" | "back"
+  side: "front" | "back",
+  variant?: RPBlankVariant | null
 ): {
   placementId: string;
   defaultX: number;
@@ -244,20 +318,18 @@ export function getPlacementFingerprintSliceForProduct(
   renderZoneDefaults: { blendMode?: string | null; blendOpacity?: number | null } | null;
   simpleRenderControls8394: { realism: number; inkStrength: number; sizePreset: string } | null;
 } | null {
-  const row = getPlacementRowForSide(
-    blank,
-    side,
-    side === "front"
-      ? product?.renderSetup?.front?.placementKey
-      : product?.renderSetup?.back?.placementKey
-  );
+  const pk = resolvePlacementKeyForSide(product, variant ?? null, side);
+  const row = getPlacementRowForSide(blank, side, pk);
   if (!row) return null;
 
-  const eff = resolveEffectivePlacement(product, blank, side);
+  const eff = resolveEffectivePlacement(product, blank, side, variant);
   if (!eff) return null;
 
+  const mergedSimpleRaw = mergeSimple8394FromVariant(row, variant ?? null, side);
   const simple =
-    row.simpleRenderControls8394 != null ? normalizeSimpleControls8394(row.simpleRenderControls8394) : null;
+    mergedSimpleRaw != null ? normalizeSimpleControls8394(mergedSimpleRaw) : null;
+
+  const blendEff = resolveEffectiveRenderSettings(product, blank, variant ?? null, row, side);
 
   return {
     placementId: row.placementId,
@@ -266,7 +338,7 @@ export function getPlacementFingerprintSliceForProduct(
     defaultScale: eff.defaultScale,
     safeArea: eff.safeArea,
     artboardBase: eff.artboardBase,
-    renderZoneDefaults: row.renderZoneDefaults ?? null,
+    renderZoneDefaults: { blendMode: blendEff.blendMode, blendOpacity: blendEff.blendOpacity },
     simpleRenderControls8394: simple
       ? { realism: simple.realism, inkStrength: simple.inkStrength, sizePreset: simple.sizePreset }
       : null,

@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * Shared implementation: parent rp_products doc + one variant subdoc.
+ * Shared implementation: parent rp_products doc + Color × Size variant subdocs (sizes from blank or XS–XL).
  * Used by createProductFromDesignBlank callable and bulk find-or-create.
  *
  * @param {object} ctx
@@ -16,6 +16,7 @@
  * @param {number} ctx.MASTER_BLANK_SCHEMA_VERSION
  * @param {function} ctx.sanitizeForFirestore
  * @param {function} ctx.deriveAvailableSizesFromBlank
+ * @param {function} ctx.deriveSizesForProductMatrix
  * @param {object} ctx.merchandisingAtCreate
  * @param {object} ctx.resolveBlankTemplates
  * @param {string} ctx.designId
@@ -23,6 +24,23 @@
  * @param {string} [ctx.blankVariantId]
  * @param {string} ctx.userId
  */
+const { resolvePrintSidesForProductBuild } = require("./resolveDefaultPrintSides");
+const {
+  buildSku,
+  buildDesignCodeForSku,
+  resolveColorCodeForSku,
+  assertDistinctSkuCandidates,
+} = require("./buildSku");
+const { assertSkusUnusedInDatastore } = require("./skuUniqueness");
+
+function deriveColorFamilyFromName(colorName) {
+  const dark = new Set(["black", "midnight navy", "navy", "indigo"]);
+  const n = String(colorName || "")
+    .trim()
+    .toLowerCase();
+  return dark.has(n) ? "dark" : "light";
+}
+
 async function runCreateProductFromDesignBlankCore(ctx) {
   const {
     db,
@@ -36,6 +54,7 @@ async function runCreateProductFromDesignBlankCore(ctx) {
     MASTER_BLANK_SCHEMA_VERSION,
     sanitizeForFirestore,
     deriveAvailableSizesFromBlank,
+    deriveSizesForProductMatrix,
     merchandisingAtCreate,
     resolveBlankTemplates,
     designId,
@@ -70,6 +89,14 @@ async function runCreateProductFromDesignBlankCore(ctx) {
     );
   }
 
+  const sideRes = resolvePrintSidesForProductBuild(blank, design);
+  if (!sideRes.canGenerate) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      sideRes.blockMessage || "Design and blank print sides are incompatible."
+    );
+  }
+
   const variantRow = resolveBlankVariantForProduct(blank, blankVariantId);
 
   let team = null;
@@ -100,34 +127,12 @@ async function runCreateProductFromDesignBlankCore(ctx) {
     blank.schemaVersion === MASTER_BLANK_SCHEMA_VERSION && variantRow.variantId
       ? variantRow.variantId
       : "legacy";
-  const variantIdentityKey = buildProductIdentityKey({
-    leagueCode: leagueCodeRaw,
-    teamCode: teamCodeRaw,
-    designId,
-    blankId,
-    blankVariantIdOrLegacy: variantIdOrLegacy,
-  });
   const parentProductIdentityKey = buildParentProductIdentityKey({
     leagueCode: leagueCodeRaw,
     teamCode: teamCodeRaw,
     designId,
     blankId,
   });
-
-  const legacyDup = await db
-    .collection("rp_products")
-    .where("productIdentityKey", "==", variantIdentityKey)
-    .limit(1)
-    .get();
-  if (!legacyDup.empty) {
-    const d = legacyDup.docs[0];
-    const dslug = d.data().slug || d.id;
-    throw new functions.https.HttpsError(
-      "already-exists",
-      `A product already exists for this design + blank + variant (identity key). slug: ${dslug}`,
-      { productId: d.id, slug: d.data().slug }
-    );
-  }
 
   const parentSnap = await db
     .collection("rp_products")
@@ -207,8 +212,51 @@ async function runCreateProductFromDesignBlankCore(ctx) {
 
   const now = admin.firestore.FieldValue.serverTimestamp();
 
+  const FALLBACK_PRICE_8394 = 24.99;
+  const FALLBACK_WEIGHT_G_8394 = Math.round(0.1 * 453.592);
+
   const dp = blank.defaultPricing || {};
-  const retail = dp.retailPrice != null ? dp.retailPrice : dp.basePrice;
+  let retail = dp.retailPrice != null ? dp.retailPrice : dp.basePrice;
+  if ((retail == null || !Number.isFinite(Number(retail))) && String(blank.styleCode || "").trim() === "8394") {
+    retail = FALLBACK_PRICE_8394;
+  }
+
+  let defaultWeightGrams =
+    blank.defaultShipping && blank.defaultShipping.defaultWeightGrams != null
+      ? Number(blank.defaultShipping.defaultWeightGrams)
+      : null;
+  if (defaultWeightGrams == null || !Number.isFinite(defaultWeightGrams)) {
+    defaultWeightGrams =
+      String(blank.styleCode || "").trim() === "8394" ? FALLBACK_WEIGHT_G_8394 : 0;
+  }
+  const requiresShippingDefault =
+    blank.defaultShipping && blank.defaultShipping.requiresShipping === false ? false : true;
+
+  const pricingBlock =
+    retail != null && Number.isFinite(Number(retail))
+      ? {
+          basePrice: Number(retail),
+          compareAtPrice: dp.compareAtPrice != null ? Number(dp.compareAtPrice) : undefined,
+          currencyCode: (dp.currencyCode && String(dp.currencyCode).trim()) || "USD",
+        }
+      : undefined;
+
+  const shippingBlock = {
+    defaultWeightGrams,
+    requiresShipping: requiresShippingDefault,
+  };
+
+  const designCode = buildDesignCodeForSku({
+    designFamily: parentBundle.tax.designFamily,
+    designSeries: design.designSeries,
+    themeCode: parentBundle.tax.themeCode,
+    designType: design.designType,
+    designId,
+  });
+  const colorCode = resolveColorCodeForSku(colorNameForProduct);
+
+  const leagueSku = leagueCodeRaw || "XX";
+  const teamSku = teamCodeRaw || "XX";
 
   const isV2Master = blank.schemaVersion === MASTER_BLANK_SCHEMA_VERSION;
   const initialRender = buildInitialRenderSetupForProduct({
@@ -239,7 +287,11 @@ async function runCreateProductFromDesignBlankCore(ctx) {
       productKind: "parent",
       schemaVersion: 1,
       parentProductIdentityKey,
-      teamId: design.teamId || null,
+      teamId:
+        parentBundle.tax.taxonomy?.teamId ??
+        parentBundle.tax.taxonomy?.teamSlug ??
+        design.teamId ??
+        null,
       teamCode:
         parentBundle.tax.teamCode ??
         (team && team.teamCode && String(team.teamCode).trim() ? String(team.teamCode).trim().toUpperCase() : null) ??
@@ -283,7 +335,7 @@ async function runCreateProductFromDesignBlankCore(ctx) {
       defaultVariantId: null,
       heroVariantId: null,
       displayMedia: null,
-      availableSizes: deriveAvailableSizesFromBlank(blank),
+      availableSizes: deriveSizesForProductMatrix(blank),
       ai: {
         productArtifactId: null,
         productTrigger: null,
@@ -293,26 +345,8 @@ async function runCreateProductFromDesignBlankCore(ctx) {
       status: "draft",
       tags: parentBundle.tags,
       tagsNormalized: parentBundle.tagsNormalized,
-      pricing:
-        blank.defaultPricing &&
-        (retail != null ||
-          dp.basePrice != null ||
-          dp.compareAtPrice != null ||
-          (dp.currencyCode && String(dp.currencyCode).trim()))
-          ? {
-              basePrice: retail ?? dp.basePrice ?? undefined,
-              compareAtPrice: dp.compareAtPrice ?? undefined,
-              currencyCode: (dp.currencyCode && String(dp.currencyCode).trim()) || "USD",
-            }
-          : undefined,
-      shipping:
-        blank.defaultShipping &&
-        (blank.defaultShipping.defaultWeightGrams != null || blank.defaultShipping.requiresShipping != null)
-          ? {
-              defaultWeightGrams: blank.defaultShipping.defaultWeightGrams ?? undefined,
-              requiresShipping: blank.defaultShipping.requiresShipping ?? true,
-            }
-          : undefined,
+      pricing: pricingBlock,
+      shipping: shippingBlock,
       counters: { assetsTotal: 0, assetsApproved: 0, assetsPublished: 0 },
       createdAt: now,
       updatedAt: now,
@@ -325,109 +359,289 @@ async function runCreateProductFromDesignBlankCore(ctx) {
     console.log("[createProductFromDesignBlank] Created parent product:", parentId, slug);
   }
 
-  const dupVar = await parentRef.collection("variants").where("blankVariantId", "==", variantRow.variantId).limit(1).get();
-  if (!dupVar.empty) {
-    const v = dupVar.docs[0];
+  const blankVariantFk = isV2Master ? variantRow.variantId : blankVariantId || "legacy";
+  const sizesList = deriveSizesForProductMatrix(blank);
+
+  const existingForColorSnap = await parentRef.collection("variants").where("blankVariantId", "==", blankVariantFk).get();
+
+  const existingBySize = new Map();
+  let legacyNoSizeDoc = null;
+  for (const d of existingForColorSnap.docs) {
+    const data = d.data();
+    const sz = data.optionValues && data.optionValues.size;
+    if (sz) {
+      existingBySize.set(String(sz), d);
+    } else {
+      legacyNoSizeDoc = d;
+    }
+  }
+
+  let sizesToCreate = sizesList.filter((s) => !existingBySize.has(s));
+  const skusToRegister = [];
+  let wroteAnyVariant = false;
+
+  let legacyLeadPatch = null;
+  if (legacyNoSizeDoc && existingBySize.size === 0 && sizesList.length > 0) {
+    const leadSize = sizesList[0];
+    const leadKey = buildProductIdentityKey({
+      leagueCode: leagueCodeRaw,
+      teamCode: teamCodeRaw,
+      designId,
+      blankId,
+      blankVariantIdOrLegacy: variantIdOrLegacy,
+      garmentSizeCode: leadSize,
+    });
+    const legacyDupLead = await db
+      .collection("rp_products")
+      .where("productIdentityKey", "==", leadKey)
+      .limit(1)
+      .get();
+    if (!legacyDupLead.empty) {
+      const d = legacyDupLead.docs[0];
+      throw new functions.https.HttpsError(
+        "already-exists",
+        `A product already exists for this design + blank + variant + size (identity key). slug: ${d.data().slug || d.id}`,
+        { productId: d.id, slug: d.data().slug }
+      );
+    }
+    const existingSku = legacyNoSizeDoc.data().sku;
+    const newSku =
+      existingSku && String(existingSku).trim()
+        ? String(existingSku).trim()
+        : buildSku({
+            leagueCode: leagueSku,
+            teamCode: teamSku,
+            designCode,
+            colorCode,
+            size: leadSize,
+          });
+    if (!existingSku || !String(existingSku).trim()) {
+      skusToRegister.push(newSku);
+    }
+    legacyLeadPatch = {
+      ref: legacyNoSizeDoc.ref,
+      payload: sanitizeForFirestore({
+        variantIdentityKey: leadKey,
+        optionValues: { color: colorTitle, size: leadSize },
+        sku: newSku,
+        inventory: { quantity: 999, management: null },
+        taxable: true,
+        pricing: pricingBlock,
+        shipping: shippingBlock,
+        updatedAt: now,
+        updatedBy: userId,
+      }),
+    };
+    existingBySize.set(leadSize, legacyNoSizeDoc);
+    sizesToCreate = sizesList.slice(1);
+  }
+
+  for (const sizeCode of sizesToCreate) {
+    skusToRegister.push(
+      buildSku({ leagueCode: leagueSku, teamCode: teamSku, designCode, colorCode, size: sizeCode })
+    );
+  }
+  if (skusToRegister.length > 0) {
+    assertDistinctSkuCandidates(skusToRegister);
+    try {
+      await assertSkusUnusedInDatastore(db, skusToRegister);
+    } catch (skuErr) {
+      throw new functions.https.HttpsError(
+        "already-exists",
+        skuErr && skuErr.message ? String(skuErr.message) : "Duplicate SKU"
+      );
+    }
+  }
+
+  if (legacyLeadPatch) {
+    await legacyLeadPatch.ref.set(legacyLeadPatch.payload, { merge: true });
+    wroteAnyVariant = true;
+  }
+
+  if (sizesToCreate.length > 0) {
+    for (const sizeCode of sizesToCreate) {
+      const variantIdentityKey = buildProductIdentityKey({
+        leagueCode: leagueCodeRaw,
+        teamCode: teamCodeRaw,
+        designId,
+        blankId,
+        blankVariantIdOrLegacy: variantIdOrLegacy,
+        garmentSizeCode: sizeCode,
+      });
+
+      const legacyDup = await db
+        .collection("rp_products")
+        .where("productIdentityKey", "==", variantIdentityKey)
+        .limit(1)
+        .get();
+      if (!legacyDup.empty) {
+        const d = legacyDup.docs[0];
+        throw new functions.https.HttpsError(
+          "already-exists",
+          `A product already exists for this design + blank + variant + size (identity key). slug: ${d.data().slug || d.id}`,
+          { productId: d.id, slug: d.data().slug }
+        );
+      }
+
+      const sku = buildSku({
+        leagueCode: leagueSku,
+        teamCode: teamSku,
+        designCode,
+        colorCode,
+        size: sizeCode,
+      });
+
+      const vRef = parentRef.collection("variants").doc();
+      const variantData = {
+        productKind: "variant",
+        schemaVersion: 1,
+        parentProductId: parentId,
+        variantIdentityKey,
+        blankVariantId: blankVariantFk,
+        designId,
+        blankId,
+        optionValues: { color: colorTitle, size: sizeCode },
+        colorName: variantRow.colorName || "",
+        colorHex: variantRow.colorHex ?? null,
+        colorFamily:
+          variantRow.colorFamily === "light" || variantRow.colorFamily === "dark"
+            ? variantRow.colorFamily
+            : deriveColorFamilyFromName(variantRow.colorName || ""),
+        preferredArtworkTone: variantRow.preferredArtworkTone ?? null,
+        sku,
+        inventory: { quantity: 999, management: null },
+        taxable: true,
+        status: "active",
+        shopify: { variantId: null, status: "not_synced" },
+        designIdFront: initialRender.designIdFront,
+        designIdBack: initialRender.designIdBack,
+        renderSetup: initialRender.renderSetup || undefined,
+        renderConfig: initialRender.renderConfig || undefined,
+        mockupUrl: null,
+        media: {},
+        flatRenders: null,
+        sceneRenders: null,
+        ai: {
+          productArtifactId: null,
+          productTrigger: null,
+          productRecommendedScale: null,
+          blankTemplateId: null,
+        },
+        blankVersionUsed,
+        designVersionUsed,
+        pricing: pricingBlock,
+        shipping: shippingBlock,
+        counters: { assetsTotal: 0, assetsApproved: 0, assetsPublished: 0 },
+        createdAt: now,
+        updatedAt: now,
+        createdBy: userId,
+        updatedBy: userId,
+      };
+
+      await vRef.set(sanitizeForFirestore(variantData));
+      wroteAnyVariant = true;
+    }
+  } else if (existingBySize.size === 0) {
     throw new functions.https.HttpsError(
-      "already-exists",
-      `Variant already exists for this parent (blankVariantId ${variantRow.variantId}).`,
-      { productId: parentId, slug: parentSlug, variantId: v.id }
+      "failed-precondition",
+      "No garment sizes configured for this blank and no legacy variant to upgrade."
     );
   }
 
-  const variantRef = parentRef.collection("variants").doc();
-  const variantData = {
-    productKind: "variant",
-    schemaVersion: 1,
-    parentProductId: parentId,
-    variantIdentityKey,
-    blankVariantId: isV2Master ? variantRow.variantId : blankVariantId || "legacy",
-    designId,
-    blankId,
-    optionValues: { color: colorTitle },
-    colorName: variantRow.colorName || "",
-    colorHex: variantRow.colorHex ?? null,
-    sku: null,
-    status: "active",
-    shopify: { variantId: null, status: "not_synced" },
-    designIdFront: initialRender.designIdFront,
-    designIdBack: initialRender.designIdBack,
-    renderSetup: initialRender.renderSetup || undefined,
-    renderConfig: initialRender.renderConfig || undefined,
-    mockupUrl: null,
-    media: {},
-    flatRenders: null,
-    sceneRenders: null,
-    ai: {
-      productArtifactId: null,
-      productTrigger: null,
-      productRecommendedScale: null,
-      blankTemplateId: null,
-    },
-    blankVersionUsed,
-    designVersionUsed,
-    pricing:
-      blank.defaultPricing &&
-      (retail != null ||
-        dp.basePrice != null ||
-        dp.compareAtPrice != null ||
-        (dp.currencyCode && String(dp.currencyCode).trim()))
-        ? {
-            basePrice: retail ?? dp.basePrice ?? undefined,
-            compareAtPrice: dp.compareAtPrice ?? undefined,
-            currencyCode: (dp.currencyCode && String(dp.currencyCode).trim()) || "USD",
-          }
-        : undefined,
-    shipping:
-      blank.defaultShipping &&
-      (blank.defaultShipping.defaultWeightGrams != null || blank.defaultShipping.requiresShipping != null)
-        ? {
-            defaultWeightGrams: blank.defaultShipping.defaultWeightGrams ?? undefined,
-            requiresShipping: blank.defaultShipping.requiresShipping ?? true,
-          }
-        : undefined,
-    counters: { assetsTotal: 0, assetsApproved: 0, assetsPublished: 0 },
-    createdAt: now,
-    updatedAt: now,
-    createdBy: userId,
-    updatedBy: userId,
-  };
-
-  await variantRef.set(sanitizeForFirestore(variantData));
+  const postSnap = await parentRef.collection("variants").where("blankVariantId", "==", blankVariantFk).get();
+  const allVariantsSnap = await parentRef.collection("variants").get();
+  const sizeOrder = { XS: 0, S: 1, M: 2, L: 3, XL: 4 };
+  const sortRows = allVariantsSnap.docs.map((d) => {
+    const v = d.data();
+    const sz = (v.optionValues && v.optionValues.size) || "";
+    return {
+      variantId: d.id,
+      blankVariantId: v.blankVariantId,
+      colorName: v.colorName || "",
+      colorHex: v.colorHex ?? null,
+      sizeCode: sz || null,
+      sortSize: sizeOrder[sz] != null ? sizeOrder[sz] : 99,
+    };
+  });
+  sortRows.sort((a, b) => {
+    const c = String(a.colorName).localeCompare(String(b.colorName));
+    if (c !== 0) return c;
+    return a.sortSize - b.sortSize;
+  });
+  const variantSummary = sortRows.map((r, i) => ({
+    variantId: r.variantId,
+    blankVariantId: r.blankVariantId,
+    colorName: r.colorName,
+    colorHex: r.colorHex,
+    sizeCode: r.sizeCode,
+    isDefault: i === 0,
+  }));
 
   const parentAfter = (await parentRef.get()).data() || {};
-  const prevSummary = Array.isArray(parentAfter.variantSummary) ? [...parentAfter.variantSummary] : [];
-  const isFirst = prevSummary.length === 0;
-  const summaryRow = {
-    variantId: variantRef.id,
-    blankVariantId: variantRow.variantId,
-    colorName: variantRow.colorName || "",
-    colorHex: variantRow.colorHex ?? null,
-    isDefault: isFirst,
-  };
-  prevSummary.push(summaryRow);
+  const prevDefaultId = parentAfter.defaultVariantId;
+  const stillExists = prevDefaultId && allVariantsSnap.docs.some((d) => d.id === prevDefaultId);
+  const nextDefaultId = stillExists ? prevDefaultId : variantSummary[0] ? variantSummary[0].variantId : null;
 
   const parentUpdate = {
-    variantSummary: prevSummary,
-    variantCount: prevSummary.length,
+    variantSummary,
+    variantCount: variantSummary.length,
     updatedAt: now,
     updatedBy: userId,
-    availableSizes: deriveAvailableSizesFromBlank(blank),
+    availableSizes: deriveSizesForProductMatrix(blank),
+    defaultVariantId: nextDefaultId,
+    heroVariantId: nextDefaultId,
   };
-  if (isFirst) {
-    parentUpdate.defaultVariantId = variantRef.id;
-    parentUpdate.heroVariantId = variantRef.id;
-    parentUpdate.displayMedia = { heroUrl: null, thumbUrl: null };
+  if (!stillExists && nextDefaultId) {
+    parentUpdate.displayMedia = parentAfter.displayMedia || { heroUrl: null, thumbUrl: null };
   }
   await parentRef.update(sanitizeForFirestore(parentUpdate));
 
-  console.log("[createProductFromDesignBlank] Created variant:", variantRef.id, "under parent", parentId);
+  let primaryVariantIdFor8394 = null;
+  for (const d of postSnap.docs) {
+    const v = d.data();
+    if ((v.optionValues && v.optionValues.size) === sizesList[0]) {
+      primaryVariantIdFor8394 = d.id;
+      break;
+    }
+  }
+  if (!primaryVariantIdFor8394 && postSnap.docs.length > 0) {
+    primaryVariantIdFor8394 = postSnap.docs[0].id;
+  }
+
+  if (String(blank.styleCode || "").trim() === "8394" && primaryVariantIdFor8394 && wroteAnyVariant) {
+    try {
+      const { queueVariant8394BaseAssets } = require("./queueVariant8394BaseAssets");
+      await queueVariant8394BaseAssets({
+        db,
+        admin,
+        sanitizeForFirestore,
+        parentId,
+        variantId: primaryVariantIdFor8394,
+        userId,
+      });
+    } catch (qe) {
+      console.error("[createProductFromDesignBlank] queueVariant8394BaseAssets failed:", qe && qe.message);
+    }
+  }
+
+  const variantIdsThisColor = postSnap.docs.map((d) => d.id);
+
+  let returnVariantId = null;
+  for (const d of postSnap.docs) {
+    const v = d.data();
+    if ((v.optionValues && v.optionValues.size) === sizesList[0]) {
+      returnVariantId = d.id;
+      break;
+    }
+  }
+  if (!returnVariantId) returnVariantId = postSnap.docs[0] ? postSnap.docs[0].id : null;
 
   return {
     ok: true,
     productId: parentId,
     slug: parentSlug,
-    variantId: variantRef.id,
+    variantId: returnVariantId,
+    variantIds: variantIdsThisColor,
   };
 }
 

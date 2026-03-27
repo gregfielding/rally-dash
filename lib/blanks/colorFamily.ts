@@ -1,18 +1,26 @@
 /**
  * Color family derivation for Blank.
- * Drives which Design asset the renderer uses: lightPng vs darkPng.
+ * Drives default garment artwork mapping (light vs dark vs white); blank variant `preferredArtworkTone` can override.
  * All new/edited blanks should explicitly store colorFamily; this is fallback for backward compatibility.
  */
 
 import type { RPBlankColorFamily } from "@/lib/types/firestore";
 import type { RPBlankColorName } from "@/lib/types/firestore";
 
-/** Colors that use the dark design asset (design.assets.darkPng). */
-const DARK_COLOR_NAMES: Set<string> = new Set([
-  "Black",
-  "Midnight Navy",
-  "Navy",
-  "Indigo",
+/**
+ * Garment colors treated as **dark** for artwork tone resolution (try light → white → dark PNG first).
+ * Includes deep blues so light-colored ink reads crisp (not muddy dark-on-blue). Case-insensitive.
+ */
+const DARK_COLOR_NAMES_LOWER: Set<string> = new Set([
+  "black",
+  "midnight navy",
+  "navy",
+  "indigo",
+  "blue",
+  "royal blue",
+  "cobalt",
+  "heather blue",
+  "dark blue",
 ]);
 
 /**
@@ -21,8 +29,8 @@ const DARK_COLOR_NAMES: Set<string> = new Set([
  */
 export function deriveColorFamily(colorName: RPBlankColorName | string | null | undefined): RPBlankColorFamily {
   if (!colorName || typeof colorName !== "string") return "light";
-  const normalized = colorName.trim();
-  if (DARK_COLOR_NAMES.has(normalized)) return "dark";
+  const normalized = colorName.trim().toLowerCase();
+  if (DARK_COLOR_NAMES_LOWER.has(normalized)) return "dark";
   return "light";
 }
 

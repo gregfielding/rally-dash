@@ -6,6 +6,7 @@ import type {
   RpScenePreset,
   RpSceneType,
 } from "@/lib/types/firestore";
+import { inferDefaultPrintSides } from "@/lib/blanks/defaultPrintSides";
 import {
   DEFAULT_SCENE_RENDER_KEY,
   FALLBACK_SCENE_PRESET_IDS,
@@ -47,9 +48,14 @@ export function resolveProductGeneration(params: {
   const { blank, team, design } = params;
   const styleCode = String(blank?.styleCode || "").trim();
 
-  // Primary view
+  // Primary view — blank.defaultPrintSides (or category inference) is the garment-level default
   let primaryView: GenerationRule<"front" | "back">;
-  if (blank?.generationDefaults?.primaryView === "front" || blank?.generationDefaults?.primaryView === "back") {
+  const dps = inferDefaultPrintSides(blank);
+  if (dps === "back_only") {
+    primaryView = rule("back", "blank", "blank.defaultPrintSides / garment category → back");
+  } else if (dps === "front_only") {
+    primaryView = rule("front", "blank", "blank.defaultPrintSides / garment category → front");
+  } else if (blank?.generationDefaults?.primaryView === "front" || blank?.generationDefaults?.primaryView === "back") {
     primaryView = rule(blank.generationDefaults.primaryView, "blank", "blank.generationDefaults.primaryView");
   } else if (styleCode && STYLE_CODES_PRIMARY_BACK.has(styleCode)) {
     primaryView = rule("back", "inferred", `styleCode ${styleCode} → back-primary set`);

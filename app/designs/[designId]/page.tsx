@@ -45,6 +45,7 @@ import {
   designHasUsablePng,
   resolveDesignAssets,
   resolveDesignSideAssets,
+  resolveFilesTabSlotDisplay,
   designGarmentAssetBadges,
   getDesignPrintSidesMode,
   type DesignPrintSidesMode,
@@ -60,39 +61,53 @@ import {
 } from "@/lib/designs/designAssetKinds";
 import type { UpdateDesignFileInput } from "@/lib/hooks/useDesignAssets";
 
-type SideSlot = "lightPng" | "darkPng" | "lightSvg" | "darkSvg" | "lightPdf" | "darkPdf";
+type SideSlot =
+  | "lightPng"
+  | "darkPng"
+  | "whitePng"
+  | "lightSvg"
+  | "darkSvg"
+  | "whiteSvg"
+  | "lightPdf"
+  | "darkPdf"
+  | "whitePdf";
 
 const FILES_TAB_SLOTS: { slot: SideSlot; short: string; format: "png" | "svg" | "pdf" }[] = [
   { slot: "lightPng", short: "Light PNG", format: "png" },
   { slot: "darkPng", short: "Dark PNG", format: "png" },
+  { slot: "whitePng", short: "White PNG", format: "png" },
   { slot: "lightSvg", short: "Light SVG", format: "svg" },
   { slot: "darkSvg", short: "Dark SVG", format: "svg" },
+  { slot: "whiteSvg", short: "White SVG", format: "svg" },
   { slot: "lightPdf", short: "Light PDF", format: "pdf" },
   { slot: "darkPdf", short: "Dark PDF", format: "pdf" },
+  { slot: "whitePdf", short: "White PDF", format: "pdf" },
 ];
 
 const KIND_FOR_SIDE_SLOT: Record<"front" | "back", Record<SideSlot, DesignFileKind>> = {
   front: {
     lightPng: "frontLightPng",
     darkPng: "frontDarkPng",
+    whitePng: "frontWhitePng",
     lightSvg: "frontLightSvg",
     darkSvg: "frontDarkSvg",
+    whiteSvg: "frontWhiteSvg",
     lightPdf: "frontLightPdf",
     darkPdf: "frontDarkPdf",
+    whitePdf: "frontWhitePdf",
   },
   back: {
     lightPng: "backLightPng",
     darkPng: "backDarkPng",
+    whitePng: "backWhitePng",
     lightSvg: "backLightSvg",
     darkSvg: "backDarkSvg",
+    whiteSvg: "backWhiteSvg",
     lightPdf: "backLightPdf",
     darkPdf: "backDarkPdf",
+    whitePdf: "backWhitePdf",
   },
 };
-
-function nestedDesignFile(design: DesignDoc, side: "front" | "back", slot: SideSlot): DesignFile | undefined {
-  return design.files?.[side]?.[slot];
-}
 
 function hasLegacyFlatDesignFiles(design: DesignDoc): boolean {
   const f = design.files;
@@ -766,11 +781,11 @@ function DesignDetailContent() {
         designId: design.id,
         supportedSides: v === "both" ? null : v === "front" ? ["front"] : ["back"],
       });
-      showToast("Print sides updated", "success");
+      showToast("Artwork sides updated", "success");
       mutate();
     } catch (err: unknown) {
-      console.error("[DesignDetail] Print sides update failed:", err);
-      showToast("Could not update print sides", "error");
+      console.error("[DesignDetail] Artwork sides update failed:", err);
+      showToast("Could not update artwork sides", "error");
       setEditPrintSides(prev);
     }
   };
@@ -872,6 +887,16 @@ function DesignDetailContent() {
     if (bytes < 1024) return `${bytes} B`;
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+
+  const fileLabelFromUrl = (url: string) => {
+    try {
+      const u = new URL(url);
+      const seg = u.pathname.split("/").filter(Boolean).pop();
+      return seg && seg.length < 120 ? decodeURIComponent(seg) : url.slice(0, 96);
+    } catch {
+      return url.slice(0, 96);
+    }
   };
 
   const handleDeleteDesign = async () => {
@@ -1137,6 +1162,13 @@ function DesignDetailContent() {
                 >
                   Dark Garment {garmentBadges.dark ? "✓" : "missing"}
                 </span>
+                <span
+                  className={`text-xs px-2 py-0.5 rounded font-medium ${
+                    garmentBadges.white ? "bg-green-100 text-green-800" : "bg-gray-100 text-gray-500"
+                  }`}
+                >
+                  White artwork {garmentBadges.white ? "✓" : "missing"}
+                </span>
               </div>
             </div>
             <div>
@@ -1178,9 +1210,12 @@ function DesignDetailContent() {
                 <div>
                   <h3 className="text-sm font-semibold text-gray-900 mb-3">Assets</h3>
                   <p className="text-xs text-gray-500 mb-4">
-                    Organized by <strong>print side</strong> (front / back) and <strong>garment tone</strong> (light vs dark
-                    garment for the overlay). The renderer picks light vs dark PNG by blank color family. Use the{" "}
-                    <span className="font-mono">Files</span> tab for legacy flat slots or bulk replace.
+                    Artwork is organized by <strong>tone</strong> (light / dark / white) and optional <strong>per-side</strong>{" "}
+                    slots for legacy or mirrored assets. Which garment side gets the print is determined by the blank’s{" "}
+                    <span className="font-mono">defaultPrintSides</span> and product build — not by filenames. The renderer
+                    picks URLs using blank color family, optional{" "}
+                    <span className="font-mono">preferredArtworkTone</span>, and fallbacks. Use the{" "}
+                    <span className="font-mono">Files</span> tab for uploads or bulk replace.
                   </p>
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                     {(
@@ -1190,20 +1225,26 @@ function DesignDetailContent() {
                           u: frontAssets,
                           pngL: "frontLightPng" as const,
                           pngD: "frontDarkPng" as const,
+                          pngW: "frontWhitePng" as const,
                           svgL: "frontLightSvg" as const,
                           svgD: "frontDarkSvg" as const,
+                          svgW: "frontWhiteSvg" as const,
                           pdfL: "frontLightPdf" as const,
                           pdfD: "frontDarkPdf" as const,
+                          pdfW: "frontWhitePdf" as const,
                         },
                         {
                           title: "Back",
                           u: backAssets,
                           pngL: "backLightPng" as const,
                           pngD: "backDarkPng" as const,
+                          pngW: "backWhitePng" as const,
                           svgL: "backLightSvg" as const,
                           svgD: "backDarkSvg" as const,
+                          svgW: "backWhiteSvg" as const,
                           pdfL: "backLightPdf" as const,
                           pdfD: "backDarkPdf" as const,
+                          pdfW: "backWhitePdf" as const,
                         },
                       ] as const
                     ).map((row) => (
@@ -1214,7 +1255,7 @@ function DesignDetailContent() {
                         <h4 className="text-sm font-semibold text-gray-900 border-b border-gray-100 pb-2">{row.title}</h4>
                         <div>
                           <p className="text-[11px] text-gray-500 mb-2">PNG</p>
-                          <div className="grid grid-cols-2 gap-2">
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                             <div className="rounded border border-amber-100 bg-amber-50/40 p-2">
                               <p className="text-[10px] font-medium text-amber-900 mb-1">Light</p>
                               <div className="bg-white rounded min-h-[120px] flex items-center justify-center border border-amber-100/80">
@@ -1257,6 +1298,28 @@ function DesignDetailContent() {
                                 className="mt-1 w-full text-[10px] py-1 rounded bg-slate-700 text-white hover:bg-slate-800 disabled:opacity-50"
                               >
                                 {uploadingKind === row.pngD ? "…" : "Upload"}
+                              </button>
+                            </div>
+                            <div className="rounded border border-zinc-200 bg-zinc-50/80 p-2">
+                              <p className="text-[10px] font-medium text-zinc-800 mb-1">White</p>
+                              <div className="bg-white rounded min-h-[120px] flex items-center justify-center border border-zinc-200/80">
+                                {row.u.whitePng ? (
+                                  <img
+                                    src={row.u.whitePng}
+                                    alt=""
+                                    className="max-w-full max-h-[120px] object-contain"
+                                  />
+                                ) : (
+                                  <span className="text-[10px] text-gray-400">—</span>
+                                )}
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => triggerOverviewPick(row.pngW)}
+                                disabled={uploadingKind === row.pngW}
+                                className="mt-1 w-full text-[10px] py-1 rounded bg-zinc-700 text-white hover:bg-zinc-800 disabled:opacity-50"
+                              >
+                                {uploadingKind === row.pngW ? "…" : "Upload"}
                               </button>
                             </div>
                           </div>
@@ -1303,6 +1366,26 @@ function DesignDetailContent() {
                             >
                               {uploadingKind === row.svgD ? "…" : "↑ Dark"}
                             </button>
+                            <span className="text-gray-300">|</span>
+                            {row.u.whiteSvg ? (
+                              <a
+                                href={row.u.whiteSvg}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-blue-600 hover:underline"
+                              >
+                                White
+                              </a>
+                            ) : (
+                              <span className="text-gray-400">White —</span>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => triggerOverviewPick(row.svgW)}
+                              className="text-blue-600 hover:underline"
+                            >
+                              {uploadingKind === row.svgW ? "…" : "↑ White"}
+                            </button>
                           </div>
                         </div>
                         <div>
@@ -1347,6 +1430,26 @@ function DesignDetailContent() {
                             >
                               {uploadingKind === row.pdfD ? "…" : "↑ Dark"}
                             </button>
+                            <span className="text-gray-300">|</span>
+                            {row.u.whitePdf ? (
+                              <a
+                                href={row.u.whitePdf}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-blue-600 hover:underline"
+                              >
+                                White
+                              </a>
+                            ) : (
+                              <span className="text-gray-400">White —</span>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => triggerOverviewPick(row.pdfW)}
+                              className="text-blue-600 hover:underline"
+                            >
+                              {uploadingKind === row.pdfW ? "…" : "↑ White"}
+                            </button>
                           </div>
                         </div>
                       </div>
@@ -1381,6 +1484,16 @@ function DesignDetailContent() {
                       Dark SVG
                     </a>
                   )}
+                  {assetUrls.whiteSvg && (
+                    <a
+                      href={assetUrls.whiteSvg}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-blue-600 hover:underline"
+                    >
+                      White SVG
+                    </a>
+                  )}
                   {assetUrls.lightPdf && (
                     <a
                       href={assetUrls.lightPdf}
@@ -1399,6 +1512,16 @@ function DesignDetailContent() {
                       className="text-blue-600 hover:underline"
                     >
                       Dark PDF
+                    </a>
+                  )}
+                  {assetUrls.whitePdf && (
+                    <a
+                      href={assetUrls.whitePdf}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-blue-600 hover:underline"
+                    >
+                      White PDF
                     </a>
                   )}
                 </div>
@@ -1503,12 +1626,11 @@ function DesignDetailContent() {
                     placeholder="e.g. will_drop_for"
                     className="w-full max-w-md border border-gray-300 rounded px-2 py-1.5 text-sm bg-white text-gray-900 font-mono"
                   />
-                  <label className="block text-xs text-gray-600 mt-3">Print sides (garment)</label>
+                  <label className="block text-xs text-gray-600 mt-3">Artwork sides available</label>
                   <p className="text-[11px] text-[#737373] mb-1">
-                    Garment placement behavior for this artwork: which sides may receive the print when only{" "}
-                    <span className="font-mono">designId</span> is set. Stored as <span className="font-mono">supportedSides</span>{" "}
-                    (<span className="font-mono">front</span>/<span className="font-mono">back</span>); if unset, we infer from{" "}
-                    <span className="font-mono">placementDefaults</span>. Product-level placement overrides live on the product.
+                    Which sides have artwork files (inventory). Garment print placement defaults live on the blank (
+                    <span className="font-mono">defaultPrintSides</span>). Stored as <span className="font-mono">supportedSides</span>{" "}
+                    or inferred from nested assets / <span className="font-mono">placementDefaults</span>.
                   </p>
                   <select
                     value={editPrintSides}
@@ -1660,18 +1782,23 @@ function DesignDetailContent() {
             {activeTab === "files" && (
               <div className="space-y-6">
                 <p className="text-sm text-gray-700">
-                  Artwork is stored <strong className="text-gray-900">per print side</strong> (front / back) and{" "}
+                  Artwork is stored <strong className="text-gray-900">per side</strong> (front / back) and{" "}
                   <strong className="text-gray-900">per garment tone</strong> (light / dark). Use transparent PNG overlays for
-                  mockups; optional SVG/PDF masters follow the same layout. Max: SVG 5MB, PNG 25MB, PDF 50MB.
+                  mockups; optional SVG/PDF masters follow the same layout. Max: SVG 5MB, PNG 25MB, PDF 50MB.{" "}
+                  <span className="text-gray-600">
+                    Thumbnails use the same merge as generation: nested <span className="font-mono text-gray-800">files.front</span>/
+                    <span className="font-mono text-gray-800">back</span>, legacy root slots, and{" "}
+                    <span className="font-mono text-gray-800">assets</span> URLs — click a preview to open full size.
+                  </span>
                 </p>
 
                 <div className="rounded-xl border border-gray-200 bg-gray-50/80 p-4 flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
                   <div className="min-w-0 flex-1">
-                    <label className="block text-sm font-semibold text-gray-900">Print sides (garment)</label>
+                    <label className="block text-sm font-semibold text-gray-900">Artwork sides available</label>
                     <p className="text-xs text-gray-600 mt-1">
-                      Same as Overview → Edit. When paths are not side-specific (legacy flat files below),{" "}
-                      <span className="font-mono text-gray-800">supportedSides</span> tells the engine which garment side(s)
-                      receive the print.
+                      Which sides have artwork files — not where a blank will print (that is{" "}
+                      <span className="font-mono text-gray-800">rp_blanks.defaultPrintSides</span>). Legacy flat files use{" "}
+                      <span className="font-mono text-gray-800">supportedSides</span> so previews know which nested slots apply.
                     </p>
                   </div>
                   <select
@@ -1694,82 +1821,121 @@ function DesignDetailContent() {
                       <div className="flex items-center gap-2 border-b border-gray-100 pb-3">
                         <h3 className="text-lg font-bold text-gray-900 capitalize">{paneSide}</h3>
                         <span className="text-xs font-medium text-gray-700 px-2 py-0.5 rounded-full bg-gray-100">
-                          Print side
+                          Artwork side
                         </span>
                       </div>
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         {FILES_TAB_SLOTS.map(({ slot, short, format }) => {
                           const kind = KIND_FOR_SIDE_SLOT[paneSide][slot];
-                          const file = nestedDesignFile(design, paneSide, slot);
+                          const slotDisplay = resolveFilesTabSlotDisplay(design, paneSide, slot);
+                          const previewUrl = slotDisplay.previewUrl;
+                          const file = slotDisplay.file;
                           const busy = uploadingKind === kind;
                           const title = `${paneSide === "front" ? "Front" : "Back"} · ${short}`;
-                          const toneHint = slot.startsWith("light") ? "light garment" : "dark garment";
+                          const toneHint = slot.startsWith("light")
+                            ? "light garment"
+                            : slot.startsWith("dark")
+                              ? "dark garment"
+                              : "white artwork";
                           const blurb =
                             format === "png"
                               ? `PNG overlay (${toneHint}) on this side.`
                               : format === "svg"
                                 ? `Vector (${toneHint}) on this side.`
                                 : `Print PDF (${toneHint}) on this side.`;
+                          const displayName = file?.fileName ?? (previewUrl ? fileLabelFromUrl(previewUrl) : "");
                           return (
                             <div key={slot} className="border border-gray-200 rounded-lg p-3 flex flex-col">
                               <h4 className="text-sm font-semibold text-gray-900">{title}</h4>
                               <p className="text-xs text-gray-600 mb-2">{blurb}</p>
                               <div className="bg-gray-50 rounded-lg p-4 flex flex-col items-center justify-center min-h-[160px] flex-1">
-                                {format === "png" && file?.downloadUrl ? (
+                                {format === "png" && previewUrl ? (
                                   <>
-                                    <img
-                                      src={file.downloadUrl}
-                                      alt=""
-                                      className="max-w-full max-h-[120px] object-contain mb-2"
-                                    />
-                                    <div className="text-xs text-gray-600 text-center">
-                                      <p className="font-medium text-gray-800">{file.fileName}</p>
-                                      <p>{formatBytes(file.sizeBytes)}</p>
-                                    </div>
-                                  </>
-                                ) : format === "svg" && file?.downloadUrl ? (
-                                  <>
-                                    <img
-                                      src={file.downloadUrl}
-                                      alt=""
-                                      className="max-w-full max-h-[120px] object-contain mb-2"
-                                    />
-                                    <div className="text-xs text-gray-600 text-center">
-                                      <p className="font-medium text-gray-800">{file.fileName}</p>
-                                      <p>{formatBytes(file.sizeBytes)}</p>
-                                    </div>
                                     <a
-                                      href={file.downloadUrl}
+                                      href={previewUrl}
                                       target="_blank"
                                       rel="noopener noreferrer"
-                                      className="mt-1 text-sm text-blue-700 font-medium hover:underline"
+                                      className="block mb-2 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                      title="Open full size"
                                     >
-                                      Open
+                                      <img
+                                        src={previewUrl}
+                                        alt=""
+                                        className="max-w-full max-h-[120px] object-contain"
+                                      />
                                     </a>
-                                  </>
-                                ) : format === "pdf" && file?.downloadUrl ? (
-                                  <>
-                                    <svg
-                                      className="w-14 h-14 text-red-500 mb-2"
-                                      fill="currentColor"
-                                      viewBox="0 0 24 24"
-                                      aria-hidden
-                                    >
-                                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm-1 2l5 5h-5V4zM6 20V4h6v6h6v10H6z" />
-                                      <path d="M8 12h8v2H8zm0 4h5v2H8z" />
-                                    </svg>
                                     <div className="text-xs text-gray-600 text-center">
-                                      <p className="font-medium text-gray-800">{file.fileName}</p>
-                                      <p>{formatBytes(file.sizeBytes)}</p>
+                                      <p className="font-medium text-gray-800 break-all">{displayName}</p>
+                                      <p>{file?.sizeBytes != null ? formatBytes(file.sizeBytes) : "—"}</p>
+                                      <a
+                                        href={previewUrl}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="mt-1 inline-block text-sm text-blue-700 font-medium hover:underline"
+                                      >
+                                        Preview
+                                      </a>
                                     </div>
+                                  </>
+                                ) : format === "svg" && previewUrl ? (
+                                  <>
                                     <a
-                                      href={file.downloadUrl}
+                                      href={previewUrl}
                                       target="_blank"
                                       rel="noopener noreferrer"
-                                      className="mt-1 text-sm text-blue-700 font-medium hover:underline"
+                                      className="block mb-2 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                      title="Open full size"
                                     >
-                                      View PDF
+                                      <img
+                                        src={previewUrl}
+                                        alt=""
+                                        className="max-w-full max-h-[120px] object-contain"
+                                      />
                                     </a>
+                                    <div className="text-xs text-gray-600 text-center">
+                                      <p className="font-medium text-gray-800 break-all">{displayName}</p>
+                                      <p>{file?.sizeBytes != null ? formatBytes(file.sizeBytes) : "—"}</p>
+                                      <a
+                                        href={previewUrl}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="mt-1 inline-block text-sm text-blue-700 font-medium hover:underline"
+                                      >
+                                        Open
+                                      </a>
+                                    </div>
+                                  </>
+                                ) : format === "pdf" && previewUrl ? (
+                                  <>
+                                    <a
+                                      href={previewUrl}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="flex flex-col items-center mb-2 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                      title="Open PDF"
+                                    >
+                                      <svg
+                                        className="w-14 h-14 text-red-500 mb-2"
+                                        fill="currentColor"
+                                        viewBox="0 0 24 24"
+                                        aria-hidden
+                                      >
+                                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm-1 2l5 5h-5V4zM6 20V4h6v6h6v10H6z" />
+                                        <path d="M8 12h8v2H8zm0 4h5v2H8z" />
+                                      </svg>
+                                    </a>
+                                    <div className="text-xs text-gray-600 text-center">
+                                      <p className="font-medium text-gray-800 break-all">{displayName}</p>
+                                      <p>{file?.sizeBytes != null ? formatBytes(file.sizeBytes) : "—"}</p>
+                                      <a
+                                        href={previewUrl}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="mt-1 inline-block text-sm text-blue-700 font-medium hover:underline"
+                                      >
+                                        View PDF
+                                      </a>
+                                    </div>
                                   </>
                                 ) : (
                                   <div className="text-center text-gray-400 text-sm">No file</div>
@@ -1781,7 +1947,7 @@ function DesignDetailContent() {
                                 disabled={busy}
                                 className="mt-3 w-full px-3 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 disabled:opacity-50"
                               >
-                                {busy ? "Uploading…" : file ? "Replace" : "Upload"}
+                                {busy ? "Uploading…" : previewUrl ? "Replace" : "Upload"}
                               </button>
                             </div>
                           );
@@ -1797,10 +1963,10 @@ function DesignDetailContent() {
                       <h3 className="text-base font-semibold text-amber-950">Legacy flat files (root paths)</h3>
                       <p className="text-xs text-amber-900 mt-1">
                         These live on the old <span className="font-mono">files.lightPng</span>,{" "}
-                        <span className="font-mono">files.svg</span>, etc. shape. The <strong>Print sides</strong> control
-                        above sets <span className="font-mono">supportedSides</span> so rendering knows which garment side(s)
-                        apply when artwork is not split into <span className="font-mono">front</span> /{" "}
-                        <span className="font-mono">back</span>.
+                        <span className="font-mono">files.svg</span>, etc. The <strong>Artwork sides available</strong> control
+                        above sets <span className="font-mono">supportedSides</span> for inventory; garment print placement uses the blank’s{" "}
+                        <span className="font-mono">defaultPrintSides</span>. Legacy paths apply when artwork is not split into{" "}
+                        <span className="font-mono">front</span> / <span className="font-mono">back</span>.
                       </p>
                     </div>
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">

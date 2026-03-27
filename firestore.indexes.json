@@ -135,6 +135,26 @@
           "order": "ASCENDING"
         }
       ]
+    },
+    {
+      "collectionGroup": "variants",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        {
+          "fieldPath": "variant8394NextRetryAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "variants",
+      "queryScope": "COLLECTION_GROUP",
+      "fields": [
+        {
+          "fieldPath": "sku",
+          "order": "ASCENDING"
+        }
+      ]
     }
   ],
   "fieldOverrides": []

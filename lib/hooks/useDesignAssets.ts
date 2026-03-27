@@ -50,11 +50,23 @@ export interface CreateDesignInput {
   tags?: string[];
   /** @deprecated use internalNotes */
   description?: string;
+  /** Bulk upload: hyphenated identity slug (e.g. mlb-san-francisco-giants-city-69) */
+  slugOverride?: string | null;
+  importKey?: string | null;
+  sportCode?: string | null;
+  leagueCode?: string | null;
+  teamCode?: string | null;
+  themeCode?: string | null;
+  designFamily?: string | null;
+  importSource?: string | null;
+  importBatchId?: string | null;
+  importVersion?: string | null;
 }
 
 export interface UpdateDesignInput {
   designId: string;
   name?: string;
+  slug?: string | null;
   status?: DesignStatus;
   colors?: DesignColor[];
   tags?: string[];
@@ -331,6 +343,97 @@ export function useUpdateDesignFile() {
   }, []);
 
   return { updateFile };
+}
+
+/** Temp upload descriptor for `parseBulkDesignUploadPreview` (matches Functions input). */
+export interface BulkDesignImportTempFileDescriptor {
+  originalFilename: string;
+  storagePath: string;
+  ext: string;
+  size: number;
+  contentType?: string;
+}
+
+export interface ParseBulkDesignUploadPreviewInput {
+  jobId: string;
+  files: BulkDesignImportTempFileDescriptor[];
+  options?: {
+    requirePng?: boolean;
+    allowLegacyFilenames?: boolean;
+  };
+}
+
+export interface CommitBulkDesignUploadItemDecision {
+  itemId: string;
+  action: "create" | "update" | "skip" | "blocked";
+  overwriteAllowed?: boolean;
+  name?: string;
+  teamId?: string;
+  themeCode?: string;
+  designSeries?: string | null;
+  slug?: string;
+}
+
+export interface CommitBulkDesignUploadInput {
+  jobId: string;
+  items: CommitBulkDesignUploadItemDecision[];
+}
+
+/**
+ * Server-owned bulk design import: preview (parse, group, match, write job/items).
+ */
+export function useParseBulkDesignUploadPreview() {
+  const parsePreview = useCallback(async (input: ParseBulkDesignUploadPreviewInput) => {
+    if (!functions) {
+      throw new Error("Cloud Functions not initialized");
+    }
+    const fn = httpsCallable(functions, "parseBulkDesignUploadPreview");
+    const result = await fn(input);
+    return result.data as {
+      ok: boolean;
+      jobId: string;
+      items: Record<string, unknown>[];
+      parseFailures: { name: string; message: string }[];
+      ignored: { name: string; reason: string }[];
+      job: Record<string, unknown>;
+    };
+  }, []);
+
+  return { parsePreview };
+}
+
+/**
+ * Server-owned bulk design import: commit (copy temp → designs/, create/update docs).
+ */
+export function useCommitBulkDesignUpload() {
+  const commitBulkImport = useCallback(async (input: CommitBulkDesignUploadInput) => {
+    if (!functions) {
+      throw new Error("Cloud Functions not initialized");
+    }
+    const fn = httpsCallable(functions, "commitBulkDesignUpload");
+    const result = await fn(input);
+    return result.data as {
+      ok: boolean;
+      jobId: string;
+      status: string;
+      results: Array<{
+        itemId: string;
+        resultStatus: string;
+        resultDesignId?: string | null;
+        resultError?: string | null;
+        note?: string;
+      }>;
+      summary: {
+        created: number;
+        updated: number;
+        skipped: number;
+        blocked: number;
+        failed: number;
+      };
+    };
+  }, []);
+
+  return { commitBulkImport };
 }
 
 const FIRESTORE_BATCH_MAX = 450;

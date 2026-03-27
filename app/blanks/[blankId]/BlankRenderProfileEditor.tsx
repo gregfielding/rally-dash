@@ -341,7 +341,7 @@ function pickDesignPreviewPng(
     if (u) return u;
   }
   const fam = variant ? getEffectiveColorFamily(variant.colorFamily, variant.colorName) : null;
-  return pickDesignSvgUrlForGarment(design, fam);
+  return pickDesignSvgUrlForGarment(design, fam, "back", variant?.preferredArtworkTone ?? undefined);
 }
 
 function toFirestorePlacement(p: ProfileRow, styleCode?: string | null): RPPlacement {
@@ -654,7 +654,10 @@ export function BlankRenderProfileEditor({
             } as RPPlacementSimpleRenderControls8394);
             const d = derivePlacementEngineFields8394(merged);
             next.simpleRenderControls8394 = merged;
-            next.defaultScale = d.defaultScale;
+            // Print-style presets only change realism/ink → blend. Do not remap scale unless size preset changed.
+            if (patch.simpleRenderControls8394.sizePreset !== undefined) {
+              next.defaultScale = d.defaultScale;
+            }
             next.renderZoneDefaults = d.renderZoneDefaults;
           }
           return next;

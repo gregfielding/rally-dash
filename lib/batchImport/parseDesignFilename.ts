@@ -1,28 +1,33 @@
 /**
  * Parse batch design filenames.
  *
- * Convention: `{league}_{...identity + theme...}_{side}_{garmentTone}.ext`
- * - `side` = second-to-last token: FRONT | BACK
- * - `garmentTone` = last token: LIGHT | DARK
- * - **designKey** (import grouping) = all tokens except the last two (same design, multiple sides/tones/formats)
+ * **Canonical (preferred):** `{league}_{…identity…}_{tone}.ext`
+ * - Final token before the extension: **LIGHT | DARK | WHITE** (artwork tone)
+ * - **designKey** = all tokens except the last (tone); encodes design identity only
+ * - Print placement is **not** in the filename — use blank `defaultPrintSides` + product build
+ *
+ * **Legacy (still accepted):** `{league}_{…}_front|back_{tone}.ext`
+ * - `_front_` / `_back_` are **legacy metadata only**; they do not override blank placement rules
  *
  * Examples:
- * - mlb_los_angeles_dodgers_city_69_back_light.png
- * - MLB_WILL_DROP_FOR_GIANTS_BACK_LIGHT.png (classic)
+ * - mlb_sf_giants_city_69_light.png  → canonical
+ * - mlb_sf_giants_city_69_back_dark.png → legacy (filenameLegacySide = back)
  */
 
-import { designFileKindFromSideToneExt } from "@/lib/designs/designAssetKinds";
+import { designFileKindFromSideToneExt, designFileKindFromToneExt } from "@/lib/designs/designAssetKinds";
 import type { DesignFileKind } from "@/lib/designs/designAssetKinds";
 
 const SUPPORTED_EXT = new Set(["png", "svg", "pdf"]);
 const KNOWN_SIDES = new Set(["FRONT", "BACK"]);
-const KNOWN_TONES = new Set(["LIGHT", "DARK"]);
-/** league + at least one middle segment + side + tone */
-const MIN_TOKENS = 5;
+const KNOWN_TONES = new Set(["LIGHT", "DARK", "WHITE"]);
+/** Canonical: league + ≥1 identity segment + tone */
+const MIN_TOKENS_CANONICAL = 3;
+/** Legacy: league + … + side + tone */
+const MIN_TOKENS_LEGACY = 5;
 
 export interface ParsedDesignFilename {
   league: string;
-  /** Same design across files; stored as `importKey` (excludes side + garmentTone). */
+  /** Same design across files; stored as `importKey` (excludes tone; legacy also excludes side). */
   designKey: string;
   /** @deprecated Alias for `designKey` */
   baseKey: string;
@@ -30,8 +35,18 @@ export interface ParsedDesignFilename {
   designFamily: string;
   /** Entity token for taxonomy (e.g. GIANTS, DODGERS) */
   team: string;
-  side: string;
-  /** Garment tone: light | dark (screen / ink on light vs dark garment) */
+  /**
+   * Legacy filenames only: `front` | `back` from `_front_` / `_back_` tokens.
+   * `null` for side-agnostic canonical names — **not** a placement hint.
+   * @deprecated Prefer `filenameLegacySide`
+   */
+  side: string | null;
+  /**
+   * Set only when a legacy `_front_` / `_back_` segment is present in the filename.
+   * Null for canonical files. Not used as the source of truth for garment placement.
+   */
+  filenameLegacySide: "front" | "back" | null;
+  /** Garment artwork tone from filename: LIGHT | DARK | WHITE */
   garmentTone: string;
   /** @deprecated Same as garmentTone (legacy name) */
   variant: string;
@@ -44,7 +59,6 @@ export type ParseStatus =
   | "invalid_format"
   | "missing_token"
   | "unsupported_extension"
-  | "unknown_side"
   | "unknown_garment_tone";
 
 export interface ParseResult {
@@ -101,42 +115,60 @@ export function parseDesignFilename(filePathOrName: string): ParseResult {
 
   const base = baseNameWithoutExt(filename);
   const tokens = base.split("_").filter(Boolean);
-  if (tokens.length < MIN_TOKENS) {
+  if (tokens.length < MIN_TOKENS_CANONICAL) {
     return {
       parsed: null,
       status: "missing_token",
-      message: `Need at least ${MIN_TOKENS} underscore-separated parts (league … side garmentTone)`,
+      message: `Need at least ${MIN_TOKENS_CANONICAL} underscore-separated parts (e.g. league_team_light)`,
     };
   }
 
   const garmentToneRaw = tokens[tokens.length - 1]!;
-  const sideRaw = tokens[tokens.length - 2]!;
-
-  if (!KNOWN_SIDES.has(sideRaw.toUpperCase())) {
-    return {
-      parsed: null,
-      status: "unknown_side",
-      message: `Side must be FRONT or BACK, got ${sideRaw}`,
-    };
-  }
   if (!KNOWN_TONES.has(garmentToneRaw.toUpperCase())) {
     return {
       parsed: null,
       status: "unknown_garment_tone",
-      message: `Garment tone must be LIGHT or DARK, got ${garmentToneRaw}`,
+      message: `Last segment must be artwork tone LIGHT, DARK, or WHITE (got "${garmentToneRaw}")`,
     };
   }
 
-  const league = tokens[0]!;
-  const middle = tokens.slice(1, -2);
-  if (middle.length < 1) {
-    return { parsed: null, status: "missing_token", message: "Missing identity segment between league and side" };
+  const secondLast = tokens.length >= 2 ? tokens[tokens.length - 2]! : "";
+  const looksLegacySide = KNOWN_SIDES.has(secondLast.toUpperCase());
+
+  let filenameLegacySide: "front" | "back" | null = null;
+  let league: string;
+  let middle: string[];
+  let designKey: string;
+
+  if (looksLegacySide) {
+    if (tokens.length < MIN_TOKENS_LEGACY) {
+      return {
+        parsed: null,
+        status: "missing_token",
+        message: `Legacy filenames with _front_/_back_ need at least ${MIN_TOKENS_LEGACY} parts (e.g. league_…_back_light)`,
+      };
+    }
+    filenameLegacySide = secondLast.toLowerCase() === "front" ? "front" : "back";
+    league = tokens[0]!;
+    middle = tokens.slice(1, -2);
+    if (middle.length < 1) {
+      return { parsed: null, status: "missing_token", message: "Missing identity segment between league and side" };
+    }
+    designKey = [league, ...middle].join("_");
+  } else {
+    league = tokens[0]!;
+    middle = tokens.slice(1, -1);
+    if (middle.length < 1) {
+      return {
+        parsed: null,
+        status: "missing_token",
+        message: "Missing identity segment between league and artwork tone",
+      };
+    }
+    designKey = [league, ...middle].join("_");
   }
 
-  const designKey = [league, ...middle].join("_");
   const { designFamily, team } = splitMiddleForTeamAndFamily(middle);
-
-  const side = sideRaw;
   const garmentTone = garmentToneRaw;
 
   const parsed: ParsedDesignFilename = {
@@ -145,7 +177,8 @@ export function parseDesignFilename(filePathOrName: string): ParseResult {
     baseKey: designKey,
     designFamily,
     team,
-    side,
+    side: filenameLegacySide,
+    filenameLegacySide,
     garmentTone,
     variant: garmentTone,
     extension: ext,
@@ -154,15 +187,22 @@ export function parseDesignFilename(filePathOrName: string): ParseResult {
   return { parsed, status: "valid" };
 }
 
-/** Callable / storage kind for this file (side-aware). */
+/** Callable / storage kind for this file (side-agnostic → legacy flat tone slots; legacy side → nested side). */
 export function importKindForParsedFile(parsed: ParsedDesignFilename): DesignFileKind {
-  return designFileKindFromSideToneExt(parsed.side, parsed.garmentTone, parsed.extension);
+  if (parsed.filenameLegacySide) {
+    return designFileKindFromSideToneExt(parsed.filenameLegacySide, parsed.garmentTone, parsed.extension);
+  }
+  return designFileKindFromToneExt(parsed.garmentTone, parsed.extension);
 }
 
 export function suggestedDesignName(parsed: ParsedDesignFilename): string {
   const toTitle = (s: string) => s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
   const id = parsed.designKey.split("_").slice(1).map(toTitle).join(" ");
-  return `${id} (${toTitle(parsed.side)} ${toTitle(parsed.garmentTone)})`.trim();
+  const tone = toTitle(parsed.garmentTone);
+  if (parsed.filenameLegacySide) {
+    return `${id} (${toTitle(parsed.filenameLegacySide)} ${tone})`.trim();
+  }
+  return `${id} (${tone})`.trim();
 }
 
 export type GroupedDesignRow = {
@@ -170,13 +210,19 @@ export type GroupedDesignRow = {
   /** @deprecated Same as designKey */
   baseKey: string;
   parsed: ParsedDesignFilename;
-  files: { file: File; ext: string; kind: DesignFileKind; side: string }[];
-  /** Distinct print sides present in this group (e.g. front + back) */
-  sides: string[];
+  files: {
+    file: File;
+    ext: string;
+    kind: DesignFileKind;
+    /** Legacy-only; null when file used canonical side-agnostic naming */
+    filenameLegacySide: "front" | "back" | null;
+  }[];
+  /** Distinct legacy filename sides in this group (empty if all files are canonical) */
+  legacyFilenameSides: string[];
 };
 
 /**
- * Group files by designKey (excludes side + garmentTone).
+ * Group files by designKey (identity only; excludes tone and legacy side segment).
  */
 export function groupParsedFiles(
   results: Array<{ file: File; result: ParseResult }>
@@ -186,18 +232,21 @@ export function groupParsedFiles(
     if (result.status !== "valid" || !result.parsed) continue;
     const key = result.parsed.designKey;
     const kind = importKindForParsedFile(result.parsed);
-    const side = result.parsed.side.toLowerCase();
+    const filenameLegacySide = result.parsed.filenameLegacySide;
     const existing = map.get(key);
+    const entry = { file, ext: result.parsed.extension, kind, filenameLegacySide };
     if (existing) {
-      existing.files.push({ file, ext: result.parsed.extension, kind, side });
-      if (!existing.sides.includes(side)) existing.sides.push(side);
+      existing.files.push(entry);
+      if (filenameLegacySide && !existing.legacyFilenameSides.includes(filenameLegacySide)) {
+        existing.legacyFilenameSides.push(filenameLegacySide);
+      }
     } else {
       map.set(key, {
         designKey: key,
         baseKey: key,
         parsed: result.parsed,
-        files: [{ file, ext: result.parsed.extension, kind, side }],
-        sides: [side],
+        files: [entry],
+        legacyFilenameSides: filenameLegacySide ? [filenameLegacySide] : [],
       });
     }
   }

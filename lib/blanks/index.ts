@@ -13,6 +13,8 @@ export {
   synthesizeLegacyVariant,
 } from "./blankModel";
 export { deriveColorFamily, getEffectiveColorFamily } from "./colorFamily";
+export { garmentCategoryDefaultPrintSides, inferDefaultPrintSides } from "./defaultPrintSides";
+export { getDefaultPrintSidesForStyleCode } from "@/lib/rp/blanks/styleRegistry";
 export {
   DEFAULT_SIMPLE_RENDER_CONTROLS_8394,
   derivePlacementEngineFields8394,
@@ -38,4 +40,4 @@ export {
   type EligibleTeamsResult,
   type TeamColorFamilyOption,
 } from "./eligibility";
-export { GARMENT_SIZE_CODES_ORDER, normalizeGarmentSizes } from "./garmentSizes";
+export { GARMENT_SIZE_CODES_ORDER, normalizeGarmentSizes, getProductVariantSizeList } from "./garmentSizes";

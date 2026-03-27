@@ -16,9 +16,18 @@ import {
   RpProduct,
   RPBlankRenderDefaults,
   type RPBlankGarmentSizeCode,
+  type RPBlankDefaultPrintSides,
 } from "@/lib/types/firestore";
 import { useAuth } from "@/lib/providers/AuthProvider";
-import { getEffectiveColorFamily, isMasterBlank, getEffectiveCategory, countActiveVariants, GARMENT_SIZE_CODES_ORDER, normalizeGarmentSizes } from "@/lib/blanks";
+import {
+  getEffectiveColorFamily,
+  isMasterBlank,
+  getEffectiveCategory,
+  countActiveVariants,
+  GARMENT_SIZE_CODES_ORDER,
+  normalizeGarmentSizes,
+  inferDefaultPrintSides,
+} from "@/lib/blanks";
 import { BlankVariantsManager } from "./BlankVariantsManager";
 import { BlankRenderProfileEditor } from "./BlankRenderProfileEditor";
 import { BlankEligibilityTab } from "./BlankEligibilityTab";
@@ -1171,6 +1180,35 @@ function BlankDetailContent() {
                       <div className="flex justify-between">
                         <dt className="text-sm text-gray-500">Linked products</dt>
                         <dd className="text-sm text-gray-900">{linkedProductCount}</dd>
+                      </div>
+                      <div className="flex justify-between gap-4">
+                        <dt className="text-sm text-gray-500 shrink-0">Default print sides</dt>
+                        <dd className="text-sm text-gray-900 text-right min-w-0">
+                          <select
+                            className={BLANK_FIELD_COMPACT + " max-w-[11rem]"}
+                            value={blank.defaultPrintSides ?? ""}
+                            onChange={async (e) => {
+                              const v = e.target.value;
+                              const next: RPBlankDefaultPrintSides | null =
+                                v === "front_only" || v === "back_only" || v === "both" ? v : null;
+                              try {
+                                await updateBlank({ blankId: blank.blankId, defaultPrintSides: next });
+                                refetchBlank();
+                                showToast("Default print sides saved", "success");
+                              } catch {
+                                showToast("Save failed", "error");
+                              }
+                            }}
+                          >
+                            <option value="">Inferred ({inferDefaultPrintSides(blank)})</option>
+                            <option value="front_only">Front only</option>
+                            <option value="back_only">Back only</option>
+                            <option value="both">Both</option>
+                          </select>
+                          <p className="text-[10px] text-gray-500 mt-1">
+                            Garment default for new products; must overlap design artwork sides.
+                          </p>
+                        </dd>
                       </div>
                       {blank.supplierUrl && (
                         <div className="flex justify-between">

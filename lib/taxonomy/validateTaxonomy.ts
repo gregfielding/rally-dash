@@ -15,7 +15,10 @@
 export interface TaxonomyClassification {
   sportCode: string | null;
   leagueCode: string | null;
-  teamCode: string | null;
+  /** Canonical entity id (`rp_taxonomy_entities.code`), e.g. `los_angeles_dodgers` */
+  teamId?: string | null;
+  /** @deprecated Prefer `teamId`; still accepted for older forms */
+  teamCode?: string | null;
 }
 
 export interface TaxonomyValidationResult {
@@ -34,10 +37,10 @@ function hasValue(s: string | null | undefined): boolean {
 export function validateTaxonomyClassification(
   classification: TaxonomyClassification
 ): TaxonomyValidationResult {
-  const { sportCode, leagueCode, teamCode } = classification;
+  const { sportCode, leagueCode, teamCode, teamId } = classification;
   const hasSport = hasValue(sportCode);
   const hasLeague = hasValue(leagueCode);
-  const hasTeam = hasValue(teamCode);
+  const hasTeam = hasValue(teamId) || hasValue(teamCode);
 
   if (hasTeam && !hasLeague) {
     return { valid: false, message: "Entity requires League. Select a League (e.g. NCAA for college)." };

@@ -31,6 +31,7 @@ import {
   RPPlacement,
   RPBlankVariant,
   RPBlankEligibility,
+  RPBlankDefaultPrintSides,
 } from "@/lib/types/firestore";
 
 // Re-export types and constants from style registry
@@ -44,6 +45,7 @@ export {
   isValidStyleColor,
   getStyleInfo,
   getDefaultPlacements,
+  getDefaultPrintSidesForStyleCode,
 } from "@/lib/rp/blanks/styleRegistry";
 
 export type {
@@ -249,6 +251,8 @@ export interface UpdateBlankInput {
    * Style-level garment sizes (XS–XL phase 1). Future Shopify sync: inherited **Size** option alongside **Color**.
    */
   garmentSizes?: RPBlankGarmentSizeCode[] | null;
+  /** Garment-level default for which sides receive print; omit to leave unchanged. */
+  defaultPrintSides?: RPBlankDefaultPrintSides | null;
 }
 
 /**
@@ -314,6 +318,30 @@ export function useSeedBlanks() {
   }, []);
 
   return { seedBlanks };
+}
+
+/**
+ * Admin: persist `defaultPrintSides` on blanks missing it (from STYLE_REGISTRY + category fallback).
+ * Default `dryRun: true`. Pass `{ dryRun: false }` to write. Pass `{ force: true }` to overwrite explicit values.
+ */
+export function useBackfillBlankDefaultPrintSides() {
+  const backfillBlankDefaultPrintSides = useCallback(
+    async (opts?: { dryRun?: boolean; force?: boolean }) => {
+      if (!functions) throw new Error("Cloud Functions not initialized");
+      const fn = httpsCallable(functions, "backfillBlankDefaultPrintSides");
+      const result = await fn(opts ?? { dryRun: true });
+      return result.data as {
+        ok: boolean;
+        dryRun?: boolean;
+        force?: boolean;
+        wouldUpdate?: number;
+        updated?: number;
+        sample?: Array<{ id: string; blankId: string; next: string; prev: string | null }>;
+      };
+    },
+    []
+  );
+  return { backfillBlankDefaultPrintSides };
 }
 
 /**

@@ -13,6 +13,7 @@ import {
   where,
   addDoc,
   serverTimestamp,
+  deleteField,
 } from "firebase/firestore";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import {
@@ -39,8 +40,19 @@ import { useBlanks } from "@/lib/hooks/useBlanks";
 import { useTaxonomyLeagues, useTaxonomyEntities, useTaxonomyDesignFamilies } from "@/lib/hooks/useTaxonomy";
 import { db, storage } from "@/lib/firebase/config";
 import { useAuth } from "@/lib/providers/AuthProvider";
-import type { DesignDoc } from "@/lib/types/firestore";
+import type { DesignDoc, RPBlank } from "@/lib/types/firestore";
 import { getDesignPreviewUrl, resolveDesignAssets } from "@/lib/designs/designHelpers";
+import { inferDefaultPrintSides } from "@/lib/blanks/defaultPrintSides";
+
+/** Garment print side for batch product creation from blank defaults (not from design filename). */
+function primaryPlacementSideFromBlank(blank: RPBlank): "front" | "back" {
+  const mode = inferDefaultPrintSides(blank);
+  if (mode === "back_only") return "back";
+  if (mode === "front_only") return "front";
+  const gv = blank.generationDefaults?.primaryView;
+  if (gv === "back") return "back";
+  return "front";
+}
 
 type Step = "upload" | "preview";
 type ImportRowResult = { baseKey: string; action: "created" | "updated" | "skipped"; designId: string; error?: string; warnings?: string[] };
@@ -180,7 +192,11 @@ function BatchImportContent() {
 
     for (const [baseKey, row] of grouped.entries()) {
       const { parsed, files: rowFiles } = row;
-      const supportedSides = [...row.sides].sort();
+      /** Legacy filename sides only; canonical imports omit field so flat tone files apply to any print side. */
+      const hasLegacyFilenameSide = rowFiles.some((f) => f.filenameLegacySide != null);
+      const supportedSidesForDoc = hasLegacyFilenameSide
+        ? [...new Set(rowFiles.map((f) => f.filenameLegacySide).filter(Boolean) as string[])].sort()
+        : null;
       const existing = existingByImportKey.get(baseKey);
       let designId: string;
 
@@ -233,7 +249,9 @@ function BatchImportContent() {
             importKey: baseKey,
             ...taxonomyPayload,
             ...importThemePayload,
-            supportedSides,
+            ...(supportedSidesForDoc != null
+              ? { supportedSides: supportedSidesForDoc }
+              : { supportedSides: deleteField() }),
             variant: parsed.garmentTone,
             updatedAt: new Date(),
             updatedByUid: uid,
@@ -277,7 +295,9 @@ function BatchImportContent() {
             importKey: baseKey,
             ...taxonomyPayload,
             ...importThemePayload,
-            supportedSides,
+            ...(supportedSidesForDoc != null
+              ? { supportedSides: supportedSidesForDoc }
+              : { supportedSides: deleteField() }),
             variant: parsed.garmentTone,
             updatedAt: new Date(),
             updatedByUid: uid,
@@ -356,7 +376,8 @@ function BatchImportContent() {
         continue;
       }
       const { parsed } = row;
-      const side = parsed.side.toUpperCase();
+      const placementSide = primaryPlacementSideFromBlank(blank);
+      const side = placementSide === "front" ? "FRONT" : "BACK";
       const parsedForProduct: ParsedForProduct = {
         leagueCode: parsed.league,
         designFamily: parsed.designFamily,
@@ -526,7 +547,12 @@ function BatchImportContent() {
         </nav>
         <h1 className="text-2xl font-bold text-gray-900">Batch Design Import</h1>
         <p className="text-sm text-gray-500 mt-1">
-          Upload PNG, SVG, or PDF files. Filenames must follow: LEAGUE_DESIGNNAME_TEAM_SIDE_VARIANT (e.g. MLB_WILL_DROP_FOR_GIANTS_BACK_LIGHT.png).
+          Upload PNG, SVG, or PDF files. Canonical names end with artwork tone only:{" "}
+          <span className="font-mono">…_light</span>, <span className="font-mono">…_dark</span>, or{" "}
+          <span className="font-mono">…_white</span> before the extension (e.g.{" "}
+          <span className="font-mono">mlb_sf_giants_city_69_light.png</span>). Legacy{" "}
+          <span className="font-mono">…_front_…</span> / <span className="font-mono">…_back_…</span> names still work.
+          Garment placement is determined by the blank and product build, not the filename.
         </p>
       </div>
 
@@ -599,8 +625,8 @@ function BatchImportContent() {
                     <th className="text-left py-2 px-3 font-medium text-gray-700">League</th>
                     <th className="text-left py-2 px-3 font-medium text-gray-700">Family</th>
                     <th className="text-left py-2 px-3 font-medium text-gray-700">Team</th>
-                    <th className="text-left py-2 px-3 font-medium text-gray-700">Side</th>
-                    <th className="text-left py-2 px-3 font-medium text-gray-700">Variant</th>
+                    <th className="text-left py-2 px-3 font-medium text-gray-700">Legacy side</th>
+                    <th className="text-left py-2 px-3 font-medium text-gray-700">Tone</th>
                     <th className="text-left py-2 px-3 font-medium text-gray-700">Suggested name</th>
                     <th className="text-left py-2 px-3 font-medium text-gray-700">Status</th>
                   </tr>
@@ -615,7 +641,9 @@ function BatchImportContent() {
                       <td className="py-2 px-3 text-gray-600">{result.parsed?.league ?? "—"}</td>
                       <td className="py-2 px-3 text-gray-600">{result.parsed?.designFamily ?? "—"}</td>
                       <td className="py-2 px-3 text-gray-600">{result.parsed?.team ?? "—"}</td>
-                      <td className="py-2 px-3 text-gray-600">{result.parsed?.side ?? "—"}</td>
+                      <td className="py-2 px-3 text-gray-600">
+                        {result.parsed?.filenameLegacySide ?? "—"}
+                      </td>
                       <td className="py-2 px-3 text-gray-600">{result.parsed?.variant ?? "—"}</td>
                       <td className="py-2 px-3 text-gray-700">{result.parsed ? suggestedDesignName(result.parsed) : "—"}</td>
                       <td className="py-2 px-3">
@@ -738,7 +766,8 @@ function BatchImportContent() {
               <section className="bg-white rounded-lg shadow-sm border border-gray-200 p-6 mb-6">
                 <h2 className="text-lg font-semibold text-gray-900 mb-3">3. Generate products</h2>
                 <p className="text-sm text-gray-500 mb-4">
-                  Create or update Rally products from selected imported designs. One product per identity (league + family + team + blank + variant); FRONT and BACK imports map to the same product.
+                  Create or update Rally products from selected imports. One product per identity (league + family + team + blank + tone variant). Print side follows the selected blank’s{" "}
+                  <span className="font-mono">defaultPrintSides</span> (or category defaults), not the filename.
                 </p>
                 <div className="flex flex-wrap items-center gap-4 mb-4">
                   <label className="flex items-center gap-2 text-sm">
@@ -796,7 +825,7 @@ function BatchImportContent() {
                           />
                         </th>
                         <th className="text-left py-2 px-3 font-medium text-gray-700">Key</th>
-                        <th className="text-left py-2 px-3 font-medium text-gray-700">Side</th>
+                        <th className="text-left py-2 px-3 font-medium text-gray-700">Legacy sides</th>
                         <th className="text-left py-2 px-3 font-medium text-gray-700">Design</th>
                       </tr>
                     </thead>
@@ -814,7 +843,11 @@ function BatchImportContent() {
                               />
                             </td>
                             <td className="py-2 px-3 font-mono text-xs text-gray-900">{r.baseKey}</td>
-                            <td className="py-2 px-3 text-gray-600">{row?.parsed?.side ?? "—"}</td>
+                            <td className="py-2 px-3 text-gray-600">
+                              {row?.legacyFilenameSides?.length
+                                ? row.legacyFilenameSides.join(", ")
+                                : "—"}
+                            </td>
                             <td className="py-2 px-3">
                               <Link href={`/designs/${r.designId}`} className="text-blue-600 hover:underline">View design</Link>
                             </td>

@@ -38,6 +38,7 @@ export function synthesizeLegacyVariant(blank: RPBlank): RPBlankVariant {
       back: blank.images?.back ?? null,
       detail: null,
     },
+    preferredArtworkTone: null,
   };
 }
 

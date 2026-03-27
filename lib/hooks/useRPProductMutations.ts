@@ -47,7 +47,13 @@ export function useCreateProductFromDesignBlank() {
       const fn = httpsCallable(functions, "createProductFromDesignBlank");
       const result = await fn(input);
       await mutate("rp_products", undefined, { revalidate: true });
-      return result.data as { ok: boolean; productId: string; slug: string; variantId?: string };
+      return result.data as {
+        ok: boolean;
+        productId: string;
+        slug: string;
+        variantId?: string;
+        variantIds?: string[];
+      };
     },
     [mutate]
   );
@@ -77,6 +83,7 @@ export function useCreateProductVariantsFromDesignBlank() {
         results: Array<{
           blankVariantId: string;
           variantFirestoreId?: string;
+          variantFirestoreIds?: string[];
           productId?: string | null;
           slug?: string | null;
           created?: boolean;
@@ -160,7 +167,11 @@ export function useGenerateProductFlatRenders() {
   const { mutate } = useSWRConfig();
 
   const generateProductFlatRenders = useCallback(
-    async (input: { productId: string }) => {
+    async (input: {
+      productId: string;
+      productVariantId?: string | null;
+      renderTypes?: ("flat_blended_back" | "flat_clean_front")[];
+    }) => {
       if (!functions) {
         throw new Error("Cloud Functions not initialized");
       }
@@ -175,7 +186,12 @@ export function useGenerateProductFlatRenders() {
         ok: boolean;
         productId: string;
         inputFingerprint: string;
-        urls: { flat_clean_back: string; flat_blended_back: string };
+        renderTypes?: string[];
+        urls: {
+          flat_clean_back: string | null;
+          flat_blended_back: string | null;
+          flat_clean_front: string | null;
+        };
       };
     },
     [mutate]
@@ -214,4 +230,79 @@ export function useGenerateProductSceneRender() {
   );
 
   return { generateProductSceneRender };
+}
+
+/** Re-queue 8394 back mock or re-run flat renders for a color variant (server-side pipeline). */
+export function useRetryVariant8394Assets() {
+  const { mutate } = useSWRConfig();
+
+  const retryVariant8394Assets = useCallback(
+    async (input: { productId: string; variantId: string }) => {
+      if (!functions) {
+        throw new Error("Cloud Functions not initialized");
+      }
+      const fn = httpsCallable(functions, "retryVariant8394Assets");
+      const result = await fn(input);
+      await mutate(
+        (key) => typeof key === "string" && key.startsWith("rp_product"),
+        undefined,
+        { revalidate: true }
+      );
+      return result.data as { ok: boolean; skipped?: boolean; reason?: string; requeued?: string; reran?: string };
+    },
+    [mutate]
+  );
+
+  return { retryVariant8394Assets };
+}
+
+/** Queue deterministic scene job (v1: neutral_hanger). Writes `rp_scene_render_jobs`; worker processes async. */
+export function useCreateSceneRenderJob() {
+  const { mutate } = useSWRConfig();
+
+  const createSceneRenderJob = useCallback(
+    async (input: { productId: string; productVariantId: string; sceneKey?: string }) => {
+      if (!functions) {
+        throw new Error("Cloud Functions not initialized");
+      }
+      const fn = httpsCallable(functions, "createSceneRenderJob");
+      const result = await fn(input);
+      await mutate(
+        (key) => typeof key === "string" && key.startsWith("rp_product"),
+        undefined,
+        { revalidate: true }
+      );
+      return result.data as { ok: boolean; jobId: string };
+    },
+    [mutate]
+  );
+
+  return { createSceneRenderJob };
+}
+
+/** Update merchandising approval on a scene row in `rp_product_assets` (+ variant cache). */
+export function useUpdateSceneAssetApproval() {
+  const { mutate } = useSWRConfig();
+
+  const updateSceneAssetApproval = useCallback(
+    async (input: {
+      assetId: string;
+      approvalState: "approved" | "rejected" | "pending_review" | "auto_approved" | "needs_review";
+    }) => {
+      if (!functions) {
+        throw new Error("Cloud Functions not initialized");
+      }
+      const fn = httpsCallable(functions, "updateSceneAssetApproval");
+      const result = await fn(input);
+      await mutate(
+        (key) => typeof key === "string" && key.startsWith("rp_product"),
+        undefined,
+        { revalidate: true }
+      );
+      return result.data as { ok: boolean };
+    },
+    [mutate]
+  );
+
+  return { updateSceneAssetApproval };
 }

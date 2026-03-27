@@ -14,7 +14,7 @@ import { useBlanks } from "@/lib/hooks/useBlanks";
 import { useCreateMockJob } from "@/lib/hooks/useMockAssets";
 import { useScenePresets as useRPScenePresets } from "@/lib/hooks/useRPScenePresets";
 import { RpProductStatus, RpProductCategory } from "@/lib/types/firestore";
-import { isMasterBlank, getBlankVariants } from "@/lib/blanks";
+import { isMasterBlank, getBlankVariants, inferDefaultPrintSides } from "@/lib/blanks";
 import useSWR from "swr";
 import { collection, getDocs, query, orderBy, doc, deleteDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase/config";
@@ -158,16 +158,16 @@ function ProductsContent() {
         blankVariantId:
           selBlank && isMasterBlank(selBlank) && designBlankVariantId ? designBlankVariantId : undefined,
       });
-      const is8394BackOnly = String(selBlank?.styleCode || "").trim() === "8394";
+      const useBack = selBlank ? inferDefaultPrintSides(selBlank) === "back_only" : false;
       const jobId = await createMockJob({
         designId: designBlankDesignId,
         blankId: designBlankBlankId,
-        view: is8394BackOnly ? "back" : "front",
-        placementId: is8394BackOnly ? "back_center" : "front_center",
+        view: useBack ? "back" : "front",
+        placementId: useBack ? "back_center" : "front_center",
         quality: "draft",
         productId: result.productId,
         productVariantId: result.variantId,
-        heroSlot: is8394BackOnly ? "hero_back" : "hero_front",
+        heroSlot: useBack ? "hero_back" : "hero_front",
       });
       if (jobId) {
         setIsDesignBlankOpen(false);

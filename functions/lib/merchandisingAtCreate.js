@@ -1,6 +1,10 @@
 "use strict";
 
 const { stripUnresolvedTemplateArtifacts } = require("./resolveBlankTemplates");
+const { buildProductTags, tagsNormalizedFromTags, slugifyUnderscore } = require("./buildProductTags");
+const {
+  canonicalTeamSlugFromDesignTeam,
+} = require("./canonicalTeamSlug");
 
 /**
  * Storefront merchandising at product creation (design + blank + team + variant).
@@ -266,29 +270,6 @@ function buildCollectionKeys({ leagueSlug, teamNicknameSlug, garmentCollectionKe
   return [...new Set(keys.filter(Boolean))];
 }
 
-function buildCommerceTags({ team, blank, colorName, designShortName, leagueToken, garmentTagSlug }) {
-  const seen = new Set();
-  const tags = [];
-
-  function pushTag(raw) {
-    const t = normalizeCommerceTag(raw);
-    if (!t || seen.has(t)) return;
-    seen.add(t);
-    tags.push(t);
-  }
-
-  if (team && team.name) pushTag(team.name.replace(/\s+/g, " "));
-  if (team && team.teamName) pushTag(team.teamName);
-  if (leagueToken) pushTag(leagueToken);
-  if (designShortName) pushTag(String(designShortName));
-  if (garmentTagSlug) pushTag(garmentTagSlug);
-  if (colorName) pushTag(colorName);
-
-  for (const m of extractMaterialStyleTags(blank)) pushTag(m);
-
-  return tags;
-}
-
 function normalizeLeagueCode(team, design) {
   const raw =
     (design.leagueCode && String(design.leagueCode).trim()) ||
@@ -419,6 +400,91 @@ function inferTaxonomyForGeneratedSportsProduct(team, design, designShortNameFor
   };
 }
 
+function buildProductTypeForTags(blank) {
+  const sc = String(blank.styleCode || "").trim();
+  if (sc === "8394") {
+    return { productTypeName: "Bikini Panty", productTypeSlug: "bikini_panty" };
+  }
+  const word = buildStorefrontProductTypeWord(blank);
+  const gs = String(blank.garmentStyle || blank.styleName || "").toLowerCase();
+  if (word === "Panty" && gs.includes("bikini")) {
+    return { productTypeName: "Bikini Panty", productTypeSlug: "bikini_panty" };
+  }
+  return { productTypeName: word, productTypeSlug: slugifyUnderscore(word) };
+}
+
+function inferCityFromTeamAndCity(team, teamDisplayName) {
+  if (team && team.city && String(team.city).trim()) {
+    const cityName = toTitleCaseWords(String(team.city).trim());
+    return { cityName, citySlug: slugifyUnderscore(cityName) };
+  }
+  if (teamDisplayName) {
+    const parts = String(teamDisplayName).trim().split(/\s+/);
+    if (parts.length >= 2) {
+      const cityName = toTitleCaseWords(parts.slice(0, -1).join(" "));
+      return { cityName, citySlug: slugifyUnderscore(cityName) };
+    }
+  }
+  return { cityName: null, citySlug: null };
+}
+
+/**
+ * Full taxonomy row for Firestore + tag builder (dual-layer tags spec).
+ * @param {object} inferred - return value of inferTaxonomyForGeneratedSportsProduct
+ */
+function mergeFullTaxonomyFromInfer(team, design, blank, inferred) {
+  const teamDisplay = inferred.taxonomy.teamName || buildTeamDisplayName(team, design);
+  const city = inferCityFromTeamAndCity(team, teamDisplay);
+  const pt = buildProductTypeForTags(blank);
+  const teamWithId =
+    team && typeof team === "object" ? { ...team, id: team.id != null ? String(team.id) : undefined } : team;
+  const canonicalSlug = canonicalTeamSlugFromDesignTeam(teamWithId, teamDisplay);
+  const teamSlug = canonicalSlug;
+
+  const taxonomy = {
+    ...inferred.taxonomy,
+    cityName: city.cityName,
+    citySlug: city.citySlug,
+    teamName: teamDisplay,
+    teamSlug,
+    teamId: canonicalSlug || undefined,
+    leagueName: inferred.taxonomy.leagueName,
+    leagueCode: inferred.leagueCode,
+    sportName: inferred.taxonomy.sportName,
+    sportCode: inferred.sportCode,
+    themeName: inferred.taxonomy.themeName,
+    themeCode: inferred.themeCode,
+    productTypeName: pt.productTypeName,
+    productTypeSlug: pt.productTypeSlug,
+  };
+
+  return {
+    sportCode: inferred.sportCode,
+    leagueCode: inferred.leagueCode,
+    teamCode: inferred.teamCode,
+    themeCode: inferred.themeCode,
+    designFamily: inferred.designFamily,
+    taxonomy,
+  };
+}
+
+/**
+ * Used by migration: same tags as create/refresh when team/design/blank are loaded.
+ */
+function rebuildProductTagsSnapshotFromSources(team, design, blank) {
+  const designShortName = designTypeToStorefrontShort(design.designType);
+  const inferred = inferTaxonomyForGeneratedSportsProduct(team, design, designShortName);
+  const tax = mergeFullTaxonomyFromInfer(team, design, blank, inferred);
+  const tags = buildProductTags({
+    taxonomy: tax.taxonomy,
+    sportCode: tax.sportCode,
+    leagueCode: tax.leagueCode,
+    themeCode: tax.themeCode,
+  });
+  const tagsNormalized = tagsNormalizedFromTags(tags);
+  return { tags, tagsNormalized, tax };
+}
+
 /**
  * @returns {object} fields to merge into rp_products
  */
@@ -455,15 +521,6 @@ function buildResolvedMerchandisingBundle({
 
   const designShortKey = designShortName ? String(designShortName).toLowerCase() : "";
 
-  const tags = buildCommerceTags({
-    team,
-    blank,
-    colorName: colorTitle,
-    designShortName,
-    leagueToken,
-    garmentTagSlug,
-  });
-
   const collectionKeys = buildCollectionKeys({
     leagueSlug: leagueToken,
     teamNicknameSlug: teamNick,
@@ -471,7 +528,15 @@ function buildResolvedMerchandisingBundle({
     designShortKey,
   });
 
-  const tax = inferTaxonomyForGeneratedSportsProduct(team, design, designShortName);
+  const taxInfer = inferTaxonomyForGeneratedSportsProduct(team, design, designShortName);
+  const tax = mergeFullTaxonomyFromInfer(team, design, blank, taxInfer);
+  const tags = buildProductTags({
+    taxonomy: tax.taxonomy,
+    sportCode: tax.sportCode,
+    leagueCode: tax.leagueCode,
+    themeCode: tax.themeCode,
+  });
+  const tagsNormalized = tagsNormalizedFromTags(tags);
 
   const trimmedResolved =
     resolvedBlankDescription && String(resolvedBlankDescription).trim()
@@ -517,7 +582,7 @@ function buildResolvedMerchandisingBundle({
     descriptionText: finalTextV,
     shortDescription,
     tags,
-    tagsNormalized: tags,
+    tagsNormalized,
     collectionKeys,
     teamNameFull,
     designShortName,
@@ -561,15 +626,6 @@ function buildResolvedMerchandisingBundleForParent({
   const garmentTagSlug = garmentCategoryToTagSlug(blank);
   const designShortKey = designShortName ? String(designShortName).toLowerCase() : "";
 
-  const tags = buildCommerceTags({
-    team,
-    blank,
-    colorName: "",
-    designShortName,
-    leagueToken,
-    garmentTagSlug,
-  });
-
   const collectionKeys = buildCollectionKeys({
     leagueSlug: leagueToken,
     teamNicknameSlug: teamNick,
@@ -577,7 +633,15 @@ function buildResolvedMerchandisingBundleForParent({
     designShortKey,
   });
 
-  const tax = inferTaxonomyForGeneratedSportsProduct(team, design, designShortName);
+  const taxInfer = inferTaxonomyForGeneratedSportsProduct(team, design, designShortName);
+  const tax = mergeFullTaxonomyFromInfer(team, design, blank, taxInfer);
+  const tags = buildProductTags({
+    taxonomy: tax.taxonomy,
+    sportCode: tax.sportCode,
+    leagueCode: tax.leagueCode,
+    themeCode: tax.themeCode,
+  });
+  const tagsNormalized = tagsNormalizedFromTags(tags);
 
   const trimmedResolved =
     resolvedBlankDescription && String(resolvedBlankDescription).trim()
@@ -612,7 +676,6 @@ function buildResolvedMerchandisingBundleForParent({
   finalHtml = `<p>${escBody}</p>`;
   const seoDescription = finalText.slice(0, 320);
   const shortDescription = buildShortDescriptionFromBody(finalText);
-  const tagsDeduped = tags.map((t) => collapseDuplicateAdjacentPhrases(t));
 
   return {
     displayTitle,
@@ -624,8 +687,8 @@ function buildResolvedMerchandisingBundleForParent({
     descriptionHtml: finalHtml,
     descriptionText: finalText,
     shortDescription,
-    tags: tagsDeduped,
-    tagsNormalized: tagsDeduped,
+    tags,
+    tagsNormalized,
     collectionKeys,
     teamNameFull,
     designShortName,
@@ -648,8 +711,9 @@ module.exports = {
   generateSlugFromTitle,
   buildStorefrontSeoDescription,
   buildSeoTitle,
-  buildCommerceTags,
   buildCollectionKeys,
+  mergeFullTaxonomyFromInfer,
+  rebuildProductTagsSnapshotFromSources,
   buildResolvedMerchandisingBundle,
   buildResolvedMerchandisingBundleForParent,
   buildStorefrontTitleParent,

@@ -216,6 +216,18 @@ service cloud.firestore {
       allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
     }
 
+    // rp_scene_templates/{sceneTemplateId} — deterministic alt-image templates (v1+)
+    match /rp_scene_templates/{sceneTemplateId} {
+      allow read: if isAdmin() && (hasRole('ops') || hasRole('admin') || hasRole('editor'));
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
+    // rp_scene_render_jobs/{jobId} — scene generation queue
+    match /rp_scene_render_jobs/{jobId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
     // rp_hero_templates/{templateId} — hero template registry (structural; pipeline not active yet)
     match /rp_hero_templates/{templateId} {
       allow read: if isAdmin() && (hasRole('ops') || hasRole('admin') || hasRole('editor'));
@@ -323,6 +335,19 @@ service cloud.firestore {
       allow create: if false; // Only created by Cloud Functions
       allow update: if false; // Only updated by Cloud Functions
       allow delete: if false;
+    }
+
+    // rp_design_import_jobs/{jobId} — bulk design upload (dashboard + ops)
+    match /rp_design_import_jobs/{jobId} {
+      allow read: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+      allow create, update: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+      allow delete: if isAdmin() && hasRole('admin');
+
+      match /items/{itemId} {
+        allow read: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+        allow create, update: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+        allow delete: if isAdmin() && hasRole('admin');
+      }
     }
 
     // --------------------------------------------------------------------

@@ -7,7 +7,8 @@ export interface ParsedForProduct {
   leagueCode: string;
   designFamily: string;
   teamCode: string;
-  side: string; // "FRONT" | "BACK"
+  /** @deprecated Batch legacy only; placement uses blank + product build, not filename */
+  side?: string | null;
   variant: string;
 }
 
@@ -23,7 +24,7 @@ function normalizeKeySegment(s: string): string {
  * Format: leagueCode_designFamily_teamCode_blankId_variant
  * Example: MLB_WILL_DROP_FOR_GIANTS_HEATHER_GREY_BIKINI_LIGHT
  *
- * FRONT and BACK imports for the same (league, family, team, blank, variant) map to the same product.
+ * Same (league, family, team, blank, variant) maps to one product; print side comes from the blank, not the filename.
  */
 export function productIdentityKey(
   leagueCode: string,

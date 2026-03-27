@@ -16,9 +16,13 @@ import {
   useGenerateProductAssets,
   useGenerateProductFlatRenders,
   useGenerateProductSceneRender,
+  useCreateSceneRenderJob,
+  useUpdateSceneAssetApproval,
   useRefreshProductMerchandisingFromSources,
+  useRetryVariant8394Assets,
 } from "@/lib/hooks/useRPProductMutations";
 import { useCreateMockJob, useWatchMockJob } from "@/lib/hooks/useMockAssets";
+import { useProductFailedMockJobsByVariant } from "@/lib/hooks/useProductMockJobFailures";
 import { useIdentities } from "@/lib/hooks/useIdentities";
 import { useModelPacks } from "@/lib/hooks/useModelPacks";
 import { useLoraArtifacts } from "@/lib/hooks/useLoraArtifacts";
@@ -27,7 +31,7 @@ import { useDesignConcepts } from "@/lib/hooks/useDesignConcepts";
 import { useCreateProductDesign, useCreateDesignFromConcept, useCreateDesignBrief } from "@/lib/hooks/useDesignMutations";
 import { useDesign, useDesigns } from "@/lib/hooks/useDesignAssets";
 import { useBlank, useBlanks } from "@/lib/hooks/useBlanks";
-import { getVariantById } from "@/lib/blanks";
+import { getVariantById, inferDefaultPrintSides } from "@/lib/blanks";
 import { designSupportsGarmentSide, getDesignPreviewUrl } from "@/lib/designs/designHelpers";
 import {
   computeProductFlatRenderFingerprintAsync,
@@ -49,6 +53,9 @@ import {
   useTaxonomyDesignFamilies,
 } from "@/lib/hooks/useTaxonomy";
 import { validateTaxonomyClassification } from "@/lib/taxonomy/validateTaxonomy";
+import { resolveTaxonomyEntity } from "@/lib/taxonomy/resolveTaxonomyEntity";
+import { enrichTaxonomyAndTagsForSave } from "@/lib/taxonomy/enrichProductTaxonomyForTags";
+import { buildProductTagsFromRpProduct, tagsNormalizedFromTags } from "@/lib/products/buildProductTags";
 import Modal from "@/components/Modal";
 import {
   RpPrintMethod,
@@ -63,6 +70,7 @@ import {
   type RPBlankGarmentSizeCode,
   type RpGenerationType,
   type RpScenePreset,
+  type RpProductFlatRendersMvp,
 } from "@/lib/types/firestore";
 import {
   hasProductPlacementOverride,
@@ -78,6 +86,13 @@ import {
   DEFAULT_SCENE_RENDER_KEY,
   IMPLEMENTED_SCENE_RENDER_KEYS,
 } from "@/lib/generation/generationDefaultsConfig";
+import {
+  getVariant8394ReadinessState,
+  isProductFullyCatalogReady8394,
+  isProductStorefrontReady8394,
+  isVariantBaseComplete8394,
+} from "@/lib/products/variantReadiness";
+import { Variant8394ReadinessBadge } from "@/components/products/Variant8394ReadinessBadge";
 import {
   resolveProductGeneration,
   inferGenerationTypeFromPreset,
@@ -1749,7 +1764,14 @@ function ProductDetailContent() {
     colorName?: string | null;
     blankVariantId?: string | null;
     mockupUrl?: string | null;
+    sku?: string | null;
+    status?: string | null;
+    optionValues?: { color?: string | null; size?: string | null } | null;
     media?: { heroFront?: string | null; heroBack?: string | null } | null;
+    flatRenders?: RpProductFlatRendersMvp | null;
+    sceneTemplateRenders?: Record<string, import("@/lib/types/firestore").RpProductVariantSceneRender> | null;
+    assetPipeline?: import("@/lib/types/firestore").RpVariantAssetPipeline8394 | null;
+    variant8394NextRetryAt?: unknown;
   };
 
   const params = useParams();
@@ -1846,14 +1868,28 @@ function ProductDetailContent() {
               colorName?: string | null;
               blankVariantId?: string | null;
               mockupUrl?: string | null;
+              sku?: string | null;
+              status?: string | null;
+              optionValues?: { color?: string | null; size?: string | null } | null;
               media?: { heroFront?: string | null; heroBack?: string | null } | null;
+              flatRenders?: RpProductFlatRendersMvp | null;
+              sceneTemplateRenders?: Record<string, import("@/lib/types/firestore").RpProductVariantSceneRender> | null;
+              assetPipeline?: import("@/lib/types/firestore").RpVariantAssetPipeline8394 | null;
+              variant8394NextRetryAt?: unknown;
             };
             return {
               id: d.id,
               colorName: v.colorName ?? null,
               blankVariantId: v.blankVariantId ?? null,
               mockupUrl: v.mockupUrl ?? null,
+              sku: v.sku ?? null,
+              status: v.status ?? null,
+              optionValues: v.optionValues ?? null,
               media: v.media ?? null,
+              flatRenders: v.flatRenders ?? null,
+              sceneTemplateRenders: v.sceneTemplateRenders ?? null,
+              assetPipeline: v.assetPipeline ?? null,
+              variant8394NextRetryAt: v.variant8394NextRetryAt,
             } as ProductVariantRow;
           })
           .sort((a, b) =>
@@ -1867,6 +1903,12 @@ function ProductDetailContent() {
             blankVariantId: s.blankVariantId ?? null,
             mockupUrl: null,
             media: null,
+            sku: null,
+            status: "active",
+            optionValues: {
+              color: s.colorName ?? null,
+              size: s.sizeCode ?? product.availableSizes?.[0] ?? null,
+            },
           }));
         }
 
@@ -1889,6 +1931,12 @@ function ProductDetailContent() {
             blankVariantId: s.blankVariantId ?? null,
             mockupUrl: null,
             media: null,
+            sku: null,
+            status: "active",
+            optionValues: {
+              color: s.colorName ?? null,
+              size: s.sizeCode ?? product.availableSizes?.[0] ?? null,
+            },
           })) ?? [];
         if (!cancelled) setProductVariants(fallback);
       } finally {
@@ -1918,7 +1966,10 @@ function ProductDetailContent() {
     [productVariants, imagesTabVariantId]
   );
 
-  /** Legacy single-doc mockup on parent, or color-variant mockup on variant row. */
+  /**
+   * Variant has any storefront-relevant image (mockup, heroes, or 8394 flat package).
+   * Must align with `shopifyPreviewGalleryUrls` so we do not show “no images” when flats exist but heroes are unset.
+   */
   const hasMockupForGenerateUi = useMemo(() => {
     if (!product) return false;
     if (treatsAsParentProduct) {
@@ -1926,10 +1977,16 @@ function ProductDetailContent() {
       return !!(
         v?.mockupUrl ||
         v?.media?.heroFront ||
-        v?.media?.heroBack
+        v?.media?.heroBack ||
+        v?.flatRenders?.flat_blended?.back?.url ||
+        v?.flatRenders?.flat_clean?.front?.url
       );
     }
-    return !!product.mockupUrl;
+    return !!(
+      product.mockupUrl ||
+      product.flatRenders?.flat_blended?.back?.url ||
+      product.flatRenders?.flat_clean?.front?.url
+    );
   }, [product, shopifyPreviewVariantDoc, treatsAsParentProduct]);
 
   /** URL for “master composite” preview: variant row for parents, else parent.mockupUrl. */
@@ -1937,37 +1994,128 @@ function ProductDetailContent() {
     if (!product) return null;
     if (treatsAsParentProduct && shopifyPreviewVariantDoc) {
       const v = shopifyPreviewVariantDoc;
-      return v.mockupUrl || v.media?.heroBack || v.media?.heroFront || null;
+      return (
+        v.mockupUrl ||
+        v.media?.heroBack ||
+        v.media?.heroFront ||
+        v.flatRenders?.flat_blended?.back?.url ||
+        v.flatRenders?.flat_clean?.front?.url ||
+        null
+      );
     }
-    return product.mockupUrl ?? null;
+    return (
+      product.mockupUrl ||
+      product.flatRenders?.flat_blended?.back?.url ||
+      product.flatRenders?.flat_clean?.front?.url ||
+      null
+    );
   }, [product, shopifyPreviewVariantDoc, treatsAsParentProduct]);
+
+  /** Default/hero variant row: Shopify readiness checks parent.media, but mocks write heroes to the variant doc */
+  const shopifyReadinessVariantDoc = useMemo(() => {
+    if (!treatsAsParentProduct || productVariants.length === 0) return null;
+    const hid = product?.heroVariantId || product?.defaultVariantId;
+    if (hid) return productVariants.find((v) => v.id === hid) ?? null;
+    return productVariants[0] ?? null;
+  }, [treatsAsParentProduct, product?.heroVariantId, product?.defaultVariantId, productVariants]);
+
+  const shopifyReadinessMediaFallback = useMemo(() => {
+    if (!shopifyReadinessVariantDoc) return undefined;
+    return {
+      heroFront: shopifyReadinessVariantDoc.media?.heroFront ?? null,
+      heroBack: shopifyReadinessVariantDoc.media?.heroBack ?? null,
+      mockupUrl: shopifyReadinessVariantDoc.mockupUrl ?? null,
+    };
+  }, [shopifyReadinessVariantDoc]);
+
+  /** Strict matrix checks for parent products (aligned with `onShopifySyncJobCreated`). */
+  const shopifyActiveVariantsInput = useMemo(() => {
+    if (!treatsAsParentProduct) return undefined;
+    return productVariants.map((v) => ({
+      sku: v.sku,
+      status: v.status,
+      optionValues: {
+        color: v.optionValues?.color ?? v.colorName,
+        size: v.optionValues?.size,
+      },
+      media: v.media,
+      mockupUrl: v.mockupUrl,
+      flatRenders: v.flatRenders,
+    }));
+  }, [treatsAsParentProduct, productVariants]);
 
   const shopifyPreviewGalleryUrls = useMemo(() => {
     if (!product) return [] as string[];
-    const v = shopifyPreviewVariantDoc;
+    const backFirst = String(product.blankStyleCode || "").trim() === "8394";
     const out: string[] = [];
     const add = (u?: string | null) => {
       if (u && typeof u === "string" && u.trim() && !out.includes(u.trim())) out.push(u.trim());
     };
-    const backFirst = String(product.blankStyleCode || "").trim() === "8394";
-    if (treatsAsParentProduct && v) {
-      const m = v.media || {};
+
+    const urlsFromVariant = (row: ProductVariantRow | null | undefined): string[] => {
+      if (!row) return [];
+      const acc: string[] = [];
+      const push = (u?: string | null) => {
+        if (u && typeof u === "string" && u.trim() && !acc.includes(u.trim())) acc.push(u.trim());
+      };
+      const m = row.media || {};
+      const fr = row.flatRenders;
+      const hasHeroSlot = !!(m.heroBack || m.heroFront);
       if (backFirst) {
-        add(m.heroBack);
-        add(m.heroFront);
+        push(m.heroBack);
+        push(m.heroFront);
       } else {
-        add(m.heroFront);
-        add(m.heroBack);
+        push(m.heroFront);
+        push(m.heroBack);
       }
-      add(v.mockupUrl);
+      // mockupUrl is usually the same back composite as heroBack; including it adds a duplicate third thumbnail.
+      if (!hasHeroSlot) {
+        push(row.mockupUrl);
+      }
+      // Same source as 8394 readiness / scene pipeline: variant-native flats (deduped with heroes).
+      if (backFirst) {
+        push(fr?.flat_blended?.back?.url);
+        push(fr?.flat_clean?.front?.url);
+      } else {
+        push(fr?.flat_clean?.front?.url);
+        push(fr?.flat_blended?.back?.url);
+      }
+      return acc;
+    };
+
+    const appendParentFallback = () => {
+      add(product.displayMedia?.heroUrl);
+      add(product.displayMedia?.thumbUrl);
+      add(product.media?.heroFront);
+      add(product.media?.heroBack);
+      add(product.mockupUrl);
+    };
+
+    if (treatsAsParentProduct && productVariants.length > 0) {
+      const tryList = [
+        shopifyPreviewVariantDoc,
+        product.heroVariantId ? productVariants.find((x) => x.id === product.heroVariantId) : undefined,
+        product.defaultVariantId ? productVariants.find((x) => x.id === product.defaultVariantId) : undefined,
+        productVariants[0],
+      ];
+      for (const row of tryList) {
+        const urls = urlsFromVariant(row);
+        if (urls.length > 0) return urls;
+      }
+      appendParentFallback();
+      return out;
     }
-    add(product.displayMedia?.heroUrl);
-    add(product.displayMedia?.thumbUrl);
-    add(product.media?.heroFront);
-    add(product.media?.heroBack);
-    add(product.mockupUrl);
+
+    appendParentFallback();
     return out;
-  }, [product, shopifyPreviewVariantDoc, treatsAsParentProduct]);
+  }, [
+    product,
+    treatsAsParentProduct,
+    productVariants,
+    shopifyPreviewVariantDoc,
+    product?.heroVariantId,
+    product?.defaultVariantId,
+  ]);
 
   const { designs, loading: designsLoading, refetch: refetchDesigns } = useProductDesigns(
     product?.id ? { productId: product.id } : null
@@ -2043,11 +2191,19 @@ function ProductDetailContent() {
   const generationType = isProductOnly ? "product_only" : "on_model";
   const { generateProductAssets } = useGenerateProductAssets();
   const { generateProductFlatRenders } = useGenerateProductFlatRenders();
+  const { retryVariant8394Assets } = useRetryVariant8394Assets();
+  const [retrying8394Assets, setRetrying8394Assets] = useState(false);
+  const [queueingNeutralHangerScene, setQueueingNeutralHangerScene] = useState(false);
   const { generateProductSceneRender } = useGenerateProductSceneRender();
+  const { createSceneRenderJob } = useCreateSceneRenderJob();
+  const { updateSceneAssetApproval } = useUpdateSceneAssetApproval();
   const { refreshProductMerchandisingFromSources } = useRefreshProductMerchandisingFromSources();
   const { createJob: createMockJob } = useCreateMockJob();
   const [lastMockJobId, setLastMockJobId] = useState<string | null>(null);
   const { job: mockJob } = useWatchMockJob(lastMockJobId);
+  const failedMockByVariant = useProductFailedMockJobsByVariant(
+    treatsAsParentProduct ? product?.id ?? null : null
+  );
   const { packs } = useModelPacks();
 
   // Render Setup: explicit blank/design/side (part of product definition)
@@ -2110,6 +2266,30 @@ function ProductDetailContent() {
       !!currentBlank &&
       String(currentBlank.styleCode || "").trim() === "8394",
     [blankLoading, product?.blankId, currentBlank]
+  );
+
+  const show8394VariantReadinessUi =
+    treatsAsParentProduct && is8394ProductContext && productVariants.length > 0;
+
+  const heroOrDefaultVariantId = product?.heroVariantId || product?.defaultVariantId || null;
+  const storefrontReady8394 = useMemo(
+    () => isProductStorefrontReady8394(heroOrDefaultVariantId, productVariants),
+    [heroOrDefaultVariantId, productVariants]
+  );
+  const catalogReady8394 = useMemo(
+    () => isProductFullyCatalogReady8394(productVariants),
+    [productVariants]
+  );
+
+  const readinessStateForVariant = useCallback(
+    (v: ProductVariantRow) => {
+      const failedMsg =
+        failedMockByVariant[v.id] && !isVariantBaseComplete8394(v)
+          ? failedMockByVariant[v.id]
+          : null;
+      return getVariant8394ReadinessState(v, { failedMessage: failedMsg });
+    },
+    [failedMockByVariant]
   );
 
   /** Canonical back placement + effective blend + inputs the server would use (8394 back MVP). */
@@ -2195,11 +2375,6 @@ function ProductDetailContent() {
   // UI-only: which view to generate in Generate tab (renderer still chooses config by view)
   const [generateView, setGenerateView] = useState<"front" | "back">("front");
 
-  useEffect(() => {
-    if (!resolved) return;
-    setGenerateView(resolved.primaryView.value);
-  }, [product?.blankId, resolved?.primaryView.value]);
-
   // Merchandising form state (spec-aligned fields); synced from product when product loads
   const [merchandising, setMerchandising] = useState({
     title: "",
@@ -2258,28 +2433,10 @@ function ProductDetailContent() {
   // Taxonomy form state (product-level)
   const [taxSportCode, setTaxSportCode] = useState<string | null>(null);
   const [taxLeagueCode, setTaxLeagueCode] = useState<string | null>(null);
-  const [taxTeamCode, setTaxTeamCode] = useState<string | null>(null);
+  const [taxTeamId, setTaxTeamId] = useState<string | null>(null);
   const [taxThemeCode, setTaxThemeCode] = useState<string | null>(null);
   const [taxDesignFamily, setTaxDesignFamily] = useState<string | null>(null);
   const [isSavingTaxonomy, setIsSavingTaxonomy] = useState(false);
-  useEffect(() => {
-    if (!product) return;
-    const tx = product.taxonomy;
-    const entityCode = tx?.teamId ?? tx?.teamCode ?? product.teamCode ?? null;
-    setTaxSportCode(product.sportCode ?? null);
-    setTaxLeagueCode(product.leagueCode ?? null);
-    setTaxTeamCode(entityCode);
-    setTaxThemeCode(tx?.themeCode ?? product.themeCode ?? null);
-    setTaxDesignFamily(product.designFamily ?? tx?.designFamily ?? null);
-  }, [
-    product?.id,
-    product?.sportCode,
-    product?.leagueCode,
-    product?.teamCode,
-    product?.themeCode,
-    product?.designFamily,
-    product?.taxonomy,
-  ]);
   const { sports: taxonomySports } = useTaxonomySports();
   const { leagues: taxonomyLeagues } = useTaxonomyLeagues(taxSportCode ?? undefined);
   const { entities: taxonomyEntities } = useTaxonomyEntities({
@@ -2289,12 +2446,39 @@ function ProductDetailContent() {
   const { themes: taxonomyThemes } = useTaxonomyThemes(taxSportCode ?? undefined);
   const { designFamilies: taxonomyDesignFamilies } = useTaxonomyDesignFamilies();
 
+  useEffect(() => {
+    if (!product) return;
+    const tx = product.taxonomy;
+    setTaxSportCode(product.sportCode ?? null);
+    setTaxLeagueCode(product.leagueCode ?? null);
+    const storedTeamKey = tx?.teamId ?? product.teamId ?? null;
+    if (!storedTeamKey?.trim()) {
+      setTaxTeamId(null);
+    } else if (taxonomyEntities?.length) {
+      const ent = resolveTaxonomyEntity(storedTeamKey, taxonomyEntities);
+      setTaxTeamId(ent?.code ?? null);
+    } else {
+      setTaxTeamId(null);
+    }
+    setTaxThemeCode(tx?.themeCode ?? product.themeCode ?? null);
+    setTaxDesignFamily(product.designFamily ?? tx?.designFamily ?? null);
+  }, [
+    product?.id,
+    product?.sportCode,
+    product?.leagueCode,
+    product?.teamId,
+    product?.themeCode,
+    product?.designFamily,
+    product?.taxonomy,
+    taxonomyEntities,
+  ]);
+
   const handleSaveProductTaxonomy = async () => {
     if (!product?.id || !db) return;
     const validation = validateTaxonomyClassification({
       sportCode: taxSportCode ?? null,
       leagueCode: taxLeagueCode ?? null,
-      teamCode: taxTeamCode ?? null,
+      teamId: taxTeamId ?? null,
     });
     if (!validation.valid) {
       showToast(validation.message ?? "Invalid taxonomy", "error");
@@ -2304,19 +2488,42 @@ function ProductDetailContent() {
     try {
       const productRef = doc(db, "rp_products", product.id);
       const prevTx = product.taxonomy ?? {};
+      const ent = resolveTaxonomyEntity(taxTeamId, taxonomyEntities);
+      const internalTeamCode = ent?.code ?? prevTx.teamCode ?? product.teamCode ?? null;
+      const { taxonomy: fullTx, tags, tagsNormalized } = enrichTaxonomyAndTagsForSave(
+        product,
+        {
+          taxSportCode,
+          taxLeagueCode,
+          taxTeamId,
+          taxThemeCode,
+          taxDesignFamily,
+        },
+        taxonomySports ?? [],
+        taxonomyLeagues ?? [],
+        taxonomyEntities ?? [],
+        taxonomyThemes ?? [],
+        currentBlank ?? null
+      );
+      const canonicalTeamKey = fullTx.teamSlug ?? fullTx.teamId ?? null;
       await updateDoc(productRef, {
         sportCode: taxSportCode ?? null,
         leagueCode: taxLeagueCode ?? null,
-        teamCode: taxTeamCode ?? null,
+        teamId: canonicalTeamKey,
+        teamName: fullTx.teamName ?? ent?.name ?? product.teamName ?? null,
+        teamCode: internalTeamCode,
         themeCode: taxThemeCode ?? null,
         designFamily: taxDesignFamily ?? null,
         taxonomy: {
-          ...prevTx,
-          teamId: taxTeamCode ?? null,
-          teamCode: taxTeamCode ?? null,
-          themeCode: taxThemeCode ?? null,
-          designFamily: taxDesignFamily ?? null,
+          ...fullTx,
+          teamId: canonicalTeamKey ?? fullTx.teamId ?? null,
+          teamName: fullTx.teamName ?? ent?.name ?? null,
+          teamCity: ent?.metadata?.city ?? fullTx.teamCity ?? null,
+          teamNickname: ent?.metadata?.nickname ?? fullTx.teamNickname ?? null,
+          teamCode: internalTeamCode,
         },
+        tags,
+        tagsNormalized,
         updatedAt: new Date(),
         updatedBy: product.updatedBy ?? "",
       });
@@ -2408,18 +2615,10 @@ function ProductDetailContent() {
   const blankIdForFallback = product?.renderConfig?.selectedBlankId || product?.blankId;
   const blankForFallback =
     blankIdForFallback === product?.blankId ? currentBlank : allBlanks.find((b) => (b as { blankId?: string }).blankId === blankIdForFallback) || currentBlank;
-  const resolvedBlankStyleCode = String(
-    currentBlank?.styleCode ||
-      (product?.blankId
-        ? (
-            allBlanks.find((b) => (b as { blankId?: string }).blankId === product.blankId) as
-              | { styleCode?: string }
-              | undefined
-          )?.styleCode || ""
-        : "")
-  ).trim();
-  /** LA Apparel 8394 bikini: catalog print is back-only (no front graphic). */
-  const is8394BackPrintOnlyBlank = resolvedBlankStyleCode === "8394";
+  /** Blank-level default for print side (8394 / panties → back_only when unset). */
+  const blankForPrintDefaults = (blankForFallback || currentBlank) as RPBlank | null | undefined;
+  const blankDefaultIsBackOnly =
+    blankForPrintDefaults != null ? inferDefaultPrintSides(blankForPrintDefaults) === "back_only" : false;
   /** Master blanks store front/back URLs on the variant row, not on blank.images.
    * Parent products: use the Images-tab color’s blankVariantId so light/dark design PNGs match the selected garment. */
   const variantForRenderSetup =
@@ -2454,7 +2653,7 @@ function ProductDetailContent() {
     !!product?.renderSetup?.front?.designAssetId ||
     !!product?.renderSetup?.front?.designAssetUrl;
   const allowImplicitFrontDesignFromProductId =
-    !is8394BackPrintOnlyBlank || explicitFrontDesignOnProduct;
+    !blankDefaultIsBackOnly || explicitFrontDesignOnProduct;
 
   const designFrontUrlResolved =
     product?.renderConfig?.selectedDesignImageUrlFront ||
@@ -2483,21 +2682,48 @@ function ProductDetailContent() {
 
   const blankAsRp = currentBlank as RPBlank | null | undefined;
   const effPlacementFront = useMemo(
-    () => (blankAsRp && product ? resolveEffectivePlacement(product, blankAsRp, "front") : null),
-    [blankAsRp, product, product?.placementOverrides, product?.renderSetup?.front?.placementOverride]
+    () =>
+      blankAsRp && product
+        ? resolveEffectivePlacement(product, blankAsRp, "front", variantForRenderSetup ?? undefined)
+        : null,
+    [
+      blankAsRp,
+      product,
+      variantForRenderSetup,
+      variantForRenderSetup?.renderProfileOverrides,
+      product?.placementOverrides,
+      product?.renderSetup?.front?.placementOverride,
+    ]
   );
   const effPlacementBack = useMemo(
-    () => (blankAsRp && product ? resolveEffectivePlacement(product, blankAsRp, "back") : null),
-    [blankAsRp, product, product?.placementOverrides, product?.renderSetup?.back?.placementOverride]
+    () =>
+      blankAsRp && product
+        ? resolveEffectivePlacement(product, blankAsRp, "back", variantForRenderSetup ?? undefined)
+        : null,
+    [
+      blankAsRp,
+      product,
+      variantForRenderSetup,
+      variantForRenderSetup?.renderProfileOverrides,
+      product?.placementOverrides,
+      product?.renderSetup?.back?.placementOverride,
+    ]
   );
 
   /** Effective config per side: prefer renderSetup, fallback to renderConfig + product (backward compat). */
   type SideConfig = { blankAssetId?: string | null; blankImageUrl?: string | null; designAssetId?: string | null; designAssetUrl?: string | null; placementKey?: string | null; placementOverride?: { x?: number; y?: number; scale?: number } | null };
+  /**
+   * Parent + master blank: light/dark PNG must follow the **blank variant’s** Family (rp_blanks.variants[].colorFamily),
+   * not a single cached URL on the product. Previously renderSetup.*.designAssetUrl won and pinned one asset for all colors.
+   */
+  const useVariantAwareDesignAssetUrl = treatsAsParentProduct && !!variantForRenderSetup;
   const effectiveFrontConfig: SideConfig = {
     blankAssetId: product?.renderSetup?.front?.blankAssetId ?? blankIdForFallback ?? null,
     blankImageUrl: product?.renderSetup?.front?.blankImageUrl ?? fallbackFrontBlankUrl ?? null,
     designAssetId: product?.renderSetup?.front?.designAssetId ?? implicitFrontDesignId ?? null,
-    designAssetUrl: product?.renderSetup?.front?.designAssetUrl ?? designFrontUrlResolved ?? null,
+    designAssetUrl: useVariantAwareDesignAssetUrl
+      ? designFrontUrlResolved ?? product?.renderSetup?.front?.designAssetUrl ?? null
+      : product?.renderSetup?.front?.designAssetUrl ?? designFrontUrlResolved ?? null,
     placementKey: product?.renderSetup?.front?.placementKey ?? "front_center",
     placementOverride: effPlacementFront
       ? { x: effPlacementFront.defaultX, y: effPlacementFront.defaultY, scale: effPlacementFront.defaultScale }
@@ -2507,7 +2733,9 @@ function ProductDetailContent() {
     blankAssetId: product?.renderSetup?.back?.blankAssetId ?? blankIdForFallback ?? null,
     blankImageUrl: product?.renderSetup?.back?.blankImageUrl ?? fallbackBackBlankUrl ?? null,
     designAssetId: product?.renderSetup?.back?.designAssetId ?? implicitBackDesignId ?? null,
-    designAssetUrl: product?.renderSetup?.back?.designAssetUrl ?? designBackUrlResolved ?? null,
+    designAssetUrl: useVariantAwareDesignAssetUrl
+      ? designBackUrlResolved ?? product?.renderSetup?.back?.designAssetUrl ?? null
+      : product?.renderSetup?.back?.designAssetUrl ?? designBackUrlResolved ?? null,
     placementKey: product?.renderSetup?.back?.placementKey ?? "back_center",
     placementOverride: effPlacementBack
       ? { x: effPlacementBack.defaultX, y: effPlacementBack.defaultY, scale: effPlacementBack.defaultScale }
@@ -2516,6 +2744,21 @@ function ProductDetailContent() {
 
   const designFrontUrl = effectiveFrontConfig.designAssetUrl ?? designFrontUrlResolved;
   const designBackUrl = effectiveBackConfig.designAssetUrl ?? designBackUrlResolved;
+
+  /** Back-only blanks: default Generate mockup to Back when no front artwork is configured. */
+  useEffect(() => {
+    if (!resolved) return;
+    if (blankDefaultIsBackOnly && !effectiveFrontConfig.designAssetUrl) {
+      setGenerateView("back");
+      return;
+    }
+    setGenerateView(resolved.primaryView.value);
+  }, [
+    product?.id,
+    resolved?.primaryView.value,
+    blankDefaultIsBackOnly,
+    effectiveFrontConfig.designAssetUrl,
+  ]);
 
   /** Persist one side's config to product.renderSetup (canonical). Also sync product.designIdFront/Back and defaults when saving design/blank. */
   const persistRenderSetupSide = async (side: "front" | "back", updates: Partial<NonNullable<NonNullable<RpProduct["renderSetup"]>["front"]>>) => {
@@ -2673,13 +2916,40 @@ function ProductDetailContent() {
     setTimeout(() => setToast(null), 5000);
   };
 
+  const handleRetry8394MissingAssets = async () => {
+    if (!product?.id || !imagesTabVariantId) return;
+    setRetrying8394Assets(true);
+    try {
+      await retryVariant8394Assets({ productId: product.id, variantId: imagesTabVariantId });
+      showToast("Retry started — mock/flat jobs will update this color variant shortly.", "success");
+      setVariantReloadTick((t) => t + 1);
+    } catch (err: unknown) {
+      const msg =
+        err && typeof err === "object" && "message" in err
+          ? String((err as { message?: string }).message)
+          : "Retry failed";
+      showToast(msg, "error");
+    } finally {
+      setRetrying8394Assets(false);
+    }
+  };
+
   const handleGenerateFlatRenders = async () => {
     if (!product?.id) return;
+    if (treatsAsParentProduct && !imagesTabVariantId) {
+      showToast("Select a color variant on the Images tab to generate flats for that variant.", "error");
+      return;
+    }
     setGeneratingFlatRenders(true);
     try {
-      await generateProductFlatRenders({ productId: product.id });
-      showToast("Natural preview + fabric blend saved on this product.", "success");
+      await generateProductFlatRenders({
+        productId: product.id,
+        productVariantId: treatsAsParentProduct ? imagesTabVariantId : undefined,
+        renderTypes: ["flat_blended_back", "flat_clean_front"],
+      });
+      showToast("Flat renders saved on the variant (natural + fabric blend + front clean).", "success");
       await refetchProduct();
+      setVariantReloadTick((t) => t + 1);
     } catch (err: unknown) {
       const msg =
         err && typeof err === "object" && "message" in err
@@ -2691,10 +2961,13 @@ function ProductDetailContent() {
     }
   };
 
-  const flatBlendedForScene = useMemo(
-    () => (product ? pickFlatBlendedUrlForScene(product.flatRenders) : null),
-    [product]
-  );
+  const flatBlendedForScene = useMemo(() => {
+    if (!product) return null;
+    if (treatsAsParentProduct && shopifyPreviewVariantDoc?.flatRenders) {
+      return pickFlatBlendedUrlForScene(shopifyPreviewVariantDoc.flatRenders);
+    }
+    return pickFlatBlendedUrlForScene(product.flatRenders);
+  }, [product, treatsAsParentProduct, shopifyPreviewVariantDoc]);
 
   const handleGenerateSceneRender = async () => {
     if (!product?.id) return;
@@ -3187,6 +3460,40 @@ function ProductDetailContent() {
           {" · "}
           {product.baseProductKey} · {product.colorway?.name ?? "—"}
         </p>
+        {show8394VariantReadinessUi && (
+          <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50/90 px-4 py-3 text-sm text-slate-800">
+            <p className="font-semibold text-slate-900">8394 variant assets</p>
+            <p className="mt-1 text-xs text-slate-600">
+              Base complete = back mock/hero, back fabric blend, front clean/hero. Storefront uses the hero or default color;
+              catalog needs every color.
+            </p>
+            <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm">
+              <span>
+                <span className="text-slate-500">Storefront ready</span>{" "}
+                <span className={storefrontReady8394 ? "font-semibold text-emerald-800" : "font-semibold text-amber-800"}>
+                  {storefrontReady8394 ? "Yes" : "No"}
+                </span>
+                {heroOrDefaultVariantId ? (
+                  <span className="text-slate-500 text-xs ml-1">
+                    (hero/default:{" "}
+                    {productVariants.find((x) => x.id === heroOrDefaultVariantId)?.colorName ||
+                      heroOrDefaultVariantId}
+                    )
+                  </span>
+                ) : null}
+              </span>
+              <span>
+                <span className="text-slate-500">Catalog complete</span>{" "}
+                <span className={catalogReady8394 ? "font-semibold text-emerald-800" : "font-semibold text-amber-800"}>
+                  {catalogReady8394 ? "Yes" : "No"}
+                </span>
+                <span className="text-slate-500 text-xs ml-1">
+                  ({productVariants.length} color{productVariants.length === 1 ? "" : "s"})
+                </span>
+              </span>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Tabs */}
@@ -3253,6 +3560,52 @@ function ProductDetailContent() {
                     No sizes copied yet — configure garment sizes on the blank, then refresh merchandising.
                   </p>
                 )}
+              </div>
+            )}
+
+            {treatsAsParentProduct && show8394VariantReadinessUi && (
+              <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
+                <h2 className="text-lg font-semibold text-gray-900 mb-2">Color variants (8394 assets)</h2>
+                <p className="text-xs text-gray-600 mb-3">
+                  Back mock/hero, back fabric blend, front clean/hero — per color. Storefront ready when the hero/default row is
+                  base complete; catalog when every row is.
+                </p>
+                <div className="overflow-x-auto rounded-md border border-gray-200 bg-white">
+                  <table className="min-w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-gray-200 bg-gray-50 text-left text-gray-600">
+                        <th className="py-2 px-3 font-medium">Color</th>
+                        <th className="py-2 px-3 font-medium">Blank variant</th>
+                        <th className="py-2 px-3 font-medium">Readiness</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {productVariants.map((v) => {
+                        const st = readinessStateForVariant(v);
+                        const isHero = v.id === heroOrDefaultVariantId;
+                        return (
+                          <tr key={v.id} className="border-b border-gray-100 last:border-b-0">
+                            <td className="py-2 px-3 text-gray-900">
+                              <span className="font-medium">{v.colorName || v.blankVariantId || v.id}</span>
+                              {isHero ? (
+                                <span className="ml-2 inline-block text-[10px] font-semibold uppercase text-blue-700">
+                                  hero/default
+                                </span>
+                              ) : null}
+                            </td>
+                            <td className="py-2 px-3 text-xs text-gray-600 font-mono">{v.blankVariantId || "—"}</td>
+                            <td className="py-2 px-3">
+                              <Variant8394ReadinessBadge
+                                state={st}
+                                title={st === "error" ? failedMockByVariant[v.id] : undefined}
+                              />
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
               </div>
             )}
 
@@ -3329,14 +3682,17 @@ function ProductDetailContent() {
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-gray-600 mb-1">Tags (comma-separated)</label>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Tags (derived from taxonomy)</label>
                   <input
                     type="text"
+                    readOnly
                     value={merchandising.tagsStr}
-                    onChange={(e) => setMerchandising((m) => ({ ...m, tagsStr: e.target.value }))}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
-                    placeholder="tag1, tag2"
+                    className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm bg-gray-50 text-gray-800"
+                    placeholder="Save taxonomy to generate tags"
                   />
+                  <p className="text-xs text-gray-500 mt-1">
+                    Tags are rebuilt from taxonomy + blank (dual-layer spec). Save taxonomy or merchandising to refresh.
+                  </p>
                 </div>
                 <div>
                   <label className="block text-xs font-medium text-gray-600 mb-1">Collection keys (comma-separated)</label>
@@ -3357,6 +3713,8 @@ function ProductDetailContent() {
                     setSavingMerchandising(true);
                     try {
                       const productRef = doc(db, "rp_products", product.id);
+                      const tagList = buildProductTagsFromRpProduct(product, currentBlank ?? null);
+                      const tagNorm = tagsNormalizedFromTags(tagList);
                       await updateDoc(productRef, {
                         title: merchandising.title || null,
                         handle: merchandising.handle || null,
@@ -3365,7 +3723,8 @@ function ProductDetailContent() {
                           title: merchandising.seoTitle || null,
                           description: merchandising.seoDescription || null,
                         },
-                        tags: merchandising.tagsStr ? merchandising.tagsStr.split(",").map((t) => t.trim()).filter(Boolean) : [],
+                        tags: tagList,
+                        tagsNormalized: tagNorm,
                         collectionKeys: merchandising.collectionKeysStr ? merchandising.collectionKeysStr.split(",").map((k) => k.trim()).filter(Boolean) : [],
                         updatedAt: new Date(),
                         updatedBy: product.updatedBy ?? "",
@@ -3402,7 +3761,7 @@ function ProductDetailContent() {
                       const v = e.target.value || null;
                       setTaxSportCode(v);
                       if (!v) setTaxLeagueCode(null);
-                      setTaxTeamCode(null);
+                      setTaxTeamId(null);
                       setTaxThemeCode(null);
                     }}
                     className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
@@ -3420,7 +3779,7 @@ function ProductDetailContent() {
                     onChange={(e) => {
                       const v = e.target.value || null;
                       setTaxLeagueCode(v);
-                      setTaxTeamCode(null);
+                      setTaxTeamId(null);
                     }}
                     className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
                   >
@@ -3433,13 +3792,13 @@ function ProductDetailContent() {
                 <div>
                   <label className="block text-xs font-medium text-gray-600 mb-1">Entity</label>
                   <select
-                    value={taxTeamCode ?? ""}
-                    onChange={(e) => setTaxTeamCode(e.target.value || null)}
+                    value={taxTeamId ?? ""}
+                    onChange={(e) => setTaxTeamId(e.target.value || null)}
                     className="w-full border border-gray-300 rounded px-2 py-1.5 bg-white text-sm"
                   >
                     <option value="">—</option>
-                    {taxTeamCode && !taxonomyEntities.some((ent) => ent.code === taxTeamCode) ? (
-                      <option value={taxTeamCode}>{taxTeamCode} (on product)</option>
+                    {taxTeamId && !resolveTaxonomyEntity(taxTeamId, taxonomyEntities) ? (
+                      <option value={taxTeamId}>Legacy entity — choose canonical team from list</option>
                     ) : null}
                     {(taxonomyEntities ?? []).map((ent) => (
                       <option key={ent.id} value={ent.code}>{ent.name}</option>
@@ -3623,24 +3982,116 @@ function ProductDetailContent() {
                 <p className="text-xs text-gray-500 mb-3">
                   Pick which color you’re working on. Per-variant assets and mockups live on the variant document; gallery below is still product-level until variant-scoped assets are fully wired.
                 </p>
+                {show8394VariantReadinessUi && (
+                  <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-600">
+                    <span>
+                      Storefront:{" "}
+                      <strong className={storefrontReady8394 ? "text-emerald-800" : "text-amber-800"}>
+                        {storefrontReady8394 ? "ready" : "not ready"}
+                      </strong>
+                    </span>
+                    <span className="text-gray-300">|</span>
+                    <span>
+                      Catalog:{" "}
+                      <strong className={catalogReady8394 ? "text-emerald-800" : "text-amber-800"}>
+                        {catalogReady8394 ? "complete" : "incomplete"}
+                      </strong>
+                    </span>
+                  </div>
+                )}
                 {productVariantsLoading ? (
                   <p className="text-sm text-gray-500">Loading variants…</p>
                 ) : productVariants.length > 0 ? (
-                  <label className="block max-w-md">
-                    <span className="sr-only">Variant</span>
-                    <select
-                      value={imagesTabVariantId}
-                      onChange={(e) => setImagesTabVariantId(e.target.value)}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white"
-                    >
-                      {productVariants.map((v) => (
-                        <option key={v.id} value={v.id}>
-                          {v.colorName || v.blankVariantId || v.id}
-                          {v.blankVariantId ? ` · ${v.blankVariantId}` : ""}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
+                  <div className="space-y-3 max-w-xl">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <label className="block flex-1 min-w-[12rem]">
+                        <span className="sr-only">Variant</span>
+                        <select
+                          value={imagesTabVariantId}
+                          onChange={(e) => setImagesTabVariantId(e.target.value)}
+                          className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm bg-white"
+                        >
+                          {productVariants.map((v) => (
+                            <option key={v.id} value={v.id}>
+                              {v.colorName || v.blankVariantId || v.id}
+                              {v.blankVariantId ? ` · ${v.blankVariantId}` : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      {is8394ProductContext && shopifyPreviewVariantDoc ? (
+                        <Variant8394ReadinessBadge
+                          state={readinessStateForVariant(shopifyPreviewVariantDoc)}
+                          title={
+                            readinessStateForVariant(shopifyPreviewVariantDoc) === "error" &&
+                            failedMockByVariant[shopifyPreviewVariantDoc.id]
+                              ? failedMockByVariant[shopifyPreviewVariantDoc.id]
+                              : undefined
+                          }
+                        />
+                      ) : null}
+                    </div>
+                    {is8394ProductContext && (
+                      <div className="rounded-md border border-gray-100 bg-gray-50/80 p-2">
+                        <p className="text-[11px] font-medium text-gray-600 mb-1.5">All colors</p>
+                        <ul className="flex flex-wrap gap-1.5">
+                          {productVariants.map((v) => {
+                            const st = readinessStateForVariant(v);
+                            const isHero =
+                              v.id === (product?.heroVariantId || product?.defaultVariantId);
+                            return (
+                              <li key={v.id}>
+                                <button
+                                  type="button"
+                                  onClick={() => setImagesTabVariantId(v.id)}
+                                  className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-left text-xs transition-colors ${
+                                    imagesTabVariantId === v.id
+                                      ? "border-blue-400 bg-blue-50/90 text-gray-900"
+                                      : "border-gray-200 bg-white text-gray-800 hover:border-gray-300"
+                                  }`}
+                                >
+                                  <span className="truncate max-w-[8rem]">
+                                    {v.colorName || v.blankVariantId || v.id}
+                                  </span>
+                                  {isHero ? (
+                                    <span className="text-[10px] font-semibold uppercase text-blue-700">hero</span>
+                                  ) : null}
+                                  <Variant8394ReadinessBadge state={st} compact title={st === "error" ? failedMockByVariant[v.id] : undefined} />
+                                </button>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      </div>
+                    )}
+                    {is8394ProductContext && shopifyPreviewVariantDoc && !isVariantBaseComplete8394(shopifyPreviewVariantDoc) ? (
+                      <div className="rounded-md border border-amber-200 bg-amber-50/60 px-3 py-2 text-xs text-amber-950">
+                        <p className="font-medium text-amber-900 mb-1">Asset pipeline</p>
+                        <p className="text-amber-800/90 mb-2">
+                          Back mock:{" "}
+                          <span className="font-mono text-[11px]">
+                            {shopifyPreviewVariantDoc.assetPipeline?.mock_back?.status ?? "—"}
+                          </span>
+                          {" · "}
+                          Flat render:{" "}
+                          <span className="font-mono text-[11px]">
+                            {shopifyPreviewVariantDoc.assetPipeline?.flat_render?.status ?? "—"}
+                          </span>
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => void handleRetry8394MissingAssets()}
+                          disabled={retrying8394Assets || !imagesTabVariantId}
+                          className="px-2.5 py-1.5 text-xs font-semibold rounded-md bg-amber-700 text-white hover:bg-amber-800 disabled:opacity-50"
+                        >
+                          {retrying8394Assets ? "Retrying…" : "Retry missing assets"}
+                        </button>
+                        <p className="text-[10px] text-amber-800/80 mt-1.5">
+                          Incomplete variants are also retried automatically on a schedule.
+                        </p>
+                      </div>
+                    ) : null}
+                  </div>
                 ) : (
                   <p className="text-sm text-amber-800">No variants under this product yet.</p>
                 )}
@@ -3672,7 +4123,7 @@ function ProductDetailContent() {
               ) : null}
               <p className="text-xs text-gray-600 mb-3">
                 Link blank + design per side. Placement numbers below follow the blank unless overridden.
-                {is8394BackPrintOnlyBlank ? (
+                {blankDefaultIsBackOnly ? (
                   <span className="block mt-1 text-gray-700">
                     <strong>8394 bikini:</strong> default layout is <strong>back print only</strong> (no front graphic from the linked design).
                   </span>
@@ -3714,7 +4165,7 @@ function ProductDetailContent() {
                     </div>
                     <div>
                       <label className="block text-xs font-medium text-gray-700 mb-1">Design</label>
-                      {is8394BackPrintOnlyBlank && !explicitFrontDesignOnProduct ? (
+                      {blankDefaultIsBackOnly && !explicitFrontDesignOnProduct ? (
                         <p className="text-sm text-gray-800 leading-snug">
                           <span className="font-mono text-gray-900">8394</span> uses a <strong>back-only</strong> print. Use{" "}
                           <strong>Back → Set design</strong> to attach artwork. The front stays blank unless you add an optional
@@ -4430,7 +4881,10 @@ function ProductDetailContent() {
               );
             })()}
             {(() => {
-              const { ready, missing, warnings } = isProductReadyForShopify(product);
+              const { ready, missing, warnings } = isProductReadyForShopify(product, {
+                mediaFallback: shopifyReadinessMediaFallback,
+                activeVariants: shopifyActiveVariantsInput,
+              });
               return (
                 <div className={`border rounded-lg p-4 ${ready ? "border-green-300 bg-green-50/50" : "border-amber-200 bg-amber-50/50"}`}>
                   <h2 className="text-lg font-semibold text-gray-900 mb-2">Product readiness</h2>
@@ -4455,8 +4909,12 @@ function ProductDetailContent() {
               );
             })()}
             {(() => {
-              const shopifyReady = isProductReadyForShopify(product);
-              const shopifyTags = buildShopifyTags(product);
+              const shopifyReady = isProductReadyForShopify(product, {
+                mediaFallback: shopifyReadinessMediaFallback,
+                activeVariants: shopifyActiveVariantsInput,
+              });
+              const shopifyTags =
+                product.tags && product.tags.length > 0 ? product.tags : buildShopifyTags(product);
               return (
                 <div className="border border-gray-200 rounded-lg p-4 bg-gray-50/50">
                   <h2 className="text-lg font-semibold text-gray-900 mb-3">Shopify</h2>
@@ -4481,7 +4939,9 @@ function ProductDetailContent() {
                             ))}
                           </span>
                         ) : (
-                          <span className="text-gray-400 text-xs">No taxonomy tags (sport/league/team/theme/model). Set classification on the Product tab to drive Smart Collections.</span>
+                          <span className="text-gray-400 text-xs">
+                            No product tags yet. Save taxonomy on the Product tab to generate dual-layer tags (human + structured).
+                          </span>
                         )}
                       </dd>
                     </div>
@@ -4521,9 +4981,19 @@ function ProductDetailContent() {
                   <div className="mt-3">
                     <button
                       type="button"
-                      disabled={!shopifyReady.ready || syncingToShopify}
+                      disabled={
+                        !shopifyReady.ready ||
+                        syncingToShopify ||
+                        (treatsAsParentProduct && productVariantsLoading)
+                      }
                       className="px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                      title={!shopifyReady.ready ? `Missing: ${shopifyReady.missing.join(", ")}` : undefined}
+                      title={
+                        treatsAsParentProduct && productVariantsLoading
+                          ? "Loading variants…"
+                          : !shopifyReady.ready
+                          ? `Missing: ${shopifyReady.missing.join(", ")}`
+                          : undefined
+                      }
                       onClick={async () => {
                         if (!db || !product?.id || !shopifyReady.ready) return;
                         setSyncingToShopify(true);
@@ -4606,6 +5076,120 @@ function ProductDetailContent() {
                   }
                 />
               </div>
+
+              {treatsAsParentProduct && product?.id && imagesTabVariantId ? (
+                <div className="border border-indigo-100 rounded-lg p-4 bg-indigo-50/30">
+                  <h3 className="text-sm font-semibold text-gray-900">Alt scenes (v1) — neutral hanger</h3>
+                  <p className="text-xs text-gray-600 mt-1 mb-3">
+                    Uses the selected color variant&apos;s flat blends / heroes. Queues a Cloud Function job; failures do not
+                    block product readiness.
+                  </p>
+                  {(() => {
+                    const vRow = productVariants.find((x) => x.id === imagesTabVariantId);
+                    const slot = vRow?.sceneTemplateRenders?.neutral_hanger;
+                    return (
+                      <div className="space-y-3">
+                        <button
+                          type="button"
+                          disabled={queueingNeutralHangerScene || !product.id}
+                          className="px-3 py-1.5 text-xs font-medium rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                          onClick={async () => {
+                            if (!product.id || !imagesTabVariantId) return;
+                            setQueueingNeutralHangerScene(true);
+                            try {
+                              await createSceneRenderJob({
+                                productId: product.id,
+                                productVariantId: imagesTabVariantId,
+                                sceneKey: "neutral_hanger",
+                              });
+                              showToast("Neutral hanger job queued. Variant list refreshes shortly.", "success");
+                              setTimeout(() => setVariantReloadTick((t) => t + 1), 6000);
+                            } catch (err) {
+                              console.error(err);
+                              showToast(err instanceof Error ? err.message : "Failed to queue scene job", "error");
+                            } finally {
+                              setQueueingNeutralHangerScene(false);
+                            }
+                          }}
+                        >
+                          {queueingNeutralHangerScene ? "Queuing…" : "Queue neutral hanger scene"}
+                        </button>
+                        {slot?.assetUrl ? (
+                          <div className="flex flex-wrap gap-4 items-start">
+                            <a
+                              href={slot.assetUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="block shrink-0"
+                            >
+                              {/* eslint-disable-next-line @next/next/no-img-element */}
+                              <img
+                                src={slot.assetUrl}
+                                alt="Neutral hanger"
+                                className="max-h-40 rounded border border-gray-200"
+                              />
+                            </a>
+                            <div className="text-xs text-gray-700 space-y-1 min-w-0">
+                              <p>
+                                Status: <span className="font-mono">{slot.status}</span> · Approval:{" "}
+                                <span className="font-mono">{slot.approvalState}</span>
+                              </p>
+                              {slot.assetId ? (
+                                <p className="font-mono text-[10px] break-all">asset: {slot.assetId}</p>
+                              ) : null}
+                              {slot.sourceAssetRef ? (
+                                <p className="text-gray-500">Source: {slot.sourceAssetRef}</p>
+                              ) : null}
+                              {slot.assetId ? (
+                                <div className="flex flex-wrap gap-2 pt-2">
+                                  <button
+                                    type="button"
+                                    className="px-2 py-1 text-xs rounded bg-white border border-gray-300 hover:bg-gray-50"
+                                    onClick={async () => {
+                                      try {
+                                        await updateSceneAssetApproval({
+                                          assetId: slot.assetId!,
+                                          approvalState: "approved",
+                                        });
+                                        showToast("Marked approved", "success");
+                                        setVariantReloadTick((t) => t + 1);
+                                      } catch (e) {
+                                        showToast(e instanceof Error ? e.message : "Update failed", "error");
+                                      }
+                                    }}
+                                  >
+                                    Approve
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="px-2 py-1 text-xs rounded bg-white border border-gray-300 hover:bg-gray-50"
+                                    onClick={async () => {
+                                      try {
+                                        await updateSceneAssetApproval({
+                                          assetId: slot.assetId!,
+                                          approvalState: "rejected",
+                                        });
+                                        showToast("Marked rejected", "success");
+                                        setVariantReloadTick((t) => t + 1);
+                                      } catch (e) {
+                                        showToast(e instanceof Error ? e.message : "Update failed", "error");
+                                      }
+                                    }}
+                                  >
+                                    Reject
+                                  </button>
+                                </div>
+                              ) : null}
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="text-xs text-gray-500">No neutral_hanger output for this color yet.</p>
+                        )}
+                      </div>
+                    );
+                  })()}
+                </div>
+              ) : null}
 
               <div className="space-y-6 border-t border-gray-200 pt-8">
             <div>

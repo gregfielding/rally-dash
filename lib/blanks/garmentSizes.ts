@@ -23,3 +23,13 @@ export function normalizeGarmentSizes(input: unknown): RPBlankGarmentSizeCode[] 
   }
   return out;
 }
+
+/**
+ * Sizes used when materializing `rp_products/.../variants` (Color × Size).
+ * Uses blank `garmentSizes` when set; otherwise full phase-1 set XS–XL.
+ */
+export function getProductVariantSizeList(blank: { garmentSizes?: unknown }): readonly RPBlankGarmentSizeCode[] {
+  const normalized = normalizeGarmentSizes(blank.garmentSizes);
+  if (normalized && normalized.length > 0) return normalized;
+  return GARMENT_SIZE_CODES_ORDER;
+}

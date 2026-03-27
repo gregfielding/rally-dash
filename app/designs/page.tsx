@@ -491,18 +491,24 @@ function DesignsContent() {
               (all <code className="text-xs bg-gray-100 px-1 rounded">design_teams</code> — colors &amp; metadata).
             </p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
+            <Link
+              href="/designs/bulk-upload"
+              className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium shadow-sm"
+            >
+              Bulk upload designs
+            </Link>
             <Link
               href="/designs/batch"
-              className="px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium"
+              className="px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 font-medium text-sm"
             >
-              Batch Import
+              Batch import (legacy + products)
             </Link>
             <button
               onClick={() => setIsCreateModalOpen(true)}
-              className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
+              className="px-4 py-2 border border-dashed border-gray-400 text-gray-700 rounded-lg hover:bg-gray-50 font-medium text-sm"
             >
-              + Create Design
+              Manual create (single)
             </button>
           </div>
         </div>
@@ -695,7 +701,7 @@ function DesignsContent() {
                         </td>
                         <td className="px-4 py-4">
                           {(() => {
-                            const { light, dark } = designGarmentAssetBadges(design);
+                            const { light, dark, white } = designGarmentAssetBadges(design);
                             return (
                               <div className="flex flex-wrap gap-1">
                                 <span
@@ -711,6 +717,13 @@ function DesignsContent() {
                                   }`}
                                 >
                                   Dark Garment {dark ? "✓" : "missing"}
+                                </span>
+                                <span
+                                  className={`inline-flex items-center text-[10px] px-2 py-0.5 rounded font-medium ${
+                                    white ? "bg-green-100 text-green-800" : "bg-gray-100 text-gray-500"
+                                  }`}
+                                >
+                                  White artwork {white ? "✓" : "missing"}
                                 </span>
                               </div>
                             );
@@ -796,9 +809,16 @@ function DesignsContent() {
           setIsCreateModalOpen(false);
           resetCreateForm();
         }}
-        title="Create New Design"
+        title="Manual create (single design)"
       >
         <div className="space-y-4">
+          <p className="text-sm text-gray-600">
+            For one-off entry when filenames are not available. For multiple tone files (light / dark / white), use{" "}
+            <Link href="/designs/bulk-upload" className="text-blue-600 font-medium underline">
+              Bulk upload designs
+            </Link>
+            .
+          </p>
           {createError && (
             <div className="p-3 bg-red-50 text-red-700 rounded-lg text-sm">
               {createError}
@@ -996,9 +1016,11 @@ function DesignsContent() {
             <div>
               <h3 className="text-sm font-semibold text-gray-900">Assets</h3>
               <p className="text-xs text-gray-500 mt-1">
-                PNGs map to <code className="text-[10px] bg-white px-1 rounded">assets.lightPng</code> /{" "}
-                <code className="text-[10px] bg-white px-1 rounded">assets.darkPng</code>. Optional SVG/PDF use the same
-                light vs dark garment split for production masters.
+                Artwork tone files (light / dark / white): these are side-agnostic unless you add per-side files on the
+                design detail page. Garment print placement comes from the blank and product build, not from filenames.
+                PNGs here map to <code className="text-[10px] bg-white px-1 rounded">assets.lightPng</code> /{" "}
+                <code className="text-[10px] bg-white px-1 rounded">assets.darkPng</code>. Optional SVG/PDF follow the
+                same tone split for production masters.
               </p>
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">

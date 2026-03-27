@@ -7,9 +7,12 @@ import type {
   RPBlank,
   RPBlankVariant,
   RPImageRef,
+  RPBlankArtworkTone,
   RPBlankColorFamily,
   RPBlankVariantEligibilityOverride,
+  RPBlankVariantRenderProfileSideOverride,
 } from "@/lib/types/firestore";
+import { getPlacementRowForSide } from "@/lib/products/resolveProductRenderProfile";
 import type { UpdateBlankInput } from "@/lib/hooks/useBlanks";
 import { useDesignTeams } from "@/lib/hooks/useDesignAssets";
 import {
@@ -109,7 +112,9 @@ export function BlankVariantsManager({
       sortOrder: variants.length,
       images: { front: null, back: null, detail: null },
       renderOverrides: null,
+      renderProfileOverrides: null,
       eligibilityOverride: null,
+      preferredArtworkTone: null,
     };
     setEditing(v);
     setAdding(true);
@@ -310,6 +315,46 @@ function VariantEditorModal({
   const [uploadingView, setUploadingView] = useState<"front" | "back" | "detail" | null>(null);
   const [deletingView, setDeletingView] = useState<"front" | "back" | "detail" | null>(null);
 
+  const backPlacementIds = useMemo(
+    () =>
+      (blank.placements ?? [])
+        .filter((p) => String(p.placementId).startsWith("back_"))
+        .map((p) => p.placementId),
+    [blank.placements]
+  );
+  const backDefaultRow = useMemo(() => getPlacementRowForSide(blank, "back", null), [blank]);
+  const customizeRenderProfile = editing.renderProfileOverrides != null;
+  const backOv = editing.renderProfileOverrides?.back;
+
+  const setBackPatch = (patch: Partial<RPBlankVariantRenderProfileSideOverride>) => {
+    const prev = editing.renderProfileOverrides ?? {};
+    setEditing({
+      ...editing,
+      renderProfileOverrides: {
+        ...prev,
+        back: { ...(prev.back ?? {}), ...patch },
+      },
+    });
+  };
+
+  const clearBackField = (key: keyof RPBlankVariantRenderProfileSideOverride) => {
+    const prev = editing.renderProfileOverrides;
+    if (!prev?.back) return;
+    const b = { ...prev.back };
+    delete (b as Record<string, unknown>)[key];
+    const next: NonNullable<RPBlankVariant["renderProfileOverrides"]> = { ...prev };
+    if (Object.keys(b).length === 0) {
+      delete next.back;
+    } else {
+      next.back = b;
+    }
+    if (!next.front && !next.back) {
+      setEditing({ ...editing, renderProfileOverrides: null });
+    } else {
+      setEditing({ ...editing, renderProfileOverrides: next });
+    }
+  };
+
   const mergeImages = (patch: Partial<NonNullable<RPBlankVariant["images"]>>): NonNullable<RPBlankVariant["images"]> => ({
     front: editing.images?.front ?? null,
     back: editing.images?.back ?? null,
@@ -482,6 +527,26 @@ function VariantEditorModal({
             <option value="light">light</option>
             <option value="dark">dark</option>
           </select>
+          <label className="block text-xs font-medium text-gray-700">Preferred artwork tone (optional)</label>
+          <p className="text-[11px] text-gray-600">
+            Overrides default light/dark garment artwork mapping when the design includes that tone (e.g. white ink on pink).
+            Leave as default to use color family only.
+          </p>
+          <select
+            className="w-full border rounded px-2 py-1"
+            value={editing.preferredArtworkTone ?? ""}
+            onChange={(e) => {
+              const v = e.target.value;
+              const next: RPBlankArtworkTone | null =
+                v === "light" || v === "dark" || v === "white" ? v : null;
+              setEditing({ ...editing, preferredArtworkTone: next });
+            }}
+          >
+            <option value="">Default (from color family)</option>
+            <option value="light">light</option>
+            <option value="dark">dark</option>
+            <option value="white">white</option>
+          </select>
           <label className="block text-xs font-medium text-gray-700">Vendor color name</label>
           <input
             className="w-full border rounded px-2 py-1"
@@ -523,6 +588,277 @@ function VariantEditorModal({
             {imageSlot("back", "Back")}
             {imageSlot("detail", "Detail")}
           </div>
+        </div>
+
+        <div className="space-y-3 border-b border-gray-100 pb-4">
+          <h4 className="text-sm font-semibold text-gray-900">Back placement &amp; render (this color)</h4>
+          <p className="text-xs text-gray-700">
+            Overrides apply only to this variant. Resolution order: blank default → variant (here) → product. Leave inherited to use
+            the blank&apos;s back zone as-is.
+          </p>
+          <label className="flex items-center gap-2 text-sm font-medium text-gray-900">
+            <input
+              type="checkbox"
+              checked={customizeRenderProfile}
+              onChange={(e) => {
+                if (!e.target.checked) {
+                  setEditing({ ...editing, renderProfileOverrides: null });
+                } else {
+                  setEditing({ ...editing, renderProfileOverrides: editing.renderProfileOverrides ?? { back: {} } });
+                }
+              }}
+            />
+            Customize placement &amp; blend for this color (override blank default)
+          </label>
+
+          {!customizeRenderProfile && (
+            <div className="rounded-md bg-slate-50 border border-slate-200 px-3 py-2 text-xs text-slate-800">
+              <div className="font-medium text-slate-900 mb-1">Inherited from blank (read-only)</div>
+              {backDefaultRow ? (
+                <p>
+                  Zone <span className="font-mono">{backDefaultRow.placementId}</span> · horizontal{" "}
+                  {backDefaultRow.defaultX ?? 0.5} · vertical {backDefaultRow.defaultY ?? 0.5} · scale{" "}
+                  {backDefaultRow.defaultScale ?? 0.6}
+                  {backDefaultRow.simpleRenderControls8394 != null && (
+                    <>
+                      {" "}
+                      · realism {backDefaultRow.simpleRenderControls8394.realism ?? "—"} · ink{" "}
+                      {backDefaultRow.simpleRenderControls8394.inkStrength ?? "—"} · size{" "}
+                      {backDefaultRow.simpleRenderControls8394.sizePreset ?? "—"}
+                    </>
+                  )}
+                </p>
+              ) : (
+                <p className="text-amber-800">No back placement row on this blank — configure placements on the blank first.</p>
+              )}
+            </div>
+          )}
+
+          {customizeRenderProfile && (
+            <div className="space-y-3 pl-1 border-l-2 border-sky-200">
+              <div className="grid sm:grid-cols-2 gap-2">
+                <label className="block text-xs text-gray-700">
+                  Back placement key (optional)
+                  <select
+                    className="mt-0.5 w-full border rounded px-2 py-1 text-sm"
+                    value={backOv?.placementKey ?? ""}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      if (!v) clearBackField("placementKey");
+                      else setBackPatch({ placementKey: v });
+                    }}
+                  >
+                    <option value="">Inherit blank default zone</option>
+                    {backPlacementIds.map((id) => (
+                      <option key={id} value={id}>
+                        {id}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <div className="grid sm:grid-cols-3 gap-2">
+                {(
+                  [
+                    ["defaultX", "Horizontal (0–1)"],
+                    ["defaultY", "Vertical (0–1)"],
+                    ["defaultScale", "Scale"],
+                  ] as const
+                ).map(([key, label]) => (
+                  <label key={key} className="block text-xs text-gray-700">
+                    {label}
+                    <input
+                      type="number"
+                      step="0.001"
+                      className="mt-0.5 w-full border rounded px-2 py-1 text-sm"
+                      value={
+                        backOv?.[key] != null && typeof backOv[key] === "number" ? String(backOv[key]) : ""
+                      }
+                      onChange={(e) => {
+                        const raw = e.target.value.trim();
+                        if (raw === "") clearBackField(key);
+                        else setBackPatch({ [key]: Number(raw) } as Partial<RPBlankVariantRenderProfileSideOverride>);
+                      }}
+                    />
+                  </label>
+                ))}
+              </div>
+              <p className="text-[11px] text-gray-600">8394 simple controls (blank when inheriting that field)</p>
+              <div className="grid sm:grid-cols-3 gap-2">
+                {(
+                  [
+                    ["realism", "Fabric feel (realism)"],
+                    ["inkStrength", "Ink strength"],
+                  ] as const
+                ).map(([sk, label]) => (
+                  <label key={sk} className="block text-xs text-gray-700">
+                    {label}
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      className="mt-0.5 w-full border rounded px-2 py-1 text-sm"
+                      value={
+                        backOv?.simpleRenderControls8394?.[sk] != null
+                          ? String(backOv.simpleRenderControls8394[sk])
+                          : ""
+                      }
+                      onChange={(e) => {
+                        const raw = e.target.value.trim();
+                        const prevS = backOv?.simpleRenderControls8394 ?? {};
+                        if (raw === "") {
+                          const nextS = { ...prevS };
+                          delete (nextS as Record<string, unknown>)[sk];
+                          if (Object.keys(nextS).length === 0) {
+                            clearBackField("simpleRenderControls8394");
+                          } else {
+                            setBackPatch({ simpleRenderControls8394: nextS });
+                          }
+                        } else {
+                          setBackPatch({
+                            simpleRenderControls8394: { ...prevS, [sk]: Number(raw) },
+                          });
+                        }
+                      }}
+                    />
+                  </label>
+                ))}
+                <label className="block text-xs text-gray-700">
+                  Size preset
+                  <select
+                    className="mt-0.5 w-full border rounded px-2 py-1 text-sm"
+                    value={backOv?.simpleRenderControls8394?.sizePreset ?? ""}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      const prevS = backOv?.simpleRenderControls8394 ?? {};
+                      if (!v) {
+                        const nextS = { ...prevS };
+                        delete nextS.sizePreset;
+                        if (Object.keys(nextS).length === 0) {
+                          clearBackField("simpleRenderControls8394");
+                        } else {
+                          setBackPatch({ simpleRenderControls8394: nextS });
+                        }
+                      } else {
+                        setBackPatch({
+                          simpleRenderControls8394: { ...prevS, sizePreset: v as "small" | "medium" | "large" | "fill_safe" },
+                        });
+                      }
+                    }}
+                  >
+                    <option value="">Inherit</option>
+                    <option value="small">small</option>
+                    <option value="medium">medium</option>
+                    <option value="large">large</option>
+                    <option value="fill_safe">fill_safe</option>
+                  </select>
+                </label>
+              </div>
+              <p className="text-[11px] text-gray-600">Zone blend (optional; merged with simple-derived blend)</p>
+              <div className="grid sm:grid-cols-2 gap-2">
+                <label className="block text-xs text-gray-700">
+                  Blend mode
+                  <input
+                    className="mt-0.5 w-full border rounded px-2 py-1 text-sm"
+                    placeholder="e.g. multiply"
+                    value={backOv?.renderZoneDefaults?.blendMode ?? ""}
+                    onChange={(e) => {
+                      const v = e.target.value.trim();
+                      const z = backOv?.renderZoneDefaults ?? {};
+                      if (!v) {
+                        const nz = { ...z };
+                        delete nz.blendMode;
+                        if (!nz.blendMode && !nz.blendOpacity) {
+                          clearBackField("renderZoneDefaults");
+                        } else {
+                          setBackPatch({ renderZoneDefaults: nz });
+                        }
+                      } else {
+                        setBackPatch({ renderZoneDefaults: { ...z, blendMode: v } });
+                      }
+                    }}
+                  />
+                </label>
+                <label className="block text-xs text-gray-700">
+                  Blend opacity (0–1)
+                  <input
+                    type="number"
+                    step="0.01"
+                    min={0}
+                    max={1}
+                    className="mt-0.5 w-full border rounded px-2 py-1 text-sm"
+                    value={
+                      backOv?.renderZoneDefaults?.blendOpacity != null
+                        ? String(backOv.renderZoneDefaults.blendOpacity)
+                        : ""
+                    }
+                    onChange={(e) => {
+                      const raw = e.target.value.trim();
+                      const z = backOv?.renderZoneDefaults ?? {};
+                      if (raw === "") {
+                        const nz = { ...z };
+                        delete nz.blendOpacity;
+                        if (!nz.blendMode && !nz.blendOpacity) {
+                          clearBackField("renderZoneDefaults");
+                        } else {
+                          setBackPatch({ renderZoneDefaults: nz });
+                        }
+                      } else {
+                        setBackPatch({ renderZoneDefaults: { ...z, blendOpacity: Number(raw) } });
+                      }
+                    }}
+                  />
+                </label>
+              </div>
+              <p className="text-[11px] text-gray-600">
+                Optional global blend hint for this color (applies after side fields; product still wins).
+              </p>
+              <div className="grid sm:grid-cols-2 gap-2">
+                <label className="block text-xs text-gray-700">
+                  Global blend mode
+                  <input
+                    className="mt-0.5 w-full border rounded px-2 py-1 text-sm"
+                    placeholder="inherit"
+                    value={editing.renderOverrides?.blendMode ?? ""}
+                    onChange={(e) => {
+                      const v = e.target.value.trim();
+                      setEditing({
+                        ...editing,
+                        renderOverrides: v
+                          ? { ...editing.renderOverrides, blendMode: v }
+                          : { ...editing.renderOverrides, blendMode: null },
+                      });
+                    }}
+                  />
+                </label>
+                <label className="block text-xs text-gray-700">
+                  Global blend opacity
+                  <input
+                    type="number"
+                    step="0.01"
+                    min={0}
+                    max={1}
+                    className="mt-0.5 w-full border rounded px-2 py-1 text-sm"
+                    value={
+                      editing.renderOverrides?.blendOpacity != null
+                        ? String(editing.renderOverrides.blendOpacity)
+                        : ""
+                    }
+                    onChange={(e) => {
+                      const raw = e.target.value.trim();
+                      setEditing({
+                        ...editing,
+                        renderOverrides:
+                          raw === ""
+                            ? { ...editing.renderOverrides, blendOpacity: null }
+                            : { ...editing.renderOverrides, blendOpacity: Number(raw) },
+                      });
+                    }}
+                  />
+                </label>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="space-y-3 border-b border-gray-100 pb-4">

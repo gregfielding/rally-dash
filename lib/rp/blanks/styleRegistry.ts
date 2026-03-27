@@ -5,6 +5,7 @@
  * This is the source of truth for all allowed styles and colors.
  */
 
+import type { RPBlankDefaultPrintSides } from "@/lib/types/firestore";
 import { DEFAULT_GARMENT_SAFE_AREA } from "@/lib/render/designArtboardSpec";
 
 export type BlankStyleCode = "8394" | "8390" | "TR3008" | "1822GD" | "HF07";
@@ -28,6 +29,8 @@ export interface StyleRegistryEntry {
   styleName: string;
   supplierUrl: string;
   allowedColors: BlankColorName[];
+  /** Canonical print default for this style (also persisted on `rp_blanks.defaultPrintSides`). */
+  defaultPrintSides: RPBlankDefaultPrintSides;
 }
 
 export const STYLE_REGISTRY: Record<BlankStyleCode, StyleRegistryEntry> = {
@@ -37,6 +40,7 @@ export const STYLE_REGISTRY: Record<BlankStyleCode, StyleRegistryEntry> = {
     styleName: "Bikini Panty",
     supplierUrl: "https://losangelesapparel.net/collections/women-intimates-panties/products/8394-bikini-panty",
     allowedColors: ["Black", "White", "Midnight Navy", "Blue", "Red", "Heather Grey"],
+    defaultPrintSides: "back_only",
   },
   "8390": {
     supplier: "Los Angeles Apparel",
@@ -44,6 +48,7 @@ export const STYLE_REGISTRY: Record<BlankStyleCode, StyleRegistryEntry> = {
     styleName: "Thong Panty",
     supplierUrl: "https://losangelesapparel.net/collections/women-intimates-panties/products/8390-thong-panty",
     allowedColors: ["Black", "White", "Midnight Navy", "Blue", "Red", "Heather Grey"],
+    defaultPrintSides: "back_only",
   },
   "TR3008": {
     supplier: "Los Angeles Apparel",
@@ -51,6 +56,7 @@ export const STYLE_REGISTRY: Record<BlankStyleCode, StyleRegistryEntry> = {
     styleName: "Tri-blend Racerback Tank",
     supplierUrl: "https://losangelesapparel.net/collections/women-tops-tank-tops/products/tr3008-tri-blend-racerback-tank",
     allowedColors: ["Black", "Indigo", "Athletic Grey"],
+    defaultPrintSides: "front_only",
   },
   "1822GD": {
     supplier: "Los Angeles Apparel",
@@ -58,6 +64,7 @@ export const STYLE_REGISTRY: Record<BlankStyleCode, StyleRegistryEntry> = {
     styleName: "Garment Dye Crop Tank",
     supplierUrl: "https://losangelesapparel.net/collections/women-tops-tank-tops/products/1822gd-garment-dye-crop-tank",
     allowedColors: ["Black", "Blue", "White"],
+    defaultPrintSides: "front_only",
   },
   "HF07": {
     supplier: "Los Angeles Apparel",
@@ -65,6 +72,7 @@ export const STYLE_REGISTRY: Record<BlankStyleCode, StyleRegistryEntry> = {
     styleName: "Heavy Fleece Crewneck (Garment Dye)",
     supplierUrl: "https://losangelesapparel.net/products/hf07-heavy-fleece-crewneck-sweater-garment-dye",
     allowedColors: ["Black", "Navy", "Off-White"],
+    defaultPrintSides: "front_only",
   },
 };
 
@@ -121,6 +129,13 @@ export function isValidStyleColor(styleCode: BlankStyleCode, colorName: BlankCol
  */
 export function getStyleInfo(styleCode: BlankStyleCode): StyleRegistryEntry | null {
   return STYLE_REGISTRY[styleCode] || null;
+}
+
+/** Explicit catalog default for a known style, or null if unknown style code. */
+export function getDefaultPrintSidesForStyleCode(styleCode: string | null | undefined): RPBlankDefaultPrintSides | null {
+  const sc = String(styleCode || "").trim() as BlankStyleCode;
+  const e = STYLE_REGISTRY[sc];
+  return e?.defaultPrintSides ?? null;
 }
 
 /**

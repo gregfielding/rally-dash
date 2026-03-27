@@ -3,7 +3,7 @@
  * Must stay in sync with `functions/lib/productFlatRenderMvp.js` (stable JSON + sha256).
  *
  * Stale when any of: blank placement (back), blank/variant render defaults (back),
- * variant back image URL, design asset URL (light/dark), design revision, blank version.
+ * variant back image URL, resolved design PNG URL (light/dark/white), design revision, blank version.
  */
 
 import type { DesignDoc, RPBlank, RPBlankVariant, RPPlacement, RpProduct } from "@/lib/types/firestore";
@@ -17,6 +17,7 @@ import {
   getPlacementFingerprintSliceForProduct,
   getPlacementRowForSide,
   resolveEffectiveRenderSettings,
+  resolvePlacementKeyForSide,
 } from "@/lib/products/resolveProductRenderProfile";
 
 const MVP_STYLE_CODE = "8394";
@@ -172,8 +173,9 @@ export async function computeProductFlatRenderFingerprintAsync(params: {
   product: RpProduct;
 }): Promise<string> {
   const { blank, variant, design, product } = params;
-  const placementRow = getPlacementRowForSide(blank, "back", product.renderSetup?.back?.placementKey);
-  const placement = getPlacementFingerprintSliceForProduct(blank, product, "back");
+  const pk = resolvePlacementKeyForSide(product, variant, "back");
+  const placementRow = getPlacementRowForSide(blank, "back", pk);
+  const placement = getPlacementFingerprintSliceForProduct(blank, product, "back", variant);
   const blendEff = resolveEffectiveRenderSettings(product, blank, variant, placementRow, "back");
   const blend = { blendMode: blendEff.blendMode, blendOpacity: blendEff.blendOpacity };
   const { url: designAssetUrl, ref: designAssetRef } = pickDesignPngUrlForVariant(design, variant);

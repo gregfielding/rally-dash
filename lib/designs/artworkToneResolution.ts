@@ -1,0 +1,113 @@
+/**
+ * Raster artwork tone: which design asset slot to use (light / dark / white garment artwork).
+ * Driven by blank variant `preferredArtworkTone` and garment color family, with deterministic fallbacks.
+ */
+
+import type { RPBlankArtworkTone, RPBlankColorFamily } from "@/lib/types/firestore";
+
+export type ArtworkToneSlot = "light" | "dark" | "white";
+
+/** URLs for one print side (PNG); SVG/PDF use parallel slot names. */
+export type SideRasterUrls = {
+  lightPng: string | null;
+  darkPng: string | null;
+  whitePng: string | null;
+};
+
+/**
+ * Fallback order when a preferred tone is set (asset may be missing).
+ * - white → dark → light
+ * - dark → white → light
+ * - light → white → dark
+ */
+export function fallbackChainForPreferredTone(preferred: RPBlankArtworkTone): ArtworkToneSlot[] {
+  if (preferred === "white") return ["white", "dark", "light"];
+  if (preferred === "dark") return ["dark", "white", "light"];
+  return ["light", "white", "dark"];
+}
+
+/**
+ * Default chain when `preferredArtworkTone` is null/undefined: garment family only
+ * (classic contrast: dark shirt → light artwork; light shirt → dark artwork), then white, then last resort.
+ * - Dark garment → light → white → dark
+ * - Light garment → dark → white → light
+ */
+export function fallbackChainForGarmentFamily(garmentColorFamily: RPBlankColorFamily): ArtworkToneSlot[] {
+  if (garmentColorFamily === "dark") return ["light", "white", "dark"];
+  return ["dark", "white", "light"];
+}
+
+/** Generic light / dark / white slots (PNG, SVG, or PDF URLs for one side). */
+export type ToneTriple = {
+  light: string | null;
+  dark: string | null;
+  white: string | null;
+};
+
+/** Same resolution as `pickRasterUrlForVariant`, for SVG/PDF triples on a side. */
+export function pickAssetUrlForVariant(
+  triple: ToneTriple,
+  garmentColorFamily: RPBlankColorFamily,
+  preferredArtworkTone: RPBlankArtworkTone | null | undefined
+): { url: string | null; ref: ArtworkToneSlot | null } {
+  const u: SideRasterUrls = {
+    lightPng: triple.light,
+    darkPng: triple.dark,
+    whitePng: triple.white,
+  };
+  return pickRasterUrlForVariant(u, garmentColorFamily, preferredArtworkTone);
+}
+
+function slotUrl(u: SideRasterUrls, tone: ArtworkToneSlot): string | null {
+  if (tone === "light") return u.lightPng && String(u.lightPng).trim() ? String(u.lightPng).trim() : null;
+  if (tone === "dark") return u.darkPng && String(u.darkPng).trim() ? String(u.darkPng).trim() : null;
+  return u.whitePng && String(u.whitePng).trim() ? String(u.whitePng).trim() : null;
+}
+
+/**
+ * Resolve which raster URL to use for a blank variant.
+ * 1. If `preferredArtworkTone` is set, try that tone first, then follow its fallback chain.
+ * 2. Otherwise use garment-family default chain.
+ */
+export function pickRasterUrlForVariant(
+  u: SideRasterUrls,
+  garmentColorFamily: RPBlankColorFamily,
+  preferredArtworkTone: RPBlankArtworkTone | null | undefined
+): { url: string | null; ref: ArtworkToneSlot | null } {
+  const pref =
+    preferredArtworkTone === "light" || preferredArtworkTone === "dark" || preferredArtworkTone === "white"
+      ? preferredArtworkTone
+      : null;
+
+  const chain: ArtworkToneSlot[] = pref
+    ? fallbackChainForPreferredTone(pref)
+    : fallbackChainForGarmentFamily(garmentColorFamily);
+
+  for (const tone of chain) {
+    const url = slotUrl(u, tone);
+    if (url) return { url, ref: tone };
+  }
+  return { url: null, ref: null };
+}
+
+export type BackRenderTreatment = "clean" | "blended";
+
+/**
+ * 8394 back flat output: fabric multiply blend vs crisp over-print.
+ * - Dark garment + light/white artwork → clean (no heavy blend)
+ * - Light garment + dark artwork → blended (normal fabric integration)
+ * - Light + white → clean (keep white readable on fashion colors)
+ */
+export function resolveBackRenderTreatment(
+  garmentFamily: RPBlankColorFamily,
+  resolvedTone: ArtworkToneSlot | null | undefined
+): BackRenderTreatment {
+  const t = resolvedTone ?? "dark";
+  if (garmentFamily === "dark") {
+    if (t === "light" || t === "white") return "clean";
+    return "blended";
+  }
+  if (t === "dark") return "blended";
+  if (t === "white" || t === "light") return "clean";
+  return "blended";
+}

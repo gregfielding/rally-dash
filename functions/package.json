@@ -19,7 +19,13 @@
     "export:design-teams-json": "node scripts/seed-design-teams-phase1.js --export-json",
     "patch:sf-team-display-names": "node scripts/patch-sf-design-team-display-names.js",
     "materialize:mlb-verified-colors": "node scripts/materialize-mlb-verified-brand-colors.js",
-    "verify:taxonomy": "node scripts/verify-taxonomy.js"
+    "verify:taxonomy": "node scripts/verify-taxonomy.js",
+    "migrate:product-tags": "node scripts/migrate-product-tags.js",
+    "migrate:product-tags:dry": "node scripts/migrate-product-tags.js --dry-run",
+    "migrate:design-team-ids": "node scripts/migrate-design-team-ids.js",
+    "migrate:design-team-ids:dry": "node scripts/migrate-design-team-ids.js --dry-run",
+    "shopify:ensure-collections": "node scripts/ensure-shopify-smart-collections.js",
+    "shopify:verify-collections": "node scripts/verify-shopify-collections.js"
   },
   "dependencies": {
     "firebase-admin": "^12.0.0",

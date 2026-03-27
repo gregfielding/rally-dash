@@ -26,12 +26,19 @@ const db = admin.firestore();
 const storage = admin.storage();
 
 const shopifySync = require("./shopifySync");
+const shopifySmartCollections = require("./lib/shopifySmartCollections");
 const { resolveBlankTemplates, stripUnresolvedTemplateArtifacts } = require("./lib/resolveBlankTemplates");
 const merchandisingAtCreate = require("./lib/merchandisingAtCreate");
 const runCreateProductFromDesignBlankCore = require("./lib/runCreateProductFromDesignBlankCore");
 const { createRegisterGenerateProductFlatRenders } = require("./lib/productFlatRenderMvp");
 const { createRegisterGenerateProductSceneRender } = require("./lib/productSceneRenderMvp");
 const { normalizeColorsForFirestore } = require("./lib/standardPrintInks");
+const variant8394Pipeline = require("./lib/variant8394Pipeline");
+const {
+  resolvePrintSidesForProductBuild,
+  inferDefaultPrintSides,
+  garmentCategoryDefaultPrintSides,
+} = require("./lib/resolveDefaultPrintSides");
 
 // Resolve a fal-ai model slug or URL into a full HTTPS URL.
 function resolveFalUrl(modelOrUrl) {
@@ -1629,7 +1636,7 @@ exports.createProduct = functions.https.onCall(async (data, context) => {
 
 /**
  * Initialize renderSetup so mockup generation does not require manual "Set design".
- * LA Apparel 8394: catalog print is back-only — front is blank only, back carries the design.
+ * Placement defaults come from `blank.defaultPrintSides` (∩ design artwork sides).
  */
 function buildInitialRenderSetupForProduct({ design, blank, variantRow, designId }) {
   const designPngUrl = designPngUrlForProcessing(design);
@@ -1641,42 +1648,53 @@ function buildInitialRenderSetupForProduct({ design, blank, variantRow, designId
     (variantRow.images && variantRow.images.back && variantRow.images.back.downloadUrl) ||
     (blank.images && blank.images.back && blank.images.back.downloadUrl) ||
     null;
-  const styleCode = String(blank.styleCode || "").trim();
-  const is8394BackOnly = styleCode === "8394";
+  const r = resolvePrintSidesForProductBuild(blank, design);
 
   if (!designPngUrl) {
     return {
       designIdFront: null,
-      designIdBack: designId,
+      designIdBack: null,
       renderSetup: null,
       renderConfig: null,
     };
   }
 
+  if (!r.canGenerate) {
+    return {
+      designIdFront: null,
+      designIdBack: null,
+      renderSetup: null,
+      renderConfig: null,
+    };
+  }
+
+  const effFront = r.effectiveFront;
+  const effBack = r.effectiveBack;
+
   return {
-    designIdFront: is8394BackOnly ? null : designId,
-    designIdBack: designId,
+    designIdFront: effFront ? designId : null,
+    designIdBack: effBack ? designId : null,
     renderSetup: {
       defaults: {
         blankId: blank.blankId,
-        designIdFront: is8394BackOnly ? null : designId,
-        designIdBack: designId,
+        designIdFront: effFront ? designId : null,
+        designIdBack: effBack ? designId : null,
       },
       front: {
         blankImageUrl: frontBlankUrl,
-        designAssetId: is8394BackOnly ? null : designId,
-        designAssetUrl: is8394BackOnly ? null : designPngUrl,
+        designAssetId: effFront ? designId : null,
+        designAssetUrl: effFront ? designPngUrl : null,
         placementKey: "front_center",
       },
       back: {
         blankImageUrl: backBlankUrl,
-        designAssetId: designId,
-        designAssetUrl: designPngUrl,
+        designAssetId: effBack ? designId : null,
+        designAssetUrl: effBack ? designPngUrl : null,
         placementKey: "back_center",
       },
     },
     renderConfig: {
-      renderSide: is8394BackOnly ? "back" : "front",
+      renderSide: r.primaryPlacementSide,
       selectedBlankId: blank.blankId,
     },
   };
@@ -1712,6 +1730,7 @@ exports.createProductFromDesignBlank = functions.https.onCall(async (data, conte
     MASTER_BLANK_SCHEMA_VERSION,
     sanitizeForFirestore,
     deriveAvailableSizesFromBlank,
+    deriveSizesForProductMatrix,
     merchandisingAtCreate,
     resolveBlankTemplates,
     designId,
@@ -1773,6 +1792,7 @@ exports.createProductVariantsFromDesignBlank = functions.https.onCall(async (dat
         MASTER_BLANK_SCHEMA_VERSION,
         sanitizeForFirestore,
         deriveAvailableSizesFromBlank,
+        deriveSizesForProductMatrix,
         merchandisingAtCreate,
         resolveBlankTemplates,
         designId,
@@ -1785,6 +1805,7 @@ exports.createProductVariantsFromDesignBlank = functions.https.onCall(async (dat
       results.push({
         blankVariantId,
         variantFirestoreId: out.variantId,
+        variantFirestoreIds: out.variantIds,
         productId: out.productId,
         slug: out.slug,
         created: true,
@@ -2008,8 +2029,9 @@ exports.refreshProductMerchandisingFromSources = functions.https.onCall(async (d
 });
 
 /**
- * Step 10 MVP: explicit flat_clean + flat_blended back renders for 8394 master blank only.
- * Writes `flatRenders` on rp_products/{productId}.
+ * Step 10 MVP: 8394 variant-native flats. Callable args: productId, productVariantId (required for parent),
+ * optional renderTypes default ["flat_blended_back","flat_clean_front"].
+ * Writes `rp_products/{productId}/variants/{variantId}` only (flatRenders, media.heroBack/heroFront, gallery, mockupUrl).
  */
 exports.generateProductFlatRenders = createRegisterGenerateProductFlatRenders({
   admin,
@@ -2028,6 +2050,179 @@ exports.generateProductSceneRender = createRegisterGenerateProductSceneRender({
   db,
   storage,
   fetch,
+});
+
+const {
+  NEUTRAL_HANGER_SCENE_KEY,
+  processNeutralHangerSceneJob,
+} = require("./lib/sceneRenderNeutralHangerJob");
+
+/**
+ * Queue a deterministic scene render job (v1: neutral_hanger only).
+ * Creates `rp_scene_render_jobs/{jobId}`; worker `onSceneRenderJobCreated` processes it.
+ */
+exports.createSceneRenderJob = functions.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
+  }
+  const productId = data && data.productId;
+  const productVariantId = data && data.productVariantId;
+  const sceneKey = (data && data.sceneKey) || NEUTRAL_HANGER_SCENE_KEY;
+  if (!productId || typeof productId !== "string") {
+    throw new functions.https.HttpsError("invalid-argument", "productId is required");
+  }
+  if (!productVariantId || typeof productVariantId !== "string") {
+    throw new functions.https.HttpsError("invalid-argument", "productVariantId is required");
+  }
+  if (sceneKey !== NEUTRAL_HANGER_SCENE_KEY) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      `Only sceneKey "${NEUTRAL_HANGER_SCENE_KEY}" is supported in v1`
+    );
+  }
+
+  const vRef = db.collection("rp_products").doc(productId).collection("variants").doc(productVariantId);
+  const vSnap = await vRef.get();
+  if (!vSnap.exists) {
+    throw new functions.https.HttpsError("not-found", "Variant not found");
+  }
+  const variant = vSnap.data();
+  const uid = context.auth.uid;
+  const now = admin.firestore.FieldValue.serverTimestamp();
+
+  const jobRef = await db.collection("rp_scene_render_jobs").add({
+    productId,
+    productVariantId,
+    blankVariantId: variant.blankVariantId || "",
+    sceneTemplateId: NEUTRAL_HANGER_SCENE_KEY,
+    sceneKey: NEUTRAL_HANGER_SCENE_KEY,
+    jobType: "scene_render",
+    generationScope: "single_variant",
+    status: "queued",
+    createdAt: now,
+    updatedAt: now,
+    createdBy: uid,
+    updatedBy: uid,
+  });
+
+  return { ok: true, jobId: jobRef.id };
+});
+
+exports.onSceneRenderJobCreated = functions
+  .runWith({ memory: "1GB", timeoutSeconds: 300 })
+  .firestore.document("rp_scene_render_jobs/{jobId}")
+  .onCreate(async (snap, ctx) => {
+    const jobId = ctx.params.jobId;
+    const jobRef = snap.ref;
+    const job = snap.data() || {};
+
+    if (job.jobType !== "scene_render") {
+      await jobRef.update({
+        status: "failed",
+        errorMessage: `Unsupported jobType: ${job.jobType || "missing"}`,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return;
+    }
+
+    if (job.sceneKey !== NEUTRAL_HANGER_SCENE_KEY) {
+      await jobRef.update({
+        status: "failed",
+        errorMessage: `Scene not implemented: ${job.sceneKey}`,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return;
+    }
+
+    const nowTs = admin.firestore.FieldValue.serverTimestamp();
+    await jobRef.update({ status: "running", updatedAt: nowTs });
+
+    try {
+      const bucket = storage.bucket();
+      const out = await processNeutralHangerSceneJob(db, bucket, fetch, admin, jobId, job);
+      await jobRef.update({
+        status: "succeeded",
+        output: {
+          assetId: out.assetId,
+          imageUrl: out.url,
+          thumbUrl: out.url,
+          storagePath: out.storagePath,
+        },
+        errorMessage: null,
+        updatedAt: nowTs,
+      });
+    } catch (err) {
+      const message = err && err.message ? String(err.message) : String(err);
+      console.error("[onSceneRenderJobCreated] failed:", jobId, message);
+      await jobRef.update({
+        status: "failed",
+        errorMessage: message,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+  });
+
+/**
+ * Update merchandising approval on a scene asset and sync variant `sceneTemplateRenders` cache.
+ */
+exports.updateSceneAssetApproval = functions.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
+  }
+  const assetId = data && data.assetId;
+  const approvalState = data && data.approvalState;
+  if (!assetId || typeof assetId !== "string") {
+    throw new functions.https.HttpsError("invalid-argument", "assetId is required");
+  }
+  const allowed = new Set(["approved", "rejected", "pending_review", "auto_approved", "needs_review"]);
+  if (!approvalState || !allowed.has(String(approvalState))) {
+    throw new functions.https.HttpsError("invalid-argument", "Invalid approvalState");
+  }
+
+  const ref = db.collection("rp_product_assets").doc(assetId);
+  const snap = await ref.get();
+  if (!snap.exists) {
+    throw new functions.https.HttpsError("not-found", "Asset not found");
+  }
+  const row = snap.data();
+  const uid = context.auth.uid;
+  const now = admin.firestore.FieldValue.serverTimestamp();
+
+  const assetStatus =
+    approvalState === "rejected" ? "rejected" : approvalState === "pending_review" || approvalState === "needs_review" ? "draft" : "approved";
+
+  await ref.update({
+    approvalState,
+    status: assetStatus,
+    updatedAt: now,
+    updatedBy: uid,
+  });
+
+  const productId = row.productId;
+  const variantDocId = row.variantDocId;
+  const slug = row.sceneTemplateSlug;
+  if (productId && variantDocId && slug) {
+    const vRef = db.collection("rp_products").doc(productId).collection("variants").doc(variantDocId);
+    const vSnap = await vRef.get();
+    if (vSnap.exists) {
+      const v = vSnap.data();
+      const prev = v.sceneTemplateRenders && typeof v.sceneTemplateRenders === "object" ? { ...v.sceneTemplateRenders } : {};
+      if (prev[slug]) {
+        prev[slug] = {
+          ...prev[slug],
+          approvalState,
+          status: approvalState === "rejected" ? "rejected" : "generated",
+        };
+        await vRef.update({
+          sceneTemplateRenders: prev,
+          updatedAt: now,
+          updatedBy: uid,
+        });
+      }
+    }
+  }
+
+  return { ok: true };
 });
 
 // ---------------------------------------------------------------------------
@@ -2239,6 +2434,7 @@ async function findOrCreateProductForBulk(designId, blankId, userId) {
       MASTER_BLANK_SCHEMA_VERSION,
       sanitizeForFirestore,
       deriveAvailableSizesFromBlank,
+      deriveSizesForProductMatrix,
       merchandisingAtCreate,
       resolveBlankTemplates,
       designId,
@@ -2381,10 +2577,10 @@ exports.processBulkGenerationJobs = functions.pubsub
             const blankSnap = await db.collection("rp_blanks").doc(blankId).get();
             const design = designSnap.exists ? designSnap.data() : {};
             const blank = blankSnap.exists ? blankSnap.data() : {};
-            const styleCode = String(blank.styleCode || "").trim();
-            const is8394BackOnly = styleCode === "8394";
-            const placementId = is8394BackOnly ? "back_center" : "front_center";
-            const viewImage = is8394BackOnly ? blank?.images?.back : blank?.images?.front;
+            const dps = inferDefaultPrintSides(blank);
+            const useBack = dps === "back_only";
+            const placementId = useBack ? "back_center" : "front_center";
+            const viewImage = useBack ? blank?.images?.back : blank?.images?.front;
             let placement = DEFAULT_MOCK_PLACEMENT;
             const blankPlacement = blank?.placements?.find(p => p.placementId === placementId);
             if (blankPlacement) {
@@ -2416,7 +2612,7 @@ exports.processBulkGenerationJobs = functions.pubsub
             const mockRef = await db.collection("rp_mock_jobs").add({
               designId,
               blankId,
-              view: is8394BackOnly ? "back" : "front",
+              view: useBack ? "back" : "front",
               placementId,
               quality: "draft",
               productId,
@@ -4912,6 +5108,7 @@ const STYLE_REGISTRY = {
     styleName: "Bikini Panty",
     supplierUrl: "https://losangelesapparel.net/collections/women-intimates-panties/products/8394-bikini-panty",
     allowedColors: ["Black", "White", "Midnight Navy", "Blue", "Red", "Heather Grey"],
+    defaultPrintSides: "back_only",
   },
   "8390": {
     supplier: "Los Angeles Apparel",
@@ -4919,6 +5116,7 @@ const STYLE_REGISTRY = {
     styleName: "Thong Panty",
     supplierUrl: "https://losangelesapparel.net/collections/women-intimates-panties/products/8390-thong-panty",
     allowedColors: ["Black", "White", "Midnight Navy", "Blue", "Red", "Heather Grey"],
+    defaultPrintSides: "back_only",
   },
   "TR3008": {
     supplier: "Los Angeles Apparel",
@@ -4926,6 +5124,7 @@ const STYLE_REGISTRY = {
     styleName: "Tri-blend Racerback Tank",
     supplierUrl: "https://losangelesapparel.net/collections/women-tops-tank-tops/products/tr3008-tri-blend-racerback-tank",
     allowedColors: ["Black", "Indigo", "Athletic Grey"],
+    defaultPrintSides: "front_only",
   },
   "1822GD": {
     supplier: "Los Angeles Apparel",
@@ -4933,6 +5132,7 @@ const STYLE_REGISTRY = {
     styleName: "Garment Dye Crop Tank",
     supplierUrl: "https://losangelesapparel.net/collections/women-tops-tank-tops/products/1822gd-garment-dye-crop-tank",
     allowedColors: ["Black", "Blue", "White"],
+    defaultPrintSides: "front_only",
   },
   "HF07": {
     supplier: "Los Angeles Apparel",
@@ -4940,6 +5140,7 @@ const STYLE_REGISTRY = {
     styleName: "Heavy Fleece Crewneck (Garment Dye)",
     supplierUrl: "https://losangelesapparel.net/products/hf07-heavy-fleece-crewneck-sweater-garment-dye",
     allowedColors: ["Black", "Navy", "Off-White"],
+    defaultPrintSides: "front_only",
   },
 };
 
@@ -4971,8 +5172,20 @@ function buildMasterBlankSlug(styleCode) {
 }
 
 function deriveColorFamilyFromName(colorName) {
-  const dark = new Set(["Black", "Midnight Navy", "Navy", "Indigo"]);
-  const n = String(colorName || "").trim();
+  const dark = new Set([
+    "black",
+    "midnight navy",
+    "navy",
+    "indigo",
+    "blue",
+    "royal blue",
+    "cobalt",
+    "heather blue",
+    "dark blue",
+  ]);
+  const n = String(colorName || "")
+    .trim()
+    .toLowerCase();
   return dark.has(n) ? "dark" : "light";
 }
 
@@ -4996,7 +5209,10 @@ function buildProductIdentityKey(params) {
   const design = norm(params.designId) || "";
   const blank = norm(params.blankId) || "";
   const variant = norm(params.blankVariantIdOrLegacy) || "legacy";
-  return [league, team, design, blank, variant].filter(Boolean).join("_");
+  const parts = [league, team, design, blank, variant].filter(Boolean);
+  const sizeSeg = norm(params.garmentSizeCode || "");
+  if (sizeSeg) parts.push(sizeSeg);
+  return parts.join("_");
 }
 
 /** Parent dedupe: league_team_design_blank (4 segments). */
@@ -5036,7 +5252,14 @@ function deriveAvailableSizesFromBlank(blank) {
   return out.length ? out : null;
 }
 
-/** Parent storefront cache: 8394 is back-print — hero prefers blended back; thumb can be blank front. */
+/** Sizes for Color × Size variant rows: blank `garmentSizes` or full XS–XL. */
+function deriveSizesForProductMatrix(blank) {
+  const fromBlank = deriveAvailableSizesFromBlank(blank);
+  if (fromBlank && fromBlank.length > 0) return fromBlank;
+  return ["XS", "S", "M", "L", "XL"];
+}
+
+/** Parent storefront cache: 8394 is back-print — hero prefers primary back (blended or clean); thumb can be blank front. */
 function pickParentDisplayMediaFromVariantMedia(media, productMockUrl, blankStyleCode) {
   const m = media || {};
   const backFirst = String(blankStyleCode || "").trim() === "8394";
@@ -5200,6 +5423,8 @@ exports.createBlank = functions.https.onCall(async (data, context) => {
       styleName,
       garmentStyle,
       supplierUrl,
+      defaultPrintSides:
+        preset && preset.defaultPrintSides != null ? preset.defaultPrintSides : garmentCategoryDefaultPrintSides(gc),
       variants: [],
       images: { front: null, back: null },
       imageMeta: null,
@@ -5417,6 +5642,10 @@ exports.seedMasterBlanks = functions.https.onCall(async (data, context) => {
       styleName: styleInfo.styleName,
       garmentStyle: styleInfo.styleName,
       supplierUrl: styleInfo.supplierUrl,
+      defaultPrintSides:
+        styleInfo.defaultPrintSides != null
+          ? styleInfo.defaultPrintSides
+          : garmentCategoryDefaultPrintSides(styleInfo.garmentCategory),
       variants,
       images: { front: null, back: null },
       imageMeta: null,
@@ -5438,6 +5667,79 @@ exports.seedMasterBlanks = functions.https.onCall(async (data, context) => {
   const skipped = results.filter((r) => r.status === "skipped").length;
   console.log("[seedMasterBlanks]", created, "created,", skipped, "skipped");
   return { ok: true, results, created, skipped, total: results.length };
+});
+
+/**
+ * One-time / occasional: persist `defaultPrintSides` on all blanks from STYLE_REGISTRY + category fallback.
+ * Skips docs that already have an explicit value unless `force: true`.
+ */
+exports.backfillBlankDefaultPrintSides = functions.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
+  }
+  const adminSnap = await db.collection("admins").doc(context.auth.uid).get();
+  if (!adminSnap.exists || adminSnap.data()?.role !== "admin") {
+    throw new functions.https.HttpsError("permission-denied", "Only admins can backfill blanks");
+  }
+
+  const dryRun = data?.dryRun !== false;
+  const force = data?.force === true;
+
+  function targetDefaultPrintSidesForBlank(b) {
+    const sc = String(b.styleCode || "").trim();
+    const preset = STYLE_REGISTRY[sc];
+    if (preset && preset.defaultPrintSides) return preset.defaultPrintSides;
+    return garmentCategoryDefaultPrintSides(b.garmentCategory);
+  }
+
+  const snap = await db.collection("rp_blanks").get();
+  const planned = [];
+  for (const doc of snap.docs) {
+    const b = doc.data() || {};
+    const next = targetDefaultPrintSidesForBlank(b);
+    const cur = b.defaultPrintSides;
+    const hasExplicit =
+      cur === "front_only" || cur === "back_only" || cur === "both";
+    if (!force && hasExplicit) continue;
+    if (cur === next) continue;
+    planned.push({
+      ref: doc.ref,
+      id: doc.id,
+      blankId: b.blankId || doc.id,
+      next,
+      prev: cur ?? null,
+    });
+  }
+
+  if (dryRun) {
+    return {
+      ok: true,
+      dryRun: true,
+      force,
+      wouldUpdate: planned.length,
+      sample: planned.slice(0, 25),
+    };
+  }
+
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const chunk = 400;
+  let updated = 0;
+  for (let i = 0; i < planned.length; i += chunk) {
+    const batch = db.batch();
+    const slice = planned.slice(i, i + chunk);
+    for (const p of slice) {
+      batch.update(p.ref, {
+        defaultPrintSides: p.next,
+        updatedAt: now,
+        updatedBy: { uid: context.auth.uid, email: context.auth.token?.email || null },
+      });
+    }
+    await batch.commit();
+    updated += slice.length;
+  }
+
+  console.log("[backfillBlankDefaultPrintSides] updated", updated, "force=", force);
+  return { ok: true, dryRun: false, force, updated };
 });
 
 /**
@@ -5494,6 +5796,7 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
     supportedRenderViews: supportedRenderViewsInput,
     preferredFlatLook8394: preferredFlatLook8394Input,
     garmentSizes: garmentSizesInput,
+    defaultPrintSides: defaultPrintSidesInput,
   } = data;
 
   if (!blankId || typeof blankId !== "string") {
@@ -5741,6 +6044,14 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
         : null;
   }
 
+  if (defaultPrintSidesInput !== undefined) {
+    if (defaultPrintSidesInput === null || defaultPrintSidesInput === "") {
+      updateData.defaultPrintSides = admin.firestore.FieldValue.delete();
+    } else if (["front_only", "back_only", "both"].includes(defaultPrintSidesInput)) {
+      updateData.defaultPrintSides = defaultPrintSidesInput;
+    }
+  }
+
   if (variantsInput !== undefined) {
     if (!Array.isArray(variantsInput)) {
       throw new functions.https.HttpsError("invalid-argument", "variants must be an array");
@@ -5969,16 +6280,22 @@ function isAllowedDesignTheme(v) {
 const DESIGN_SIDE_KIND_TO_NESTED = {
   frontLightPng: ["front", "lightPng"],
   frontDarkPng: ["front", "darkPng"],
+  frontWhitePng: ["front", "whitePng"],
   backLightPng: ["back", "lightPng"],
   backDarkPng: ["back", "darkPng"],
+  backWhitePng: ["back", "whitePng"],
   frontLightSvg: ["front", "lightSvg"],
   frontDarkSvg: ["front", "darkSvg"],
+  frontWhiteSvg: ["front", "whiteSvg"],
   backLightSvg: ["back", "lightSvg"],
   backDarkSvg: ["back", "darkSvg"],
+  backWhiteSvg: ["back", "whiteSvg"],
   frontLightPdf: ["front", "lightPdf"],
   frontDarkPdf: ["front", "darkPdf"],
+  frontWhitePdf: ["front", "whitePdf"],
   backLightPdf: ["back", "lightPdf"],
   backDarkPdf: ["back", "darkPdf"],
+  backWhitePdf: ["back", "whitePdf"],
 };
 
 const DESIGN_FILE_KINDS = new Set([
@@ -5987,17 +6304,24 @@ const DESIGN_FILE_KINDS = new Set([
   "svg",
   "lightPng",
   "darkPng",
+  "whitePng",
   "lightSvg",
   "darkSvg",
+  "whiteSvg",
   "lightPdf",
   "darkPdf",
+  "whitePdf",
   ...Object.keys(DESIGN_SIDE_KIND_TO_NESTED),
 ]);
 
 function sideHasNestedPng(files, side) {
   const s = files && files[side];
   if (!s) return false;
-  return !!(s.lightPng && s.lightPng.downloadUrl) || !!(s.darkPng && s.darkPng.downloadUrl);
+  return (
+    !!(s.lightPng && s.lightPng.downloadUrl) ||
+    !!(s.darkPng && s.darkPng.downloadUrl) ||
+    !!(s.whitePng && s.whitePng.downloadUrl)
+  );
 }
 
 function resolveDefaultSide(files, supportedSides) {
@@ -6015,10 +6339,13 @@ function buildSideAssetsFromFiles(sideFiles) {
   const o = {
     lightPng: sf.lightPng && sf.lightPng.downloadUrl ? sf.lightPng.downloadUrl : null,
     darkPng: sf.darkPng && sf.darkPng.downloadUrl ? sf.darkPng.downloadUrl : null,
+    whitePng: sf.whitePng && sf.whitePng.downloadUrl ? sf.whitePng.downloadUrl : null,
     lightSvg: sf.lightSvg && sf.lightSvg.downloadUrl ? sf.lightSvg.downloadUrl : null,
     darkSvg: sf.darkSvg && sf.darkSvg.downloadUrl ? sf.darkSvg.downloadUrl : null,
+    whiteSvg: sf.whiteSvg && sf.whiteSvg.downloadUrl ? sf.whiteSvg.downloadUrl : null,
     lightPdf: sf.lightPdf && sf.lightPdf.downloadUrl ? sf.lightPdf.downloadUrl : null,
     darkPdf: sf.darkPdf && sf.darkPdf.downloadUrl ? sf.darkPdf.downloadUrl : null,
+    whitePdf: sf.whitePdf && sf.whitePdf.downloadUrl ? sf.whitePdf.downloadUrl : null,
   };
   return Object.values(o).some(Boolean) ? o : null;
 }
@@ -6034,32 +6361,42 @@ function resolveDesignAssetUrls(data) {
   const leg = {
     lightPng: a.lightPng || (f.lightPng && f.lightPng.downloadUrl) || (f.png && f.png.downloadUrl) || null,
     darkPng: a.darkPng || (f.darkPng && f.darkPng.downloadUrl) || null,
+    whitePng: a.whitePng || (f.whitePng && f.whitePng.downloadUrl) || null,
     lightSvg:
       a.lightSvg || (f.lightSvg && f.lightSvg.downloadUrl) || (f.svg && f.svg.downloadUrl) || null,
     darkSvg: a.darkSvg || (f.darkSvg && f.darkSvg.downloadUrl) || null,
+    whiteSvg: a.whiteSvg || (f.whiteSvg && f.whiteSvg.downloadUrl) || null,
     lightPdf: a.lightPdf || (f.lightPdf && f.lightPdf.downloadUrl) || (f.pdf && f.pdf.downloadUrl) || null,
     darkPdf: a.darkPdf || (f.darkPdf && f.darkPdf.downloadUrl) || null,
+    whitePdf: a.whitePdf || (f.whitePdf && f.whitePdf.downloadUrl) || null,
   };
   const lightPng = mergeSlot("lightPng") || leg.lightPng;
   const darkPng = mergeSlot("darkPng") || leg.darkPng;
+  const whitePng = mergeSlot("whitePng") || leg.whitePng;
   const lightSvg = mergeSlot("lightSvg") || leg.lightSvg;
   const darkSvg = mergeSlot("darkSvg") || leg.darkSvg;
+  const whiteSvg = mergeSlot("whiteSvg") || leg.whiteSvg;
   const lightPdf = mergeSlot("lightPdf") || leg.lightPdf;
   const darkPdf = mergeSlot("darkPdf") || leg.darkPdf;
+  const whitePdf = mergeSlot("whitePdf") || leg.whitePdf;
   return {
     lightPng,
     darkPng,
+    whitePng,
     lightSvg,
     darkSvg,
+    whiteSvg,
     svg:
       a.svg ||
       (f.svg && f.svg.downloadUrl) ||
       lightSvg ||
       darkSvg ||
+      whiteSvg ||
       null,
     lightPdf,
     darkPdf,
-    pdf: a.pdf || (f.pdf && f.pdf.downloadUrl) || lightPdf || darkPdf || null,
+    whitePdf,
+    pdf: a.pdf || (f.pdf && f.pdf.downloadUrl) || lightPdf || darkPdf || whitePdf || null,
   };
 }
 
@@ -6068,19 +6405,24 @@ function buildAssetsFromFiles(files) {
   const f = files || {};
   const lightSvg = (f.lightSvg && f.lightSvg.downloadUrl) || (f.svg && f.svg.downloadUrl) || null;
   const darkSvg = (f.darkSvg && f.darkSvg.downloadUrl) || null;
+  const whiteSvg = (f.whiteSvg && f.whiteSvg.downloadUrl) || null;
   const lightPdf = (f.lightPdf && f.lightPdf.downloadUrl) || (f.pdf && f.pdf.downloadUrl) || null;
   const darkPdf = (f.darkPdf && f.darkPdf.downloadUrl) || null;
+  const whitePdf = (f.whitePdf && f.whitePdf.downloadUrl) || null;
   const front = buildSideAssetsFromFiles(f.front);
   const back = buildSideAssetsFromFiles(f.back);
   return {
     lightPng: (f.lightPng && f.lightPng.downloadUrl) || (f.png && f.png.downloadUrl) || null,
     darkPng: (f.darkPng && f.darkPng.downloadUrl) || null,
+    whitePng: (f.whitePng && f.whitePng.downloadUrl) || null,
     lightSvg,
     darkSvg,
-    svg: (f.svg && f.svg.downloadUrl) || lightSvg || darkSvg || null,
+    whiteSvg,
+    svg: (f.svg && f.svg.downloadUrl) || lightSvg || darkSvg || whiteSvg || null,
     lightPdf,
     darkPdf,
-    pdf: (f.pdf && f.pdf.downloadUrl) || lightPdf || darkPdf || null,
+    whitePdf,
+    pdf: (f.pdf && f.pdf.downloadUrl) || lightPdf || darkPdf || whitePdf || null,
     front: front || null,
     back: back || null,
   };
@@ -6112,7 +6454,15 @@ function mergeDesignFiles(currentFiles, kind, fileEntry) {
 }
 
 function isRasterPngKind(kind) {
-  return kind === "png" || kind === "lightPng" || kind === "darkPng" || /LightPng$/.test(kind) || /DarkPng$/.test(kind);
+  return (
+    kind === "png" ||
+    kind === "lightPng" ||
+    kind === "darkPng" ||
+    kind === "whitePng" ||
+    /LightPng$/.test(kind) ||
+    /DarkPng$/.test(kind) ||
+    /WhitePng$/.test(kind)
+  );
 }
 
 function isSvgFamilyKind(kind) {
@@ -6128,8 +6478,10 @@ function computeDesignPngFlags(files, assets) {
     !!u.lightPng || anySideHasPngSlot(f, a, "lightPng") || !!(f.png && f.png.downloadUrl);
   const hasDarkPng = !!u.darkPng || anySideHasPngSlot(f, a, "darkPng");
   const hasLegacyPng = !!(f.png && f.png.downloadUrl) && !(f.lightPng && f.lightPng.downloadUrl);
-  const hasPng = hasLightPng || hasDarkPng;
-  return { hasLightPng, hasDarkPng, hasLegacyPng, hasPng };
+  const hasWhitePng =
+    !!u.whitePng || anySideHasPngSlot(f, a, "whitePng");
+  const hasPng = hasLightPng || hasDarkPng || hasWhitePng;
+  return { hasLightPng, hasDarkPng, hasWhitePng, hasLegacyPng, hasPng };
 }
 
 /** Completeness: name + team + designType + both garment PNG URLs (no print colors required) */
@@ -6352,8 +6704,9 @@ exports.createDesignAsset = functions.https.onCall(async (data, context) => {
 
   // Check if user is admin
   const adminSnap = await db.collection("admins").doc(userId).get();
-  if (!adminSnap.exists || adminSnap.data()?.role !== "admin") {
-    throw new functions.https.HttpsError("permission-denied", "Only admins can create designs");
+  const adminRole = adminSnap.data()?.role;
+  if (!adminSnap.exists || (adminRole !== "admin" && adminRole !== "ops")) {
+    throw new functions.https.HttpsError("permission-denied", "Only admins and ops can create designs");
   }
 
   const {
@@ -6365,6 +6718,16 @@ exports.createDesignAsset = functions.https.onCall(async (data, context) => {
     internalNotes,
     tags,
     description,
+    slugOverride,
+    importKey,
+    sportCode,
+    leagueCode,
+    teamCode: teamCodeIn,
+    themeCode,
+    designFamily,
+    importSource,
+    importBatchId,
+    importVersion,
   } = data;
 
   // Validate required fields
@@ -6411,11 +6774,19 @@ exports.createDesignAsset = functions.https.onCall(async (data, context) => {
   const teamState = teamData.state || null;
   const teamNickname = teamData.teamName || null;
 
-  // Generate slug
-  const slugBase = `${teamName}-${name}`.toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "");
-  const slug = `${slugBase}-${Date.now().toString(36)}`;
+  // Slug: optional bulk identity slug, else team + name + uniqueness
+  let slug;
+  if (slugOverride && typeof slugOverride === "string" && slugOverride.trim()) {
+    const base = slugOverride.trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-|-$/g, "");
+    let candidate = base;
+    const dup = await db.collection("designs").where("slug", "==", candidate).limit(1).get();
+    slug = dup.empty ? candidate : `${candidate}-${Date.now().toString(36)}`;
+  } else {
+    const slugBase = `${teamName}-${name}`.toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "");
+    slug = `${slugBase}-${Date.now().toString(36)}`;
+  }
 
   // Normalize colors + Rally standard Off Black / Off White + CMYK on every swatch
   const normalizedColors = normalizeColorsForFirestore(colors);
@@ -6472,11 +6843,14 @@ exports.createDesignAsset = functions.https.onCall(async (data, context) => {
     pdf: null,
   };
 
+  const teamCodeDenorm = teamData.teamCode || teamCodeIn || null;
+
   const designData = {
     name: name.trim(),
     slug,
     teamId,
     teamNameCache: teamName,
+    teamCode: teamCodeDenorm,
     leagueId,
     teamCityCache: teamCity,
     teamStateCache: teamState,
@@ -6497,6 +6871,7 @@ exports.createDesignAsset = functions.https.onCall(async (data, context) => {
     hasSvg: false,
     hasLightPng: false,
     hasDarkPng: false,
+    hasWhitePng: false,
     hasPng: false,
     hasPdf: false,
     isComplete: false,
@@ -6506,6 +6881,15 @@ exports.createDesignAsset = functions.https.onCall(async (data, context) => {
     createdByUid: userId,
     updatedByUid: userId,
   };
+
+  if (importKey !== undefined) designData.importKey = importKey || null;
+  if (sportCode !== undefined) designData.sportCode = sportCode || null;
+  if (leagueCode !== undefined) designData.leagueCode = leagueCode || null;
+  if (themeCode !== undefined) designData.themeCode = themeCode || null;
+  if (designFamily !== undefined) designData.designFamily = designFamily || null;
+  if (importSource !== undefined) designData.importSource = importSource || null;
+  if (importBatchId !== undefined) designData.importBatchId = importBatchId || null;
+  if (importVersion !== undefined) designData.importVersion = importVersion || null;
 
   const designRef = await db.collection("designs").add(designData);
 
@@ -6534,8 +6918,9 @@ exports.updateDesignFile = functions.https.onCall(async (data, context) => {
 
   // Check if user is admin
   const adminSnap = await db.collection("admins").doc(userId).get();
-  if (!adminSnap.exists || adminSnap.data()?.role !== "admin") {
-    throw new functions.https.HttpsError("permission-denied", "Only admins can update design files");
+  const adminRoleUdf = adminSnap.data()?.role;
+  if (!adminSnap.exists || (adminRoleUdf !== "admin" && adminRoleUdf !== "ops")) {
+    throw new functions.https.HttpsError("permission-denied", "Only admins and ops can update design files");
   }
 
   const { designId, kind, storagePath, downloadUrl, fileName, contentType, sizeBytes, widthPx, heightPx, sha256 } = data;
@@ -6596,21 +6981,27 @@ exports.updateDesignFile = functions.https.onCall(async (data, context) => {
     mergedFiles.svg ||
     mergedFiles.lightSvg ||
     mergedFiles.darkSvg ||
+    mergedFiles.whiteSvg ||
     mergedFiles.front?.lightSvg ||
     mergedFiles.front?.darkSvg ||
+    mergedFiles.front?.whiteSvg ||
     mergedFiles.back?.lightSvg ||
-    mergedFiles.back?.darkSvg
+    mergedFiles.back?.darkSvg ||
+    mergedFiles.back?.whiteSvg
   );
   const hasPdf = !!(
     mergedFiles.pdf ||
     mergedFiles.lightPdf ||
     mergedFiles.darkPdf ||
+    mergedFiles.whitePdf ||
     mergedFiles.front?.lightPdf ||
     mergedFiles.front?.darkPdf ||
+    mergedFiles.front?.whitePdf ||
     mergedFiles.back?.lightPdf ||
-    mergedFiles.back?.darkPdf
+    mergedFiles.back?.darkPdf ||
+    mergedFiles.back?.whitePdf
   );
-  const { hasLightPng, hasDarkPng, hasPng } = computeDesignPngFlags(mergedFiles, mergedAssets);
+  const { hasLightPng, hasDarkPng, hasWhitePng, hasPng } = computeDesignPngFlags(mergedFiles, mergedAssets);
 
   const updateData = {
     files: mergedFiles,
@@ -6622,6 +7013,7 @@ exports.updateDesignFile = functions.https.onCall(async (data, context) => {
   updateData.hasSvg = hasSvg;
   updateData.hasLightPng = hasLightPng;
   updateData.hasDarkPng = hasDarkPng;
+  updateData.hasWhitePng = hasWhitePng;
   updateData.hasPng = hasPng;
   updateData.hasPdf = hasPdf;
 
@@ -6652,8 +7044,9 @@ exports.updateDesignAsset = functions.https.onCall(async (data, context) => {
 
   // Check if user is admin
   const adminSnap = await db.collection("admins").doc(userId).get();
-  if (!adminSnap.exists || adminSnap.data()?.role !== "admin") {
-    throw new functions.https.HttpsError("permission-denied", "Only admins can update designs");
+  const adminRoleUda = adminSnap.data()?.role;
+  if (!adminSnap.exists || (adminRoleUda !== "admin" && adminRoleUda !== "ops")) {
+    throw new functions.https.HttpsError("permission-denied", "Only admins and ops can update designs");
   }
 
   const {
@@ -6663,6 +7056,7 @@ exports.updateDesignAsset = functions.https.onCall(async (data, context) => {
     tags,
     description,
     name,
+    slug,
     sportCode,
     leagueCode,
     teamCode,
@@ -6702,6 +7096,10 @@ exports.updateDesignAsset = functions.https.onCall(async (data, context) => {
   // Name update
   if (name && typeof name === "string" && name.trim().length > 0) {
     updateData.name = name.trim();
+  }
+
+  if (slug !== undefined && typeof slug === "string" && slug.trim().length > 0) {
+    updateData.slug = slug.trim();
   }
 
   // Description (legacy) / internal notes
@@ -7076,7 +7474,13 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
             placementSource = vSnap.data();
           }
         }
-        const eff = resolveEffectivePlacement(placementSource, blank, view);
+        const blankVariantIdForPlacement =
+          (placementSource && placementSource.blankVariantId) || (prodData && prodData.blankVariantId) || null;
+        const blankVariantRow =
+          blankVariantIdForPlacement && Array.isArray(blank.variants)
+            ? blank.variants.find((v) => v && v.variantId === blankVariantIdForPlacement) || null
+            : null;
+        const eff = resolveEffectivePlacement(placementSource, blank, view, blankVariantRow);
         if (eff) {
           placement.x = eff.defaultX;
           placement.y = eff.defaultY;
@@ -7137,7 +7541,7 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
  * Stage A: Exact composite (always). Stage B: AI realism (only when quality=final and not MOCK_PHASE1_DETERMINISTIC_ONLY).
  */
 exports.onMockJobCreated = functions
-  .runWith({ memory: "1GB", timeoutSeconds: 300 })
+  .runWith({ memory: "2GB", timeoutSeconds: 300 })
   .firestore.document("rp_mock_jobs/{jobId}")
   .onCreate(async (snap, ctx) => {
     const sharp = require("sharp");
@@ -7383,11 +7787,11 @@ exports.onMockJobCreated = functions
         const productMockUrl = `https://storage.googleapis.com/${bucket.name}/${productMockPath}`;
         const targetRef = variantRef || productRef;
         const currentProduct = (await targetRef.get()).data() || {};
+        const prevMedia = currentProduct.media || {};
+        // Do not set heroFront/heroBack to undefined — Firestore rejects undefined. Spread copies existing slots only.
         const media = {
-          ...(currentProduct.media || {}),
-          heroFront: currentProduct.media?.heroFront,
-          heroBack: currentProduct.media?.heroBack,
-          gallery: currentProduct.media?.gallery || [],
+          ...prevMedia,
+          gallery: Array.isArray(prevMedia.gallery) ? prevMedia.gallery : [],
         };
 
         let blankVariantIdForAsset = null;
@@ -7512,6 +7916,29 @@ exports.onMockJobCreated = functions
         if (!awaitingItems.empty) {
           await batch.commit();
           console.log("[onMockJobCreated] Unblocked", awaitingItems.size, "bulk job items for product", job.productId);
+        }
+
+        if (variantRef && productVariantId && (job.view === "back" || !job.view)) {
+          try {
+            const parentSnap8394 = await productRef.get();
+            const pdata8394 = parentSnap8394.data() || {};
+            const bid8394 = pdata8394.blankId;
+            if (bid8394) {
+              const bs8394 = await db.collection("rp_blanks").doc(String(bid8394)).get();
+              if (bs8394.exists && String(bs8394.data().styleCode || "").trim() === "8394") {
+                await variant8394Pipeline.run8394FlatAfterVariantMock({
+                  admin,
+                  db,
+                  parentId,
+                  productVariantId,
+                  jobId,
+                  createdByUid: job.createdByUid,
+                });
+              }
+            }
+          } catch (pipeErr) {
+            console.error("[onMockJobCreated] 8394 flat pipeline:", pipeErr && pipeErr.message ? pipeErr.message : pipeErr);
+          }
         }
       }
 
@@ -7858,6 +8285,27 @@ exports.onMockJobCreated = functions
         },
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
+
+      try {
+        const pid = job.productId;
+        const vid = job.productVariantId && typeof job.productVariantId === "string" ? job.productVariantId : null;
+        if (pid && vid) {
+          const vref = db.collection("rp_products").doc(pid).collection("variants").doc(vid);
+          await vref.update({
+            "assetPipeline.mock_back": {
+              status: "failed",
+              jobId,
+              error: err.message || String(err),
+              failedAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            variant8394NextRetryAt: admin.firestore.Timestamp.fromMillis(Date.now() + 10 * 60 * 1000),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedBy: job.createdByUid || "",
+          });
+        }
+      } catch (annotateErr) {
+        console.warn("[onMockJobCreated] variant pipeline annotate failed:", annotateErr && annotateErr.message);
+      }
     }
   });
 
@@ -7914,7 +8362,9 @@ exports.onShopifySyncJobCreated = functions
     }
 
     const product = productSnap.data();
-    const readiness = shopifySync.readinessCheck(product);
+    const variantSnap = await productRef.collection("variants").get();
+    const variantDocs = variantSnap.docs.map((d) => ({ firestoreDocId: d.id, ...d.data() }));
+    const readiness = shopifySync.readinessCheck(product, { variantDocs });
 
     if (!readiness.ready) {
       const errorMsg = `Product not ready for sync: ${readiness.missing.join(", ")}`;
@@ -7940,29 +8390,77 @@ exports.onShopifySyncJobCreated = functions
 
     try {
       const { store, accessToken } = shopifySync.getShopifyConfig();
-      const { productId, variantId } = await shopifySync.runProductSync(product, store, accessToken);
+      const { productId, variantLinks } = await shopifySync.runProductSync(product, variantDocs, store, accessToken);
+
+      try {
+        const colSummary = await shopifySmartCollections.ensureShopifyCollectionsAfterProductSync(
+          product,
+          store,
+          accessToken
+        );
+        console.log("[onShopifySyncJobCreated] Smart collections ensured:", jobId, JSON.stringify(colSummary));
+      } catch (colErr) {
+        console.warn(
+          "[onShopifySyncJobCreated] Smart collection ensure failed (non-fatal):",
+          jobId,
+          colErr && colErr.message
+        );
+      }
+
+      const defaultRallyVid = product.heroVariantId || product.defaultVariantId;
+      const defaultLink =
+        (defaultRallyVid && variantLinks.find((l) => l.rallyDocId === defaultRallyVid)) || variantLinks[0];
+      const primaryShopifyVariantId = defaultLink ? defaultLink.shopifyVariantId : null;
+
+      const nowTs = admin.firestore.FieldValue.serverTimestamp();
+      const prevShopifyByVariantId = new Map();
+      variantSnap.docs.forEach((d) => {
+        const row = d.data();
+        prevShopifyByVariantId.set(d.id, row.shopify || {});
+      });
+      const linksWithDocs = variantLinks.filter((l) => l.rallyDocId);
+      const BATCH_MAX = 400;
+      for (let i = 0; i < linksWithDocs.length; i += BATCH_MAX) {
+        const slice = linksWithDocs.slice(i, i + BATCH_MAX);
+        const batch = db.batch();
+        for (const link of slice) {
+          const vRef = productRef.collection("variants").doc(link.rallyDocId);
+          batch.update(vRef, {
+            shopify: {
+              ...(prevShopifyByVariantId.get(link.rallyDocId) || {}),
+              variantId: link.shopifyVariantId,
+              status: "synced",
+              lastSyncAt: nowTs,
+              lastSyncError: null,
+            },
+            updatedAt: nowTs,
+            updatedBy: product.updatedBy || "",
+          });
+        }
+        await batch.commit();
+      }
 
       await productRef.update({
         shopify: {
           ...(product.shopify || {}),
           productId,
-          variantId: variantId || null,
+          variantId: primaryShopifyVariantId || null,
           status: "synced",
-          lastSyncAt: admin.firestore.FieldValue.serverTimestamp(),
+          lastSyncAt: nowTs,
           lastSyncError: null,
         },
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: nowTs,
         updatedBy: product.updatedBy || "",
       });
 
       await jobRef.update({
         status: "succeeded",
-        responseSummary: `productId=${productId}`,
+        responseSummary: `productId=${productId};variants=${variantLinks.length}`,
         finishedAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      console.log("[onShopifySyncJobCreated] Sync succeeded:", jobId, productId);
+      console.log("[onShopifySyncJobCreated] Sync succeeded:", jobId, productId, "variants", variantLinks.length);
     } catch (err) {
       const message = err.message || String(err);
       console.error("[onShopifySyncJobCreated] Sync failed:", jobId, message);
@@ -8030,3 +8528,64 @@ exports.approveMockAsset = functions.https.onCall(async (data, context) => {
 
   return { ok: true };
 });
+
+/**
+ * Manual retry for 8394 variant base assets (re-queue mock or re-run flat).
+ */
+exports.retryVariant8394Assets = functions.runWith({ memory: "1GB", timeoutSeconds: 300 }).https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
+  }
+  const productId = data && data.productId;
+  const variantId = data && data.variantId;
+  if (!productId || typeof productId !== "string" || !variantId || typeof variantId !== "string") {
+    throw new functions.https.HttpsError("invalid-argument", "productId and variantId are required");
+  }
+  const result = await variant8394Pipeline.retryVariant8394PipelineCore({
+    db,
+    admin,
+    sanitizeForFirestore,
+    parentId: productId,
+    variantId,
+    userId: context.auth.uid,
+  });
+  return { ok: true, ...result };
+});
+
+/** Auto-retry variants with variant8394NextRetryAt in the past. */
+exports.scheduledRetryVariant8394Assets = functions
+  .runWith({ memory: "512MB", timeoutSeconds: 300 })
+  .pubsub.schedule("every 10 minutes")
+  .onRun(async () => {
+    const now = admin.firestore.Timestamp.now();
+    let snap;
+    try {
+      snap = await db.collectionGroup("variants").where("variant8394NextRetryAt", "<=", now).limit(15).get();
+    } catch (e) {
+      console.warn("[scheduledRetryVariant8394Assets] query failed (index may be deploying):", e.message);
+      return null;
+    }
+    const systemUid = "system_scheduled_retry";
+    for (const doc of snap.docs) {
+      const pathParts = doc.ref.path.split("/");
+      const pid = pathParts[1];
+      const vid = pathParts[3];
+      if (!pid || !vid || pathParts[0] !== "rp_products" || pathParts[2] !== "variants") continue;
+      try {
+        await variant8394Pipeline.retryVariant8394PipelineCore({
+          db,
+          admin,
+          sanitizeForFirestore,
+          parentId: pid,
+          variantId: vid,
+          userId: systemUid,
+        });
+      } catch (err) {
+        console.error("[scheduledRetryVariant8394Assets]", pid, vid, err && err.message);
+      }
+    }
+    return null;
+  });
+
+const { registerBulkDesignImportHandlers } = require("./lib/bulkDesignImportHandlers");
+registerBulkDesignImportHandlers(exports, functions, admin);
