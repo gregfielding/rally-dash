@@ -71,6 +71,7 @@ import {
   type RpGenerationType,
   type RpScenePreset,
   type RpProductFlatRendersMvp,
+  type RpProductAsset,
 } from "@/lib/types/firestore";
 import {
   hasProductPlacementOverride,
@@ -79,6 +80,10 @@ import {
 import { HANGER_CREWNECK_SCENE_TEMPLATE } from "@/lib/scenes/sceneTemplates";
 import { pickFlatBlendedUrlForScene } from "@/lib/scenes/sceneRenderHelpers";
 import { isProductReadyForShopify } from "@/lib/shopify/isProductReadyForShopify";
+import {
+  orderedGalleryAssetUrlsForVariant,
+  sortRpProductAssetsForGallery,
+} from "@/lib/shopify/galleryAssetOrdering";
 import { buildShopifyTags } from "@/lib/shopify/buildShopifyTags";
 import { formatCmyk, resolveRpInkColorsWithStandard } from "@/lib/print/standardPrintInks";
 import {
@@ -2044,12 +2049,30 @@ function ProductDetailContent() {
     }));
   }, [treatsAsParentProduct, productVariants]);
 
+  const { assets, loading: assetsLoading, refetch: refetchAssets } = useProductAssets(
+    product?.id ? { productId: product.id, productSlug: product.slug } : null
+  );
+  const sortedGalleryAssets = useMemo(
+    () => sortRpProductAssetsForGallery(assets as RpProductAsset[]),
+    [assets]
+  );
+
   const shopifyPreviewGalleryUrls = useMemo(() => {
     if (!product) return [] as string[];
     const backFirst = String(product.blankStyleCode || "").trim() === "8394";
     const out: string[] = [];
     const add = (u?: string | null) => {
       if (u && typeof u === "string" && u.trim() && !out.includes(u.trim())) out.push(u.trim());
+    };
+
+    const appendSceneExtras = () => {
+      const sceneExtras = orderedGalleryAssetUrlsForVariant(
+        assets as RpProductAsset[],
+        imagesTabVariantId || undefined,
+        treatsAsParentProduct,
+        "storefront"
+      );
+      for (const u of sceneExtras) add(u);
     };
 
     const urlsFromVariant = (row: ProductVariantRow | null | undefined): string[] => {
@@ -2100,13 +2123,19 @@ function ProductDetailContent() {
       ];
       for (const row of tryList) {
         const urls = urlsFromVariant(row);
-        if (urls.length > 0) return urls;
+        if (urls.length > 0) {
+          for (const u of urls) add(u);
+          appendSceneExtras();
+          return out;
+        }
       }
       appendParentFallback();
+      appendSceneExtras();
       return out;
     }
 
     appendParentFallback();
+    appendSceneExtras();
     return out;
   }, [
     product,
@@ -2115,13 +2144,12 @@ function ProductDetailContent() {
     shopifyPreviewVariantDoc,
     product?.heroVariantId,
     product?.defaultVariantId,
+    assets,
+    imagesTabVariantId,
   ]);
 
   const { designs, loading: designsLoading, refetch: refetchDesigns } = useProductDesigns(
     product?.id ? { productId: product.id } : null
-  );
-  const { assets, loading: assetsLoading, refetch: refetchAssets } = useProductAssets(
-    product?.id ? { productId: product.id, productSlug: product.slug } : null
   );
   const { jobs, loading: jobsLoading, refetch: refetchJobs } = useGenerationJobs(
     product?.id ? { productId: product.id, limit: 10 } : undefined
@@ -2194,6 +2222,7 @@ function ProductDetailContent() {
   const { retryVariant8394Assets } = useRetryVariant8394Assets();
   const [retrying8394Assets, setRetrying8394Assets] = useState(false);
   const [queueingNeutralHangerScene, setQueueingNeutralHangerScene] = useState(false);
+  const [queueingBackdropNeutralScene, setQueueingBackdropNeutralScene] = useState(false);
   const { generateProductSceneRender } = useGenerateProductSceneRender();
   const { createSceneRenderJob } = useCreateSceneRenderJob();
   const { updateSceneAssetApproval } = useUpdateSceneAssetApproval();
@@ -5044,7 +5073,7 @@ function ProductDetailContent() {
                 <p className="text-sm text-gray-500 mb-4">Generated assets and hero slots for storefront.</p>
                 <AssetsTab
                   product={product}
-                  assets={assets}
+                  assets={sortedGalleryAssets}
                   assetsLoading={assetsLoading}
                   refetchAssets={refetchAssets}
                   showToast={showToast}
@@ -5078,20 +5107,27 @@ function ProductDetailContent() {
               </div>
 
               {treatsAsParentProduct && product?.id && imagesTabVariantId ? (
-                <div className="border border-indigo-100 rounded-lg p-4 bg-indigo-50/30">
-                  <h3 className="text-sm font-semibold text-gray-900">Alt scenes (v1) — neutral hanger</h3>
-                  <p className="text-xs text-gray-600 mt-1 mb-3">
-                    Uses the selected color variant&apos;s flat blends / heroes. Queues a Cloud Function job; failures do not
-                    block product readiness.
-                  </p>
+                <div className="border border-indigo-100 rounded-lg p-4 bg-indigo-50/30 space-y-6">
+                  <div>
+                    <h3 className="text-sm font-semibold text-gray-900">Alt scenes (v1)</h3>
+                    <p className="text-xs text-gray-600 mt-1">
+                      Uses the selected color variant&apos;s flat blends / heroes. Deterministic composites only; failures do
+                      not block product readiness.
+                    </p>
+                  </div>
+
                   {(() => {
                     const vRow = productVariants.find((x) => x.id === imagesTabVariantId);
-                    const slot = vRow?.sceneTemplateRenders?.neutral_hanger;
+                    const slotHanger = vRow?.sceneTemplateRenders?.neutral_hanger;
                     return (
-                      <div className="space-y-3">
+                      <div className="space-y-3 border-t border-indigo-100/80 pt-4">
+                        <h4 className="text-xs font-semibold text-gray-800 uppercase tracking-wide">Neutral hanger</h4>
+                        <p className="text-xs text-gray-600">Tees, tanks, crewnecks (not panties).</p>
                         <button
                           type="button"
-                          disabled={queueingNeutralHangerScene || !product.id}
+                          disabled={
+                            queueingNeutralHangerScene || queueingBackdropNeutralScene || !product.id
+                          }
                           className="px-3 py-1.5 text-xs font-medium rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
                           onClick={async () => {
                             if (!product.id || !imagesTabVariantId) return;
@@ -5114,33 +5150,33 @@ function ProductDetailContent() {
                         >
                           {queueingNeutralHangerScene ? "Queuing…" : "Queue neutral hanger scene"}
                         </button>
-                        {slot?.assetUrl ? (
+                        {slotHanger?.assetUrl ? (
                           <div className="flex flex-wrap gap-4 items-start">
                             <a
-                              href={slot.assetUrl}
+                              href={slotHanger.assetUrl}
                               target="_blank"
                               rel="noopener noreferrer"
                               className="block shrink-0"
                             >
                               {/* eslint-disable-next-line @next/next/no-img-element */}
                               <img
-                                src={slot.assetUrl}
+                                src={slotHanger.assetUrl}
                                 alt="Neutral hanger"
                                 className="max-h-40 rounded border border-gray-200"
                               />
                             </a>
                             <div className="text-xs text-gray-700 space-y-1 min-w-0">
                               <p>
-                                Status: <span className="font-mono">{slot.status}</span> · Approval:{" "}
-                                <span className="font-mono">{slot.approvalState}</span>
+                                Status: <span className="font-mono">{slotHanger.status}</span> · Approval:{" "}
+                                <span className="font-mono">{slotHanger.approvalState}</span>
                               </p>
-                              {slot.assetId ? (
-                                <p className="font-mono text-[10px] break-all">asset: {slot.assetId}</p>
+                              {slotHanger.assetId ? (
+                                <p className="font-mono text-[10px] break-all">asset: {slotHanger.assetId}</p>
                               ) : null}
-                              {slot.sourceAssetRef ? (
-                                <p className="text-gray-500">Source: {slot.sourceAssetRef}</p>
+                              {slotHanger.sourceAssetRef ? (
+                                <p className="text-gray-500">Source: {slotHanger.sourceAssetRef}</p>
                               ) : null}
-                              {slot.assetId ? (
+                              {slotHanger.assetId ? (
                                 <div className="flex flex-wrap gap-2 pt-2">
                                   <button
                                     type="button"
@@ -5148,7 +5184,7 @@ function ProductDetailContent() {
                                     onClick={async () => {
                                       try {
                                         await updateSceneAssetApproval({
-                                          assetId: slot.assetId!,
+                                          assetId: slotHanger.assetId!,
                                           approvalState: "approved",
                                         });
                                         showToast("Marked approved", "success");
@@ -5166,7 +5202,7 @@ function ProductDetailContent() {
                                     onClick={async () => {
                                       try {
                                         await updateSceneAssetApproval({
-                                          assetId: slot.assetId!,
+                                          assetId: slotHanger.assetId!,
                                           approvalState: "rejected",
                                         });
                                         showToast("Marked rejected", "success");
@@ -5184,6 +5220,115 @@ function ProductDetailContent() {
                           </div>
                         ) : (
                           <p className="text-xs text-gray-500">No neutral_hanger output for this color yet.</p>
+                        )}
+                      </div>
+                    );
+                  })()}
+
+                  {(() => {
+                    const vRow = productVariants.find((x) => x.id === imagesTabVariantId);
+                    const slotBackdrop = vRow?.sceneTemplateRenders?.backdrop_neutral;
+                    return (
+                      <div className="space-y-3 border-t border-indigo-100/80 pt-4">
+                        <h4 className="text-xs font-semibold text-gray-800 uppercase tracking-wide">Backdrop neutral</h4>
+                        <p className="text-xs text-gray-600">Plain studio backdrop; works for panties and tops.</p>
+                        <button
+                          type="button"
+                          disabled={
+                            queueingBackdropNeutralScene || queueingNeutralHangerScene || !product.id
+                          }
+                          className="px-3 py-1.5 text-xs font-medium rounded-md bg-slate-700 text-white hover:bg-slate-800 disabled:opacity-50"
+                          onClick={async () => {
+                            if (!product.id || !imagesTabVariantId) return;
+                            setQueueingBackdropNeutralScene(true);
+                            try {
+                              await createSceneRenderJob({
+                                productId: product.id,
+                                productVariantId: imagesTabVariantId,
+                                sceneKey: "backdrop_neutral",
+                              });
+                              showToast("Backdrop neutral job queued. Variant list refreshes shortly.", "success");
+                              setTimeout(() => setVariantReloadTick((t) => t + 1), 6000);
+                            } catch (err) {
+                              console.error(err);
+                              showToast(err instanceof Error ? err.message : "Failed to queue scene job", "error");
+                            } finally {
+                              setQueueingBackdropNeutralScene(false);
+                            }
+                          }}
+                        >
+                          {queueingBackdropNeutralScene ? "Queuing…" : "Queue backdrop neutral scene"}
+                        </button>
+                        {slotBackdrop?.assetUrl ? (
+                          <div className="flex flex-wrap gap-4 items-start">
+                            <a
+                              href={slotBackdrop.assetUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="block shrink-0"
+                            >
+                              {/* eslint-disable-next-line @next/next/no-img-element */}
+                              <img
+                                src={slotBackdrop.assetUrl}
+                                alt="Backdrop neutral"
+                                className="max-h-40 rounded border border-gray-200"
+                              />
+                            </a>
+                            <div className="text-xs text-gray-700 space-y-1 min-w-0">
+                              <p>
+                                Status: <span className="font-mono">{slotBackdrop.status}</span> · Approval:{" "}
+                                <span className="font-mono">{slotBackdrop.approvalState}</span>
+                              </p>
+                              {slotBackdrop.assetId ? (
+                                <p className="font-mono text-[10px] break-all">asset: {slotBackdrop.assetId}</p>
+                              ) : null}
+                              {slotBackdrop.sourceAssetRef ? (
+                                <p className="text-gray-500">Source: {slotBackdrop.sourceAssetRef}</p>
+                              ) : null}
+                              {slotBackdrop.assetId ? (
+                                <div className="flex flex-wrap gap-2 pt-2">
+                                  <button
+                                    type="button"
+                                    className="px-2 py-1 text-xs rounded bg-white border border-gray-300 hover:bg-gray-50"
+                                    onClick={async () => {
+                                      try {
+                                        await updateSceneAssetApproval({
+                                          assetId: slotBackdrop.assetId!,
+                                          approvalState: "approved",
+                                        });
+                                        showToast("Marked approved", "success");
+                                        setVariantReloadTick((t) => t + 1);
+                                      } catch (e) {
+                                        showToast(e instanceof Error ? e.message : "Update failed", "error");
+                                      }
+                                    }}
+                                  >
+                                    Approve
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="px-2 py-1 text-xs rounded bg-white border border-gray-300 hover:bg-gray-50"
+                                    onClick={async () => {
+                                      try {
+                                        await updateSceneAssetApproval({
+                                          assetId: slotBackdrop.assetId!,
+                                          approvalState: "rejected",
+                                        });
+                                        showToast("Marked rejected", "success");
+                                        setVariantReloadTick((t) => t + 1);
+                                      } catch (e) {
+                                        showToast(e instanceof Error ? e.message : "Update failed", "error");
+                                      }
+                                    }}
+                                  >
+                                    Reject
+                                  </button>
+                                </div>
+                              ) : null}
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="text-xs text-gray-500">No backdrop_neutral output for this color yet.</p>
                         )}
                       </div>
                     );

@@ -2056,10 +2056,16 @@ const {
   NEUTRAL_HANGER_SCENE_KEY,
   processNeutralHangerSceneJob,
 } = require("./lib/sceneRenderNeutralHangerJob");
+const {
+  BACKDROP_NEUTRAL_SCENE_KEY,
+  processBackdropNeutralSceneJob,
+} = require("./lib/sceneRenderBackdropNeutralJob");
+const { productMatchesSceneTemplate } = require("./lib/sceneTemplateEligibility");
+
+const SUPPORTED_SCENE_RENDER_KEYS = new Set([NEUTRAL_HANGER_SCENE_KEY, BACKDROP_NEUTRAL_SCENE_KEY]);
 
 /**
- * Queue a deterministic scene render job (v1: neutral_hanger only).
- * Creates `rp_scene_render_jobs/{jobId}`; worker `onSceneRenderJobCreated` processes it.
+ * Queue a deterministic scene render job. Creates `rp_scene_render_jobs/{jobId}`; worker processes async.
  */
 exports.createSceneRenderJob = functions.https.onCall(async (data, context) => {
   if (!context.auth) {
@@ -2074,19 +2080,39 @@ exports.createSceneRenderJob = functions.https.onCall(async (data, context) => {
   if (!productVariantId || typeof productVariantId !== "string") {
     throw new functions.https.HttpsError("invalid-argument", "productVariantId is required");
   }
-  if (sceneKey !== NEUTRAL_HANGER_SCENE_KEY) {
+  if (!SUPPORTED_SCENE_RENDER_KEYS.has(sceneKey)) {
     throw new functions.https.HttpsError(
       "invalid-argument",
-      `Only sceneKey "${NEUTRAL_HANGER_SCENE_KEY}" is supported in v1`
+      `Unsupported sceneKey "${sceneKey}". Supported: ${[...SUPPORTED_SCENE_RENDER_KEYS].join(", ")}`
     );
   }
 
-  const vRef = db.collection("rp_products").doc(productId).collection("variants").doc(productVariantId);
-  const vSnap = await vRef.get();
+  const productRef = db.collection("rp_products").doc(productId);
+  const vRef = productRef.collection("variants").doc(productVariantId);
+  const [vSnap, productSnap, templateSnap] = await Promise.all([
+    vRef.get(),
+    productRef.get(),
+    db.collection("rp_scene_templates").doc(sceneKey).get(),
+  ]);
   if (!vSnap.exists) {
     throw new functions.https.HttpsError("not-found", "Variant not found");
   }
+  if (!productSnap.exists) {
+    throw new functions.https.HttpsError("not-found", "Product not found");
+  }
   const variant = vSnap.data();
+  const product = productSnap.data();
+  const templateDoc = templateSnap.exists ? templateSnap.data() : {};
+  if (templateSnap.exists && templateDoc.status === "archived") {
+    throw new functions.https.HttpsError("failed-precondition", "Scene template is archived");
+  }
+  if (!productMatchesSceneTemplate(product, templateDoc)) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "This product is not eligible for the selected scene template (category / product type)."
+    );
+  }
+
   const uid = context.auth.uid;
   const now = admin.firestore.FieldValue.serverTimestamp();
 
@@ -2094,8 +2120,8 @@ exports.createSceneRenderJob = functions.https.onCall(async (data, context) => {
     productId,
     productVariantId,
     blankVariantId: variant.blankVariantId || "",
-    sceneTemplateId: NEUTRAL_HANGER_SCENE_KEY,
-    sceneKey: NEUTRAL_HANGER_SCENE_KEY,
+    sceneTemplateId: sceneKey,
+    sceneKey,
     jobType: "scene_render",
     generationScope: "single_variant",
     status: "queued",
@@ -2125,7 +2151,7 @@ exports.onSceneRenderJobCreated = functions
       return;
     }
 
-    if (job.sceneKey !== NEUTRAL_HANGER_SCENE_KEY) {
+    if (!SUPPORTED_SCENE_RENDER_KEYS.has(job.sceneKey)) {
       await jobRef.update({
         status: "failed",
         errorMessage: `Scene not implemented: ${job.sceneKey}`,
@@ -2139,7 +2165,14 @@ exports.onSceneRenderJobCreated = functions
 
     try {
       const bucket = storage.bucket();
-      const out = await processNeutralHangerSceneJob(db, bucket, fetch, admin, jobId, job);
+      let out;
+      if (job.sceneKey === NEUTRAL_HANGER_SCENE_KEY) {
+        out = await processNeutralHangerSceneJob(db, bucket, fetch, admin, jobId, job);
+      } else if (job.sceneKey === BACKDROP_NEUTRAL_SCENE_KEY) {
+        out = await processBackdropNeutralSceneJob(db, bucket, fetch, admin, jobId, job);
+      } else {
+        throw new Error(`Unhandled sceneKey: ${job.sceneKey}`);
+      }
       await jobRef.update({
         status: "succeeded",
         output: {
@@ -2149,7 +2182,7 @@ exports.onSceneRenderJobCreated = functions
           storagePath: out.storagePath,
         },
         errorMessage: null,
-        updatedAt: nowTs,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     } catch (err) {
       const message = err && err.message ? String(err.message) : String(err);

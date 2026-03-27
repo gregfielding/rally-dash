@@ -1,62 +1,15 @@
 "use strict";
 
 /**
- * Phase 2: deterministic neutral_hanger scene from variant-native commerce sources.
+ * Deterministic `backdrop_neutral`: garment on plain studio backdrop (universal tops + intimates).
+ * Reuses the same commerce source priority as neutral_hanger.
  */
 
 const { savePngAndPublicUrl, compositeGarmentOnBackground } = require("./sceneRenderDeterministicShared");
+const { pickNeutralHangerCommerceSource } = require("./sceneRenderNeutralHangerJob");
 const { productMatchesSceneTemplate } = require("./sceneTemplateEligibility");
 
-const NEUTRAL_HANGER_SCENE_KEY = "neutral_hanger";
-
-/**
- * Explicit priority: 8394 back-primary uses back chain first; else front chain.
- * @param {object} variant - variant doc
- * @param {object} product - parent product doc
- * @returns {{ url: string, sourceAssetRef: string, sourceView: "front" | "back" } | null}
- */
-function pickNeutralHangerCommerceSource(variant, product) {
-  const fr = variant.flatRenders || {};
-  const blended = fr.flat_blended || {};
-  const clean = fr.flat_clean || {};
-  const m = variant.media || {};
-  const is8394 = String(product.blankStyleCode || "").trim() === "8394";
-
-  if (is8394) {
-    if (blended.back && blended.back.url) {
-      return { url: String(blended.back.url), sourceAssetRef: "flat_blended.back", sourceView: "back" };
-    }
-    if (m.heroBack && String(m.heroBack).trim()) {
-      return { url: String(m.heroBack).trim(), sourceAssetRef: "media.heroBack", sourceView: "back" };
-    }
-    if (blended.front && blended.front.url) {
-      return { url: String(blended.front.url), sourceAssetRef: "flat_blended.front", sourceView: "front" };
-    }
-    if (m.heroFront && String(m.heroFront).trim()) {
-      return { url: String(m.heroFront).trim(), sourceAssetRef: "media.heroFront", sourceView: "front" };
-    }
-    if (clean.front && clean.front.url) {
-      return { url: String(clean.front.url), sourceAssetRef: "flat_clean.front", sourceView: "front" };
-    }
-  } else {
-    if (blended.front && blended.front.url) {
-      return { url: String(blended.front.url), sourceAssetRef: "flat_blended.front", sourceView: "front" };
-    }
-    if (m.heroFront && String(m.heroFront).trim()) {
-      return { url: String(m.heroFront).trim(), sourceAssetRef: "media.heroFront", sourceView: "front" };
-    }
-    if (clean.front && clean.front.url) {
-      return { url: String(clean.front.url), sourceAssetRef: "flat_clean.front", sourceView: "front" };
-    }
-    if (blended.back && blended.back.url) {
-      return { url: String(blended.back.url), sourceAssetRef: "flat_blended.back", sourceView: "back" };
-    }
-    if (m.heroBack && String(m.heroBack).trim()) {
-      return { url: String(m.heroBack).trim(), sourceAssetRef: "media.heroBack", sourceView: "back" };
-    }
-  }
-  return null;
-}
+const BACKDROP_NEUTRAL_SCENE_KEY = "backdrop_neutral";
 
 /**
  * @param {import("firebase-admin").firestore.Firestore} db
@@ -64,7 +17,7 @@ function pickNeutralHangerCommerceSource(variant, product) {
  * @param {typeof fetch} fetchFn
  * @param {import("firebase-admin")} admin
  */
-async function processNeutralHangerSceneJob(db, bucket, fetchFn, admin, jobId, job) {
+async function processBackdropNeutralSceneJob(db, bucket, fetchFn, admin, jobId, job) {
   const globalFetch = fetchFn;
   const productId = job.productId;
   const variantId = job.productVariantId;
@@ -82,25 +35,25 @@ async function processNeutralHangerSceneJob(db, bucket, fetchFn, admin, jobId, j
   const product = productSnap.data();
   const variant = variantSnap.data();
 
-  const tSnap = await db.collection("rp_scene_templates").doc(NEUTRAL_HANGER_SCENE_KEY).get();
+  const tSnap = await db.collection("rp_scene_templates").doc(BACKDROP_NEUTRAL_SCENE_KEY).get();
   const templateDoc = tSnap.exists ? tSnap.data() : {};
 
   if (!productMatchesSceneTemplate(product, templateDoc)) {
     throw new Error(
-      "Product is not eligible for neutral_hanger (see rp_scene_templates/neutral_hanger blankCategoriesAllowed)."
+      "Product is not eligible for backdrop_neutral (see rp_scene_templates/backdrop_neutral blankCategoriesAllowed)."
     );
   }
 
   const backgroundImageUrl = String(
-    templateDoc.backgroundAssetUrl || process.env.SCENE_HANGER_CREWNECK_BACKGROUND_URL || ""
+    templateDoc.backgroundAssetUrl || process.env.SCENE_BACKDROP_NEUTRAL_BACKGROUND_URL || ""
   ).trim();
   if (!backgroundImageUrl) {
     throw new Error(
-      "No background URL: set rp_scene_templates/neutral_hanger.backgroundAssetUrl or SCENE_HANGER_CREWNECK_BACKGROUND_URL"
+      "No background URL: set rp_scene_templates/backdrop_neutral.backgroundAssetUrl or SCENE_BACKDROP_NEUTRAL_BACKGROUND_URL"
     );
   }
 
-  const shadowUrl = String(templateDoc.shadowAssetUrl || process.env.SCENE_HANGER_CREWNECK_SHADOW_URL || "")
+  const shadowUrl = String(templateDoc.shadowAssetUrl || process.env.SCENE_BACKDROP_NEUTRAL_SHADOW_URL || "")
     .trim() || null;
 
   const gp = templateDoc.garmentPlacement;
@@ -108,10 +61,10 @@ async function processNeutralHangerSceneJob(db, bucket, fetchFn, admin, jobId, j
     gp && typeof gp === "object"
       ? {
           x: Number(gp.x) || 0.5,
-          y: Number(gp.y) || 0.46,
-          scale: Number(gp.scale) || 0.52,
+          y: Number(gp.y) || 0.52,
+          scale: Number(gp.scale) || 0.58,
         }
-      : { x: 0.5, y: 0.46, scale: 0.52 };
+      : { x: 0.5, y: 0.52, scale: 0.58 };
 
   const source = pickNeutralHangerCommerceSource(variant, product);
   if (!source) {
@@ -133,7 +86,7 @@ async function processNeutralHangerSceneJob(db, bucket, fetchFn, admin, jobId, j
   const sharp = require("sharp");
   const meta = await sharp(outBuf).metadata();
 
-  const storagePath = `rp_products/${productId}/variants/${variantId}/scene_templates/${NEUTRAL_HANGER_SCENE_KEY}/final.png`;
+  const storagePath = `rp_products/${productId}/variants/${variantId}/scene_templates/${BACKDROP_NEUTRAL_SCENE_KEY}/final.png`;
   const url = await savePngAndPublicUrl(bucket, storagePath, outBuf);
 
   const templateVersion = templateDoc.templateVersion != null ? Number(templateDoc.templateVersion) : 1;
@@ -147,13 +100,13 @@ async function processNeutralHangerSceneJob(db, bucket, fetchFn, admin, jobId, j
     parentProductId: productId,
     variantDocId: variantId,
     blankVariantId: variant.blankVariantId || null,
-    sceneTemplateId: NEUTRAL_HANGER_SCENE_KEY,
-    sceneTemplateSlug: NEUTRAL_HANGER_SCENE_KEY,
+    sceneTemplateId: BACKDROP_NEUTRAL_SCENE_KEY,
+    sceneTemplateSlug: BACKDROP_NEUTRAL_SCENE_KEY,
     assetType: "lifestyleImage",
     type: "lifestyleImage",
-    semanticAssetKind: "scene_hanger",
-    galleryRole: "alt_scene_primary",
-    gallerySort: 40,
+    semanticAssetKind: "scene_backdrop_neutral",
+    galleryRole: "alt_scene_secondary",
+    gallerySort: 50,
     sourceType: "deterministic_scene",
     status: autoApprove ? "approved" : "draft",
     approvalState: autoApprove ? "auto_approved" : "pending_review",
@@ -179,9 +132,9 @@ async function processNeutralHangerSceneJob(db, bucket, fetchFn, admin, jobId, j
   const assetRef = await db.collection("rp_product_assets").add(assetPayload);
 
   const variantSceneEntry = {
-    sceneTemplateId: NEUTRAL_HANGER_SCENE_KEY,
-    sceneTemplateSlug: NEUTRAL_HANGER_SCENE_KEY,
-    sceneType: "hanger",
+    sceneTemplateId: BACKDROP_NEUTRAL_SCENE_KEY,
+    sceneTemplateSlug: BACKDROP_NEUTRAL_SCENE_KEY,
+    sceneType: "backdrop",
     status: "generated",
     assetUrl: url,
     thumbUrl: url,
@@ -203,7 +156,7 @@ async function processNeutralHangerSceneJob(db, bucket, fetchFn, admin, jobId, j
   const prev = variant.sceneTemplateRenders && typeof variant.sceneTemplateRenders === "object" ? variant.sceneTemplateRenders : {};
 
   await variantRef.update({
-    sceneTemplateRenders: { ...prev, [NEUTRAL_HANGER_SCENE_KEY]: variantSceneEntry },
+    sceneTemplateRenders: { ...prev, [BACKDROP_NEUTRAL_SCENE_KEY]: variantSceneEntry },
     updatedAt: now,
     updatedBy: uid,
   });
@@ -219,7 +172,6 @@ async function processNeutralHangerSceneJob(db, bucket, fetchFn, admin, jobId, j
 }
 
 module.exports = {
-  NEUTRAL_HANGER_SCENE_KEY,
-  pickNeutralHangerCommerceSource,
-  processNeutralHangerSceneJob,
+  BACKDROP_NEUTRAL_SCENE_KEY,
+  processBackdropNeutralSceneJob,
 };

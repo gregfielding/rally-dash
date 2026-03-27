@@ -256,7 +256,7 @@ export function useRetryVariant8394Assets() {
   return { retryVariant8394Assets };
 }
 
-/** Queue deterministic scene job (v1: neutral_hanger). Writes `rp_scene_render_jobs`; worker processes async. */
+/** Queue deterministic scene job (`neutral_hanger`, `backdrop_neutral`, …). Writes `rp_scene_render_jobs`; worker runs async. */
 export function useCreateSceneRenderJob() {
   const { mutate } = useSWRConfig();
 

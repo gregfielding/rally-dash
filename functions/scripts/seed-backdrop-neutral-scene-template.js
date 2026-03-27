@@ -1,16 +1,15 @@
 #!/usr/bin/env node
 
 /**
- * Seed `rp_scene_templates/neutral_hanger` for Phase 2 deterministic hanger scene.
- * Background URL may be omitted here if you use SCENE_HANGER_CREWNECK_BACKGROUND_URL on functions.
+ * Seed `rp_scene_templates/backdrop_neutral` — plain studio backdrop for most garment categories.
  *
  * Usage (from functions/):
- *   node scripts/seed-neutral-hanger-scene-template.js
+ *   node scripts/seed-backdrop-neutral-scene-template.js
  */
 
 const admin = require("firebase-admin");
 
-const DOC_ID = "neutral_hanger";
+const DOC_ID = "backdrop_neutral";
 
 async function main() {
   if (!admin.apps.length) {
@@ -19,22 +18,21 @@ async function main() {
   const db = admin.firestore();
   const ref = db.collection("rp_scene_templates").doc(DOC_ID);
   const payload = {
-    name: "Neutral Hanger",
+    name: "Backdrop Neutral",
     sceneKey: DOC_ID,
-    sceneType: "hanger",
+    sceneType: "backdrop",
     status: "active",
     templateMode: "deterministic",
     templateVersion: 1,
-    description: "Garment on neutral studio / wall hanger; best for tees, tanks, crewnecks (not panties—use flatlays/backdrop).",
-    /** Policy: no panties — use backdrop_neutral / flatlays instead */
-    blankCategoriesAllowed: ["tees", "tanks", "crewnecks"],
+    description: "Front/back commerce cutout on a neutral studio backdrop; works across tops and intimates.",
+    blankCategoriesAllowed: ["panties", "tees", "tanks", "crewnecks", "bralettes"],
     supportsFront: true,
-    supportsBack: false,
+    supportsBack: true,
     supportsPerColor: true,
     defaultGenerationScope: "manual_only",
     defaultGalleryRole: "pdp_alt",
     autoApproveDefault: true,
-    garmentPlacement: { x: 0.5, y: 0.46, scale: 0.52 },
+    garmentPlacement: { x: 0.5, y: 0.52, scale: 0.58 },
     renderDefaults: {
       outputWidth: 1200,
       outputHeight: 1600,
@@ -49,16 +47,17 @@ async function main() {
       "commerce_back_blended",
       "commerce_back_hero",
     ],
-    usageTags: ["pdp", "apparel", "tops"],
-    notes: "Set backgroundAssetUrl to HTTPS image or rely on SCENE_HANGER_CREWNECK_BACKGROUND_URL on Cloud Functions.",
+    usageTags: ["pdp", "universal", "studio"],
+    notes:
+      "Set backgroundAssetUrl to HTTPS image or SCENE_BACKDROP_NEUTRAL_BACKGROUND_URL on Cloud Functions. Secondary alt scene vs hanger (gallerySort 50).",
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    updatedBy: "seed-neutral-hanger-scene-template",
+    updatedBy: "seed-backdrop-neutral-scene-template",
   };
 
   const existing = await ref.get();
   if (!existing.exists) {
     payload.createdAt = admin.firestore.FieldValue.serverTimestamp();
-    payload.createdBy = "seed-neutral-hanger-scene-template";
+    payload.createdBy = "seed-backdrop-neutral-scene-template";
   }
 
   await ref.set(payload, { merge: true });
