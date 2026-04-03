@@ -7,6 +7,7 @@ import { collection, doc, getDoc, getDocs, query, where } from "firebase/firesto
 import Modal from "@/components/Modal";
 import { db } from "@/lib/firebase/config";
 import { useCreateProductVariantsFromDesignBlank } from "@/lib/hooks/useRPProductMutations";
+import { mapRpBlankFromFirestore } from "@/lib/blanks/blankFirestore";
 import type { DesignDoc, DesignTeam, RPBlank, RpProduct } from "@/lib/types/firestore";
 import {
   buildTeamGenerateExistingLookup,
@@ -26,7 +27,9 @@ async function fetchBlanksByIds(ids: string[]): Promise<Record<string, RPBlank |
   const pairs = await Promise.all(
     ids.map(async (id) => {
       const snap = await getDoc(doc(database, "rp_blanks", id));
-      const blank = snap.exists() ? ({ ...snap.data(), blankId: snap.id } as RPBlank) : null;
+      const blank = snap.exists()
+        ? mapRpBlankFromFirestore(snap.id, snap.data() as Record<string, unknown>)
+        : null;
       return [id, blank] as const;
     })
   );

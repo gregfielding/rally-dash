@@ -12,6 +12,18 @@ export {
   newVariantId,
   synthesizeLegacyVariant,
 } from "./blankModel";
+export {
+  getVariantFlatBackUrl,
+  getVariantFlatFrontUrl,
+  getVariantModelBackUrl,
+  getVariantModelFrontUrl,
+} from "./variantRenderSources";
+export {
+  getVariantRenderReady8394,
+  isVariantRenderReady8394,
+  type VariantRenderReady8394Result,
+  type VariantRenderReady8394ChecklistItem,
+} from "./variant8394MasterReadiness";
 export { deriveColorFamily, getEffectiveColorFamily } from "./colorFamily";
 export { garmentCategoryDefaultPrintSides, inferDefaultPrintSides } from "./defaultPrintSides";
 export { getDefaultPrintSidesForStyleCode } from "@/lib/rp/blanks/styleRegistry";
@@ -41,3 +53,20 @@ export {
   type TeamColorFamilyOption,
 } from "./eligibility";
 export { GARMENT_SIZE_CODES_ORDER, normalizeGarmentSizes, getProductVariantSizeList } from "./garmentSizes";
+export { mapRpBlankFromFirestore } from "./blankFirestore";
+export { normalizeRPBlankRenderProfile } from "./renderProfileNormalize";
+export {
+  buildRenderTargetSettingsMap,
+  getDefaultRenderTargetSettings,
+  getRenderTargetPreviewUrl,
+  legacyZoneBlendToBlend01,
+  mergeRenderTargetSettings,
+  RENDER_TARGET_LABELS,
+  RENDER_TARGETS,
+  variantSliceToRenderTargetSettingsPatch,
+} from "@/lib/render/renderTargetTuning";
+export {
+  resolveEffectiveRenderTargetSettings,
+  resolveEngineBlendForRenderTarget,
+  type ResolveRenderTargetSettingsQa,
+} from "@/lib/products/resolveProductRenderProfile";

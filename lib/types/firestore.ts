@@ -772,8 +772,8 @@ export interface RpInspiration {
   updatedAt?: Timestamp;
 }
 
-/** Step 10 flat mockup look types (MVP). */
-export type RpFlatRenderLookType = "flat_clean" | "flat_blended";
+/** Step 10 flat mockup look types (MVP) + model template outputs (8394 multi-source). */
+export type RpFlatRenderLookType = "flat_clean" | "flat_blended" | "model_clean" | "model_blended";
 
 /** Step 10 MVP views (expand later). */
 export type RpFlatRenderView = "front" | "back";
@@ -798,10 +798,35 @@ export interface RpProductFlatRenderSlot {
 
 /**
  * Nested by look then view. MVP: 8394 uses `back`; tees / crewneck may use `front` when generated.
+ * `model_*` holds outputs from variant `modelFront` / `modelBack` sources (separate from flat vendor flats).
  */
 export interface RpProductFlatRendersMvp {
   flat_clean?: { front?: RpProductFlatRenderSlot | null; back?: RpProductFlatRenderSlot | null };
   flat_blended?: { front?: RpProductFlatRenderSlot | null; back?: RpProductFlatRenderSlot | null };
+  model_clean?: { front?: RpProductFlatRenderSlot | null; back?: RpProductFlatRenderSlot | null };
+  model_blended?: { front?: RpProductFlatRenderSlot | null; back?: RpProductFlatRenderSlot | null };
+}
+
+/** Deterministic gallery ordering helper on `rp_products/.../variants/*` (Shopify prep). */
+export type RpVariantGeneratedRenderOutputRole =
+  | "flat_front"
+  | "flat_back"
+  | "model_front"
+  | "model_back"
+  | "detail";
+
+export interface RpVariantGeneratedRenderOutput {
+  role: RpVariantGeneratedRenderOutputRole;
+  sourceType: "variant_render_source";
+  sourceImageRole?: string | null;
+  url: string;
+  storagePath?: string | null;
+  width?: number | null;
+  height?: number | null;
+  sort: number;
+  createdAt?: Timestamp | null;
+  lookType?: string | null;
+  view?: RpFlatRenderView | null;
 }
 
 /** One deterministic scene output (non-AI composite). */
@@ -842,6 +867,7 @@ export type RpSemanticAssetKind =
   | "scene_backdrop_neutral"
   | "scene_flatlay_wood"
   | "scene_flatlay_boutique"
+  | "scene_model_back"
   | "scene_bed_soft"
   | "scene_folded"
   | "scene_hero_studio"
@@ -871,6 +897,7 @@ export type RpSceneTemplateSceneType =
   | "backdrop"
   | "flatlay_floor"
   | "flatlay_boutique"
+  | "body_model"
   | "flatlay_bed"
   | "promo_card"
   | "hero_studio"
@@ -901,7 +928,14 @@ export interface RpSceneTemplate {
   defaultGalleryRole?: RpSceneDefaultGalleryRoleDoc;
   backgroundAssetUrl?: string | null;
   shadowAssetUrl?: string | null;
+  /** Garment / fabric region mask (same aspect as `backgroundAssetUrl` after resize). Required for `body_model`. */
   maskAssetUrl?: string | null;
+  /** Optional warm or cool lighting overlay (full-frame, composited last). */
+  lightingAssetUrl?: string | null;
+  /** Written to `rp_product_assets.galleryRole` for deterministic workers that support it. */
+  sceneOutputGalleryRole?: RpGalleryRole;
+  /** Written to `rp_product_assets.gallerySort` when set. */
+  gallerySort?: number;
   placementZone?: {
     x: number;
     y: number;
@@ -1357,6 +1391,10 @@ export interface RpProductVariant {
   media?: RpProduct["media"];
   flatRenders?: RpProductFlatRendersMvp | null;
   sceneRenders?: RpProductSceneRendersMvp | null;
+  /**
+   * Ordered list of generated commerce outputs for this SKU/color (flat + model). Used for gallery / future multi-image Shopify sync.
+   */
+  generatedRenderOutputs?: RpVariantGeneratedRenderOutput[] | null;
   /**
    * Typed deterministic scene outputs keyed by `sceneTemplateSlug` (alt-image v1).
    * Canonical rows also live in `rp_product_assets`; this is a cache for fast UI.
@@ -2088,6 +2126,87 @@ export interface RPBlankVariantRenderProfileOverrides {
   back?: RPBlankVariantRenderProfileSideOverride | null;
 }
 
+/** Per render-target keys: variant source slots / pipeline outputs (flat vs on-model). */
+export type RpRenderTarget =
+  | "flat_front"
+  | "flat_back"
+  | "model_front"
+  | "model_back";
+
+/** Alias retained for existing imports and `Record<…>` maps. */
+export type RpRenderTargetKey = RpRenderTarget;
+
+export interface RpPlacementSettings {
+  scale: number;
+  /** 0–1 */
+  x: number;
+  /** 0–1 */
+  y: number;
+  safeArea?: boolean;
+}
+
+export interface RpBlendSettings {
+  /** 0–1 */
+  fabricFeel: number;
+  /** 0–1 */
+  printStrength: number;
+  mode?: "clean" | "soft" | "vintage" | "bold";
+}
+
+export interface RpWarpSettings {
+  enabled: boolean;
+  /** Curve intensity */
+  warpStrength?: number;
+  verticalStretch?: number;
+  horizontalWarp?: number;
+}
+
+export interface RpMaskSettings {
+  enabled: boolean;
+  feather?: number;
+  edgeFade?: number;
+}
+
+export interface RpRenderTargetSettings {
+  placement: RpPlacementSettings;
+  blend: RpBlendSettings;
+  warp?: RpWarpSettings;
+  mask?: RpMaskSettings;
+}
+
+/**
+ * Per-render-target tuning on the blank (placement scale/position hints, blend, warp, mask).
+ * **Zone geometry and safe-area shape** remain on `RPBlank.placements[]` only.
+ */
+export interface RPBlankRenderProfile {
+  renderTargets?: Partial<Record<RpRenderTarget, RpRenderTargetSettings>>;
+}
+
+export type RPBlankVariantRenderTargetOverrides = Partial<
+  Record<RpRenderTargetKey, RPBlankVariantRenderProfileSideOverride | null>
+>;
+
+export type RPBlankVariantMarketingImageRole =
+  | "lifestyle"
+  | "flatlay"
+  | "bed"
+  | "wood"
+  | "promo"
+  | "detail";
+
+/** Manual marketing / lifestyle assets — not consumed by the flat/model compositor. */
+export interface RPBlankVariantMarketingImage {
+  id: string;
+  role: RPBlankVariantMarketingImageRole;
+  storagePath: string;
+  downloadUrl: string;
+  width?: number | null;
+  height?: number | null;
+  sort?: number | null;
+  caption?: string | null;
+  updatedAt?: Timestamp | null;
+}
+
 /** One color / SKU line on a master blank */
 export interface RPBlankVariant {
   variantId: string;
@@ -2110,10 +2229,18 @@ export interface RPBlankVariant {
    * that generation — see RALLY_MASTER_BLANK_SCHEMA.md (Storefront / Shopify).
    */
   images?: {
+    /** @deprecated Prefer `flatFront`; kept for backward compatibility (lazy-mapped to flat front in readers). */
     front?: RPImageRef | null;
+    /** @deprecated Prefer `flatBack`; lazy-mapped to flat back in readers. */
     back?: RPImageRef | null;
     detail?: RPImageRef | null;
+    flatFront?: RPImageRef | null;
+    flatBack?: RPImageRef | null;
+    modelFront?: RPImageRef | null;
+    modelBack?: RPImageRef | null;
   };
+  /** Lifestyle / promo shots stored for merchandising only (not render inputs). */
+  marketingImages?: RPBlankVariantMarketingImage[] | null;
   /**
    * Quick global blend hint (applies before product overrides; after `renderProfileOverrides` side blend).
    * Prefer `renderProfileOverrides` for per-side control.
@@ -2124,6 +2251,11 @@ export interface RPBlankVariant {
    * Resolution: blank placement row → `renderProfileOverrides.{front|back}` → product overrides.
    */
   renderProfileOverrides?: RPBlankVariantRenderProfileOverrides | null;
+  /**
+   * Optional per render-target overrides (e.g. `model_back` vs `flat_back`).
+   * `flat_*` merges with legacy `renderProfileOverrides.{front|back}`; `model_*` does not inherit legacy side overrides.
+   */
+  renderTargetOverrides?: RPBlankVariantRenderTargetOverrides | null;
   sortOrder?: number | null;
   eligibilityOverride?: RPBlankVariantEligibilityOverride | null;
 }
@@ -2305,6 +2437,11 @@ export interface RPBlank {
 
   imageMeta?: RPImageMeta;
   placements?: RPPlacement[];
+  /**
+   * Optional per-render-target tuning (see `RPBlankRenderProfile`).
+   * Canonical zone geometry remains `placements[]`.
+   */
+  renderProfile?: RPBlankRenderProfile | null;
   /**
    * Blank-level render profile gate (not product-level).
    * `approved` = safe for production / bulk generation once zones are tuned.

@@ -14,11 +14,11 @@ export { pickDesignPngUrlForVariant };
 import { getBlankVersionValue, getDesignVersionValue } from "@/lib/products/staleness";
 import { DEFAULT_GARMENT_SAFE_AREA } from "@/lib/render/designArtboardSpec";
 import {
-  getPlacementFingerprintSliceForProduct,
-  getPlacementRowForSide,
-  resolveEffectiveRenderSettings,
-  resolvePlacementKeyForSide,
+  getPlacementFingerprintSliceForRenderTarget,
+  resolveEffectiveRenderTargetSettings,
+  resolveEngineBlendForRenderTarget,
 } from "@/lib/products/resolveProductRenderProfile";
+import { getVariantFlatBackUrl } from "@/lib/blanks/variantRenderSources";
 
 const MVP_STYLE_CODE = "8394";
 
@@ -137,7 +137,7 @@ export function get8394DesignTreatmentFromPlacement(placementRow: RPPlacement | 
 }
 
 export function getVariantBackImageUrl(blank: RPBlank, variant: RPBlankVariant): string | null {
-  return variant.images?.back?.downloadUrl ?? blank.images?.back?.downloadUrl ?? null;
+  return getVariantFlatBackUrl(blank, variant);
 }
 
 /**
@@ -173,22 +173,31 @@ export async function computeProductFlatRenderFingerprintAsync(params: {
   product: RpProduct;
 }): Promise<string> {
   const { blank, variant, design, product } = params;
-  const pk = resolvePlacementKeyForSide(product, variant, "back");
-  const placementRow = getPlacementRowForSide(blank, "back", pk);
-  const placement = getPlacementFingerprintSliceForProduct(blank, product, "back", variant);
-  const blendEff = resolveEffectiveRenderSettings(product, blank, variant, placementRow, "back");
+  const placement = getPlacementFingerprintSliceForRenderTarget(blank, product, "flat_back", variant);
+  const tuningFlat = resolveEffectiveRenderTargetSettings(product, blank, variant, "flat_back");
+  const blendEff = resolveEngineBlendForRenderTarget(
+    product,
+    blank,
+    variant,
+    "flat_back",
+    tuningFlat.settings.blend
+  );
   const blend = { blendMode: blendEff.blendMode, blendOpacity: blendEff.blendOpacity };
   const { url: designAssetUrl, ref: designAssetRef } = pickDesignPngUrlForVariant(design, variant);
   const variantBackUrl = getVariantBackImageUrl(blank, variant);
   const designId = product.designIdBack?.trim() || product.designId?.trim() || "";
 
   const payload = {
-    scope: "step10_mvp_8394_back_v4",
+    scope: "step10_mvp_8394_back_v6_flat_target",
+    renderTarget: "flat_back",
     blankId: product.blankId,
     blankVariantId: product.blankVariantId,
     blankVersion: getBlankVersionValue(blank),
     placementBack: placement,
     backBlend: blend,
+    targetTuningQa: tuningFlat.qa,
+    targetTuningPlacement: tuningFlat.settings.placement,
+    targetTuningBlend01: tuningFlat.settings.blend,
     variantBackUrl,
     designId,
     designVersion: getDesignVersionValue(design),

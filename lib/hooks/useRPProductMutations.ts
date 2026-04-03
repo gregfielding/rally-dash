@@ -170,7 +170,12 @@ export function useGenerateProductFlatRenders() {
     async (input: {
       productId: string;
       productVariantId?: string | null;
-      renderTypes?: ("flat_blended_back" | "flat_clean_front")[];
+      renderTypes?: (
+        | "flat_blended_back"
+        | "flat_clean_front"
+        | "model_blended_back"
+        | "model_clean_front"
+      )[];
     }) => {
       if (!functions) {
         throw new Error("Cloud Functions not initialized");
@@ -187,10 +192,17 @@ export function useGenerateProductFlatRenders() {
         productId: string;
         inputFingerprint: string;
         renderTypes?: string[];
+        /** QA: why each target was included or skipped (8394 auto-expand or explicit). */
+        renderSelectionLog?: string[];
         urls: {
           flat_clean_back: string | null;
           flat_blended_back: string | null;
           flat_clean_front: string | null;
+          flat_blended_front: string | null;
+          model_clean_back: string | null;
+          model_blended_back: string | null;
+          model_clean_front: string | null;
+          model_blended_front: string | null;
         };
       };
     },
@@ -256,7 +268,7 @@ export function useRetryVariant8394Assets() {
   return { retryVariant8394Assets };
 }
 
-/** Queue deterministic scene job (neutral_hanger, backdrop_neutral, flatlay_wood, flatlay_boutique, …). Writes `rp_scene_render_jobs`. */
+/** Queue deterministic scene job (neutral_hanger, backdrop_neutral, body_model, flatlay_wood, flatlay_boutique, …). Writes `rp_scene_render_jobs`. */
 export function useCreateSceneRenderJob() {
   const { mutate } = useSWRConfig();
 

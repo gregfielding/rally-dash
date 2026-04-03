@@ -2030,7 +2030,8 @@ exports.refreshProductMerchandisingFromSources = functions.https.onCall(async (d
 
 /**
  * Step 10 MVP: 8394 variant-native flats. Callable args: productId, productVariantId (required for parent),
- * optional renderTypes default ["flat_blended_back","flat_clean_front"].
+ * optional renderTypes. When omitted, expands from variant sources (flat/model back + front URLs).
+ * Fallback when expansion is empty: model_blended_back, flat_clean_front, flat_blended_back, model_clean_front.
  * Writes `rp_products/{productId}/variants/{variantId}` only (flatRenders, media.heroBack/heroFront, gallery, mockupUrl).
  */
 exports.generateProductFlatRenders = createRegisterGenerateProductFlatRenders({
@@ -2061,11 +2062,16 @@ const {
   processBackdropNeutralSceneJob,
 } = require("./lib/sceneRenderBackdropNeutralJob");
 const { FLATLAY_SCENE_KEYS, processFlatlaySceneJob } = require("./lib/sceneRenderFlatlayJobs");
+const {
+  BODY_MODEL_SCENE_KEY,
+  processBodyModelSceneJob,
+} = require("./lib/sceneRenderBodyModelJob");
 const { productMatchesSceneTemplate } = require("./lib/sceneTemplateEligibility");
 
 const SUPPORTED_SCENE_RENDER_KEYS = new Set([
   NEUTRAL_HANGER_SCENE_KEY,
   BACKDROP_NEUTRAL_SCENE_KEY,
+  BODY_MODEL_SCENE_KEY,
   ...FLATLAY_SCENE_KEYS,
 ]);
 
@@ -2175,6 +2181,8 @@ exports.onSceneRenderJobCreated = functions
         out = await processNeutralHangerSceneJob(db, bucket, fetch, admin, jobId, job);
       } else if (job.sceneKey === BACKDROP_NEUTRAL_SCENE_KEY) {
         out = await processBackdropNeutralSceneJob(db, bucket, fetch, admin, jobId, job);
+      } else if (job.sceneKey === BODY_MODEL_SCENE_KEY) {
+        out = await processBodyModelSceneJob(db, bucket, fetch, admin, jobId, job);
       } else if (FLATLAY_SCENE_KEYS.has(job.sceneKey)) {
         out = await processFlatlaySceneJob(db, bucket, fetch, admin, jobId, job);
       } else {
@@ -5782,6 +5790,57 @@ exports.backfillBlankDefaultPrintSides = functions.https.onCall(async (data, con
   return { ok: true, dryRun: false, force, updated };
 });
 
+/** Admin write sanitizer for `rp_blanks.renderProfile` (per-render-target tuning only). */
+function sanitizeBlankRenderProfileForWrite(rp) {
+  if (rp == null || typeof rp !== "object") return null;
+  const ALLOWED = new Set(["flat_front", "flat_back", "model_front", "model_back"]);
+  const BLEND_MODES = new Set(["clean", "soft", "vintage", "bold"]);
+  const rtRaw = rp.renderTargets;
+  if (!rtRaw || typeof rtRaw !== "object") return null;
+  const renderTargets = {};
+  for (const key of ALLOWED) {
+    const v = rtRaw[key];
+    if (v == null || typeof v !== "object") continue;
+    const pl = v.placement;
+    const bl = v.blend;
+    if (!pl || typeof pl !== "object" || !bl || typeof bl !== "object") continue;
+    const scale = pl.scale != null ? Number(pl.scale) : NaN;
+    const x = pl.x != null ? Number(pl.x) : NaN;
+    const y = pl.y != null ? Number(pl.y) : NaN;
+    if (!Number.isFinite(scale) || !Number.isFinite(x) || !Number.isFinite(y)) continue;
+    const fabricFeel = bl.fabricFeel != null ? Number(bl.fabricFeel) : NaN;
+    const printStrength = bl.printStrength != null ? Number(bl.printStrength) : NaN;
+    if (!Number.isFinite(fabricFeel) || !Number.isFinite(printStrength)) continue;
+    const row = {
+      placement: { scale, x, y },
+      blend: { fabricFeel, printStrength },
+    };
+    if (pl.safeArea === true) row.placement.safeArea = true;
+    else if (pl.safeArea === false) row.placement.safeArea = false;
+    if (typeof bl.mode === "string" && BLEND_MODES.has(bl.mode)) row.blend.mode = bl.mode;
+    if (v.warp && typeof v.warp === "object" && (v.warp.enabled === true || v.warp.enabled === false)) {
+      row.warp = { enabled: v.warp.enabled };
+      for (const [wk, wv] of [
+        ["warpStrength", v.warp.warpStrength],
+        ["verticalStretch", v.warp.verticalStretch],
+        ["horizontalWarp", v.warp.horizontalWarp],
+      ]) {
+        if (wv != null && Number.isFinite(Number(wv))) row.warp[wk] = Number(wv);
+      }
+    }
+    if (v.mask && typeof v.mask === "object" && (v.mask.enabled === true || v.mask.enabled === false)) {
+      row.mask = { enabled: v.mask.enabled };
+      if (v.mask.feather != null && Number.isFinite(Number(v.mask.feather)))
+        row.mask.feather = Number(v.mask.feather);
+      if (v.mask.edgeFade != null && Number.isFinite(Number(v.mask.edgeFade)))
+        row.mask.edgeFade = Number(v.mask.edgeFade);
+    }
+    renderTargets[key] = row;
+  }
+  if (Object.keys(renderTargets).length === 0) return null;
+  return { renderTargets };
+}
+
 /**
  * Update a Blank (v2)
  * Allows status updates and image attachments
@@ -5837,6 +5896,7 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
     preferredFlatLook8394: preferredFlatLook8394Input,
     garmentSizes: garmentSizesInput,
     defaultPrintSides: defaultPrintSidesInput,
+    renderProfile: renderProfileInput,
   } = data;
 
   if (!blankId || typeof blankId !== "string") {
@@ -6063,6 +6123,19 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
     }));
   }
 
+  if (renderProfileInput !== undefined) {
+    if (renderProfileInput === null) {
+      updateData.renderProfile = admin.firestore.FieldValue.delete();
+    } else if (typeof renderProfileInput === "object" && renderProfileInput !== null) {
+      const sanitized = sanitizeBlankRenderProfileForWrite(renderProfileInput);
+      if (sanitized == null) {
+        updateData.renderProfile = admin.firestore.FieldValue.delete();
+      } else {
+        updateData.renderProfile = sanitized;
+      }
+    }
+  }
+
   if (renderProfileStatus !== undefined) {
     updateData.renderProfileStatus =
       renderProfileStatus === "draft" || renderProfileStatus === "approved" ? renderProfileStatus : null;
@@ -6201,6 +6274,7 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
   // Bump when: placements, renderDefaults, templates, shopifyDefaults, defaultPricing, defaultShipping, variants.
   const versionBumpKeys = [
     "placements",
+    "renderProfile",
     "renderDefaults",
     "renderProfileStatus",
     "renderProfileNotes",

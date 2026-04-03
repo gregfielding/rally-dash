@@ -7,6 +7,7 @@
 
 const { resolveMockPlacementForProduct } = require("./resolveProductRenderProfile");
 const { executeProductFlatRender8394Mvp, pickDesignPngForVariant } = require("./productFlatRenderMvp");
+const { getVariantFlatBackUrl } = require("./variantRenderSources");
 
 const RETRY_DELAY_MS = 10 * 60 * 1000;
 
@@ -18,14 +19,6 @@ function mergePlacementSource(parent, variantDoc) {
     placementOverrides: variantDoc.placementOverrides != null ? variantDoc.placementOverrides : parent.placementOverrides,
     renderOverrides: variantDoc.renderOverrides != null ? variantDoc.renderOverrides : parent.renderOverrides,
   };
-}
-
-function getVariantBackUrl(blank, variant) {
-  return (
-    (variant.images && variant.images.back && variant.images.back.downloadUrl) ||
-    (blank.images && blank.images.back && blank.images.back.downloadUrl) ||
-    null
-  );
 }
 
 function isVariantBaseComplete8394(v) {
@@ -84,7 +77,7 @@ async function queueVariant8394BaseAssets(ctx) {
   const placementProduct = mergePlacementSource(parent, variantDoc);
   const variantBackUrl =
     (variantDoc.renderSetup && variantDoc.renderSetup.back && variantDoc.renderSetup.back.blankImageUrl) ||
-    getVariantBackUrl(blank, variantRow);
+    getVariantFlatBackUrl(blank, variantRow);
   if (!variantBackUrl) {
     console.warn("[queueVariant8394BaseAssets] no back image URL");
     await variantRef.update({
@@ -206,7 +199,6 @@ async function run8394FlatAfterVariantMock(ctx) {
       data: {
         productId: parentId,
         productVariantId,
-        renderTypes: ["flat_blended_back", "flat_clean_front"],
       },
       contextUid: uid,
     });
@@ -292,7 +284,7 @@ async function retryVariant8394PipelineCore(ctx) {
     if (!variantRow) throw new Error("Blank variant row missing");
     const variantBackUrl =
       (variantDoc.renderSetup && variantDoc.renderSetup.back && variantDoc.renderSetup.back.blankImageUrl) ||
-      getVariantBackUrl(blank, variantRow);
+      getVariantFlatBackUrl(blank, variantRow);
     const designId =
       (variantDoc.designIdBack && String(variantDoc.designIdBack).trim()) ||
       (parent.designIdBack && String(parent.designIdBack).trim()) ||
@@ -361,7 +353,6 @@ async function retryVariant8394PipelineCore(ctx) {
       data: {
         productId: parentId,
         productVariantId: variantId,
-        renderTypes: ["flat_blended_back", "flat_clean_front"],
       },
       contextUid: userId,
     });

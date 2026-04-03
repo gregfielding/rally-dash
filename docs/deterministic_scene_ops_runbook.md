@@ -15,6 +15,7 @@
 | `backdrop_neutral` | Universal studio PDP | Panties + tops. |
 | `flatlay_wood` | PDP + lifestyle | Broad categories. |
 | `flatlay_boutique` | PDP selective / marketing-leaning | Narrower eligibility. |
+| `body_model` | Worn back (panties), deterministic | Body + mask + `flat_clean.back`; `scene_model_back`; defaults to **needs approval**. |
 
 ---
 
@@ -24,16 +25,18 @@ Run **staging → prod** in order.
 
 ### 2.1 Firestore `rp_scene_templates/{sceneKey}`
 
-For each: `neutral_hanger`, `backdrop_neutral`, `flatlay_wood`, `flatlay_boutique`
+For each: `neutral_hanger`, `backdrop_neutral`, `flatlay_wood`, `flatlay_boutique`, `body_model`
 
 - [ ] Document exists; `status: "active"`.
 - [ ] **`backgroundAssetUrl`** is a stable HTTPS URL **or** you intentionally rely on Cloud Functions env (see §2.2).
+- [ ] **`body_model` only:** **`maskAssetUrl`** (aligned to body frame) **required**; optional `lightingAssetUrl`, `shadowAssetUrl`, `garmentPlacement`.
 - [ ] Optional: `shadowAssetUrl`, `garmentPlacement` (tune after first real outputs).
 - [ ] Seeds: run from `functions/` if docs are missing or stale:
   - `node scripts/seed-neutral-hanger-scene-template.js`
   - `node scripts/seed-backdrop-neutral-scene-template.js`
   - `node scripts/seed-flatlay-wood-scene-template.js`
   - `node scripts/seed-flatlay-boutique-scene-template.js`
+  - `node scripts/seed-body-model-scene-template.js`
 
 ### 2.2 Cloud Functions env (when not using Firestore URLs)
 
@@ -43,6 +46,7 @@ Set as appropriate for the project (names align with workers):
 - Backdrop: `SCENE_BACKDROP_NEUTRAL_BACKGROUND_URL`, optional `SCENE_BACKDROP_NEUTRAL_SHADOW_URL`
 - Wood: `SCENE_FLATLAY_WOOD_BACKGROUND_URL`, optional `SCENE_FLATLAY_WOOD_SHADOW_URL`
 - Boutique: `SCENE_FLATLAY_BOUTIQUE_BACKGROUND_URL`, optional `SCENE_FLATLAY_BOUTIQUE_SHADOW_URL`
+- Body model: `BODY_MODEL_BASE_IMAGE_URL`, `BODY_MODEL_MASK_URL`, optional `BODY_MODEL_SHADOW_URL`, `BODY_MODEL_LIGHTING_URL`
 
 ### 2.3 Deploy
 
@@ -73,6 +77,9 @@ Eligibility is **data-driven**: `blankCategoriesAllowed` / optional `productType
 | `backdrop_neutral` | Yes | Yes |
 | `flatlay_wood` | Yes | Yes |
 | `flatlay_boutique` | Yes | **No** (seed: `panties`, `bralettes`, `tees` only) |
+| `body_model` | Yes (`blankCategoriesAllowed: ["panties"]`) | **No** |
+
+**body_model:** Requires **`flat_clean.back`** plus **body + mask** art (see §2.1–2.2). Seed defaults to **manual approval** (`autoApproveDefault: false`).
 
 If merchandising requires **boutique for tanks**, change **seed / Firestore** eligibility — not a new template.
 
@@ -118,6 +125,7 @@ Before any automation:
 
 Documented in `galleryAssetOrdering.ts` comments; asset rows set by workers:
 
+- `body_model`: `alt_scene_primary` (or `alt_scene_secondary` if `sceneOutputGalleryRole` on template), **`gallerySort` 38** default
 - `neutral_hanger`: `alt_scene_primary`, `gallerySort` **40**
 - `backdrop_neutral`: `alt_scene_secondary`, **50**
 - `flatlay_wood`: `alt_scene_secondary`, **52** (override via template `gallerySort`)

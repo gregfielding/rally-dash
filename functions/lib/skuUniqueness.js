@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * Global SKU uniqueness across all `rp_products/*/variants/*` docs.
+ * Global SKU uniqueness across all variant docs (rp_products → variants subcollection).
  * Uses collection group query on `sku` (requires index).
  *
  * @param {FirebaseFirestore.Firestore} db

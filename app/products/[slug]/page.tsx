@@ -58,6 +58,12 @@ import { enrichTaxonomyAndTagsForSave } from "@/lib/taxonomy/enrichProductTaxono
 import { buildProductTagsFromRpProduct, tagsNormalizedFromTags } from "@/lib/products/buildProductTags";
 import Modal from "@/components/Modal";
 import {
+  FlatRender8394LastRunQaPanel,
+  type FlatRender8394VariantQaSnapshot,
+  type LastFlatRender8394Payload,
+} from "@/components/products/FlatRender8394LastRunQaPanel";
+import { RenderTargetTuningQaSummary } from "@/components/products/RenderTargetTuningQaSummary";
+import {
   RpPrintMethod,
   RpDesignPlacement,
   RpInkColor,
@@ -2189,6 +2195,10 @@ function ProductDetailContent() {
   // Generate form state
   const [generating, setGenerating] = useState(false);
   const [generatingFlatRenders, setGeneratingFlatRenders] = useState(false);
+  /** Last `renderSelectionLog` from `generateProductFlatRenders` (8394 QA). */
+  const [lastFlatRenderSelectionLog, setLastFlatRenderSelectionLog] = useState<string[] | null>(null);
+  /** Last callable `urls` + `renderTypes` for 8394 ordered-output QA. */
+  const [lastFlatRender8394Payload, setLastFlatRender8394Payload] = useState<LastFlatRender8394Payload | null>(null);
   const [generatingSceneRender, setGeneratingSceneRender] = useState(false);
   const [flatRenderFingerprint, setFlatRenderFingerprint] = useState<string | null>(null);
   const [generateError, setGenerateError] = useState<string | null>(null);
@@ -2219,17 +2229,23 @@ function ProductDetailContent() {
   const generationType = isProductOnly ? "product_only" : "on_model";
   const { generateProductAssets } = useGenerateProductAssets();
   const { generateProductFlatRenders } = useGenerateProductFlatRenders();
+  useEffect(() => {
+    setLastFlatRenderSelectionLog(null);
+    setLastFlatRender8394Payload(null);
+  }, [product?.id]);
   const { retryVariant8394Assets } = useRetryVariant8394Assets();
   const [retrying8394Assets, setRetrying8394Assets] = useState(false);
   const [queueingNeutralHangerScene, setQueueingNeutralHangerScene] = useState(false);
   const [queueingBackdropNeutralScene, setQueueingBackdropNeutralScene] = useState(false);
   const [queueingFlatlayWoodScene, setQueueingFlatlayWoodScene] = useState(false);
   const [queueingFlatlayBoutiqueScene, setQueueingFlatlayBoutiqueScene] = useState(false);
+  const [queueingBodyModelScene, setQueueingBodyModelScene] = useState(false);
   const sceneQueueBusy =
     queueingNeutralHangerScene ||
     queueingBackdropNeutralScene ||
     queueingFlatlayWoodScene ||
-    queueingFlatlayBoutiqueScene;
+    queueingFlatlayBoutiqueScene ||
+    queueingBodyModelScene;
   const { generateProductSceneRender } = useGenerateProductSceneRender();
   const { createSceneRenderJob } = useCreateSceneRenderJob();
   const { updateSceneAssetApproval } = useUpdateSceneAssetApproval();
@@ -2976,14 +2992,46 @@ function ProductDetailContent() {
       showToast("Select a color variant on the Images tab to generate flats for that variant.", "error");
       return;
     }
+
+    const runVariantSnapshot: FlatRender8394VariantQaSnapshot = (() => {
+        if (treatsAsParentProduct && imagesTabVariantId) {
+          const row = productVariants.find((v) => v.id === imagesTabVariantId);
+          return {
+            variantId: row?.id ?? imagesTabVariantId,
+            blankVariantId: row?.blankVariantId ?? null,
+            colorName: row?.colorName ?? row?.optionValues?.color ?? null,
+          };
+        }
+        return {
+          variantId: product.id,
+          blankVariantId: product.blankVariantId ?? null,
+          colorName:
+            ("colorName" in product && typeof (product as { colorName?: string }).colorName === "string"
+              ? (product as { colorName?: string }).colorName
+              : null) ??
+            product.colorway?.name ??
+            null,
+        };
+      })();
+
     setGeneratingFlatRenders(true);
     try {
-      await generateProductFlatRenders({
+      const data = await generateProductFlatRenders({
         productId: product.id,
         productVariantId: treatsAsParentProduct ? imagesTabVariantId : undefined,
-        renderTypes: ["flat_blended_back", "flat_clean_front"],
       });
-      showToast("Flat renders saved on the variant (natural + fabric blend + front clean).", "success");
+      setLastFlatRenderSelectionLog(
+        Array.isArray(data?.renderSelectionLog) ? data.renderSelectionLog : null
+      );
+      setLastFlatRender8394Payload({
+        urls: data?.urls ?? null,
+        renderTypes: Array.isArray(data?.renderTypes) ? data.renderTypes : null,
+        runVariantSnapshot,
+      });
+      showToast(
+        "Renders saved on the variant (8394 auto targets: flat/model back + front when sources exist).",
+        "success"
+      );
       await refetchProduct();
       setVariantReloadTick((t) => t + 1);
     } catch (err: unknown) {
@@ -4472,6 +4520,27 @@ function ProductDetailContent() {
                   </button>
                 </div>
 
+                <FlatRender8394LastRunQaPanel
+                  lines={lastFlatRenderSelectionLog}
+                  lastPayload={lastFlatRender8394Payload}
+                  variant={shopifyPreviewVariantDoc}
+                />
+
+                <RenderTargetTuningQaSummary lines={lastFlatRenderSelectionLog} />
+
+                {lastFlatRenderSelectionLog && lastFlatRenderSelectionLog.length > 0 ? (
+                  <details className="mb-4 rounded-lg border border-indigo-200 bg-white/95 text-xs text-indigo-950 shadow-sm">
+                    <summary className="cursor-pointer select-none px-3 py-2 font-semibold text-indigo-900 hover:bg-indigo-50/80 rounded-lg">
+                      Flat render target debug (raw log)
+                    </summary>
+                    <ul className="list-none border-t border-indigo-100 px-3 py-2 space-y-0.5 font-mono text-[11px] text-gray-800 max-h-48 overflow-y-auto">
+                      {lastFlatRenderSelectionLog.map((line, i) => (
+                        <li key={i}>{line}</li>
+                      ))}
+                    </ul>
+                  </details>
+                ) : null}
+
                 {linked8394Nav.length > 1 && (
                   <div className="flex flex-wrap items-center gap-2 sm:gap-3 mb-4 text-sm text-indigo-950 bg-white/70 border border-indigo-100 rounded-lg px-3 py-2">
                     <span className="text-xs font-semibold text-indigo-700 uppercase tracking-wide shrink-0">Same blank</span>
@@ -5332,6 +5401,116 @@ function ProductDetailContent() {
                           </div>
                         ) : (
                           <p className="text-xs text-gray-500">No backdrop_neutral output for this color yet.</p>
+                        )}
+                      </div>
+                    );
+                  })()}
+
+                  {(() => {
+                    const vRow = productVariants.find((x) => x.id === imagesTabVariantId);
+                    const slotBody = vRow?.sceneTemplateRenders?.body_model;
+                    return (
+                      <div className="space-y-3 border-t border-indigo-100/80 pt-4">
+                        <h4 className="text-xs font-semibold text-gray-800 uppercase tracking-wide">Body model (back)</h4>
+                        <p className="text-xs text-gray-600">
+                          Panties: worn look from body + mask + <span className="font-mono">flat_clean.back</span> (no AI).
+                          Requires template art in Firestore / env.
+                        </p>
+                        <button
+                          type="button"
+                          disabled={sceneQueueBusy || !product.id}
+                          className="px-3 py-1.5 text-xs font-medium rounded-md bg-rose-900 text-white hover:bg-rose-950 disabled:opacity-50"
+                          onClick={async () => {
+                            if (!product.id || !imagesTabVariantId) return;
+                            setQueueingBodyModelScene(true);
+                            try {
+                              await createSceneRenderJob({
+                                productId: product.id,
+                                productVariantId: imagesTabVariantId,
+                                sceneKey: "body_model",
+                              });
+                              showToast("Body model job queued. Variant list refreshes shortly.", "success");
+                              setTimeout(() => setVariantReloadTick((t) => t + 1), 6000);
+                            } catch (err) {
+                              console.error(err);
+                              showToast(err instanceof Error ? err.message : "Failed to queue scene job", "error");
+                            } finally {
+                              setQueueingBodyModelScene(false);
+                            }
+                          }}
+                        >
+                          {queueingBodyModelScene ? "Queuing…" : "Queue body model (back) scene"}
+                        </button>
+                        {slotBody?.assetUrl ? (
+                          <div className="flex flex-wrap gap-4 items-start">
+                            <a
+                              href={slotBody.assetUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="block shrink-0"
+                            >
+                              {/* eslint-disable-next-line @next/next/no-img-element */}
+                              <img
+                                src={slotBody.assetUrl}
+                                alt="Body model back"
+                                className="max-h-40 rounded border border-gray-200"
+                              />
+                            </a>
+                            <div className="text-xs text-gray-700 space-y-1 min-w-0">
+                              <p>
+                                Status: <span className="font-mono">{slotBody.status}</span> · Approval:{" "}
+                                <span className="font-mono">{slotBody.approvalState}</span>
+                              </p>
+                              {slotBody.assetId ? (
+                                <p className="font-mono text-[10px] break-all">asset: {slotBody.assetId}</p>
+                              ) : null}
+                              {slotBody.sourceAssetRef ? (
+                                <p className="text-gray-500">Source: {slotBody.sourceAssetRef}</p>
+                              ) : null}
+                              {slotBody.assetId ? (
+                                <div className="flex flex-wrap gap-2 pt-2">
+                                  <button
+                                    type="button"
+                                    className="px-2 py-1 text-xs rounded bg-white border border-gray-300 hover:bg-gray-50"
+                                    onClick={async () => {
+                                      try {
+                                        await updateSceneAssetApproval({
+                                          assetId: slotBody.assetId!,
+                                          approvalState: "approved",
+                                        });
+                                        showToast("Marked approved", "success");
+                                        setVariantReloadTick((t) => t + 1);
+                                      } catch (e) {
+                                        showToast(e instanceof Error ? e.message : "Update failed", "error");
+                                      }
+                                    }}
+                                  >
+                                    Approve
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="px-2 py-1 text-xs rounded bg-white border border-gray-300 hover:bg-gray-50"
+                                    onClick={async () => {
+                                      try {
+                                        await updateSceneAssetApproval({
+                                          assetId: slotBody.assetId!,
+                                          approvalState: "rejected",
+                                        });
+                                        showToast("Marked rejected", "success");
+                                        setVariantReloadTick((t) => t + 1);
+                                      } catch (e) {
+                                        showToast(e instanceof Error ? e.message : "Update failed", "error");
+                                      }
+                                    }}
+                                  >
+                                    Reject
+                                  </button>
+                                </div>
+                              ) : null}
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="text-xs text-gray-500">No body_model output for this color yet.</p>
                         )}
                       </div>
                     );

@@ -32,7 +32,9 @@ import {
   RPBlankVariant,
   RPBlankEligibility,
   RPBlankDefaultPrintSides,
+  RPBlankRenderProfile,
 } from "@/lib/types/firestore";
+import { mapRpBlankFromFirestore } from "@/lib/blanks/blankFirestore";
 
 // Re-export types and constants from style registry
 export {
@@ -95,7 +97,9 @@ async function fetchBlanks(filters?: UseBlanksFilters): Promise<RPBlank[]> {
   const q = query(base, ...conditions);
   const snapshot = await getDocs(q);
 
-  let blanks = snapshot.docs.map((d) => ({ ...d.data(), blankId: d.id } as RPBlank));
+  let blanks = snapshot.docs.map((d) =>
+    mapRpBlankFromFirestore(d.id, d.data() as Record<string, unknown>)
+  );
 
   if (filters?.mastersOnly) {
     blanks = blanks.filter((b) => b.schemaVersion === 2);
@@ -126,7 +130,7 @@ async function fetchBlankById(blankId: string): Promise<RPBlank | null> {
 
   if (!docSnap.exists()) return null;
 
-  return { ...docSnap.data(), blankId: docSnap.id } as RPBlank;
+  return mapRpBlankFromFirestore(docSnap.id, docSnap.data() as Record<string, unknown>);
 }
 
 /**
@@ -231,6 +235,11 @@ export interface UpdateBlankInput {
   version?: number | null;
   /** Canonical placement / render zone config; single source of truth for product generation. */
   placements?: RPPlacement[] | null;
+  /**
+   * Per-render-target tuning; pass `null` to remove. Omit to leave unchanged.
+   * Geometry stays on `placements[]`.
+   */
+  renderProfile?: RPBlankRenderProfile | null;
   /** Blank-level render profile readiness (not product-level). */
   renderProfileStatus?: "draft" | "approved" | null;
   renderProfileNotes?: string | null;

@@ -9,7 +9,7 @@ import {
   type CSSProperties,
   type LegacyRef,
 } from "react";
-import type { RPBlank, RPPlacement } from "@/lib/types/firestore";
+import type { RPBlank, RPPlacement, RpRenderTarget, RpRenderTargetSettings } from "@/lib/types/firestore";
 import type { UpdateBlankInput } from "@/lib/hooks/useBlanks";
 import { useDesigns } from "@/lib/hooks/useDesignAssets";
 import {
@@ -29,7 +29,11 @@ import {
 } from "@/lib/blanks";
 import type { DesignDoc, RP8394SizePreset } from "@/lib/types/firestore";
 import type { RPPlacementSimpleRenderControls8394 } from "@/lib/types/firestore";
-import { get8394DesignTreatmentFromPlacement, getBackBlendForFlatRender } from "@/lib/products/flatRenderFingerprint";
+import { get8394DesignTreatmentFromPlacement } from "@/lib/products/flatRenderFingerprint";
+import {
+  resolveEffectiveRenderTargetSettings,
+  resolveEngineBlendForRenderTarget,
+} from "@/lib/products/resolveProductRenderProfile";
 import { sizePresetToDefaultScale } from "@/lib/blanks/simpleRenderControls8394";
 import {
   DEFAULT_GARMENT_SAFE_AREA,
@@ -45,29 +49,24 @@ import {
   matchRenderStylePresetZone,
   type RenderStylePresetId,
 } from "@/lib/render/renderStylePresets";
+import {
+  RENDER_TARGETS,
+  RENDER_TARGET_LABELS,
+  blendSettingsToPreviewCss,
+  buildRenderTargetSettingsMap,
+  cloneRenderTargetSettings,
+  defaultRenderTargetForZoneView,
+  getDefaultRenderTargetSettings,
+  getRenderTargetPreviewUrl,
+  mergeRenderTargetSettings,
+  renderTargetToGarmentSide,
+} from "@/lib/render/renderTargetTuning";
 
 const BLEND_OPTIONS = ["normal", "multiply", "overlay", "soft-light"] as const;
 
 function placementSide(placementId: string): "front" | "back" {
   if (placementId.startsWith("back_")) return "back";
   return "front";
-}
-
-function blankImageForSide(blank: RPBlank, variantId: string | null, side: "front" | "back"): string | null {
-  const v = variantId ? getVariantById(blank, variantId) : firstActiveVariant(blank);
-  if (v?.images) {
-    const url =
-      side === "front"
-        ? v.images.front?.downloadUrl ?? blank.images?.front?.downloadUrl
-        : v.images.back?.downloadUrl ?? blank.images?.back?.downloadUrl;
-    if (url) return url;
-  }
-  if (blank.images) {
-    return side === "front"
-      ? blank.images.front?.downloadUrl ?? blank.images.back?.downloadUrl ?? null
-      : blank.images.back?.downloadUrl ?? blank.images.front?.downloadUrl ?? null;
-  }
-  return null;
 }
 
 function clamp(n: number, lo: number, hi: number) {
@@ -453,6 +452,22 @@ export function BlankRenderProfileEditor({
       : ""
   );
 
+  const [selectedRenderTarget, setSelectedRenderTarget] = useState<RpRenderTarget>("flat_front");
+  const [targetSettingsMap, setTargetSettingsMap] = useState<Record<RpRenderTarget, RpRenderTargetSettings>>(() =>
+    buildRenderTargetSettingsMap(
+      blank.renderProfile?.renderTargets,
+      normalizeProfileRows(blank.placements, blank.styleCode),
+      blank.styleCode
+    )
+  );
+  const [baselineTargetMap, setBaselineTargetMap] = useState<Record<RpRenderTarget, RpRenderTargetSettings>>(() =>
+    buildRenderTargetSettingsMap(
+      blank.renderProfile?.renderTargets,
+      normalizeProfileRows(blank.placements, blank.styleCode),
+      blank.styleCode
+    )
+  );
+
   const imgRef = useRef<HTMLImageElement>(null);
   const dragOffsetRef = useRef<{ x: number; y: number } | null>(null);
 
@@ -506,6 +521,28 @@ export function BlankRenderProfileEditor({
     blank.preferredFlatLook8394,
   ]);
 
+  useEffect(() => {
+    const normalizedRows = normalizeProfileRows(blank.placements, blank.styleCode);
+    const built = buildRenderTargetSettingsMap(
+      blank.renderProfile?.renderTargets,
+      normalizedRows,
+      blank.styleCode
+    );
+    setTargetSettingsMap(built);
+    setBaselineTargetMap(
+      Object.fromEntries(
+        RENDER_TARGETS.map((k) => [k, cloneRenderTargetSettings(built[k]!)])
+      ) as Record<RpRenderTarget, RpRenderTargetSettings>
+    );
+  }, [blank.blankId, blank.renderProfile, blank.placements, blank.styleCode]);
+
+  const selectedRowView = rows[selectedIndex]?.view;
+  useEffect(() => {
+    if (selectedRowView === "front" || selectedRowView === "back") {
+      setSelectedRenderTarget(defaultRenderTargetForZoneView(selectedRowView));
+    }
+  }, [selectedIndex, selectedRowView]);
+
   const variants = useMemo(
     () => getBlankVariants(blank).filter((v) => v.isActive !== false),
     [blank]
@@ -538,9 +575,63 @@ export function BlankRenderProfileEditor({
   }, [previewDesignId, designs]);
 
   const selected = rows[selectedIndex];
-  const side = selected ? selected.view : "front";
-  const garmentUrl = blankImageForSide(blank, variantId, side);
   const previewVariant = variantId ? getVariantById(blank, variantId) : null;
+  const previewGarmentUrl = previewVariant
+    ? getRenderTargetPreviewUrl(blank, previewVariant, selectedRenderTarget)
+    : null;
+  const previewSide = renderTargetToGarmentSide(selectedRenderTarget);
+  const tuning: RpRenderTargetSettings | null = selected
+    ? targetSettingsMap[selectedRenderTarget] ??
+      getDefaultRenderTargetSettings(selectedRenderTarget, selected, blank.styleCode)
+    : null;
+
+  const blankWithDraftRenderTargets = useMemo(
+    () =>
+      ({
+        ...blank,
+        renderProfile: {
+          ...blank.renderProfile,
+          renderTargets: targetSettingsMap,
+        },
+      }) as RPBlank,
+    [blank, targetSettingsMap]
+  );
+
+  const resolvedTargetForEngine = useMemo(() => {
+    return resolveEffectiveRenderTargetSettings(
+      null,
+      blankWithDraftRenderTargets,
+      previewVariant ?? undefined,
+      selectedRenderTarget
+    );
+  }, [blankWithDraftRenderTargets, previewVariant, selectedRenderTarget]);
+
+  const engineBlendResolved = useMemo(
+    () =>
+      resolveEngineBlendForRenderTarget(
+        null,
+        blankWithDraftRenderTargets,
+        previewVariant ?? undefined,
+        selectedRenderTarget,
+        resolvedTargetForEngine.settings.blend
+      ),
+    [blankWithDraftRenderTargets, previewVariant, selectedRenderTarget, resolvedTargetForEngine.settings.blend]
+  );
+
+  const copyBackTargetTuning = useCallback(
+    (from: "flat_back" | "model_back", to: "flat_back" | "model_back") => {
+      setTargetSettingsMap((prev) => {
+        const src = prev[from];
+        if (!src) return prev;
+        return { ...prev, [to]: cloneRenderTargetSettings(src) };
+      });
+      showToast(
+        `Copied ${RENDER_TARGET_LABELS[from]} → ${RENDER_TARGET_LABELS[to]} (Save to persist)`,
+        "success"
+      );
+    },
+    [showToast]
+  );
 
   const previewDesign = useMemo(
     () => (previewDesignId ? (designs.find((x) => x.id === previewDesignId) as DesignDoc | undefined) : undefined),
@@ -560,13 +651,12 @@ export function BlankRenderProfileEditor({
   const hasLightPng = Boolean(previewDesign && resolveDesignAssets(previewDesign).lightPng);
   const hasDarkPng = Boolean(previewDesign && resolveDesignAssets(previewDesign).darkPng);
 
+  /** Blended canvas uses per–render-target tuning (`renderProfile`), not zone `renderZoneDefaults`. */
   const zoneBlend = useMemo(() => {
+    if (tuning) return blendSettingsToPreviewCss(tuning.blend);
     if (!selected) return { blendMode: "multiply", blendOpacity: 1 };
-    if (is8394 && selected.view === "back" && previewVariant) {
-      return getBackBlendForFlatRender(blank, previewVariant, selected);
-    }
-    return effectiveZoneBlend(blank, side, selected);
-  }, [blank, is8394, previewVariant, selected, side]);
+    return effectiveZoneBlend(blank, selected.view, selected);
+  }, [blank, selected, tuning]);
 
   const designTreatment8394 = useMemo(() => {
     if (!is8394 || !selected || selected.view !== "back") {
@@ -667,18 +757,36 @@ export function BlankRenderProfileEditor({
     [selectedIndex, blank.styleCode]
   );
 
+  const patchTargetTuning = useCallback(
+    (patch: Partial<RpRenderTargetSettings>) => {
+      setTargetSettingsMap((prev) => {
+        const cur =
+          prev[selectedRenderTarget] ??
+          (selected
+            ? getDefaultRenderTargetSettings(selectedRenderTarget, selected, blank.styleCode)
+            : null);
+        if (!cur) return prev;
+        return {
+          ...prev,
+          [selectedRenderTarget]: mergeRenderTargetSettings(cur, patch),
+        };
+      });
+    },
+    [blank.styleCode, selected, selectedRenderTarget]
+  );
+
   const handlePointerDownOverlay = useCallback(
     (e: React.PointerEvent) => {
       e.preventDefault();
       e.stopPropagation();
       const wrap = (e.currentTarget as HTMLElement).closest("[data-garment-preview]");
       const img = (wrap?.querySelector("img") as HTMLImageElement | null) || imgRef.current;
-      if (!img || !selected) return;
+      if (!img || !selected || !tuning) return;
       const r = img.getBoundingClientRect();
       const mx = e.clientX - r.left;
       const my = e.clientY - r.top;
-      const cx = selected.defaultX * r.width;
-      const cy = selected.defaultY * r.height;
+      const cx = tuning.placement.x * r.width;
+      const cy = tuning.placement.y * r.height;
       dragOffsetRef.current = { x: mx - cx, y: my - cy };
       (e.target as HTMLElement).setPointerCapture(e.pointerId);
       const imgEl = img;
@@ -688,9 +796,12 @@ export function BlankRenderProfileEditor({
         const rect = imgEl.getBoundingClientRect();
         const px = ev.clientX - rect.left - dragOffsetRef.current.x;
         const py = ev.clientY - rect.top - dragOffsetRef.current.y;
-        updateSelected({
-          defaultX: clamp(px / rect.width, 0, 1),
-          defaultY: clamp(py / rect.height, 0, 1),
+        patchTargetTuning({
+          placement: {
+            x: clamp(px / rect.width, 0, 1),
+            y: clamp(py / rect.height, 0, 1),
+            scale: tuning.placement.scale,
+          },
         });
       };
 
@@ -706,7 +817,7 @@ export function BlankRenderProfileEditor({
       window.addEventListener("pointerup", onUp);
       window.addEventListener("pointercancel", onUp);
     },
-    [selected, updateSelected]
+    [selected, tuning, patchTargetTuning]
   );
 
   const handleReset = () => {
@@ -716,6 +827,11 @@ export function BlankRenderProfileEditor({
     setSupportedFront(baselineMeta.supportedFront);
     setSupportedBack(baselineMeta.supportedBack);
     setPreferredFlatLook8394(baselineMeta.preferredFlatLook8394);
+    setTargetSettingsMap(
+      Object.fromEntries(
+        RENDER_TARGETS.map((k) => [k, cloneRenderTargetSettings(baselineTargetMap[k]!)])
+      ) as Record<RpRenderTarget, RpRenderTargetSettings>
+    );
     showToast("Reverted to last saved render profile", "success");
   };
 
@@ -726,9 +842,13 @@ export function BlankRenderProfileEditor({
       const supportedRenderViews: ("front" | "back")[] = [];
       if (supportedFront) supportedRenderViews.push("front");
       if (supportedBack) supportedRenderViews.push("back");
+      const renderTargets = Object.fromEntries(
+        RENDER_TARGETS.map((t) => [t, targetSettingsMap[t]!])
+      ) as NonNullable<NonNullable<RPBlank["renderProfile"]>["renderTargets"]>;
       await updateBlank({
         blankId: blank.blankId,
         placements: rows.map((r) => toFirestorePlacement(r, blank.styleCode)),
+        renderProfile: { renderTargets },
         renderProfileStatus,
         renderProfileNotes: renderProfileNotes.trim() || null,
         supportedRenderViews: supportedRenderViews.length ? supportedRenderViews : null,
@@ -740,6 +860,11 @@ export function BlankRenderProfileEditor({
       });
       await refetchBlank();
       setBaselineRows(JSON.parse(JSON.stringify(rows)) as ProfileRow[]);
+      setBaselineTargetMap(
+        Object.fromEntries(
+          RENDER_TARGETS.map((k) => [k, cloneRenderTargetSettings(targetSettingsMap[k]!)])
+        ) as Record<RpRenderTarget, RpRenderTargetSettings>
+      );
       setBaselineMeta({
         renderProfileStatus,
         renderProfileNotes,
@@ -805,14 +930,14 @@ export function BlankRenderProfileEditor({
     );
   }
 
-  const scale = selected?.defaultScale ?? 0.6;
+  const scale = tuning?.placement.scale ?? selected?.defaultScale ?? 0.6;
   const artBase = selected?.artboardBase ?? 0.5;
   const sx = selected?.safeArea?.x ?? DEFAULT_GARMENT_SAFE_AREA.x;
   const sy = selected?.safeArea?.y ?? DEFAULT_GARMENT_SAFE_AREA.y;
   const sw = selected?.safeArea?.w ?? DEFAULT_GARMENT_SAFE_AREA.w;
   const sh = selected?.safeArea?.h ?? DEFAULT_GARMENT_SAFE_AREA.h;
-  const px = selected?.defaultX ?? 0.5;
-  const py = selected?.defaultY ?? 0.5;
+  const px = tuning?.placement.x ?? selected?.defaultX ?? 0.5;
+  const py = tuning?.placement.y ?? selected?.defaultY ?? 0.5;
 
   const zoneBlendMode = selected?.renderZoneDefaults?.blendMode ?? "";
   const zoneBlendOpacity = selected?.renderZoneDefaults?.blendOpacity;
@@ -861,10 +986,8 @@ export function BlankRenderProfileEditor({
   const canvasFilter =
     useBlendedCanvas && is8394SimpleBackUi ? previewFilter : is8394SimpleBackUi ? "contrast(100%)" : undefined;
 
-  const previewAssetsReady = Boolean(garmentUrl && (!previewDesignId || overlayArtUrl));
+  const previewAssetsReady = Boolean(previewGarmentUrl && (!previewDesignId || overlayArtUrl));
 
-  const backZoneRow = rows.find((r) => r.placementId === "back_center" || r.view === "back");
-  const previewHasBackImage = previewVariant?.images?.back?.downloadUrl;
   const profileHeaderSubtitle = [blank.styleCode, blank.garmentStyle || blank.styleName]
     .filter(Boolean)
     .join(" ")
@@ -904,9 +1027,9 @@ export function BlankRenderProfileEditor({
             Preview: {previewAssetsReady ? "Ready" : "Missing assets"}
           </span>
         </div>
-        {is8394 && !previewHasBackImage && previewVariant ? (
+        {is8394 && selectedRenderTarget === "flat_back" && !previewGarmentUrl && previewVariant ? (
           <p className="text-xs text-red-700 mt-2 bg-red-50 border border-red-100 rounded-lg px-3 py-2 inline-block">
-            Selected variant has no back photo — upload on the Variants tab for a useful preview.
+            Selected variant has no flat back photo — upload on the Variants tab for a useful preview.
           </p>
         ) : null}
       </header>
@@ -984,6 +1107,380 @@ export function BlankRenderProfileEditor({
             ) : null}
           </section>
 
+          {/* Target tuning (renderProfile.renderTargets) */}
+          <section className="space-y-3 rounded-xl border border-violet-200 bg-violet-50/40 p-4">
+            <h2 className="text-xs font-bold uppercase tracking-wider text-violet-800">
+              Target tuning (render target specific)
+            </h2>
+            <p className="text-xs text-violet-950/80 leading-relaxed">
+              <span className="font-semibold text-neutral-900">Zone geometry</span>{" "}
+              <code className="text-[10px] bg-white/80 px-1 rounded">placements[]</code> — safe area, default zone
+              placement, side.{" "}
+              <span className="font-semibold text-neutral-900">Target tuning</span>{" "}
+              <code className="text-[10px] bg-white/80 px-1 rounded">renderProfile.renderTargets[target]</code> — x/y/scale
+              and blend curve for each garment photo (flat vs on-model).
+            </p>
+            <div>
+              <label className="block text-xs font-medium text-neutral-800 mb-1">Render target</label>
+              <select
+                value={selectedRenderTarget}
+                onChange={(e) => setSelectedRenderTarget(e.target.value as RpRenderTarget)}
+                className="w-full border border-violet-200 rounded-lg px-3 py-2 text-sm bg-white text-neutral-900"
+              >
+                {RENDER_TARGETS.map((t) => (
+                  <option key={t} value={t}>
+                    {RENDER_TARGET_LABELS[t]}
+                  </option>
+                ))}
+              </select>
+              <p className="text-[11px] text-neutral-600 mt-1.5">
+                Defaults to Flat Front / Flat Back when you switch render zone. Preview image follows this target.
+              </p>
+            </div>
+            {is8394 ? (
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => copyBackTargetTuning("flat_back", "model_back")}
+                  className="text-[11px] px-2.5 py-1 rounded-md border border-violet-300 bg-white text-violet-900 hover:bg-violet-100/80 font-medium"
+                >
+                  Copy flat_back → model_back
+                </button>
+                <button
+                  type="button"
+                  onClick={() => copyBackTargetTuning("model_back", "flat_back")}
+                  className="text-[11px] px-2.5 py-1 rounded-md border border-violet-300 bg-white text-violet-900 hover:bg-violet-100/80 font-medium"
+                >
+                  Copy model_back → flat_back
+                </button>
+              </div>
+            ) : null}
+            {selected ? (
+              <div className="rounded-lg border border-emerald-300/80 bg-emerald-50/70 px-3 py-2.5">
+                <h3 className="text-[10px] font-bold uppercase tracking-wide text-emerald-900 mb-1">
+                  Resolved target tuning (read-only QA)
+                </h3>
+                <p className="text-[10px] text-emerald-900/85 mb-2 leading-snug">
+                  Effective values for <strong>{RENDER_TARGET_LABELS[selectedRenderTarget]}</strong> with the preview
+                  variant (no product overrides). Matches the compositor merge order for this blank.
+                </p>
+                <dl className="grid grid-cols-1 gap-1 font-mono text-[10px] text-gray-900">
+                  <div className="flex justify-between gap-2">
+                    <dt className="text-gray-600 shrink-0">placement.x</dt>
+                    <dd>{resolvedTargetForEngine.settings.placement.x.toFixed(3)}</dd>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <dt className="text-gray-600 shrink-0">placement.y</dt>
+                    <dd>{resolvedTargetForEngine.settings.placement.y.toFixed(3)}</dd>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <dt className="text-gray-600 shrink-0">placement.scale</dt>
+                    <dd>{resolvedTargetForEngine.settings.placement.scale.toFixed(3)}</dd>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <dt className="text-gray-600 shrink-0">blend.fabricFeel</dt>
+                    <dd>{resolvedTargetForEngine.settings.blend.fabricFeel.toFixed(3)}</dd>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <dt className="text-gray-600 shrink-0">blend.printStrength</dt>
+                    <dd>{resolvedTargetForEngine.settings.blend.printStrength.toFixed(3)}</dd>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <dt className="text-gray-600 shrink-0">blend.mode</dt>
+                    <dd className="text-right break-all">
+                      {resolvedTargetForEngine.settings.blend.mode != null &&
+                      String(resolvedTargetForEngine.settings.blend.mode).trim() !== ""
+                        ? String(resolvedTargetForEngine.settings.blend.mode)
+                        : "—"}
+                    </dd>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <dt className="text-gray-600 shrink-0">engineBlend.blendMode</dt>
+                    <dd>{engineBlendResolved.blendMode}</dd>
+                  </div>
+                  <div className="flex justify-between gap-2">
+                    <dt className="text-gray-600 shrink-0">engineBlend.blendOpacity</dt>
+                    <dd>{engineBlendResolved.blendOpacity.toFixed(3)}</dd>
+                  </div>
+                </dl>
+                <p className="text-[9px] text-emerald-900/70 mt-2 pt-2 border-t border-emerald-200/80 font-sans">
+                  Flags: blank target row{" "}
+                  {resolvedTargetForEngine.qa.blankTuningExisted ? "present" : "absent"} · variant target override{" "}
+                  {resolvedTargetForEngine.qa.variantTargetOverrideExisted ? "yes" : "no"} · product placement{" "}
+                  {resolvedTargetForEngine.qa.productPlacementApplied ? "applied" : "no"}
+                </p>
+              </div>
+            ) : null}
+            {tuning ? (
+              <div className="space-y-5 pt-2 border-t border-violet-200/80">
+                <div>
+                  <h3 className="text-[11px] font-bold uppercase tracking-wide text-neutral-600 mb-2">
+                    Placement tuning (this target)
+                  </h3>
+                  <p className="text-[11px] text-neutral-500 mb-2">
+                    Overlay position/size for this photo only. Drag on preview updates these values.
+                  </p>
+                  <div>
+                    <div className="flex justify-between text-xs text-neutral-600 mb-1">
+                      <span className="font-medium text-neutral-800">Scale</span>
+                      <span>{scalePercentFromEngine(tuning.placement.scale)}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={SCALE_PCT_MIN}
+                      max={SCALE_PCT_MAX}
+                      step={1}
+                      value={scalePercentFromEngine(tuning.placement.scale)}
+                      onChange={(e) =>
+                        patchTargetTuning({
+                          placement: {
+                            ...tuning.placement,
+                            scale: scaleEngineFromPercent(Number(e.target.value)),
+                          },
+                        })
+                      }
+                      className="w-full accent-violet-600"
+                    />
+                  </div>
+                  <div className="mt-3">
+                    <div className="flex justify-between text-xs text-neutral-600 mb-1">
+                      <span className="font-medium text-neutral-800">Horizontal</span>
+                      <span>{Math.round(tuning.placement.x * 100)}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={1}
+                      value={Math.round(tuning.placement.x * 100)}
+                      onChange={(e) =>
+                        patchTargetTuning({
+                          placement: {
+                            ...tuning.placement,
+                            x: Number(e.target.value) / 100,
+                          },
+                        })
+                      }
+                      className="w-full accent-violet-600"
+                    />
+                  </div>
+                  <div className="mt-3">
+                    <div className="flex justify-between text-xs text-neutral-600 mb-1">
+                      <span className="font-medium text-neutral-800">Vertical</span>
+                      <span>{Math.round(tuning.placement.y * 100)}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={1}
+                      value={Math.round(tuning.placement.y * 100)}
+                      onChange={(e) =>
+                        patchTargetTuning({
+                          placement: {
+                            ...tuning.placement,
+                            y: Number(e.target.value) / 100,
+                          },
+                        })
+                      }
+                      className="w-full accent-violet-600"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <h3 className="text-[11px] font-bold uppercase tracking-wide text-neutral-600 mb-2">
+                    Print style / blend (this target)
+                  </h3>
+                  <div className="grid grid-cols-1 gap-3">
+                    <div>
+                      <div className="flex justify-between text-xs text-neutral-600 mb-1">
+                        <span className="font-medium text-neutral-800">Fabric feel</span>
+                        <span>{Math.round(tuning.blend.fabricFeel * 100)}%</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={100}
+                        step={1}
+                        value={Math.round(tuning.blend.fabricFeel * 100)}
+                        onChange={(e) =>
+                          patchTargetTuning({
+                            blend: { ...tuning.blend, fabricFeel: Number(e.target.value) / 100 },
+                          })
+                        }
+                        className="w-full accent-violet-600"
+                      />
+                    </div>
+                    <div>
+                      <div className="flex justify-between text-xs text-neutral-600 mb-1">
+                        <span className="font-medium text-neutral-800">Print strength</span>
+                        <span>{Math.round(tuning.blend.printStrength * 100)}%</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={100}
+                        step={1}
+                        value={Math.round(tuning.blend.printStrength * 100)}
+                        onChange={(e) =>
+                          patchTargetTuning({
+                            blend: { ...tuning.blend, printStrength: Number(e.target.value) / 100 },
+                          })
+                        }
+                        className="w-full accent-violet-600"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-neutral-700 mb-1">Mode (optional)</label>
+                      <select
+                        value={tuning.blend.mode ?? ""}
+                        onChange={(e) =>
+                          patchTargetTuning({
+                            blend: {
+                              ...tuning.blend,
+                              mode:
+                                e.target.value === ""
+                                  ? undefined
+                                  : (e.target.value as NonNullable<typeof tuning.blend.mode>),
+                            },
+                          })
+                        }
+                        className="w-full border border-neutral-300 rounded-lg px-2 py-2 text-sm bg-white text-neutral-900"
+                      >
+                        <option value="">Engine curve (default)</option>
+                        <option value="clean">Clean</option>
+                        <option value="soft">Soft</option>
+                        <option value="vintage">Vintage</option>
+                        <option value="bold">Bold</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+                <div>
+                  <h3 className="text-[11px] font-bold uppercase tracking-wide text-neutral-600 mb-2">Warp (saved)</h3>
+                  <label className="flex items-center gap-2 text-sm text-neutral-800 mb-2">
+                    <input
+                      type="checkbox"
+                      checked={tuning.warp?.enabled === true}
+                      onChange={(e) =>
+                        patchTargetTuning({
+                          warp: { ...(tuning.warp ?? { enabled: false }), enabled: e.target.checked },
+                        })
+                      }
+                    />
+                    Enabled
+                  </label>
+                  <div className="grid grid-cols-1 gap-2 text-xs">
+                    <label className="flex flex-col gap-0.5">
+                      <span className="text-neutral-600">Warp strength</span>
+                      <input
+                        type="number"
+                        step={0.01}
+                        value={tuning.warp?.warpStrength ?? 0}
+                        onChange={(e) =>
+                          patchTargetTuning({
+                            warp: {
+                              ...(tuning.warp ?? { enabled: false }),
+                              warpStrength: Number(e.target.value),
+                            },
+                          })
+                        }
+                        className="border border-neutral-300 rounded px-2 py-1 bg-white text-neutral-900"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-0.5">
+                      <span className="text-neutral-600">Vertical stretch</span>
+                      <input
+                        type="number"
+                        step={0.01}
+                        value={tuning.warp?.verticalStretch ?? 0}
+                        onChange={(e) =>
+                          patchTargetTuning({
+                            warp: {
+                              ...(tuning.warp ?? { enabled: false }),
+                              verticalStretch: Number(e.target.value),
+                            },
+                          })
+                        }
+                        className="border border-neutral-300 rounded px-2 py-1 bg-white text-neutral-900"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-0.5">
+                      <span className="text-neutral-600">Horizontal warp</span>
+                      <input
+                        type="number"
+                        step={0.01}
+                        value={tuning.warp?.horizontalWarp ?? 0}
+                        onChange={(e) =>
+                          patchTargetTuning({
+                            warp: {
+                              ...(tuning.warp ?? { enabled: false }),
+                              horizontalWarp: Number(e.target.value),
+                            },
+                          })
+                        }
+                        className="border border-neutral-300 rounded px-2 py-1 bg-white text-neutral-900"
+                      />
+                    </label>
+                  </div>
+                  <p className="text-[10px] text-neutral-500 mt-1">Preview does not warp the overlay yet; values persist.</p>
+                </div>
+                <div>
+                  <h3 className="text-[11px] font-bold uppercase tracking-wide text-neutral-600 mb-2">Mask (saved)</h3>
+                  <label className="flex items-center gap-2 text-sm text-neutral-800 mb-2">
+                    <input
+                      type="checkbox"
+                      checked={tuning.mask?.enabled === true}
+                      onChange={(e) =>
+                        patchTargetTuning({
+                          mask: { ...(tuning.mask ?? { enabled: false }), enabled: e.target.checked },
+                        })
+                      }
+                    />
+                    Enabled
+                  </label>
+                  <div className="grid grid-cols-2 gap-2 text-xs">
+                    <label className="flex flex-col gap-0.5">
+                      <span className="text-neutral-600">Feather</span>
+                      <input
+                        type="number"
+                        step={0.01}
+                        value={tuning.mask?.feather ?? 0}
+                        onChange={(e) =>
+                          patchTargetTuning({
+                            mask: {
+                              ...(tuning.mask ?? { enabled: false }),
+                              feather: Number(e.target.value),
+                            },
+                          })
+                        }
+                        className="border border-neutral-300 rounded px-2 py-1 bg-white text-neutral-900"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-0.5">
+                      <span className="text-neutral-600">Edge fade</span>
+                      <input
+                        type="number"
+                        step={0.01}
+                        value={tuning.mask?.edgeFade ?? 0}
+                        onChange={(e) =>
+                          patchTargetTuning({
+                            mask: {
+                              ...(tuning.mask ?? { enabled: false }),
+                              edgeFade: Number(e.target.value),
+                            },
+                          })
+                        }
+                        className="border border-neutral-300 rounded px-2 py-1 bg-white text-neutral-900"
+                      />
+                    </label>
+                  </div>
+                  <p className="text-[10px] text-neutral-500 mt-1">Mask is not drawn on this canvas yet.</p>
+                </div>
+              </div>
+            ) : null}
+          </section>
+
           {/* Zone + readiness row */}
           <section className="space-y-3 pt-2 border-t border-neutral-100">
             <h2 className="text-xs font-bold uppercase tracking-wider text-neutral-500">Zone</h2>
@@ -1016,9 +1513,15 @@ export function BlankRenderProfileEditor({
             </div>
           </section>
 
-          {/* 2. Placement */}
+          {/* 2. Zone geometry (placements[]) */}
           <section className="space-y-4 pt-2 border-t border-neutral-100">
-            <h2 className="text-xs font-bold uppercase tracking-wider text-neutral-500">2. Placement</h2>
+            <h2 className="text-xs font-bold uppercase tracking-wider text-neutral-500">
+              2. Zone geometry (placements[])
+            </h2>
+            <p className="text-[11px] text-neutral-500 leading-relaxed">
+              Saved on the placement row for this zone — safe area and default zone placement. Per-photo x/y/scale overrides
+              live under <strong>Target tuning</strong> above.
+            </p>
             <div>
               <div className="flex justify-between text-xs text-neutral-600 mb-1">
                 <span className="font-medium text-neutral-800">Scale</span>
@@ -1634,7 +2137,7 @@ export function BlankRenderProfileEditor({
                   {m === "clean" ? "Clean" : m === "blended" ? "Blended" : "Side-by-side"}
                 </button>
               ))}
-              {garmentUrl ? (
+              {previewGarmentUrl ? (
                 <button
                   type="button"
                   onClick={() => setPreviewLightbox(true)}
@@ -1646,21 +2149,21 @@ export function BlankRenderProfileEditor({
             </div>
           </div>
 
-          {!garmentUrl ? (
+          {!previewGarmentUrl ? (
             <div className="rounded-xl border border-amber-200 bg-amber-50 p-8 text-amber-950 text-sm min-h-[320px] flex items-center justify-center text-center">
               <div>
-                <p className="font-medium">No {side} garment image</p>
+                <p className="font-medium">No image for {RENDER_TARGET_LABELS[selectedRenderTarget]}</p>
                 <p className="text-amber-800/90 mt-1">
-                  {isMasterBlank(blank) ? "Upload on the Variants tab." : "Upload on the Images tab."} You can still save
-                  placement numbers in Advanced.
+                  {isMasterBlank(blank) ? "Upload the matching slot on the Variants tab." : "Upload on the Images tab."}{" "}
+                  You can still edit target tuning and zone geometry; save when ready.
                 </p>
               </div>
             </div>
           ) : !previewDesignId ? (
             <div className="relative rounded-xl border border-neutral-200 bg-neutral-50 min-h-[min(72vh,640px)] flex items-center justify-center p-8">
               <GarmentPreviewCanvas
-                garmentUrl={garmentUrl}
-                side={side}
+                garmentUrl={previewGarmentUrl}
+                side={previewSide}
                 imgRef={imgRef}
                 showSafeArea={showSafeArea}
                 showClipHint={showClipHint}
@@ -1701,8 +2204,8 @@ export function BlankRenderProfileEditor({
                 <div key={label} className="space-y-2">
                   <p className="text-xs font-semibold text-center text-neutral-700">{label}</p>
                   <GarmentPreviewCanvas
-                    garmentUrl={garmentUrl}
-                    side={side}
+                    garmentUrl={previewGarmentUrl}
+                    side={previewSide}
                     imgRef={label === "Blended" ? imgRef : undefined}
                     showSafeArea={showSafeArea}
                     showClipHint={showClipHint}
@@ -1734,8 +2237,8 @@ export function BlankRenderProfileEditor({
             </div>
           ) : (
             <GarmentPreviewCanvas
-              garmentUrl={garmentUrl}
-              side={side}
+              garmentUrl={previewGarmentUrl}
+              side={previewSide}
               imgRef={imgRef}
               showSafeArea={showSafeArea}
               showClipHint={showClipHint}
@@ -1758,7 +2261,7 @@ export function BlankRenderProfileEditor({
         </div>
       </div>
 
-      {previewLightbox && garmentUrl ? (
+      {previewLightbox && previewGarmentUrl ? (
         <div
           className="fixed inset-0 z-[60] flex flex-col items-center justify-center bg-black/75 p-4"
           role="presentation"
@@ -1771,7 +2274,7 @@ export function BlankRenderProfileEditor({
             onClick={(e) => e.stopPropagation()}
           >
             <img
-              src={garmentUrl}
+              src={previewGarmentUrl}
               alt="Preview enlarged"
               className="max-h-[88vh] w-auto mx-auto rounded-lg shadow-2xl"
             />

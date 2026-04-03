@@ -73,13 +73,20 @@ function pickImageUrl(ref: RPImageRef | null | undefined): string | null {
 export function getMasterBlankPreviewUrl(blank: RPBlank): string | null {
   const v = firstActiveVariant(blank);
   if (!v) return pickImageUrl(blank.images?.front);
-  return pickImageUrl(v.images?.front) ?? pickImageUrl(v.images?.back) ?? pickImageUrl(blank.images?.front);
+  return (
+    pickImageUrl(v.images?.flatFront) ??
+    pickImageUrl(v.images?.front) ??
+    pickImageUrl(v.images?.flatBack) ??
+    pickImageUrl(v.images?.back) ??
+    pickImageUrl(blank.images?.front)
+  );
 }
 
+/** True when flat (or legacy) source exists for each side. */
 export function variantHasFrontBack(v: RPBlankVariant): { front: boolean; back: boolean } {
   return {
-    front: Boolean(v.images?.front?.downloadUrl),
-    back: Boolean(v.images?.back?.downloadUrl),
+    front: Boolean(v.images?.flatFront?.downloadUrl || v.images?.front?.downloadUrl),
+    back: Boolean(v.images?.flatBack?.downloadUrl || v.images?.back?.downloadUrl),
   };
 }
 

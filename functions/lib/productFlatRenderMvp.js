@@ -1,12 +1,12 @@
 "use strict";
 
 /**
- * Step 10 MVP: 8394 variant-native flats on `rp_products/{id}/variants/{variantId}`.
- * Callable `data`: productId, productVariantId (required for parent), optional renderTypes
- * (default ["flat_blended_back","flat_clean_front"]). Assigns media.heroBack ← primary back URL (same as
- * flat_blended.back; clean treatment reuses that slot per Option A), heroFront ← flat_clean.front
- * (garment-only, no front artwork when back_only), mockupUrl ← primary back,
- * deduped gallery. Legacy single-product (non-parent) still writes the product doc when no variant id.
+ * Step 10 MVP: 8394 variant-native flats + optional model templates on `rp_products/.../variants/...`.
+ * Callable `data`: productId, productVariantId (parent), optional renderTypes. When `renderTypes` is omitted,
+ * expands from blank variant sources (flat + model URLs for back and front). **Back** targets get full design
+ * compositing (placement, blend, warp, mask). **Front** targets are garment pass-through only (display photos).
+ * Gallery seed order: model_back → flat_front → flat_back → model_front. heroBack prefers model blended back;
+ * heroFront is flat garment front when present.
  */
 
 const functions = require("firebase-functions");
@@ -29,18 +29,31 @@ function sanitizeForFirestore(value) {
 }
 const {
   getPlacementRowForSide,
-  getPlacementFingerprintSliceForProduct,
-  resolveEffectivePlacement,
-  resolveEffectiveRenderSettings,
-  resolvePlacementKeyForSide,
+  getPlacementFingerprintSliceForRenderTarget,
+  resolveEffectivePlacementForRenderTarget,
+  resolveEffectiveRenderTargetSettings,
+  resolveEngineBlendForRenderTarget,
+  resolvePlacementKeyForRenderTarget,
+  mergeSimple8394ForTarget,
 } = require("./resolveProductRenderProfile");
+const {
+  getVariantFlatBackUrl,
+  getVariantFlatFrontUrl,
+  getVariantModelBackUrl,
+  getVariantModelFrontUrl,
+} = require("./variantRenderSources");
 const { pickRasterUrlForVariant, resolveBackRenderTreatment } = require("./artworkToneResolution");
+const {
+  applyDesignWarp8394,
+  applyDesignMask8394,
+  cropDesignToArtworkBounds: cropDesignToArtworkBounds8394,
+  snapshotWarp,
+  snapshotMask,
+} = require("./compositor8394");
 
 const MASTER_BLANK_SCHEMA_VERSION = 2;
 const MVP_STYLE_CODE = "8394";
 const ART_BASE = 0.5;
-const ARTWORK_BOUNDS_ALPHA_THRESHOLD = 5;
-
 function stableStringify(value) {
   if (value === null || typeof value !== "object") {
     return JSON.stringify(value);
@@ -217,22 +230,6 @@ async function apply8394DesignTreatmentPng(buffer, sharpLib, d8394) {
   return img.png().toBuffer();
 }
 
-function getVariantBackUrl(blank, variant) {
-  return (
-    (variant.images && variant.images.back && variant.images.back.downloadUrl) ||
-    (blank.images && blank.images.back && blank.images.back.downloadUrl) ||
-    null
-  );
-}
-
-function getVariantFrontUrl(blank, variant) {
-  return (
-    (variant.images && variant.images.front && variant.images.front.downloadUrl) ||
-    (blank.images && blank.images.front && blank.images.front.downloadUrl) ||
-    null
-  );
-}
-
 /** Merge Firestore variant doc placement/render fields over parent for resolveEffectivePlacement. */
 function mergePlacementSource(parent, variantDoc) {
   if (!variantDoc || typeof variantDoc !== "object") return parent;
@@ -277,51 +274,199 @@ function premultiplyRgbaBuffer(buffer) {
   return b;
 }
 
-async function cropDesignToArtworkBounds(designBuffer, sharp) {
-  const meta = await sharp(designBuffer).metadata();
-  const w = meta.width;
-  const h = meta.height;
-  if (!w || !h) return { buffer: designBuffer, width: w || 1, height: h || 1 };
-
-  const raw = await sharp(designBuffer).ensureAlpha().raw().toBuffer({ depth: 8, resolveWithObject: false });
-
-  let minX = w;
-  let minY = h;
-  let maxX = -1;
-  let maxY = -1;
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const i = (y * w + x) * 4;
-      const a = raw[i + 3];
-      if (a > ARTWORK_BOUNDS_ALPHA_THRESHOLD) {
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
-      }
-    }
-  }
-
-  const boundsW = maxX >= minX ? maxX - minX + 1 : w;
-  const boundsH = maxY >= minY ? maxY - minY + 1 : h;
-  if (boundsW < 1 || boundsH < 1) {
-    return { buffer: designBuffer, width: w, height: h };
-  }
-
-  const cropped = await sharp(designBuffer)
-    .extract({ left: minX, top: minY, width: boundsW, height: boundsH })
-    .png()
-    .toBuffer();
-
-  return { buffer: cropped, width: boundsW, height: boundsH };
-}
-
 function mapBlendMode(mode) {
   const m = String(mode || "multiply").toLowerCase();
   if (m === "normal") return "over";
   const allowed = new Set(["over", "multiply", "overlay", "soft-light", "screen", "darken", "lighten"]);
   if (allowed.has(m)) return m;
   return "multiply";
+}
+
+async function pipeWarpMaskForDesignLayer(buf, sharpLib, tuningSettings) {
+  const warp = tuningSettings && tuningSettings.warp;
+  const mask = tuningSettings && tuningSettings.mask;
+  const warpApplied = !!(warp && warp.enabled === true);
+  const maskApplied = !!(mask && mask.enabled === true);
+  let out = buf;
+  if (warpApplied) out = await applyDesignWarp8394(out, sharpLib, warp);
+  if (maskApplied) out = await applyDesignMask8394(out, sharpLib, mask);
+  return {
+    buffer: out,
+    warpApplied,
+    maskApplied,
+    resolvedWarp: snapshotWarp(warp),
+    resolvedMask: snapshotMask(mask),
+  };
+}
+
+/**
+ * Shared 8394 compositor: crop design, layout, warp/mask, clean + blended PNG buffers on garment.
+ */
+async function render8394DesignOnGarmentSharp(options) {
+  const {
+    sharp,
+    blankBuffer,
+    designBuffer,
+    tuning,
+    blend,
+    placementRow,
+    effPl,
+    variant,
+    target,
+    renderTreatment,
+    renderSelectionLog,
+  } = options;
+
+  const layoutPlacement =
+    effPl && placementRow
+      ? {
+          ...placementRow,
+          defaultX: tuning.settings.placement.x,
+          defaultY: tuning.settings.placement.y,
+          defaultScale: tuning.settings.placement.scale,
+          safeArea: effPl.safeArea,
+        }
+      : placementRow;
+
+  const blankMeta = await sharp(blankBuffer).metadata();
+  const blankWidth = blankMeta.width;
+  const blankHeight = blankMeta.height;
+  if (!blankWidth || !blankHeight) {
+    throw new functions.https.HttpsError("internal", "Invalid blank image dimensions");
+  }
+
+  const cropped = await cropDesignToArtworkBounds8394(designBuffer, sharp);
+  const designBufferC = cropped.buffer;
+  const designWidth = cropped.width;
+  const designHeight = cropped.height;
+
+  const { left: left0, top: top0, resizedWidth, resizedHeight } = computeLayout(
+    blankWidth,
+    blankHeight,
+    layoutPlacement,
+    designWidth,
+    designHeight
+  );
+
+  let resizedBasePng = await sharp(designBufferC)
+    .resize(resizedWidth, resizedHeight, { fit: "inside" })
+    .ensureAlpha()
+    .png()
+    .toBuffer();
+
+  const wm = await pipeWarpMaskForDesignLayer(resizedBasePng, sharp, tuning.settings);
+  resizedBasePng = wm.buffer;
+
+  const view = String(target).includes("back") ? "back" : "front";
+  const slotHint =
+    target === "flat_back"
+      ? ["flat_clean.back", "flat_blended.back"]
+      : target === "model_back"
+        ? ["model_clean.back", "model_blended.back"]
+        : [`composite.${target}`];
+  renderSelectionLog.push(
+    JSON.stringify({
+      tag: "render_pass_qa",
+      renderTarget: target,
+      view,
+      compositorPath: "design_composite_8394",
+      usedDesignComposite: true,
+      flatRenderSlotsHint: slotHint,
+      lookTypesEmitted:
+        renderTreatment === "clean"
+          ? ["clean_primary", "blended_same_as_clean"]
+          : ["clean_over", "blended_target_blend"],
+      warpApplied: wm.warpApplied,
+      resolvedWarp: wm.resolvedWarp,
+      maskApplied: wm.maskApplied,
+      resolvedMask: wm.resolvedMask,
+      renderTreatment,
+      outputShape:
+        renderTreatment === "clean"
+          ? { clean: true, blendedMatchesClean: true }
+          : { clean: true, blended: true, blendMode: blend.blendMode, blendOpacity: blend.blendOpacity },
+    })
+  );
+
+  let flatCleanBuffer;
+  let flatBlendedBuffer;
+
+  if (renderTreatment === "clean") {
+    const cleanMeta = await sharp(resizedBasePng).metadata();
+    const cw = cleanMeta.width || resizedWidth;
+    const ch = cleanMeta.height || resizedHeight;
+    const leftClean = Math.max(0, Math.min(Math.round(left0 + (resizedWidth - cw) / 2), blankWidth - cw));
+    const topClean = Math.max(0, Math.min(Math.round(top0 + (resizedHeight - ch) / 2), blankHeight - ch));
+
+    flatCleanBuffer = await sharp(blankBuffer)
+      .composite([{ input: resizedBasePng, left: leftClean, top: topClean, blend: "over" }])
+      .png()
+      .toBuffer();
+    flatBlendedBuffer = flatCleanBuffer;
+  } else {
+    const mergedSimple = mergeSimple8394ForTarget(placementRow, variant, target);
+    const d8394 = derive8394Engine(mergedSimple);
+    let processedPng = resizedBasePng;
+    if (d8394) {
+      processedPng = await apply8394DesignTreatmentPng(processedPng, sharp, d8394);
+    }
+
+    let resizedCleanPng = processedPng;
+    if (d8394) {
+      const cleanRaw = await sharp(resizedCleanPng).raw().toBuffer({ depth: 8, resolveWithObject: true });
+      const tw = applyOpacityToRgbaBuffer(cleanRaw.data, d8394.designOpacityMultiplier);
+      resizedCleanPng = await sharp(tw, {
+        raw: {
+          width: cleanRaw.info.width,
+          height: cleanRaw.info.height,
+          channels: 4,
+        },
+      })
+        .png()
+        .toBuffer();
+    }
+
+    const cleanMeta = await sharp(resizedCleanPng).metadata();
+    const cw = cleanMeta.width || resizedWidth;
+    const ch = cleanMeta.height || resizedHeight;
+    const leftClean = Math.max(0, Math.min(Math.round(left0 + (resizedWidth - cw) / 2), blankWidth - cw));
+    const topClean = Math.max(0, Math.min(Math.round(top0 + (resizedHeight - ch) / 2), blankHeight - ch));
+
+    flatCleanBuffer = await sharp(blankBuffer)
+      .composite([{ input: resizedCleanPng, left: leftClean, top: topClean, blend: "over" }])
+      .png()
+      .toBuffer();
+
+    const resizedResult = await sharp(processedPng).raw().toBuffer({ depth: 8, resolveWithObject: true });
+    let raw = resizedResult.data;
+    const actualW = resizedResult.info.width;
+    const actualH = resizedResult.info.height;
+    const leftBlend = Math.max(0, Math.min(Math.round(left0 + (resizedWidth - actualW) / 2), blankWidth - actualW));
+    const topBlend = Math.max(0, Math.min(Math.round(top0 + (resizedHeight - actualH) / 2), blankHeight - actualH));
+    const inkMult = d8394 ? d8394.designOpacityMultiplier : 1;
+    raw = applyOpacityToRgbaBuffer(raw, blend.blendOpacity * inkMult);
+    raw = premultiplyRgbaBuffer(raw);
+    const blendedInput = await sharp(raw, {
+      raw: { width: actualW, height: actualH, channels: 4, premultiplied: true },
+    })
+      .png()
+      .toBuffer();
+
+    flatBlendedBuffer = await sharp(blankBuffer)
+      .composite([
+        {
+          input: blendedInput,
+          left: leftBlend,
+          top: topBlend,
+          blend: mapBlendMode(blend.blendMode),
+          premultiplied: true,
+        },
+      ])
+      .png()
+      .toBuffer();
+  }
+
+  return { flatCleanBuffer, flatBlendedBuffer, wm };
 }
 
 /**
@@ -414,18 +559,13 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
       }
       const product = productSnap.data();
 
-      const DEFAULT_RENDER_TYPES = ["flat_blended_back", "flat_clean_front"];
+      const DEFAULT_RENDER_TYPES = [
+        "model_blended_back",
+        "flat_clean_front",
+        "flat_blended_back",
+        "model_clean_front",
+      ];
       const rtRaw = data && Array.isArray(data.renderTypes) ? data.renderTypes : null;
-      const renderTypes =
-        rtRaw && rtRaw.length ? rtRaw.map((x) => String(x).trim()) : DEFAULT_RENDER_TYPES;
-      const wantBlendedBack = renderTypes.includes("flat_blended_back");
-      const wantFrontClean = renderTypes.includes("flat_clean_front");
-      if (!wantBlendedBack && !wantFrontClean) {
-        throw new functions.https.HttpsError(
-          "invalid-argument",
-          "renderTypes must include at least one of: flat_blended_back, flat_clean_front"
-        );
-      }
 
       const isParent = product.productKind === "parent";
       if (isParent && !productVariantId) {
@@ -495,45 +635,156 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
         throw new functions.https.HttpsError("failed-precondition", "Variant is inactive");
       }
 
-      let placementRow = null;
-      let placementFingerprint = null;
+      const variantFlatBackUrlBase =
+        (variantDoc &&
+          variantDoc.renderSetup &&
+          variantDoc.renderSetup.back &&
+          variantDoc.renderSetup.back.blankImageUrl) ||
+        getVariantFlatBackUrl(blank, variant);
+      const variantFlatFrontUrlBase =
+        (variantDoc &&
+          variantDoc.renderSetup &&
+          variantDoc.renderSetup.front &&
+          variantDoc.renderSetup.front.blankImageUrl) ||
+        getVariantFlatFrontUrl(blank, variant);
+      const variantModelBackUrlBase = getVariantModelBackUrl(blank, variant);
+      const variantModelFrontUrlBase = getVariantModelFrontUrl(blank, variant);
+
+      /* Priority-aligned default set: model_back (hero) → flat_front → flat_back → model_front */
+      const autoExpandedTypes = [
+        ...(variantModelBackUrlBase ? ["model_blended_back"] : []),
+        ...(variantFlatFrontUrlBase ? ["flat_clean_front"] : []),
+        ...(variantFlatBackUrlBase ? ["flat_blended_back"] : []),
+        ...(variantModelFrontUrlBase ? ["model_clean_front"] : []),
+      ];
+      let renderTypes =
+        rtRaw && rtRaw.length ? rtRaw.map((x) => String(x).trim()) : autoExpandedTypes.slice();
+      const usedDefaultRenderTypes = !renderTypes.length;
+      if (usedDefaultRenderTypes) {
+        renderTypes = DEFAULT_RENDER_TYPES.slice();
+      }
+
+      const renderSelectionLog = [];
+      if (rtRaw && rtRaw.length) {
+        renderSelectionLog.push("Explicit renderTypes from request: " + renderTypes.join(", "));
+      } else {
+        renderSelectionLog.push("Auto-expanded (no renderTypes in request)");
+        renderSelectionLog.push(
+          variantFlatBackUrlBase
+            ? "flat_blended_back: included — flat/back source URL present"
+            : "flat_blended_back: skipped — no flat/back source URL"
+        );
+        renderSelectionLog.push(
+          variantFlatFrontUrlBase
+            ? "flat_clean_front: included — flat front source URL present"
+            : "flat_clean_front: skipped — no flat front source URL"
+        );
+        renderSelectionLog.push(
+          variantModelBackUrlBase
+            ? "model_blended_back: included — modelBack URL present"
+            : "model_blended_back: skipped — no modelBack URL"
+        );
+        renderSelectionLog.push(
+          variantModelFrontUrlBase
+            ? "model_clean_front: included — modelFront URL present"
+            : "model_clean_front: skipped — no modelFront URL"
+        );
+        renderSelectionLog.push("Resolved renderTypes: " + renderTypes.join(", "));
+        if (usedDefaultRenderTypes) {
+          renderSelectionLog.push(
+            "Note: auto list was empty — applied DEFAULT " + DEFAULT_RENDER_TYPES.join(", ")
+          );
+        }
+      }
+      console.info(
+        JSON.stringify({
+          tag: "flat8394_render_target_selection",
+          productId,
+          productVariantId,
+          blankVariantId,
+          lines: renderSelectionLog,
+        })
+      );
+
+      const wantBlendedBack = renderTypes.includes("flat_blended_back");
+      const wantModelBlendedBack = renderTypes.includes("model_blended_back");
+      const wantFrontClean = renderTypes.includes("flat_clean_front");
+      const wantModelFrontClean = renderTypes.includes("model_clean_front");
+      const anyRequested =
+        wantBlendedBack || wantModelBlendedBack || wantFrontClean || wantModelFrontClean;
+      if (!anyRequested) {
+        throw new functions.https.HttpsError(
+          "invalid-argument",
+          "renderTypes must include at least one of: flat_blended_back, model_blended_back, flat_clean_front, model_clean_front"
+        );
+      }
+
+      let placementRowFlat = null;
+      let placementRowModel = null;
+      let placementFingerprintFlat = null;
+      let placementFingerprintModel = null;
       if (wantBlendedBack) {
-        const pk = resolvePlacementKeyForSide(placementProduct, variant, "back");
-        placementRow = getPlacementRowForSide(blank, "back", pk);
-        if (!placementRow) {
+        const pk = resolvePlacementKeyForRenderTarget(placementProduct, variant, "flat_back");
+        placementRowFlat = getPlacementRowForSide(blank, "back", pk);
+        if (!placementRowFlat) {
           throw new functions.https.HttpsError(
             "failed-precondition",
             "Blank has no back placement; configure placements on the blank (e.g. back_center)"
           );
         }
-        placementFingerprint = getPlacementFingerprintSliceForProduct(blank, placementProduct, "back", variant);
+        placementFingerprintFlat = getPlacementFingerprintSliceForRenderTarget(
+          blank,
+          placementProduct,
+          "flat_back",
+          variant
+        );
       }
-
-      const variantBackUrl = wantBlendedBack
-        ? (variantDoc &&
-            variantDoc.renderSetup &&
-            variantDoc.renderSetup.back &&
-            variantDoc.renderSetup.back.blankImageUrl) ||
-          getVariantBackUrl(blank, variant)
-        : null;
-      if (wantBlendedBack && !variantBackUrl) {
-        throw new functions.https.HttpsError(
-          "failed-precondition",
-          "Variant has no back image URL; upload back image on the variant"
+      if (wantModelBlendedBack) {
+        const pkM = resolvePlacementKeyForRenderTarget(placementProduct, variant, "model_back");
+        placementRowModel = getPlacementRowForSide(blank, "back", pkM);
+        if (!placementRowModel) {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "Blank has no back placement; configure placements on the blank (e.g. back_center)"
+          );
+        }
+        placementFingerprintModel = getPlacementFingerprintSliceForRenderTarget(
+          blank,
+          placementProduct,
+          "model_back",
+          variant
         );
       }
 
-      const variantFrontUrl = wantFrontClean
-        ? (variantDoc &&
-            variantDoc.renderSetup &&
-            variantDoc.renderSetup.front &&
-            variantDoc.renderSetup.front.blankImageUrl) ||
-          getVariantFrontUrl(blank, variant)
-        : null;
+      const variantFlatBackUrl = wantBlendedBack ? variantFlatBackUrlBase : null;
+      if (wantBlendedBack && !variantFlatBackUrl) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "Variant has no flat back image URL (flatBack or legacy back)"
+        );
+      }
+
+      const variantModelBackUrl = wantModelBlendedBack ? variantModelBackUrlBase : null;
+      if (wantModelBlendedBack && !variantModelBackUrl) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "Variant has no model back image URL (modelBack)"
+        );
+      }
+
+      const variantFrontUrl = wantFrontClean ? variantFlatFrontUrlBase : null;
       if (wantFrontClean && (!variantFrontUrl || !String(variantFrontUrl).trim())) {
         throw new functions.https.HttpsError(
           "failed-precondition",
-          "8394 flat render needs a front blank image per color (renderSetup.front.blankImageUrl or blank variant images.front)."
+          "8394 flat render needs a front blank image per color (flatFront or legacy front)."
+        );
+      }
+
+      const variantModelFrontUrl = wantModelFrontClean ? variantModelFrontUrlBase : null;
+      if (wantModelFrontClean && (!variantModelFrontUrl || !String(variantModelFrontUrl).trim())) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "model_clean_front requires modelFront on the blank variant"
         );
       }
 
@@ -551,13 +802,21 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
 
       const now = admin.firestore.FieldValue.serverTimestamp();
 
-      let inputFingerprint = null;
+      let sharedDesignDoc = null;
+      let sharedDesignIdLoaded = null;
+
+      let inputFingerprintFlat = null;
+      let inputFingerprintModel = null;
       let clean = null;
       let blended = null;
       let flatCleanBackSlot = null;
       let flatBlendedBackSlot = null;
+      let modelCleanBackSlot = null;
+      let modelBlendedBackSlot = null;
+      let modelClean = null;
+      let modelBlended = null;
 
-      if (wantBlendedBack) {
+      if (wantBlendedBack || wantModelBlendedBack) {
         const designId =
           (variantDoc && variantDoc.designIdBack && String(variantDoc.designIdBack).trim()) ||
           (product.designIdBack && String(product.designIdBack).trim()) ||
@@ -572,6 +831,8 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
           throw new functions.https.HttpsError("not-found", `Design ${designId} not found`);
         }
         const design = designSnap.data();
+        sharedDesignDoc = design;
+        sharedDesignIdLoaded = designId;
 
         const { url: designPngUrl, ref: resolvedToneRef } = pickDesignPngForVariant(design, variant, variantDoc);
         if (!designPngUrl) {
@@ -591,16 +852,44 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
         );
         const renderTreatment = resolveBackRenderTreatment(garmentFam, resolvedToneRef);
 
-        const blend = resolveEffectiveRenderSettings(placementProduct, blank, variant, placementRow, "back");
+        let designBufferCached = null;
+
+        if (wantBlendedBack) {
+        const tuningFlat = resolveEffectiveRenderTargetSettings(placementProduct, blank, variant, "flat_back");
+        const blend = resolveEngineBlendForRenderTarget(
+          placementProduct,
+          blank,
+          variant,
+          "flat_back",
+          tuningFlat.settings.blend
+        );
+        renderSelectionLog.push(
+          JSON.stringify({
+            tag: "render_target_tuning_resolved",
+            renderTarget: "flat_back",
+            placement: tuningFlat.settings.placement,
+            blend: tuningFlat.settings.blend,
+            warp: tuningFlat.settings.warp,
+            mask: tuningFlat.settings.mask,
+            blankTuningExisted: tuningFlat.qa.blankTuningExisted,
+            variantTargetOverrideExisted: tuningFlat.qa.variantTargetOverrideExisted,
+            productPlacementApplied: tuningFlat.qa.productPlacementApplied,
+            engineBlend: blend,
+          })
+        );
 
         const fingerprintPayload = {
-          scope: "step10_mvp_8394_back_v5_tone_treatment",
+          scope: "step10_mvp_8394_back_v6_flat_target",
+          renderTarget: "flat_back",
           blankId,
           blankVariantId,
           blankVersion: getBlankVersionValue(blank),
-          placementBack: placementFingerprint,
+          placementBack: placementFingerprintFlat,
           backBlend: blend,
-          variantBackUrl,
+          targetTuningQa: tuningFlat.qa,
+          targetTuningPlacement: tuningFlat.settings.placement,
+          targetTuningBlend01: tuningFlat.settings.blend,
+          variantBackUrl: variantFlatBackUrl,
           designId,
           designVersion: getDesignVersionValue(design),
           garmentFamily: garmentFam,
@@ -609,9 +898,9 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
           designAssetRef: resolvedToneRef,
           designAssetUrl: designPngUrl,
         };
-        inputFingerprint = fingerprintFromPayload(fingerprintPayload, crypto);
+        inputFingerprintFlat = fingerprintFromPayload(fingerprintPayload, crypto);
 
-        const blankResp = await fetch(variantBackUrl);
+        const blankResp = await fetch(variantFlatBackUrl);
         if (!blankResp.ok) {
           throw new functions.https.HttpsError("internal", `Failed to fetch blank back image: ${blankResp.status}`);
         }
@@ -621,45 +910,12 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
         if (!designResp.ok) {
           throw new functions.https.HttpsError("internal", `Failed to fetch design PNG: ${designResp.status}`);
         }
-        let designBuffer = Buffer.from(await designResp.arrayBuffer());
+        const designBufferRaw = Buffer.from(await designResp.arrayBuffer());
+        designBufferCached = designBufferRaw;
 
-        const cropped = await cropDesignToArtworkBounds(designBuffer, sharp);
-        designBuffer = cropped.buffer;
-        const designWidth = cropped.width;
-        const designHeight = cropped.height;
+        const effPl = resolveEffectivePlacementForRenderTarget(placementProduct, blank, variant, "flat_back");
 
-        const blankMeta = await sharp(blankBuffer).metadata();
-        const blankWidth = blankMeta.width;
-        const blankHeight = blankMeta.height;
-        if (!blankWidth || !blankHeight) {
-          throw new functions.https.HttpsError("internal", "Invalid blank image dimensions");
-        }
-
-        const effPl = resolveEffectivePlacement(placementProduct, blank, "back", variant);
-        const layoutPlacement =
-          effPl && placementRow
-            ? {
-                ...placementRow,
-                defaultX: effPl.defaultX,
-                defaultY: effPl.defaultY,
-                defaultScale: effPl.defaultScale,
-              }
-            : placementRow;
-        const { left: left0, top: top0, resizedWidth, resizedHeight } = computeLayout(
-          blankWidth,
-          blankHeight,
-          layoutPlacement,
-          designWidth,
-          designHeight
-        );
-
-        const resizedBasePng = await sharp(designBuffer)
-          .resize(resizedWidth, resizedHeight, { fit: "inside" })
-          .ensureAlpha()
-          .png()
-          .toBuffer();
-
-        const slotBack = (lookType, view, url, storagePath, fp, designRef, dims) => {
+        const slotBackFlat = (lookType, view, url, storagePath, fp, designRef, dims) => {
           const o = {
             url,
             storagePath,
@@ -668,135 +924,72 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
             view,
             sourceBlankVariantId: blankVariantId,
             sourceDesignAssetRef: designRef,
-            inputFingerprint: fp || inputFingerprint,
+            inputFingerprint: fp || inputFingerprintFlat,
           };
           if (dims && dims.width) o.width = dims.width;
           if (dims && dims.height) o.height = dims.height;
           return o;
         };
 
+        const { flatCleanBuffer, flatBlendedBuffer } = await render8394DesignOnGarmentSharp({
+          sharp,
+          blankBuffer,
+          designBuffer: designBufferRaw,
+          tuning: tuningFlat,
+          blend,
+          placementRow: placementRowFlat,
+          effPl,
+          variant,
+          target: "flat_back",
+          renderTreatment,
+          renderSelectionLog,
+        });
+
         if (renderTreatment === "clean") {
-          const cleanMeta = await sharp(resizedBasePng).metadata();
-          const cw = cleanMeta.width || resizedWidth;
-          const ch = cleanMeta.height || resizedHeight;
-          const leftClean = Math.max(0, Math.min(Math.round(left0 + (resizedWidth - cw) / 2), blankWidth - cw));
-          const topClean = Math.max(0, Math.min(Math.round(top0 + (resizedHeight - ch) / 2), blankHeight - ch));
-
-          const flatPrimaryBuffer = await sharp(blankBuffer)
-            .composite([{ input: resizedBasePng, left: leftClean, top: topClean, blend: "over" }])
-            .png()
-            .toBuffer();
-
-          const primaryUp = await uploadPng("flat_back_primary_clean", flatPrimaryBuffer);
+          const primaryUp = await uploadPng("flat_back_primary_clean", flatCleanBuffer);
           clean = primaryUp;
           blended = primaryUp;
-          const dims = await sharp(flatPrimaryBuffer).metadata();
-          flatCleanBackSlot = slotBack(
+          const dims = await sharp(flatCleanBuffer).metadata();
+          flatCleanBackSlot = slotBackFlat(
             "flat_clean",
             "back",
             primaryUp.url,
             primaryUp.storagePath,
-            inputFingerprint,
+            inputFingerprintFlat,
             resolvedToneRef,
             dims
           );
-          flatBlendedBackSlot = slotBack(
+          flatBlendedBackSlot = slotBackFlat(
             "flat_blended",
             "back",
             primaryUp.url,
             primaryUp.storagePath,
-            inputFingerprint,
+            inputFingerprintFlat,
             resolvedToneRef,
             dims
           );
         } else {
-          const d8394 = derive8394Engine(placementRow.simpleRenderControls8394);
-          let processedPng = resizedBasePng;
-          if (d8394) {
-            processedPng = await apply8394DesignTreatmentPng(processedPng, sharp, d8394);
-          }
-
-          let resizedCleanPng = processedPng;
-          if (d8394) {
-            const cleanRaw = await sharp(resizedCleanPng).raw().toBuffer({ depth: 8, resolveWithObject: true });
-            const tw = applyOpacityToRgbaBuffer(cleanRaw.data, d8394.designOpacityMultiplier);
-            resizedCleanPng = await sharp(tw, {
-              raw: {
-                width: cleanRaw.info.width,
-                height: cleanRaw.info.height,
-                channels: 4,
-              },
-            })
-              .png()
-              .toBuffer();
-          }
-
-          const cleanMeta = await sharp(resizedCleanPng).metadata();
-          const cw = cleanMeta.width || resizedWidth;
-          const ch = cleanMeta.height || resizedHeight;
-          const leftClean = Math.max(0, Math.min(Math.round(left0 + (resizedWidth - cw) / 2), blankWidth - cw));
-          const topClean = Math.max(0, Math.min(Math.round(top0 + (resizedHeight - ch) / 2), blankHeight - ch));
-
-          const flatCleanBuffer = await sharp(blankBuffer)
-            .composite([{ input: resizedCleanPng, left: leftClean, top: topClean, blend: "over" }])
-            .png()
-            .toBuffer();
-
-          const resizedResult = await sharp(processedPng).raw().toBuffer({ depth: 8, resolveWithObject: true });
-          let raw = resizedResult.data;
-          const actualW = resizedResult.info.width;
-          const actualH = resizedResult.info.height;
-          const leftBlend = Math.max(
-            0,
-            Math.min(Math.round(left0 + (resizedWidth - actualW) / 2), blankWidth - actualW)
-          );
-          const topBlend = Math.max(
-            0,
-            Math.min(Math.round(top0 + (resizedHeight - actualH) / 2), blankHeight - actualH)
-          );
-          const inkMult = d8394 ? d8394.designOpacityMultiplier : 1;
-          raw = applyOpacityToRgbaBuffer(raw, blend.blendOpacity * inkMult);
-          raw = premultiplyRgbaBuffer(raw);
-          const blendedInput = await sharp(raw, {
-            raw: { width: actualW, height: actualH, channels: 4, premultiplied: true },
-          })
-            .png()
-            .toBuffer();
-
-          const flatBlendedBuffer = await sharp(blankBuffer)
-            .composite([
-              {
-                input: blendedInput,
-                left: leftBlend,
-                top: topBlend,
-                blend: mapBlendMode(blend.blendMode),
-                premultiplied: true,
-              },
-            ])
-            .png()
-            .toBuffer();
-
           clean = await uploadPng("flat_clean_back", flatCleanBuffer);
           blended = await uploadPng("flat_blended_back", flatBlendedBuffer);
 
           const cleanDims = await sharp(flatCleanBuffer).metadata();
           const blendedDims = await sharp(flatBlendedBuffer).metadata();
 
-          flatCleanBackSlot = slotBack(
+          flatCleanBackSlot = slotBackFlat(
             "flat_clean",
             "back",
             clean.url,
             clean.storagePath,
-            inputFingerprint,
+            inputFingerprintFlat,
             resolvedToneRef,
             cleanDims
           );
-          flatBlendedBackSlot = slotBack(
+          flatBlendedBackSlot = slotBackFlat(
             "flat_blended",
             "back",
             blended.url,
             blended.storagePath,
-            inputFingerprint,
+            inputFingerprintFlat,
             resolvedToneRef,
             blendedDims
           );
@@ -831,6 +1024,154 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
             })
           );
         }
+        }
+
+        if (wantModelBlendedBack) {
+          const tuningModel = resolveEffectiveRenderTargetSettings(placementProduct, blank, variant, "model_back");
+          const blendM = resolveEngineBlendForRenderTarget(
+            placementProduct,
+            blank,
+            variant,
+            "model_back",
+            tuningModel.settings.blend
+          );
+          renderSelectionLog.push(
+            JSON.stringify({
+              tag: "render_target_tuning_resolved",
+              renderTarget: "model_back",
+              placement: tuningModel.settings.placement,
+              blend: tuningModel.settings.blend,
+              warp: tuningModel.settings.warp,
+              mask: tuningModel.settings.mask,
+              blankTuningExisted: tuningModel.qa.blankTuningExisted,
+              variantTargetOverrideExisted: tuningModel.qa.variantTargetOverrideExisted,
+              productPlacementApplied: tuningModel.qa.productPlacementApplied,
+              engineBlend: blendM,
+            })
+          );
+          const fingerprintPayloadM = {
+            scope: "step10_mvp_8394_back_v6_model_target",
+            renderTarget: "model_back",
+            blankId,
+            blankVariantId,
+            blankVersion: getBlankVersionValue(blank),
+            placementBack: placementFingerprintModel,
+            backBlend: blendM,
+            targetTuningQa: tuningModel.qa,
+            targetTuningPlacement: tuningModel.settings.placement,
+            targetTuningBlend01: tuningModel.settings.blend,
+            variantBackUrl: variantModelBackUrl,
+            designId,
+            designVersion: getDesignVersionValue(design),
+            garmentFamily: garmentFam,
+            renderTreatment,
+            resolvedTone: resolvedToneRef,
+            designAssetRef: resolvedToneRef,
+            designAssetUrl: designPngUrl,
+          };
+          inputFingerprintModel = fingerprintFromPayload(fingerprintPayloadM, crypto);
+
+          const blankRespM = await fetch(variantModelBackUrl);
+          if (!blankRespM.ok) {
+            throw new functions.https.HttpsError(
+              "internal",
+              `Failed to fetch model back blank image: ${blankRespM.status}`
+            );
+          }
+          const blankBufferM = Buffer.from(await blankRespM.arrayBuffer());
+
+          let designBufferForModel = designBufferCached;
+          if (designBufferForModel == null) {
+            const designRespM = await fetch(designPngUrl);
+            if (!designRespM.ok) {
+              throw new functions.https.HttpsError("internal", `Failed to fetch design PNG: ${designRespM.status}`);
+            }
+            designBufferForModel = Buffer.from(await designRespM.arrayBuffer());
+          }
+
+          const effPlM = resolveEffectivePlacementForRenderTarget(placementProduct, blank, variant, "model_back");
+
+          const slotBackModel = (lookType, view, url, storagePath, fp, designRef, dims) => {
+            const o = {
+              url,
+              storagePath,
+              generatedAt: now,
+              lookType,
+              view,
+              sourceBlankVariantId: blankVariantId,
+              sourceDesignAssetRef: designRef,
+              inputFingerprint: fp || inputFingerprintModel,
+            };
+            if (dims && dims.width) o.width = dims.width;
+            if (dims && dims.height) o.height = dims.height;
+            return o;
+          };
+
+          const { flatCleanBuffer: modelCleanBuf, flatBlendedBuffer: modelBlendedBuf } =
+            await render8394DesignOnGarmentSharp({
+              sharp,
+              blankBuffer: blankBufferM,
+              designBuffer: designBufferForModel,
+              tuning: tuningModel,
+              blend: blendM,
+              placementRow: placementRowModel,
+              effPl: effPlM,
+              variant,
+              target: "model_back",
+              renderTreatment,
+              renderSelectionLog,
+            });
+
+          if (renderTreatment === "clean") {
+            const primaryUpM = await uploadPng("model_back_primary_clean", modelCleanBuf);
+            modelClean = primaryUpM;
+            modelBlended = primaryUpM;
+            const dimsM = await sharp(modelCleanBuf).metadata();
+            modelCleanBackSlot = slotBackModel(
+              "model_clean",
+              "back",
+              primaryUpM.url,
+              primaryUpM.storagePath,
+              inputFingerprintModel,
+              resolvedToneRef,
+              dimsM
+            );
+            modelBlendedBackSlot = slotBackModel(
+              "model_blended",
+              "back",
+              primaryUpM.url,
+              primaryUpM.storagePath,
+              inputFingerprintModel,
+              resolvedToneRef,
+              dimsM
+            );
+          } else {
+            modelClean = await uploadPng("model_clean_back", modelCleanBuf);
+            modelBlended = await uploadPng("model_blended_back", modelBlendedBuf);
+
+            const cleanDimsM = await sharp(modelCleanBuf).metadata();
+            const blendedDimsM = await sharp(modelBlendedBuf).metadata();
+
+            modelCleanBackSlot = slotBackModel(
+              "model_clean",
+              "back",
+              modelClean.url,
+              modelClean.storagePath,
+              inputFingerprintModel,
+              resolvedToneRef,
+              cleanDimsM
+            );
+            modelBlendedBackSlot = slotBackModel(
+              "model_blended",
+              "back",
+              modelBlended.url,
+              modelBlended.storagePath,
+              inputFingerprintModel,
+              resolvedToneRef,
+              blendedDimsM
+            );
+          }
+        }
       }
 
       let flatCleanFrontSlot = null;
@@ -846,6 +1187,16 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
           );
         }
         const frontBuf = Buffer.from(await frontResp.arrayBuffer());
+        renderSelectionLog.push(
+          JSON.stringify({
+            tag: "render_pass_qa",
+            renderTarget: "flat_front",
+            view: "front",
+            compositorPath: "garment_pass_through_display_only",
+            usedDesignComposite: false,
+            note: "8394 flat front: garment copy only (no design composite in this pipeline)",
+          })
+        );
         const frontFpPayload = {
           scope: "step10_mvp_8394_front_clean_v2_garment",
           blankId,
@@ -869,6 +1220,52 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
         };
       }
 
+      let modelCleanFrontSlot = null;
+      let modelCleanFrontUrl = null;
+      let modelFrontFingerprint = null;
+
+      if (wantModelFrontClean) {
+        const mfResp = await fetch(variantModelFrontUrl);
+        if (!mfResp.ok) {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            `Failed to fetch model front blank image: HTTP ${mfResp.status}`
+          );
+        }
+        const mfBuf = Buffer.from(await mfResp.arrayBuffer());
+        renderSelectionLog.push(
+          JSON.stringify({
+            tag: "render_pass_qa",
+            renderTarget: "model_front",
+            view: "front",
+            compositorPath: "garment_pass_through_display_only",
+            usedDesignComposite: false,
+            note: "8394 model front: garment copy only (no design composite in this pipeline)",
+          })
+        );
+        const mfFpPayload = {
+          scope: "step10_mvp_8394_model_front_clean_v1",
+          blankId,
+          blankVariantId,
+          variantModelFrontUrl,
+        };
+        modelFrontFingerprint = fingerprintFromPayload(mfFpPayload, crypto);
+        const mfUp = await uploadPng("model_clean_front", mfBuf);
+        modelCleanFrontUrl = mfUp.url;
+        const mfDims = await sharp(mfBuf).metadata();
+        modelCleanFrontSlot = {
+          url: mfUp.url,
+          storagePath: mfUp.storagePath,
+          generatedAt: now,
+          lookType: "model_clean",
+          view: "front",
+          sourceBlankVariantId: blankVariantId,
+          inputFingerprint: modelFrontFingerprint,
+          ...(mfDims.width ? { width: mfDims.width } : {}),
+          ...(mfDims.height ? { height: mfDims.height } : {}),
+        };
+      }
+
       const prevFlat = currentTarget.flatRenders || {};
       const mergedFlat = {
         flat_clean: {
@@ -880,21 +1277,65 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
           ...(prevFlat.flat_blended || {}),
           ...(flatBlendedBackSlot && { back: flatBlendedBackSlot }),
         },
+        model_clean: {
+          ...(prevFlat.model_clean || {}),
+          ...(modelCleanBackSlot && { back: modelCleanBackSlot }),
+          ...(modelCleanFrontSlot && { front: modelCleanFrontSlot }),
+        },
+        model_blended: {
+          ...(prevFlat.model_blended || {}),
+          ...(modelBlendedBackSlot && { back: modelBlendedBackSlot }),
+        },
       };
 
       const mediaNext = { ...(currentTarget.media || {}) };
-      const blendedUrl = blended && blended.url ? blended.url : null;
-      if (blendedUrl) {
-        mediaNext.heroBack = blendedUrl;
+      const flatBlendedUrl = blended && blended.url ? blended.url : null;
+      const modelBlendedUrl = modelBlended && modelBlended.url ? modelBlended.url : null;
+      const heroBackUrl = modelBlendedUrl || flatBlendedUrl;
+      if (heroBackUrl) {
+        mediaNext.heroBack = heroBackUrl;
       }
       if (flatCleanFrontUrl) {
         mediaNext.heroFront = flatCleanFrontUrl;
       }
+      /* Gallery: model_back (hero) → flat_front → flat_back → model_front */
       const gallerySeed = [];
-      if (blendedUrl) gallerySeed.push(blendedUrl);
+      if (modelBlendedUrl) gallerySeed.push(modelBlendedUrl);
       if (flatCleanFrontUrl) gallerySeed.push(flatCleanFrontUrl);
+      if (flatBlendedUrl) gallerySeed.push(flatBlendedUrl);
+      if (modelCleanFrontUrl) gallerySeed.push(modelCleanFrontUrl);
       const existingGal = Array.isArray(mediaNext.gallery) ? mediaNext.gallery : [];
       mediaNext.gallery = dedupeGalleryUrls([...gallerySeed, ...existingGal]);
+
+      const genOutputs = [];
+      const pushGen = (role, sourceImageRole, slot, sort) => {
+        if (!slot || !slot.url) return;
+        genOutputs.push({
+          role,
+          sourceType: "variant_render_source",
+          sourceImageRole,
+          url: slot.url,
+          storagePath: slot.storagePath != null ? slot.storagePath : null,
+          width: slot.width != null ? slot.width : null,
+          height: slot.height != null ? slot.height : null,
+          sort,
+          createdAt: now,
+          lookType: slot.lookType != null ? slot.lookType : null,
+          view: slot.view != null ? slot.view : null,
+        });
+      };
+      pushGen("model_back", "modelBack", modelBlendedBackSlot, 10);
+      pushGen("flat_front", "flatFront", flatCleanFrontSlot, 20);
+      pushGen("flat_back", "flatBack", flatBlendedBackSlot, 30);
+      pushGen("model_front", "modelFront", modelCleanFrontSlot, 40);
+      genOutputs.sort((a, b) => a.sort - b.sort);
+
+      const prevGen = Array.isArray(currentTarget.generatedRenderOutputs)
+        ? currentTarget.generatedRenderOutputs
+        : [];
+      const patchRoles = new Set(genOutputs.map((g) => g.role));
+      const kept = prevGen.filter((g) => g && g.role && !patchRoles.has(g.role));
+      const mergedGen = [...kept, ...genOutputs].sort((a, b) => (a.sort || 0) - (b.sort || 0));
 
       const uid =
         contextUid && typeof contextUid === "string" && contextUid.trim() ? contextUid.trim() : "system";
@@ -905,8 +1346,13 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
         updatedAt: now,
         updatedBy: uid,
       };
-      if (blendedUrl) {
-        updatePayload.mockupUrl = blendedUrl;
+      if (mergedGen.length) {
+        updatePayload.generatedRenderOutputs = mergedGen;
+      } else {
+        updatePayload.generatedRenderOutputs = admin.firestore.FieldValue.delete();
+      }
+      if (heroBackUrl) {
+        updatePayload.mockupUrl = heroBackUrl;
       }
 
       await targetRef.update(sanitizeForFirestore(updatePayload));
@@ -927,11 +1373,22 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
         productId,
         productVariantId: productVariantId || null,
         renderTypes,
-        inputFingerprint: inputFingerprint || frontFingerprint,
+        renderSelectionLog,
+        inputFingerprint:
+          inputFingerprintFlat ||
+          inputFingerprintModel ||
+          frontFingerprint ||
+          modelFrontFingerprint ||
+          null,
         urls: {
           flat_clean_back: clean ? clean.url : null,
           flat_blended_back: blended ? blended.url : null,
           flat_clean_front: flatCleanFrontUrl || null,
+          flat_blended_front: null,
+          model_clean_back: modelClean ? modelClean.url : null,
+          model_blended_back: modelBlended ? modelBlended.url : null,
+          model_clean_front: modelCleanFrontUrl || null,
+          model_blended_front: null,
         },
       };
   } catch (err) {
