@@ -8,6 +8,8 @@
 const { resolveMockPlacementForProduct } = require("./resolveProductRenderProfile");
 const { executeProductFlatRender8394Mvp, pickDesignPngForVariant } = require("./productFlatRenderMvp");
 const { getVariantFlatBackUrl } = require("./variantRenderSources");
+const { launchBatchLog } = require("./productAssetBatchHelpers");
+const { DEFAULT_ASSET_PLAN } = require("./defaultAssetPlan");
 
 const RETRY_DELAY_MS = 10 * 60 * 1000;
 
@@ -40,6 +42,24 @@ function nextRetryAt(admin) {
   return admin.firestore.Timestamp.fromMillis(Date.now() + RETRY_DELAY_MS);
 }
 
+function logQueueResultPerRole(ctx, { queued, jobId, reasonIfNotQueued }) {
+  const { productAssetBatchId, productAssetColorKey } = ctx;
+  const bid = productAssetBatchId || null;
+  const bvar = productAssetColorKey || null;
+  for (const role of DEFAULT_ASSET_PLAN) {
+    launchBatchLog("QUEUE_RESULT", {
+      batchId: bid,
+      blankVariantId: bvar,
+      role,
+      jobType: "rp_mock_jobs",
+      collection: "rp_mock_jobs",
+      jobId: jobId || null,
+      queued: !!queued,
+      reasonIfNotQueued: reasonIfNotQueued != null ? String(reasonIfNotQueued) : null,
+    });
+  }
+}
+
 /**
  * After variant create (8394): enqueue back mock job; `onMockJobCreated` then runs
  * `generateProductFlatRenders` (flat_blended_back + flat_clean_front) on the variant doc — mock → flat for stability.
@@ -49,28 +69,39 @@ async function queueVariant8394BaseAssets(ctx) {
   const fetchFn = typeof global.fetch === "function" ? global.fetch.bind(global) : null;
   if (!fetchFn) {
     console.warn("[queueVariant8394BaseAssets] global fetch unavailable; skip auto assets");
+    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "no_global_fetch" });
     return;
   }
 
   const productRef = db.collection("rp_products").doc(parentId);
   const variantRef = productRef.collection("variants").doc(variantId);
   const [parentSnap, variantSnap] = await Promise.all([productRef.get(), variantRef.get()]);
-  if (!parentSnap.exists || !variantSnap.exists) return;
+  if (!parentSnap.exists || !variantSnap.exists) {
+    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "missing_product_or_variant" });
+    return;
+  }
 
   const parent = parentSnap.data();
   const variantDoc = variantSnap.data();
   const blankId = parent.blankId;
-  if (!blankId) return;
+  if (!blankId) {
+    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "no_blank_id_on_product" });
+    return;
+  }
 
   const bSnap = await db.collection("rp_blanks").doc(blankId).get();
   if (!bSnap.exists) return;
   const blank = bSnap.data();
-  if (String(blank.styleCode || "").trim() !== "8394") return;
+  if (String(blank.styleCode || "").trim() !== "8394") {
+    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "not_8394_blank" });
+    return;
+  }
 
   const blankVariantId = variantDoc.blankVariantId;
   const variantRow = (blank.variants || []).find((v) => v.variantId === blankVariantId);
   if (!variantRow) {
     console.warn("[queueVariant8394BaseAssets] blank variant row missing");
+    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "blank_variant_row_missing" });
     return;
   }
 
@@ -80,6 +111,7 @@ async function queueVariant8394BaseAssets(ctx) {
     getVariantFlatBackUrl(blank, variantRow);
   if (!variantBackUrl) {
     console.warn("[queueVariant8394BaseAssets] no back image URL");
+    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "no_back_image_url" });
     await variantRef.update({
       assetPipeline: {
         mock_back: { status: "failed", error: "no_back_image_url", failedAt: admin.firestore.FieldValue.serverTimestamp() },
@@ -97,14 +129,21 @@ async function queueVariant8394BaseAssets(ctx) {
     (parent.designIdBack && String(parent.designIdBack).trim()) ||
     variantDoc.designId ||
     parent.designId;
-  if (!designId) return;
+  if (!designId) {
+    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "no_design_id" });
+    return;
+  }
 
   const designSnap = await db.collection("designs").doc(designId).get();
-  if (!designSnap.exists) return;
+  if (!designSnap.exists) {
+    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "design_doc_missing" });
+    return;
+  }
   const design = designSnap.data();
   const { url: designPngUrl } = pickDesignPngForVariant(design, variantRow, variantDoc);
   if (!designPngUrl) {
     console.warn("[queueVariant8394BaseAssets] no design PNG for variant");
+    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "no_design_png" });
     await variantRef.update({
       assetPipeline: {
         mock_back: { status: "failed", error: "no_design_png", failedAt: admin.firestore.FieldValue.serverTimestamp() },
@@ -145,6 +184,16 @@ async function queueVariant8394BaseAssets(ctx) {
 
   const jobRef = await db.collection("rp_mock_jobs").add(sanitizeForFirestore(jobData));
 
+  logQueueResultPerRole(ctx, { queued: true, jobId: jobRef.id, reasonIfNotQueued: null });
+
+  launchBatchLog("MOCK_JOB_CREATED", {
+    productId: parentId,
+    batchId: productAssetBatchId || null,
+    blankVariantId: productAssetColorKey || null,
+    primaryVariantId: variantId,
+    mockJobId: jobRef.id,
+  });
+
   await variantRef.update({
     assetPipeline: {
       mock_back: {
@@ -166,7 +215,7 @@ async function queueVariant8394BaseAssets(ctx) {
 async function run8394FlatAfterVariantMock(ctx) {
   const { admin, db, parentId, productVariantId, jobId, createdByUid, sanitizeForFirestore: sanitizeFn } = ctx;
   const sanitizeForFirestore = typeof sanitizeFn === "function" ? sanitizeFn : (x) => x;
-  const { on8394FlatPipelineFinishedForBatch } = require("./productAssetBatchHelpers");
+  const { on8394SecondaryPipelineMediaInheritance } = require("./productAssetBatchHelpers");
   const crypto = require("crypto");
   const fetchFn = typeof global.fetch === "function" ? global.fetch.bind(global) : null;
   if (!fetchFn) {
@@ -191,6 +240,13 @@ async function run8394FlatAfterVariantMock(ctx) {
     },
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     updatedBy: uid,
+  });
+
+  launchBatchLog("FLAT_PIPELINE", {
+    productId: parentId,
+    productVariantId,
+    mockJobId: jobId || null,
+    stage: "executeProductFlatRender8394Mvp_start",
   });
 
   try {
@@ -222,16 +278,15 @@ async function run8394FlatAfterVariantMock(ctx) {
       updatedBy: uid,
     });
     try {
-      await on8394FlatPipelineFinishedForBatch({
+      await on8394SecondaryPipelineMediaInheritance({
         db,
         admin,
-        sanitizeForFirestore,
         parentId,
         productVariantId,
         succeeded: true,
       });
-    } catch (batchErr) {
-      console.warn("[run8394FlatAfterVariantMock] batch progress:", batchErr && batchErr.message ? batchErr.message : batchErr);
+    } catch (inhErr) {
+      console.warn("[run8394FlatAfterVariantMock] secondary inheritance:", inhErr && inhErr.message ? inhErr.message : inhErr);
     }
   } catch (err) {
     const msg =
@@ -240,6 +295,22 @@ async function run8394FlatAfterVariantMock(ctx) {
         : err && String(err)
           ? String(err).slice(0, 480)
           : "flat_failed";
+    let batchIdForLog = null;
+    try {
+      const vs = await variantRef.get();
+      const vd = vs.exists ? vs.data() || {} : {};
+      batchIdForLog =
+        vd.productAssetBatchId && String(vd.productAssetBatchId).trim() ? String(vd.productAssetBatchId).trim() : null;
+    } catch (_) {
+      batchIdForLog = null;
+    }
+    launchBatchLog("WORKER_FAILURE", {
+      batchId: batchIdForLog,
+      role: "flat_pipeline",
+      jobId: jobId || null,
+      stage: "executeProductFlatRender8394Mvp",
+      error: msg,
+    });
     await variantRef.update({
       "assetPipeline.flat_render": {
         status: "failed",
@@ -250,19 +321,6 @@ async function run8394FlatAfterVariantMock(ctx) {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedBy: uid,
     });
-    try {
-      await on8394FlatPipelineFinishedForBatch({
-        db,
-        admin,
-        sanitizeForFirestore,
-        parentId,
-        productVariantId,
-        succeeded: false,
-        errorMessage: msg,
-      });
-    } catch (batchErr) {
-      console.warn("[run8394FlatAfterVariantMock] batch progress (fail):", batchErr && batchErr.message ? batchErr.message : batchErr);
-    }
   }
 }
 

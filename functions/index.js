@@ -33,10 +33,18 @@ const runCreateProductFromDesignBlankCore = require("./lib/runCreateProductFromD
 const { startInitialProductAssetBatch } = require("./lib/startInitialProductAssetBatch");
 const { executeTeamProductVariantCreation } = require("./lib/executeTeamProductVariantCreation");
 const { launchProductsFromDesign } = require("./lib/launchProductsFromDesign");
+const {
+  bulkMarkProductsReviewed,
+  bulkSyncProductsToShopify,
+  bulkRetryProductAssets,
+} = require("./lib/bulkProductOps");
+const { LAUNCH_STATUS } = require("./lib/productLaunchStatus");
+const { pipelineFailurePatch, pipelineClearErrorPatch, PIPELINE_STAGE } = require("./lib/pipelineReporting");
 const { createRegisterGenerateProductFlatRenders } = require("./lib/productFlatRenderMvp");
 const { createRegisterGenerateProductSceneRender } = require("./lib/productSceneRenderMvp");
 const { normalizeColorsForFirestore } = require("./lib/standardPrintInks");
 const variant8394Pipeline = require("./lib/variant8394Pipeline");
+const { launchBatchLog } = require("./lib/productAssetBatchHelpers");
 const {
   resolvePrintSidesForProductBuild,
   inferDefaultPrintSides,
@@ -87,22 +95,13 @@ function sanitizeForFirestore(value) {
   return out;
 }
 
-// Cost estimation for fal.ai generation
-// Based on typical pricing: ~$0.01-0.05 per image depending on size and LoRAs
-function estimateGenerationCost(imageCount, imageSize, loraCount) {
-  const baseCostPerImage = 0.02; // Base cost per image in USD
-  const sizeMultiplier = {
-    square: 1.0,
-    portrait: 1.2,
-    landscape: 1.2,
-  };
-  const loraMultiplier = 1.0 + (loraCount * 0.1); // 10% increase per LoRA
-  
-  const size = typeof imageSize === "string" ? imageSize : "square";
-  const multiplier = (sizeMultiplier[size] || 1.0) * loraMultiplier;
-  
-  return imageCount * baseCostPerImage * multiplier;
-}
+const { resolvePromptWithGuardrails } = require("./lib/promptGuardrailsShared");
+const {
+  createCreateGenerationJob,
+  estimateGenerationCost,
+  BASELINE_NEGATIVE_PROMPT,
+} = require("./lib/createGenerationJobCore");
+const createGenerationJob = createCreateGenerationJob({ db, admin, sanitizeForFirestore });
 
 // Check if placeholder worker mode is enabled (default: true for safety)
 function usePlaceholderWorker() {
@@ -127,9 +126,6 @@ function usePlaceholderWorker() {
     return true; // Default: use placeholder for safety
   }
 }
-
-// Baseline negative prompt to prevent male model drift
-const BASELINE_NEGATIVE_PROMPT = "man, male, masculine, beard, mustache, chest hair, broad shoulders, muscular male body, penis, bulge, male underwear, jockstrap, thong for men";
 
 // Internal helper used by both the callable and the scheduled runner.
 async function internalCheckTrainingJob(jobId) {
@@ -1933,6 +1929,80 @@ exports.launchProductsFromDesign = functions.https.onCall(async (data, context) 
   });
 });
 
+/** Bulk approve or hold products after human review (moves approved rows to `shopify_ready`). */
+exports.bulkMarkProductsReviewed = functions.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
+  }
+  const { productIds, action } = data || {};
+  if (!Array.isArray(productIds) || productIds.length === 0) {
+    throw new functions.https.HttpsError("invalid-argument", "productIds must be a non-empty array");
+  }
+  if (productIds.length > 100) {
+    throw new functions.https.HttpsError("invalid-argument", "Maximum 100 products per request");
+  }
+  if (action !== "approve" && action !== "hold") {
+    throw new functions.https.HttpsError("invalid-argument", "action must be approve or hold");
+  }
+  const uid = context.auth.uid;
+  const ids = [...new Set(productIds.map((x) => String(x || "").trim()).filter(Boolean))];
+  return bulkMarkProductsReviewed({
+    db,
+    admin,
+    sanitizeForFirestore,
+    productIds: ids,
+    action,
+    userId: uid,
+  });
+});
+
+/** Enqueue Shopify sync jobs for products in `shopify_ready` state. */
+exports.bulkSyncProductsToShopify = functions.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
+  }
+  const { productIds } = data || {};
+  if (!Array.isArray(productIds) || productIds.length === 0) {
+    throw new functions.https.HttpsError("invalid-argument", "productIds must be a non-empty array");
+  }
+  if (productIds.length > 50) {
+    throw new functions.https.HttpsError("invalid-argument", "Maximum 50 products per request");
+  }
+  const uid = context.auth.uid;
+  const ids = [...new Set(productIds.map((x) => String(x || "").trim()).filter(Boolean))];
+  return bulkSyncProductsToShopify({
+    db,
+    admin,
+    sanitizeForFirestore,
+    productIds: ids,
+    userId: uid,
+  });
+});
+
+/** Retry initial 8394 asset batch for selected parent products (force re-enqueue). */
+exports.bulkRetryProductAssets = functions.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
+  }
+  const { productIds } = data || {};
+  if (!Array.isArray(productIds) || productIds.length === 0) {
+    throw new functions.https.HttpsError("invalid-argument", "productIds must be a non-empty array");
+  }
+  if (productIds.length > 25) {
+    throw new functions.https.HttpsError("invalid-argument", "Maximum 25 products per request");
+  }
+  const uid = context.auth.uid;
+  const ids = [...new Set(productIds.map((x) => String(x || "").trim()).filter(Boolean))];
+  return bulkRetryProductAssets({
+    db,
+    admin,
+    sanitizeForFirestore,
+    deriveSizesForProductMatrix,
+    productIds: ids,
+    userId: uid,
+  });
+});
+
 /**
  * Recompute merchandising fields from linked design + blank + team (same rules as createProductFromDesignBlank).
  * Use to repair legacy products or after taxonomy/design updates.
@@ -2832,394 +2902,6 @@ exports.processBulkGenerationJobs = functions.pubsub
 
     return null;
   });
-
-/**
- * Helper: Join positive prompt parts with commas
- */
-function joinPos(...parts) {
-  return parts
-    .filter(Boolean)
-    .map(p => p.trim())
-    .filter(p => p.length > 0)
-    .join(", ");
-}
-
-/**
- * Helper: Join negative prompt parts with commas
- */
-function joinNeg(...parts) {
-  return parts
-    .filter(Boolean)
-    .map(p => p.trim())
-    .filter(p => p.length > 0)
-    .join(", ");
-}
-
-/**
- * Helper: Normalize prompt (trim, collapse whitespace, remove duplicate commas)
- */
-function normalizePrompt(text) {
-  if (!text) return "";
-  return text
-    .trim()
-    .replace(/\s+/g, " ") // collapse whitespace
-    .replace(/,\s*,/g, ",") // remove duplicate commas
-    .replace(/^,|,$/g, ""); // remove leading/trailing commas
-}
-
-/**
- * Helper: Clamp number to 0..1 range and round to 2 decimals
- */
-function clamp01(n) {
-  if (typeof n !== "number" || isNaN(n)) return null;
-  return Math.max(0, Math.min(1, Math.round(n * 100) / 100));
-}
-
-/**
- * Comprehensive prompt resolver with guardrails (Section 3)
- * Implements mode enforcement, underwear strict safety, identity locking
- */
-function resolvePromptWithGuardrails(input) {
-  const trace = [];
-  const loras = [];
-  
-  const { product, preset, identity, faceArtifact, bodyArtifact, productArtifact, faceScale, bodyScale, productScale, additionalPrompt, additionalNegativePrompt } = input;
-  
-  let prompt = preset.promptTemplate || "";
-  let negative = preset.negativePromptTemplate || "";
-  
-  // Determine mode (use preset.mode if available, fallback to generationType for backward compatibility)
-  const mode = preset.mode || (input.generationType === "product_only" ? "productOnly" : "onModel");
-  
-  // 1) Apply mode rules (Rule A)
-  if (mode === "productOnly") {
-    trace.push("preset.mode=productOnly → stripped identity + face/body artifacts");
-    // Strip identity/face/body (ignore even if provided)
-    // Add product-only constraints
-    prompt = joinPos("clean ecommerce packshot, product only", prompt);
-    negative = joinNeg(negative, "person, model, mannequin, body, hands, legs, torso, wearing");
-  } else {
-    // onModel mode
-    trace.push("preset.mode=onModel → enforced female subject constraints");
-    prompt = joinPos("adult woman, female model", prompt);
-    negative = joinNeg(negative, "man, male, boy");
-  }
-  
-  // 2) Identity injection (onModel only, Rule C)
-  if (mode === "onModel") {
-    if ((preset.requireIdentity !== false) && !identity) {
-      throw new Error("Identity required for this preset");
-    }
-    if (identity) {
-      const trigger = identity.token || identity.defaultTriggerPhrase || identity.triggerPhrase || "";
-      if (trigger) {
-        // Front-load identity trigger (Rule C - identity locking)
-        const identityDescriptor = identity.description || "blonde hair, blue-green eyes";
-        prompt = joinPos(trigger, identityDescriptor, prompt);
-        trace.push("identity trigger front-loaded");
-      }
-    }
-  }
-  
-  // 3) Underwear strict clamp (Rule B)
-  const isUnderwear = ["panties", "underwear", "lingerie"].includes(product.category);
-  const strict = preset.safetyProfile === "underwear_strict" || (isUnderwear && mode === "onModel");
-  if (strict) {
-    prompt = joinPos(prompt, "wearing matching bra or bralette and panties, fully covered, no nudity");
-    negative = joinNeg(negative, "nude, topless, nipples, areola, exposed breasts, naked, explicit");
-    trace.push("underwear_strict clamp applied (wardrobe + nudity negative)");
-  }
-  
-  // 4) LoRA stacking (Rule D - scale defaults)
-  if (mode === "onModel") {
-    if ((preset.allowFaceArtifact !== false) && faceArtifact) {
-      const weight = clamp01(faceScale ?? preset.defaultFaceScale ?? preset.defaults?.faceScale ?? 0.80);
-      if (weight !== null) {
-        loras.push({
-          artifactId: faceArtifact.id,
-          type: "face",
-          weight: weight,
-          trigger: faceArtifact.trigger || null,
-        });
-        trace.push(`face artifact added (weight: ${weight})`);
-      }
-    }
-    if ((preset.allowBodyArtifact !== false) && bodyArtifact) {
-      const weight = clamp01(bodyScale ?? preset.defaultBodyScale ?? preset.defaults?.bodyScale ?? 0.60);
-      if (weight !== null) {
-        loras.push({
-          artifactId: bodyArtifact.id,
-          type: "body",
-          weight: weight,
-          trigger: bodyArtifact.trigger || null,
-        });
-        trace.push(`body artifact added (weight: ${weight})`);
-      }
-    }
-  }
-  
-  // Product LoRA allowed in both modes
-  if ((preset.allowProductArtifact !== false) && productArtifact) {
-    const weight = clamp01(productScale ?? preset.defaultProductScale ?? preset.defaults?.productScale ?? 0.90);
-    if (weight !== null) {
-      loras.push({
-        artifactId: productArtifact.id,
-        type: "product",
-        weight: weight,
-        trigger: productArtifact.trigger || null,
-      });
-      trace.push(`product artifact added (weight: ${weight})`);
-    }
-  }
-  
-  // 5) Append caller-specified overrides (rare)
-  if (additionalPrompt) {
-    prompt = joinPos(prompt, additionalPrompt);
-    trace.push("additional prompt override applied");
-  }
-  if (additionalNegativePrompt) {
-    negative = joinNeg(negative, additionalNegativePrompt);
-    trace.push("additional negative prompt override applied");
-  }
-  
-  // 6) Token replacements
-  prompt = prompt
-    .replace(/{productName}/g, product.name || "")
-    .replace(/{productColorway}/g, product.colorway?.name || "")
-    .replace(/{productCategory}/g, product.category || "")
-    .replace(/{identityTrigger}/g, identity?.token || identity?.defaultTriggerPhrase || identity?.triggerPhrase || "")
-    .replace(/{identityDescriptor}/g, identity?.description || "")
-    .replace(/{PRODUCT_TRIGGER}/g, product.ai?.productTrigger || product.baseProductKey || "")
-    .replace(/{COLORWAY_NAME}/g, product.colorway?.name || "");
-  
-  // 7) Cleanup
-  prompt = normalizePrompt(prompt);
-  negative = normalizePrompt(negative);
-  
-  return {
-    prompt,
-    negativePrompt: negative,
-    loras,
-    trace,
-  };
-}
-
-/**
- * Legacy wrapper for backward compatibility
- * Maps old generationType-based calls to new mode-based resolver
- */
-function resolvePrompt(args) {
-  const { generationType, product, scenePreset, identity } = args;
-  
-  // Convert generationType to mode for backward compatibility
-  const mode = generationType === "product_only" ? "productOnly" : "onModel";
-  
-  // Use new resolver
-  return resolvePromptWithGuardrails({
-    product,
-    preset: scenePreset,
-    identity,
-    faceArtifact: args.faceArtifact || null,
-    bodyArtifact: args.bodyArtifact || null,
-    productArtifact: args.productArtifact || null,
-    faceScale: args.faceScale,
-    bodyScale: args.bodyScale,
-    productScale: args.productScale,
-    generationType, // pass through for mode detection
-  });
-}
-
-/**
- * Generate product assets (creates a generation job)
- */
-/**
- * Helper: Create a generation job (extracted for reuse in batch operations)
- */
-async function createGenerationJob(data, userId) {
-  const {
-    productId,
-    designId,
-    generationType = "on_model",
-    identityId,
-    presetId,
-    artifacts,
-    promptOverrides,
-    imageCount = 4,
-    imageSize = "square",
-    seed,
-  } = data || {};
-
-  // Validation
-  if (!productId || !presetId) {
-    throw new Error("productId and presetId are required");
-  }
-
-  // Fetch product
-  const productRef = db.collection("rp_products").doc(productId);
-  const productSnap = await productRef.get();
-  if (!productSnap.exists) {
-    throw new Error("Product not found");
-  }
-  const product = productSnap.data();
-
-  // Fetch preset
-  const presetRef = db.collection("rp_scene_presets").doc(presetId);
-  const presetSnap = await presetRef.get();
-  if (!presetSnap.exists) {
-    throw new Error(`Scene preset not found: ${presetId}`);
-  }
-  const preset = presetSnap.data();
-
-  // Determine preset mode
-  const presetMode = preset.mode || (generationType === "product_only" ? "productOnly" : "onModel");
-
-  // Fetch identity (only for on_model)
-  let identity = null;
-  if (presetMode === "onModel" && identityId) {
-    try {
-      const identityRef = db.collection("rp_identities").doc(identityId);
-      const identitySnap = await identityRef.get();
-      if (identitySnap.exists) {
-        identity = identitySnap.data();
-      }
-    } catch (err) {
-      console.warn("[createGenerationJob] Could not fetch identity:", err);
-    }
-  }
-
-  // Fetch artifacts if provided
-  let faceArtifact = null;
-  let bodyArtifact = null;
-  let productArtifact = null;
-
-  if (artifacts?.faceArtifactId && presetMode === "onModel") {
-    try {
-      const faceRef = db.collection("rp_lora_artifacts").doc(artifacts.faceArtifactId);
-      const faceSnap = await faceRef.get();
-      if (faceSnap.exists) {
-        faceArtifact = { id: faceSnap.id, ...faceSnap.data() };
-      }
-    } catch (err) {
-      console.warn("[createGenerationJob] Could not fetch face artifact:", err);
-    }
-  }
-
-  if (artifacts?.bodyArtifactId && presetMode === "onModel") {
-    try {
-      const bodyRef = db.collection("rp_lora_artifacts").doc(artifacts.bodyArtifactId);
-      const bodySnap = await bodyRef.get();
-      if (bodySnap.exists) {
-        bodyArtifact = { id: bodySnap.id, ...bodySnap.data() };
-      }
-    } catch (err) {
-      console.warn("[createGenerationJob] Could not fetch body artifact:", err);
-    }
-  }
-
-  if (artifacts?.productArtifactId || product.ai?.productArtifactId) {
-    try {
-      const productArtifactId = artifacts?.productArtifactId || product.ai?.productArtifactId;
-      const productRef = db.collection("rp_lora_artifacts").doc(productArtifactId);
-      const productSnap = await productRef.get();
-      if (productSnap.exists) {
-        productArtifact = { id: productSnap.id, ...productSnap.data() };
-      }
-    } catch (err) {
-      console.warn("[createGenerationJob] Could not fetch product artifact:", err);
-    }
-  }
-
-  // Resolve prompts using new guardrail resolver
-  const resolved = resolvePromptWithGuardrails({
-    product,
-    preset,
-    identity,
-    faceArtifact,
-    bodyArtifact,
-    productArtifact,
-    faceScale: artifacts?.faceScale,
-    bodyScale: artifacts?.bodyScale,
-    productScale: artifacts?.productScale,
-    generationType,
-    additionalPrompt: promptOverrides?.prompt,
-    additionalNegativePrompt: promptOverrides?.negativePrompt,
-  });
-
-  const { prompt: resolvedPrompt, negativePrompt: resolvedNegativePrompt, loras: resolvedLoras, trace: resolverTrace } = resolved;
-
-  // Combine baseline negative prompt
-  const finalNegativePrompt = [
-    BASELINE_NEGATIVE_PROMPT,
-    resolvedNegativePrompt || ""
-  ].filter(Boolean).join(", ");
-
-  // Merge artifact scales
-  const finalArtifacts = generationType === "on_model" ? {
-    faceArtifactId: artifacts?.faceArtifactId || null,
-    faceScale: artifacts?.faceScale ?? preset.defaultFaceScale ?? 0.80,
-    bodyArtifactId: artifacts?.bodyArtifactId || null,
-    bodyScale: artifacts?.bodyScale ?? preset.defaultBodyScale ?? 0.60,
-    productArtifactId: artifacts?.productArtifactId || product.ai?.productArtifactId || null,
-    productScale: artifacts?.productScale ?? preset.defaultProductScale ?? product.ai?.productRecommendedScale ?? 0.90,
-  } : {
-    productArtifactId: artifacts?.productArtifactId || product.ai?.productArtifactId || null,
-    productScale: artifacts?.productScale ?? preset.defaultProductScale ?? product.ai?.productRecommendedScale ?? 0.90,
-  };
-
-  const now = admin.firestore.FieldValue.serverTimestamp();
-  const finalImageCount = imageCount ?? preset.defaultImageCount ?? 4;
-  const loraCount = [artifacts?.faceArtifactId, artifacts?.bodyArtifactId, artifacts?.productArtifactId].filter(Boolean).length;
-  const costEstimate = estimateGenerationCost(finalImageCount, imageSize, loraCount);
-
-  // Create generation job (inputImageUrl = product.mockupUrl for LoRA pipeline: mockup → model photos)
-  const jobData = {
-    productId,
-    productSlug: product.slug || null,
-    designId: designId || null,
-    inputImageUrl: product.mockupUrl || null,
-    generationType,
-    presetMode,
-    presetId,
-    identityId: presetMode === "onModel" ? identityId : null,
-    faceArtifactId: presetMode === "onModel" ? (artifacts?.faceArtifactId || null) : null,
-    bodyArtifactId: presetMode === "onModel" ? (artifacts?.bodyArtifactId || null) : null,
-    productArtifactId: artifacts?.productArtifactId || product.ai?.productArtifactId || null,
-    faceScale: presetMode === "onModel" ? (artifacts?.faceScale ?? preset.defaultFaceScale ?? 0.80) : null,
-    bodyScale: presetMode === "onModel" ? (artifacts?.bodyScale ?? preset.defaultBodyScale ?? 0.60) : null,
-    productScale: artifacts?.productScale ?? preset.defaultProductScale ?? product.ai?.productRecommendedScale ?? 0.90,
-    imageCount: finalImageCount,
-    size: imageSize,
-    seed: seed || preset.defaultSeed || null,
-    resolvedPrompt,
-    resolvedNegativePrompt: finalNegativePrompt,
-    resolvedLoras,
-    resolverTrace,
-    prompt: resolvedPrompt,
-    negativePrompt: finalNegativePrompt,
-    artifacts: finalArtifacts,
-    provider: "fal",
-    endpoint: "fal-ai/flux-lora",
-    params: {
-      imageCount: finalImageCount,
-      size: imageSize,
-      seed: seed || preset.defaultSeed || null,
-    },
-    costEstimate,
-    costCurrency: "USD",
-    retryCount: 0,
-    maxRetries: 3,
-    status: "queued",
-    attempts: 0,
-    createdAt: now,
-    updatedAt: now,
-    createdBy: userId,
-    updatedBy: userId,
-  };
-
-  const sanitized = sanitizeForFirestore(jobData);
-  const jobRef = await db.collection("rp_generation_jobs").add(sanitized);
-  return { jobId: jobRef.id, costEstimate };
-}
 
 exports.generateProductAssets = functions.https.onCall(async (data, context) => {
   if (!context.auth) {
@@ -4237,6 +3919,23 @@ exports.onRpGenerationJobStatusChanged = functions.firestore
     // Only process if status actually changed
     if (before.status === after.status) {
       return;
+    }
+
+    try {
+      const { handleOfficialGenerationJobTerminal } = require("./lib/officialProductImageJobs");
+      await handleOfficialGenerationJobTerminal({
+        db,
+        admin,
+        sanitizeForFirestore,
+        before,
+        after,
+        jobId,
+      });
+    } catch (e) {
+      console.warn(
+        "[onRpGenerationJobStatusChanged] official asset batch hook:",
+        e && e.message ? e.message : e
+      );
     }
 
     const userId = after.createdBy;
@@ -8246,6 +7945,18 @@ exports.onMockJobCreated = functions
             }
           } catch (pipeErr) {
             console.error("[onMockJobCreated] 8394 flat pipeline:", pipeErr && pipeErr.message ? pipeErr.message : pipeErr);
+            launchBatchLog("WORKER_FAILURE", {
+              batchId: job.productAssetBatchId || null,
+              role: "flat_pipeline",
+              jobId,
+              stage: "run8394FlatAfterVariantMock_outer",
+              error:
+                pipeErr && pipeErr.message
+                  ? String(pipeErr.message)
+                  : pipeErr != null
+                    ? String(pipeErr)
+                    : "unknown",
+            });
           }
         }
       }
@@ -8585,6 +8296,14 @@ exports.onMockJobCreated = functions
     } catch (err) {
       console.error("[onMockJobCreated] Job failed:", jobId, err);
 
+      launchBatchLog("WORKER_FAILURE", {
+        batchId: job.productAssetBatchId || null,
+        role: "mock_back",
+        jobId,
+        stage: "onMockJobCreated",
+        error: err.message || String(err),
+      });
+
       await jobRef.update({
         status: "failed",
         error: {
@@ -8683,6 +8402,9 @@ exports.onShopifySyncJobCreated = functions
           lastSyncError: errorMsg,
           lastSyncAt: admin.firestore.FieldValue.serverTimestamp(),
         },
+        launchStatus: LAUNCH_STATUS.FAILED,
+        launchUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        ...pipelineFailurePatch(admin, errorMsg, PIPELINE_STAGE.SHOPIFY_SYNC),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedBy: product.updatedBy || "",
       });
@@ -8757,6 +8479,9 @@ exports.onShopifySyncJobCreated = functions
           lastSyncAt: nowTs,
           lastSyncError: null,
         },
+        ...pipelineClearErrorPatch(admin),
+        launchStatus: LAUNCH_STATUS.LIVE,
+        launchUpdatedAt: nowTs,
         updatedAt: nowTs,
         updatedBy: product.updatedBy || "",
       });
@@ -8780,6 +8505,9 @@ exports.onShopifySyncJobCreated = functions
           lastSyncError: message,
           lastSyncAt: admin.firestore.FieldValue.serverTimestamp(),
         },
+        launchStatus: LAUNCH_STATUS.FAILED,
+        launchUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        ...pipelineFailurePatch(admin, message, PIPELINE_STAGE.SHOPIFY_SYNC),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedBy: product.updatedBy || "",
       });

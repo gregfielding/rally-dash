@@ -848,6 +848,8 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
       }
 
       const now = admin.firestore.FieldValue.serverTimestamp();
+      /** Firestore rejects `FieldValue.serverTimestamp()` inside array elements; use Timestamp for `generatedRenderOutputs[]`. */
+      const outputCreatedAt = admin.firestore.Timestamp.now();
 
       let sharedDesignDoc = null;
       let sharedDesignIdLoaded = null;
@@ -1366,7 +1368,7 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
           width: slot.width != null ? slot.width : null,
           height: slot.height != null ? slot.height : null,
           sort,
-          createdAt: now,
+          createdAt: outputCreatedAt,
           lookType: slot.lookType != null ? slot.lookType : null,
           view: slot.view != null ? slot.view : null,
         });

@@ -1,6 +1,6 @@
 /**
- * Mirror of `functions/lib/default8394AssetPlan.js` — single source of truth for role keys in app code.
- * Server remains authoritative for orchestration.
+ * @deprecated Legacy alias — prefer `DEFAULT_ASSET_PLAN` from `./defaultAssetPlan`.
+ * Mirrors historical 8394 mock/flat ordering; orchestration now uses official generation roles.
  */
 export const DEFAULT_8394_ASSET_PLAN = [
   "model_back_designed",

@@ -1,12 +1,16 @@
 "use strict";
 
-const { DEFAULT_8394_ASSET_PLAN } = require("./default8394AssetPlan");
+const { DEFAULT_ASSET_PLAN } = require("./defaultAssetPlan");
+const { createCreateGenerationJob } = require("./createGenerationJobCore");
 const { resolveModelIdentity } = require("./resolveModelIdentity");
 const { queueVariant8394BaseAssets } = require("./variant8394Pipeline");
+const { enqueueOfficialProductImages, resolveOfficialScenePresetId } = require("./officialProductImageJobs");
+const { logOfficialAssetBatchStart } = require("./officialAssetPipelineLog");
 const {
   emptyRoleMap,
   recomputeAndSyncParent,
   supersedeOpenBatchesForProduct,
+  launchBatchLog,
 } = require("./productAssetBatchHelpers");
 
 const SIZE_ORDER = { XS: 0, S: 1, M: 2, L: 3, XL: 4, XXL: 5, "2XL": 6, "3XL": 7 };
@@ -14,6 +18,19 @@ const SIZE_ORDER = { XS: 0, S: 1, M: 2, L: 3, XL: 4, XXL: 5, "2XL": 6, "3XL": 7 
 function sortSizeKey(sz) {
   const s = String(sz || "").trim();
   return SIZE_ORDER[s] != null ? SIZE_ORDER[s] : 99;
+}
+
+/** Best-effort flags for source images already on the primary variant doc (pre-pipeline). */
+function variantSourceImageFlags(vr) {
+  const fr = vr && vr.flatRenders ? vr.flatRenders : {};
+  const u = (node) =>
+    node && typeof node === "object" && node.url && String(node.url).trim() ? String(node.url).trim() : "";
+  return {
+    hasFlatFront: !!u(fr.flat_clean && fr.flat_clean.front),
+    hasFlatBack: !!u(fr.flat_blended && fr.flat_blended.back),
+    hasModelFront: !!u(fr.model_clean && fr.model_clean.front),
+    hasModelBack: !!u(fr.model_blended && fr.model_blended.back),
+  };
 }
 
 /**
@@ -158,10 +175,24 @@ async function startInitialProductAssetBatch(ctx) {
       primaryVariantId,
       roles: emptyRoleMap(),
     };
+
+    const sz = vr.optionValues && vr.optionValues.size ? String(vr.optionValues.size) : "";
+    const img = variantSourceImageFlags(vr);
+    launchBatchLog("PRIMARY_VARIANT", {
+      batchId,
+      blankVariantId: blankVariantKey,
+      colorName: colors[blankVariantKey].colorName,
+      primaryVariantId,
+      size: sz,
+      hasFlatFront: img.hasFlatFront,
+      hasFlatBack: img.hasFlatBack,
+      hasModelFront: img.hasModelFront,
+      hasModelBack: img.hasModelBack,
+    });
   }
 
   const colorCount = Object.keys(colors).length;
-  const totalRoles = colorCount * DEFAULT_8394_ASSET_PLAN.length;
+  const totalRoles = colorCount * DEFAULT_ASSET_PLAN.length;
   const now = admin.firestore.FieldValue.serverTimestamp();
 
   await batchRef.set(
@@ -193,9 +224,28 @@ async function startInitialProductAssetBatch(ctx) {
     })
   );
 
+  launchBatchLog("START", {
+    productId,
+    batchId,
+    queuedColorCount: colorCount,
+    queuedRoleCount: totalRoles,
+    launchPipeline: !!(launchOptions && typeof launchOptions === "object"),
+  });
+
+  logOfficialAssetBatchStart({
+    productId,
+    batchId,
+    colors: Object.keys(colors),
+    roles: [...DEFAULT_ASSET_PLAN],
+    pipeline: "official_rp_generation_jobs",
+    resolvedModelIdentityId: resolvedModelIdentityId || null,
+    officialScenePresetIdResolved: resolveOfficialScenePresetId(product),
+  });
+
   await recomputeAndSyncParent({ db, admin, sanitizeForFirestore, productId, batchId });
 
-  let enqueueErrors = 0;
+  const createGenerationJob = createCreateGenerationJob({ db, admin, sanitizeForFirestore });
+
   for (const { blankVariantId, primaryVariantId } of primaries) {
     const vRef = productRef.collection("variants").doc(primaryVariantId);
     await vRef.update(
@@ -208,47 +258,73 @@ async function startInitialProductAssetBatch(ctx) {
         updatedBy: userId,
       })
     );
+  }
 
-    let failed = false;
-    try {
-      await queueVariant8394BaseAssets({
-        db,
-        admin,
-        sanitizeForFirestore,
-        parentId: productId,
-        variantId: primaryVariantId,
-        userId,
-        productAssetBatchId: batchId,
-        productAssetColorKey: blankVariantId,
-      });
-    } catch (e) {
-      failed = true;
-      enqueueErrors += 1;
-      console.error("[startInitialProductAssetBatch] queueVariant8394BaseAssets:", e && e.message ? e.message : e);
-      const br = await batchRef.get();
-      const bdata = br.data() || {};
-      const col = { ...(bdata.colors || {}) };
+  let enqueueErrors = 0;
+  let enqueueFailed = false;
+  try {
+    await enqueueOfficialProductImages({
+      db,
+      admin,
+      sanitizeForFirestore,
+      createGenerationJob,
+      productId,
+      userId,
+      batchId,
+      primaries,
+      product,
+      designId,
+      resolvedModelIdentityId,
+    });
+  } catch (e) {
+    enqueueFailed = true;
+    enqueueErrors = primaries.length;
+    console.error("[startInitialProductAssetBatch] enqueueOfficialProductImages:", e && e.message ? e.message : e);
+    const failMsg = e && e.message ? String(e.message).slice(0, 400) : "enqueue_failed";
+    for (const { blankVariantId } of primaries) {
+      for (const role of DEFAULT_ASSET_PLAN) {
+        launchBatchLog("ROLE_MARK_FAILED", {
+          batchId,
+          blankVariantId,
+          role,
+          reason: failMsg,
+        });
+      }
+    }
+    const br = await batchRef.get();
+    const bdata = br.data() || {};
+    const col = { ...(bdata.colors || {}) };
+    for (const { blankVariantId } of primaries) {
       const block = { ...(col[blankVariantId] || {}) };
       const roles = { ...(block.roles || {}) };
-      for (const role of DEFAULT_8394_ASSET_PLAN) {
+      for (const role of DEFAULT_ASSET_PLAN) {
         roles[role] = {
           status: "failed",
-          error: e && e.message ? String(e.message).slice(0, 400) : "enqueue_failed",
+          error: failMsg,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         };
       }
       block.roles = roles;
       col[blankVariantId] = block;
-      await batchRef.update(sanitizeForFirestore({ colors: col, updatedAt: admin.firestore.FieldValue.serverTimestamp() }));
     }
+    await batchRef.update(sanitizeForFirestore({ colors: col, updatedAt: admin.firestore.FieldValue.serverTimestamp() }));
+  }
 
-    if (!failed) {
-      const snapAfter = await batchRef.get();
-      const cdata = snapAfter.data() || {};
-      const col2 = { ...(cdata.colors || {}) };
+  if (!enqueueFailed) {
+    launchBatchLog("ROLE_ENQUEUE", {
+      productId,
+      batchId,
+      colorKeys: primaries.map((p) => p.blankVariantId),
+      rolesQueued: [...DEFAULT_ASSET_PLAN],
+      pipeline: "official_rp_generation_jobs",
+    });
+    const snapAfter = await batchRef.get();
+    const cdata = snapAfter.data() || {};
+    const col2 = { ...(cdata.colors || {}) };
+    for (const { blankVariantId } of primaries) {
       const block2 = { ...(col2[blankVariantId] || {}) };
       const roles2 = { ...(block2.roles || {}) };
-      for (const role of DEFAULT_8394_ASSET_PLAN) {
+      for (const role of DEFAULT_ASSET_PLAN) {
         roles2[role] = {
           status: "running",
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -256,9 +332,30 @@ async function startInitialProductAssetBatch(ctx) {
       }
       block2.roles = roles2;
       col2[blankVariantId] = block2;
-      await batchRef.update(sanitizeForFirestore({ colors: col2, updatedAt: admin.firestore.FieldValue.serverTimestamp() }));
     }
-    await recomputeAndSyncParent({ db, admin, sanitizeForFirestore, productId, batchId });
+    await batchRef.update(sanitizeForFirestore({ colors: col2, updatedAt: admin.firestore.FieldValue.serverTimestamp() }));
+  }
+
+  await recomputeAndSyncParent({ db, admin, sanitizeForFirestore, productId, batchId });
+
+  const run8394Secondary = !(launchOptions && launchOptions.queue8394Secondary === false);
+  if (run8394Secondary && enqueueErrors === 0) {
+    for (const { blankVariantId, primaryVariantId } of primaries) {
+      try {
+        await queueVariant8394BaseAssets({
+          db,
+          admin,
+          sanitizeForFirestore,
+          parentId: productId,
+          variantId: primaryVariantId,
+          userId,
+          productAssetBatchId: batchId,
+          productAssetColorKey: blankVariantId,
+        });
+      } catch (e) {
+        console.warn("[startInitialProductAssetBatch] secondary 8394 queue:", e && e.message ? e.message : e);
+      }
+    }
   }
 
   const queuedColorCount = colorCount;

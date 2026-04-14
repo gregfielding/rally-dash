@@ -27,7 +27,8 @@
     "migrate:design-team-ids": "node scripts/migrate-design-team-ids.js",
     "migrate:design-team-ids:dry": "node scripts/migrate-design-team-ids.js --dry-run",
     "shopify:ensure-collections": "node scripts/ensure-shopify-smart-collections.js",
-    "shopify:verify-collections": "node scripts/verify-shopify-collections.js"
+    "shopify:verify-collections": "node scripts/verify-shopify-collections.js",
+    "validate:launch-batch": "node scripts/validate-launch-batch.js"
   },
   "dependencies": {
     "firebase-admin": "^12.0.0",

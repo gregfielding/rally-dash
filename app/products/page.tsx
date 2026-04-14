@@ -5,8 +5,9 @@ import Link from "next/link";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import { TableSkeleton } from "@/components/Skeleton";
 import Modal from "@/components/Modal";
-import { useProducts } from "@/lib/hooks/useRPProducts";
+import { LaunchOpsFilter, useProducts } from "@/lib/hooks/useRPProducts";
 import {
+  useBulkProductOps,
   useCreateProductFromDesignBlank,
   useLaunchProductsFromDesign,
 } from "@/lib/hooks/useRPProductMutations";
@@ -16,7 +17,7 @@ import GenerateTeamProductsModal from "@/components/products/GenerateTeamProduct
 import { useBlanks } from "@/lib/hooks/useBlanks";
 import { useCreateMockJob } from "@/lib/hooks/useMockAssets";
 import { useScenePresets as useRPScenePresets } from "@/lib/hooks/useRPScenePresets";
-import { RpProductStatus, RpProductCategory } from "@/lib/types/firestore";
+import { RpProduct, RpProductStatus, RpProductCategory } from "@/lib/types/firestore";
 import { isMasterBlank, getBlankVariants, inferDefaultPrintSides } from "@/lib/blanks";
 import useSWR from "swr";
 import { collection, getDocs, query, orderBy, doc, deleteDoc } from "firebase/firestore";
@@ -44,6 +45,61 @@ function CategoryBadge({ category }: { category: RpProductCategory }) {
   );
 }
 
+function LaunchStatusChip({ product }: { product: RpProduct }) {
+  const s = product.launchStatus;
+  const label = s ? s.replace(/_/g, " ") : "—";
+  const classes: Record<string, string> = {
+    draft: "bg-slate-100 text-slate-800",
+    materializing: "bg-amber-100 text-amber-900",
+    generating_assets: "bg-amber-100 text-amber-900",
+    assembling_metadata: "bg-amber-100 text-amber-900",
+    needs_review: "bg-violet-100 text-violet-900",
+    shopify_ready: "bg-emerald-100 text-emerald-900",
+    syncing_shopify: "bg-sky-100 text-sky-900",
+    live: "bg-green-100 text-green-900",
+    failed: "bg-red-100 text-red-900",
+  };
+  const cls = (s && classes[s]) || "bg-gray-50 text-gray-600";
+  return (
+    <span className={`inline-flex px-2 py-0.5 rounded text-[11px] font-semibold capitalize ${cls}`} title={s || ""}>
+      {label}
+    </span>
+  );
+}
+
+function AssetsStatusChip({ product }: { product: RpProduct }) {
+  const s = product.assetsStatus;
+  const label = s ?? "—";
+  const classes: Record<string, string> = {
+    idle: "bg-gray-50 text-gray-600",
+    queued: "bg-amber-50 text-amber-900",
+    running: "bg-amber-50 text-amber-900",
+    complete: "bg-emerald-50 text-emerald-800",
+    failed: "bg-red-50 text-red-800",
+    partial: "bg-orange-50 text-orange-900",
+  };
+  const cls = (s && classes[s]) || "bg-gray-50 text-gray-600";
+  return (
+    <span className={`inline-flex px-2 py-0.5 rounded text-[11px] font-medium ${cls}`}>
+      {label}
+    </span>
+  );
+}
+
+function BoolChip({ ok, label }: { ok: boolean | undefined; label: string }) {
+  const good = ok === true;
+  const bad = ok === false;
+  return (
+    <span
+      className={`inline-flex px-2 py-0.5 rounded text-[11px] font-medium ${
+        good ? "bg-emerald-50 text-emerald-800" : bad ? "bg-red-50 text-red-800" : "bg-gray-50 text-gray-500"
+      }`}
+    >
+      {good ? `${label}: yes` : bad ? `${label}: no` : "—"}
+    </span>
+  );
+}
+
 function ProductsContent() {
   const [statusFilter, setStatusFilter] = useState<RpProductStatus | "all">("all");
   const [categoryFilter, setCategoryFilter] = useState<RpProductCategory | "all">("all");
@@ -57,6 +113,8 @@ function ProductsContent() {
   const [selectedProducts, setSelectedProducts] = useState<Set<string>>(new Set());
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [launchOpsFilter, setLaunchOpsFilter] = useState<LaunchOpsFilter>("all");
+  const [bulkOpsBusy, setBulkOpsBusy] = useState(false);
 
   const [isGenTeamProductsOpen, setIsGenTeamProductsOpen] = useState(false);
   const [isDesignBlankOpen, setIsDesignBlankOpen] = useState(false);
@@ -77,6 +135,7 @@ function ProductsContent() {
 
   const { createProductFromDesignBlank } = useCreateProductFromDesignBlank();
   const { launchProductsFromDesign } = useLaunchProductsFromDesign();
+  const { bulkMarkProductsReviewed, bulkSyncProductsToShopify, bulkRetryProductAssets } = useBulkProductOps();
   const { createJob: createMockJob } = useCreateMockJob();
   const { batchGenerate } = useBatchGeneration();
   const { presets } = useRPScenePresets({ isActive: true });
@@ -125,6 +184,7 @@ function ProductsContent() {
       category?: RpProductCategory;
       search?: string;
       parentsOnly?: boolean;
+      launchOpsFilter?: LaunchOpsFilter;
     } = {};
     if (statusFilter !== "all") {
       f.status = statusFilter;
@@ -136,8 +196,11 @@ function ProductsContent() {
       f.search = searchQuery.trim();
     }
     f.parentsOnly = !showLegacyTopLevel;
+    if (launchOpsFilter !== "all") {
+      f.launchOpsFilter = launchOpsFilter;
+    }
     return f;
-  }, [statusFilter, categoryFilter, searchQuery, showLegacyTopLevel]);
+  }, [statusFilter, categoryFilter, searchQuery, showLegacyTopLevel, launchOpsFilter]);
 
   const { products, loading, error, refetch } = useProducts(filters);
 
@@ -540,7 +603,7 @@ function ProductsContent() {
 
       {/* Filters */}
       <div className="bg-white rounded-lg shadow p-4">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           <div>
             <label className="block text-xs font-medium text-gray-700 mb-1">
               Search
@@ -585,6 +648,22 @@ function ProductsContent() {
               <option value="other">Other</option>
             </select>
           </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">
+              Launch / ops
+            </label>
+            <select
+              value={launchOpsFilter}
+              onChange={(e) => setLaunchOpsFilter(e.target.value as LaunchOpsFilter)}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
+            >
+              <option value="all">All (launch stages)</option>
+              <option value="generating">Generating / in progress</option>
+              <option value="needs_review">Needs review</option>
+              <option value="shopify_ready">Shopify ready</option>
+              <option value="failed">Failed</option>
+            </select>
+          </div>
         </div>
         <div className="mt-4 flex flex-wrap items-center gap-3">
           <label className="inline-flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
@@ -602,13 +681,126 @@ function ProductsContent() {
         </div>
       </div>
 
+      {selectedProducts.size > 0 && (
+        <div className="rounded-lg border border-violet-200 bg-violet-50/80 px-4 py-3 flex flex-wrap items-center gap-2">
+          <span className="text-sm font-medium text-violet-900">
+            {selectedProducts.size} selected
+          </span>
+          <button
+            type="button"
+            disabled={bulkOpsBusy}
+            onClick={async () => {
+              const ids = Array.from(selectedProducts);
+              setBulkOpsBusy(true);
+              try {
+                const out = await bulkMarkProductsReviewed({ productIds: ids, action: "approve" });
+                const failed = out.results?.filter((r) => !r.ok) ?? [];
+                alert(
+                  failed.length
+                    ? `Approved ${ids.length - failed.length}/${ids.length}. Failed: ${failed.map((f) => `${f.productId} (${f.reason})`).join("; ")}`
+                    : `Approved ${ids.length} product(s). They are now Shopify ready (when server checks passed).`
+                );
+                setSelectedProducts(new Set());
+                await refetch();
+              } catch (e: unknown) {
+                const err = e as { message?: string };
+                alert(err?.message || "Approve failed.");
+              } finally {
+                setBulkOpsBusy(false);
+              }
+            }}
+            className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-violet-700 text-white hover:bg-violet-800 disabled:opacity-50"
+          >
+            Approve / mark reviewed
+          </button>
+          <button
+            type="button"
+            disabled={bulkOpsBusy}
+            onClick={async () => {
+              const ids = Array.from(selectedProducts);
+              setBulkOpsBusy(true);
+              try {
+                const out = await bulkSyncProductsToShopify({ productIds: ids });
+                const failed = out.results?.filter((r) => !r.ok) ?? [];
+                alert(
+                  failed.length
+                    ? `Sync queued ${(out.results?.filter((r) => r.ok).length ?? 0)}/${ids.length}. Failed: ${failed.map((f) => `${f.productId} (${f.reason})`).join("; ")}`
+                    : `Queued Shopify sync for ${ids.length} product(s).`
+                );
+                setSelectedProducts(new Set());
+                await refetch();
+              } catch (e: unknown) {
+                const err = e as { message?: string };
+                alert(err?.message || "Sync failed.");
+              } finally {
+                setBulkOpsBusy(false);
+              }
+            }}
+            className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-emerald-700 text-white hover:bg-emerald-800 disabled:opacity-50"
+          >
+            Sync selected to Shopify
+          </button>
+          <button
+            type="button"
+            disabled={bulkOpsBusy}
+            onClick={async () => {
+              const ids = Array.from(selectedProducts);
+              if (!window.confirm(`Retry asset generation for ${ids.length} product(s)?`)) return;
+              setBulkOpsBusy(true);
+              try {
+                const out = await bulkRetryProductAssets({ productIds: ids });
+                const failed = out.results?.filter((r) => !r.ok) ?? [];
+                alert(
+                  failed.length
+                    ? `Retried ${ids.length - failed.length}/${ids.length}. Errors: ${failed.map((f) => `${f.productId}: ${f.error || "?"}`).join("; ")}`
+                    : `Retried asset batch for ${ids.length} product(s).`
+                );
+                if (!failed.length) setSelectedProducts(new Set());
+                await refetch();
+              } catch (e: unknown) {
+                const err = e as { message?: string };
+                alert(err?.message || "Retry failed.");
+              } finally {
+                setBulkOpsBusy(false);
+              }
+            }}
+            className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50"
+          >
+            Retry generation
+          </button>
+          <button
+            type="button"
+            disabled={bulkOpsBusy}
+            onClick={async () => {
+              const ids = Array.from(selectedProducts);
+              setBulkOpsBusy(true);
+              try {
+                const out = await bulkMarkProductsReviewed({ productIds: ids, action: "hold" });
+                const failed = out.results?.filter((r) => !r.ok) ?? [];
+                alert(failed.length ? `Hold failed for some rows: ${failed.map((f) => f.productId).join(", ")}` : `Marked ${ids.length} on hold.`);
+                if (!failed.length) setSelectedProducts(new Set());
+                await refetch();
+              } catch (e: unknown) {
+                const err = e as { message?: string };
+                alert(err?.message || "Hold failed.");
+              } finally {
+                setBulkOpsBusy(false);
+              }
+            }}
+            className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-gray-400 bg-white text-gray-800 hover:bg-gray-50 disabled:opacity-50"
+          >
+            Mark hold
+          </button>
+        </div>
+      )}
+
       {/* Products Table */}
       <div className="bg-white rounded-lg shadow overflow-hidden">
         {products.length === 0 ? (
           <div className="p-12 text-center">
             <p className="text-gray-500">No products found.</p>
             <p className="text-sm text-gray-400 mt-2">
-              {searchQuery || statusFilter !== "all" || categoryFilter !== "all"
+              {searchQuery || statusFilter !== "all" || categoryFilter !== "all" || launchOpsFilter !== "all"
                 ? "Try adjusting your filters."
                 : "Use Generate Team Products for standard creation or Create One-off Product for QA/advanced cases. Legacy-only view is off — enable it above if you need old per-color rows."}
             </p>
@@ -618,22 +810,40 @@ function ProductsContent() {
             <table className="min-w-full divide-y divide-gray-200">
               <thead className="bg-gray-50">
                 <tr>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-14">
+                    {/* thumb */}
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                     Product
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Base Product
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Launch
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Category
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Status
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                     Assets
                   </th>
-                  <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Shopify
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Fulfill
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Colors / SKUs
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Base Product
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Category
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Status
+                  </th>
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider max-w-[220px]">
+                    Last error
+                  </th>
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
                     Actions
                   </th>
                 </tr>
@@ -645,9 +855,23 @@ function ProductsContent() {
                     (product.variantSummary?.length
                       ? new Set(product.variantSummary.map((s) => s.blankVariantId).filter(Boolean)).size
                       : null);
+                  const thumbUrl = product.displayMedia?.thumbUrl || product.displayMedia?.heroUrl;
+                  const fulfillmentReady = product.fulfillmentSummary?.fulfillmentReady;
                   return (
                   <tr key={product.id} className={`hover:bg-gray-50 ${selectedProducts.has(product.id || "") ? "bg-blue-50" : ""}`}>
-                    <td className="px-6 py-4 whitespace-nowrap">
+                    <td className="px-4 py-3 whitespace-nowrap align-middle">
+                      {thumbUrl ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={thumbUrl}
+                          alt=""
+                          className="h-10 w-10 rounded object-cover border border-gray-200 bg-gray-50"
+                        />
+                      ) : (
+                        <div className="h-10 w-10 rounded border border-dashed border-gray-200 bg-gray-50" title="No hero thumbnail" />
+                      )}
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap">
                       <div className="flex items-center gap-3">
                         <input
                           type="checkbox"
@@ -675,43 +899,61 @@ function ProductsContent() {
                               Legacy
                             </span>
                           )}
-                          <p className="text-xs text-gray-500 mt-1">
-                            {product.productKind === "parent" && (derivedColorLines != null || product.variantCount != null)
-                              ? [
-                                  derivedColorLines != null
-                                    ? `${derivedColorLines} color${derivedColorLines === 1 ? "" : "s"}`
-                                    : null,
-                                  product.variantCount != null
-                                    ? `${product.variantCount} SKU${product.variantCount === 1 ? "" : "s"}`
-                                    : null,
-                                ]
-                                  .filter(Boolean)
-                                  .join(" · ")
-                              : product.colorway?.name ?? "—"}
-                          </p>
+                          {product.opsReviewStatus && product.opsReviewStatus !== "pending" && (
+                            <span className="ml-2 text-[10px] uppercase font-semibold text-gray-500">
+                              ({product.opsReviewStatus})
+                            </span>
+                          )}
                         </div>
                       </div>
                     </td>
-                    <td className="px-6 py-4 whitespace-nowrap">
+                    <td className="px-4 py-3 whitespace-nowrap align-top">
+                      <LaunchStatusChip product={product} />
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap align-top">
+                      <div className="flex flex-col gap-1">
+                        <AssetsStatusChip product={product} />
+                        <span className="text-[11px] text-gray-500">
+                          {product.counters?.assetsTotal ?? 0} total
+                          {product.counters?.assetsApproved != null ? (
+                            <span className="text-green-700"> · {product.counters.assetsApproved} ok</span>
+                          ) : null}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap align-top">
+                      <BoolChip ok={product.shopifyReady} label="Ready" />
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap align-top">
+                      <BoolChip ok={fulfillmentReady} label="Ready" />
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-700">
+                      {product.productKind === "parent" && (derivedColorLines != null || product.variantCount != null)
+                        ? [
+                            derivedColorLines != null ? `${derivedColorLines} colors` : null,
+                            product.variantCount != null ? `${product.variantCount} SKUs` : null,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ") || "—"
+                        : product.colorway?.name ?? "—"}
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap">
                       <span className="text-sm text-gray-900 font-mono">
                         {product.baseProductKey}
                       </span>
                     </td>
-                    <td className="px-6 py-4 whitespace-nowrap">
+                    <td className="px-4 py-3 whitespace-nowrap">
                       <CategoryBadge category={product.category} />
                     </td>
-                    <td className="px-6 py-4 whitespace-nowrap">
+                    <td className="px-4 py-3 whitespace-nowrap">
                       <StatusBadge status={product.status} />
                     </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                      {product.counters?.assetsTotal || 0} total
-                      {product.counters?.assetsApproved ? (
-                        <span className="ml-2 text-green-600">
-                          {product.counters.assetsApproved} approved
-                        </span>
-                      ) : null}
+                    <td className="px-4 py-3 text-xs text-red-700 max-w-[220px] align-top">
+                      <span className="line-clamp-2" title={product.lastPipelineError || ""}>
+                        {product.lastPipelineError || "—"}
+                      </span>
                     </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                    <td className="px-4 py-3 whitespace-nowrap text-right text-sm font-medium">
                       <div className="flex items-center justify-end gap-3">
                         <Link
                           href={`/products/${product.slug}`}

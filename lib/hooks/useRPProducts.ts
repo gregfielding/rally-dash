@@ -20,12 +20,41 @@ import {
   RpProductVariant,
 } from "@/lib/types/firestore";
 
+/** Ops filter for launch pipeline rows on `/products` (client-side after fetch). */
+export type LaunchOpsFilter = "all" | "generating" | "needs_review" | "shopify_ready" | "failed";
+
+export function matchLaunchOpsFilter(p: RpProduct, filter: LaunchOpsFilter): boolean {
+  if (filter === "all") return true;
+  const ls = p.launchStatus;
+  const as = p.assetsStatus;
+  if (filter === "needs_review") return ls === "needs_review";
+  if (filter === "shopify_ready") return ls === "shopify_ready";
+  if (filter === "failed") {
+    return ls === "failed" || as === "failed";
+  }
+  if (filter === "generating") {
+    if (
+      ls === "materializing" ||
+      ls === "generating_assets" ||
+      ls === "assembling_metadata" ||
+      ls === "syncing_shopify"
+    ) {
+      return true;
+    }
+    if (as === "queued" || as === "running" || as === "partial") return true;
+    return false;
+  }
+  return true;
+}
+
 export interface UseProductsFilters {
   status?: RpProductStatus;
   category?: RpProductCategory;
   baseProductKey?: string;
   search?: string; // client-side search for now
   limit?: number;
+  /** Narrow list by launch pipeline stage (applied client-side). */
+  launchOpsFilter?: LaunchOpsFilter;
   /**
    * When explicitly `true`, only top-level docs with `productKind === "parent"` (excludes legacy per-color docs).
    * Omit or `false` to list all top-level `rp_products` rows (e.g. dashboard / publish). The Products page passes `true` by default.
@@ -91,6 +120,10 @@ async function fetchRPProducts(filters?: UseProductsFilters): Promise<RpProduct[
   // Apply limit
   if (filters?.limit) {
     products = products.slice(0, filters.limit);
+  }
+
+  if (filters?.launchOpsFilter && filters.launchOpsFilter !== "all") {
+    products = products.filter((p) => matchLaunchOpsFilter(p, filters.launchOpsFilter!));
   }
 
   return products;

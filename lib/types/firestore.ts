@@ -1052,6 +1052,49 @@ export type Rp8394InitialAssetRole =
 /** Aggregated per-role status on parent `rp_products` (worst color wins). */
 export type RpParentAssetRoleState = "idle" | "queued" | "running" | "done" | "failed";
 
+/** Parent-level fulfillment snapshot (`rp_products.fulfillmentSummary`). */
+export interface RpProductFulfillmentSummary {
+  version?: number;
+  blankId?: string | null;
+  designId?: string | null;
+  teamId?: string | null;
+  blankStyleCode?: string | null;
+  printSides?: Record<string, unknown>;
+  artworkToneNotes?: string | null;
+  sizesOffered?: string[];
+  colorLines?: Array<{
+    blankVariantId: string;
+    colorName?: string | null;
+    variantDocCount?: number;
+  }>;
+  variantCount?: number;
+  fulfillmentReady?: boolean;
+  fulfillmentMissing?: string[];
+  generatedAt?: Timestamp | null;
+}
+
+/** Variant-level fulfillment (`variants/{id}.fulfillmentPackage`). */
+export interface RpProductVariantFulfillmentPackage {
+  version?: number;
+  blankId?: string | null;
+  blankVariantId?: string | null;
+  designId?: string | null;
+  designIdFront?: string | null;
+  designIdBack?: string | null;
+  colorName?: string | null;
+  optionValues?: { color?: string; size?: string };
+  sku?: string | null;
+  preferredArtworkTone?: string | null;
+  printSides?: Record<string, unknown>;
+  printFileRefs?: Record<string, string | null | undefined>;
+  renderSetup?: unknown;
+  placementOverrides?: unknown;
+  renderOverrides?: unknown;
+  fulfillmentReady?: boolean;
+  fulfillmentMissing?: string[];
+  generatedAt?: Timestamp | null;
+}
+
 /** `rp_product_asset_batches/{batchId}` — per-color / per-role progress for initial assets. */
 export interface RpProductAssetBatch {
   id?: string;
@@ -1145,6 +1188,7 @@ export interface RpProduct {
     | "materializing"
     | "generating_assets"
     | "assembling_metadata"
+    | "needs_review"
     | "shopify_ready"
     | "syncing_shopify"
     | "live"
@@ -1165,6 +1209,23 @@ export interface RpProduct {
   /** Server evaluation vs `shopifySync.readinessCheck` (variant matrix). */
   shopifyReady?: boolean;
   shopifyReadinessMissing?: string[] | null;
+  /** Human approval gate before bulk Shopify sync (`approve` / `hold` / `pending` / `skipped`). */
+  opsReviewStatus?: "pending" | "approved" | "hold" | "skipped";
+  reviewedAt?: Timestamp | null;
+  reviewedBy?: string | null;
+  reviewRequestedAt?: Timestamp | null;
+
+  /** Structured fulfillment snapshot for ops / export (built server-side). */
+  fulfillmentSummary?: RpProductFulfillmentSummary | null;
+
+  /** Last pipeline / asset error string for list surfaces. */
+  lastPipelineError?: string | null;
+  /**
+   * Where the last recorded pipeline issue occurred (`materializing` | `generating_assets` | `assembling_metadata` | `fulfillment` | `shopify_sync`).
+   * Cleared on successful transitions; may be set without error when entering Shopify sync.
+   */
+  lastPipelineStage?: string | null;
+  lastPipelineAt?: Timestamp | null;
 
   /** Alt-image system: denormalized counts / by-kind (optional; canonical data in `rp_product_assets`). */
   sceneAssetSummary?: {
@@ -1505,6 +1566,8 @@ export interface RpProductVariant {
   productAssetBatchId?: string | null;
   /** Blank color key matching batch.colors (usually `blankVariantId`). */
   productAssetColorKey?: string | null;
+  /** Deterministic fulfillment row for export / manufacturing handoff. */
+  fulfillmentPackage?: RpProductVariantFulfillmentPackage | null;
   createdAt: Timestamp;
   updatedAt: Timestamp;
   createdBy: string;

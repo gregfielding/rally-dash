@@ -79,7 +79,21 @@ import {
   type RpScenePreset,
   type RpProductFlatRendersMvp,
   type RpProductAsset,
+  type RpProductVariantFulfillmentPackage,
 } from "@/lib/types/firestore";
+
+function formatFirestoreTimestamp(ts: unknown): string {
+  if (!ts || typeof ts !== "object") return "—";
+  const t = ts as { toDate?: () => Date };
+  if (typeof t.toDate === "function") {
+    try {
+      return t.toDate().toLocaleString();
+    } catch {
+      return "—";
+    }
+  }
+  return "—";
+}
 import {
   hasProductPlacementOverride,
   resolveEffectivePlacement,
@@ -1785,6 +1799,7 @@ function ProductDetailContent() {
     sceneTemplateRenders?: Record<string, import("@/lib/types/firestore").RpProductVariantSceneRender> | null;
     assetPipeline?: import("@/lib/types/firestore").RpVariantAssetPipeline8394 | null;
     variant8394NextRetryAt?: unknown;
+    fulfillmentPackage?: RpProductVariantFulfillmentPackage | null;
   };
 
   const params = useParams();
@@ -1900,6 +1915,7 @@ function ProductDetailContent() {
               sceneTemplateRenders?: Record<string, import("@/lib/types/firestore").RpProductVariantSceneRender> | null;
               assetPipeline?: import("@/lib/types/firestore").RpVariantAssetPipeline8394 | null;
               variant8394NextRetryAt?: unknown;
+              fulfillmentPackage?: RpProductVariantFulfillmentPackage | null;
             };
             return {
               id: d.id,
@@ -1914,6 +1930,7 @@ function ProductDetailContent() {
               sceneTemplateRenders: v.sceneTemplateRenders ?? null,
               assetPipeline: v.assetPipeline ?? null,
               variant8394NextRetryAt: v.variant8394NextRetryAt,
+              fulfillmentPackage: v.fulfillmentPackage ?? null,
             } as ProductVariantRow;
           })
           .sort((a, b) =>
@@ -3591,6 +3608,175 @@ function ProductDetailContent() {
           {" · "}
           {product.baseProductKey} · {product.colorway?.name ?? "—"}
         </p>
+
+        <div className="mt-4 grid gap-3 lg:grid-cols-2">
+          <section
+            className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm"
+            aria-labelledby="ops-summary-heading"
+          >
+            <h2 id="ops-summary-heading" className="text-sm font-semibold text-slate-900">
+              Ops summary
+            </h2>
+            <dl className="mt-3 space-y-2 text-sm">
+              <div className="flex justify-between gap-4">
+                <dt className="text-slate-500 shrink-0">Launch status</dt>
+                <dd className="font-mono text-slate-900 text-right">{product.launchStatus ?? "—"}</dd>
+              </div>
+              <div className="flex justify-between gap-4">
+                <dt className="text-slate-500 shrink-0">Assets status</dt>
+                <dd className="font-mono text-slate-900 text-right">{product.assetsStatus ?? "—"}</dd>
+              </div>
+              <div className="flex justify-between gap-4">
+                <dt className="text-slate-500 shrink-0">Shopify ready</dt>
+                <dd className="text-slate-900 text-right">{product.shopifyReady === true ? "Yes" : product.shopifyReady === false ? "No" : "—"}</dd>
+              </div>
+              <div className="flex justify-between gap-4">
+                <dt className="text-slate-500 shrink-0">Fulfillment ready</dt>
+                <dd className="text-slate-900 text-right">
+                  {product.fulfillmentSummary?.fulfillmentReady === true
+                    ? "Yes"
+                    : product.fulfillmentSummary?.fulfillmentReady === false
+                      ? "No"
+                      : "—"}
+                </dd>
+              </div>
+              <div className="flex justify-between gap-4">
+                <dt className="text-slate-500 shrink-0">Ops review</dt>
+                <dd className="font-mono text-slate-900 text-right">{product.opsReviewStatus ?? "—"}</dd>
+              </div>
+              <div className="flex justify-between gap-4">
+                <dt className="text-slate-500 shrink-0">Colors / SKUs</dt>
+                <dd className="text-slate-900 text-right">
+                  {(() => {
+                    const colors =
+                      product.colorVariantCount ??
+                      (product.variantSummary?.length
+                        ? new Set(product.variantSummary.map((s) => s.blankVariantId).filter(Boolean)).size
+                        : treatsAsParentProduct
+                          ? new Set(productVariants.map((v) => v.blankVariantId).filter(Boolean)).size
+                          : null);
+                    const skus = product.variantCount ?? (treatsAsParentProduct ? productVariants.length : null);
+                    const c = colors != null ? `${colors} color${colors === 1 ? "" : "s"}` : "—";
+                    const s = skus != null ? `${skus} SKU${skus === 1 ? "" : "s"}` : "—";
+                    return `${c} · ${s}`;
+                  })()}
+                </dd>
+              </div>
+              {(product.lastPipelineError || product.lastPipelineStage || product.lastPipelineAt) && (
+                <div className="pt-2 border-t border-slate-100 space-y-1">
+                  {product.lastPipelineError ? (
+                    <p className="text-red-700 text-sm">
+                      <span className="font-medium text-slate-700">Last pipeline error: </span>
+                      {product.lastPipelineError}
+                    </p>
+                  ) : null}
+                  <p className="text-xs text-slate-500">
+                    {product.lastPipelineStage ? (
+                      <span className="mr-2">
+                        Stage: <span className="font-mono text-slate-700">{product.lastPipelineStage}</span>
+                      </span>
+                    ) : null}
+                    {product.lastPipelineAt ? (
+                      <span>· {formatFirestoreTimestamp(product.lastPipelineAt)}</span>
+                    ) : null}
+                  </p>
+                </div>
+              )}
+            </dl>
+          </section>
+
+          <section
+            className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm"
+            aria-labelledby="fulfillment-qa-heading"
+          >
+            <h2 id="fulfillment-qa-heading" className="text-sm font-semibold text-slate-900">
+              Fulfillment package (QA)
+            </h2>
+            {product.fulfillmentSummary ? (
+              <div className="mt-3 space-y-3 text-sm">
+                <div>
+                  <span className="text-slate-500">Print sides</span>
+                  <pre className="mt-1 text-xs font-mono bg-slate-50 border border-slate-100 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">
+                    {JSON.stringify(product.fulfillmentSummary.printSides ?? {}, null, 2)}
+                  </pre>
+                </div>
+                <div className="flex flex-wrap gap-x-4 gap-y-1">
+                  <span className="text-slate-500">Sizes offered</span>
+                  <span className="text-slate-900">
+                    {product.fulfillmentSummary.sizesOffered?.length
+                      ? product.fulfillmentSummary.sizesOffered.join(", ")
+                      : "—"}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-slate-500 block mb-1">Color lines</span>
+                  <ul className="list-disc list-inside text-slate-800 text-sm space-y-0.5">
+                    {(product.fulfillmentSummary.colorLines ?? []).slice(0, 12).map((line) => (
+                      <li key={line.blankVariantId}>
+                        {line.colorName || line.blankVariantId}
+                        {line.variantDocCount != null ? (
+                          <span className="text-slate-500"> ({line.variantDocCount} variant docs)</span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                  {(product.fulfillmentSummary.colorLines?.length ?? 0) > 12 ? (
+                    <p className="text-xs text-slate-500 mt-1">Showing first 12 color lines.</p>
+                  ) : null}
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-slate-500">Package ready</span>
+                  <span
+                    className={
+                      product.fulfillmentSummary.fulfillmentReady
+                        ? "text-emerald-800 font-medium"
+                        : "text-amber-800 font-medium"
+                    }
+                  >
+                    {product.fulfillmentSummary.fulfillmentReady ? "Yes" : "No"}
+                  </span>
+                </div>
+                {(product.fulfillmentSummary.fulfillmentMissing?.length ?? 0) > 0 ? (
+                  <div>
+                    <span className="text-slate-500">Missing</span>
+                    <p className="mt-1 text-amber-900 text-sm font-mono">
+                      {(product.fulfillmentSummary.fulfillmentMissing ?? []).join(", ")}
+                    </p>
+                  </div>
+                ) : null}
+                <div>
+                  <span className="text-slate-500 block mb-1">Sample print file refs (variants)</span>
+                  {(() => {
+                    const samples = productVariants
+                      .filter((v) => v.fulfillmentPackage?.printFileRefs)
+                      .slice(0, 2);
+                    const rows = samples.length > 0 ? samples : productVariants.slice(0, 2);
+                    if (rows.length === 0) {
+                      return <p className="text-xs text-slate-500">Load variants to see sample refs.</p>;
+                    }
+                    return (
+                      <ul className="space-y-2">
+                        {rows.map((v) => (
+                          <li key={v.id} className="text-xs">
+                            <span className="font-medium text-slate-800">{v.colorName || v.id}</span>
+                            <pre className="mt-1 font-mono bg-slate-50 border border-slate-100 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">
+                              {JSON.stringify(v.fulfillmentPackage?.printFileRefs ?? {}, null, 2)}
+                            </pre>
+                          </li>
+                        ))}
+                      </ul>
+                    );
+                  })()}
+                </div>
+              </div>
+            ) : (
+              <p className="mt-3 text-sm text-slate-500">
+                No fulfillment snapshot yet. It is written when the launch pipeline completes the asset batch (server-side).
+              </p>
+            )}
+          </section>
+        </div>
+
         {showProductVariantDebugPanel && product?.id && (
           <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-mono text-amber-950 space-y-1">
             <div className="font-semibold text-amber-900">Variant load debug (ops / dev)</div>

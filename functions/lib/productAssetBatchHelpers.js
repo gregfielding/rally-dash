@@ -1,11 +1,13 @@
 "use strict";
 
+const { DEFAULT_ASSET_PLAN } = require("./defaultAssetPlan");
+const { logOfficialAssetBatchRollup } = require("./officialAssetPipelineLog");
 const { DEFAULT_8394_ASSET_PLAN } = require("./default8394AssetPlan");
 
 function emptyRoleMap() {
   /** @type {Record<string, { status: string }>} */
   const m = {};
-  for (const r of DEFAULT_8394_ASSET_PLAN) {
+  for (const r of DEFAULT_ASSET_PLAN) {
     m[r] = { status: "queued" };
   }
   return m;
@@ -14,13 +16,14 @@ function emptyRoleMap() {
 function deriveBatchStatus(colors) {
   const keys = Object.keys(colors || {});
   if (keys.length === 0) return "complete";
+  const totalSlots = keys.length * DEFAULT_ASSET_PLAN.length;
   let doneC = 0;
   let failC = 0;
   let runC = 0;
   let qC = 0;
   for (const k of keys) {
     const roles = colors[k].roles || {};
-    for (const r of DEFAULT_8394_ASSET_PLAN) {
+    for (const r of DEFAULT_ASSET_PLAN) {
       const st = roles[r] && roles[r].status ? String(roles[r].status) : "queued";
       if (st === "done") doneC += 1;
       else if (st === "failed") failC += 1;
@@ -28,8 +31,8 @@ function deriveBatchStatus(colors) {
       else qC += 1;
     }
   }
-  if (doneC === total) return "complete";
-  if (failC > 0 && runC === 0 && qC === 0) return failC === total ? "failed" : "partial";
+  if (doneC === totalSlots) return "complete";
+  if (failC > 0 && runC === 0 && qC === 0) return failC === totalSlots ? "failed" : "partial";
   if (runC > 0) return "running";
   return "queued";
 }
@@ -52,7 +55,7 @@ function aggregateRoleAcrossColors(colors, roleKey) {
 function summarizeParentAssets(colors) {
   /** @type {Record<string, string>} */
   const assets = {};
-  for (const r of DEFAULT_8394_ASSET_PLAN) {
+  for (const r of DEFAULT_ASSET_PLAN) {
     assets[r] = aggregateRoleAcrossColors(colors, r);
   }
   return assets;
@@ -60,15 +63,34 @@ function summarizeParentAssets(colors) {
 
 function assetsProgressFromColors(colors) {
   let done = 0;
-  const total = Object.keys(colors || {}).length * DEFAULT_8394_ASSET_PLAN.length;
+  const total = Object.keys(colors || {}).length * DEFAULT_ASSET_PLAN.length;
   for (const c of Object.values(colors || {})) {
     const roles = c && c.roles ? c.roles : {};
-    for (const r of DEFAULT_8394_ASSET_PLAN) {
+    for (const r of DEFAULT_ASSET_PLAN) {
       const st = roles[r] && roles[r].status ? String(roles[r].status) : "queued";
       if (st === "done") done += 1;
     }
   }
   return { completed: done, total };
+}
+
+/** Scan batch.colors for failed roles (stable order) for FINAL_FAIL_REASON logging. */
+function collectBatchFailureDetails(colors) {
+  const failedRoles = [];
+  let firstError = null;
+  const colorKeys = Object.keys(colors || {}).sort();
+  for (const k of colorKeys) {
+    const roles = (colors[k] && colors[k].roles) || {};
+    for (const r of DEFAULT_ASSET_PLAN) {
+      const o = roles[r];
+      if (o && String(o.status) === "failed") {
+        const err = o.error != null ? String(o.error) : "";
+        failedRoles.push({ blankVariantId: k, role: r, error: err || null });
+        if (!firstError && err) firstError = `${k}/${r}: ${err}`;
+      }
+    }
+  }
+  return { failedRoles, firstError };
 }
 
 /**
@@ -104,15 +126,45 @@ async function applyPrimaryVariantMediaInheritance({ db, admin, parentId, primar
   return { ok: true, updated: n };
 }
 
+function launchBatchLog(tag, payload) {
+  try {
+    console.log(`[LAUNCH_BATCH:${tag}]\n${JSON.stringify(payload, null, 2)}`);
+  } catch {
+    console.log(`[LAUNCH_BATCH:${tag}]`, payload);
+  }
+}
+
 async function recomputeAndSyncParent({ db, admin, sanitizeForFirestore, productId, batchId }) {
   const batchRef = db.collection("rp_product_asset_batches").doc(batchId);
   const batchSnap = await batchRef.get();
-  if (!batchSnap.exists) return;
+  if (!batchSnap.exists) {
+    launchBatchLog("ERROR", {
+      productId,
+      batchId,
+      stage: "recomputeAndSyncParent",
+      error: "batch_doc_missing",
+    });
+    return;
+  }
   const b = batchSnap.data() || {};
   const colors = b.colors || {};
-  const status = deriveBatchStatus(colors);
-  const assetsProgress = assetsProgressFromColors(colors);
-  const assets = summarizeParentAssets(colors);
+  let status;
+  let assetsProgress;
+  let assets;
+  try {
+    status = deriveBatchStatus(colors);
+    assetsProgress = assetsProgressFromColors(colors);
+    assets = summarizeParentAssets(colors);
+  } catch (reErr) {
+    launchBatchLog("ERROR", {
+      productId,
+      batchId,
+      stage: "deriveBatchStatus",
+      error: reErr && reErr.message ? String(reErr.message) : String(reErr),
+    });
+    throw reErr;
+  }
+  /** Parent `assetsStatus`: treat batch "queued" as in-flight work (roles not all terminal). */
   const assetsStatus =
     status === "complete"
       ? "complete"
@@ -121,7 +173,7 @@ async function recomputeAndSyncParent({ db, admin, sanitizeForFirestore, product
         : status === "partial"
           ? "partial"
           : status === "queued"
-            ? "queued"
+            ? "running"
             : "running";
 
   await batchRef.update(
@@ -142,6 +194,28 @@ async function recomputeAndSyncParent({ db, admin, sanitizeForFirestore, product
       assetsUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
     })
   );
+
+  if (status === "failed") {
+    const { failedRoles, firstError } = collectBatchFailureDetails(colors);
+    launchBatchLog("FINAL_FAIL_REASON", {
+      batchId,
+      productId,
+      completed: assetsProgress.completed,
+      total: assetsProgress.total,
+      failedRoles,
+      firstError: firstError || null,
+    });
+  }
+
+  launchBatchLog("ROLLUP", {
+    productId,
+    batchId,
+    batchStatus: status,
+    assetsStatus,
+    assetsProgress,
+    assetsRoles: assets,
+    launchPipeline: b.launchPipeline === true,
+  });
 
   try {
     const {
@@ -182,32 +256,47 @@ async function recomputeAndSyncParent({ db, admin, sanitizeForFirestore, product
       });
     }
   } catch (launchErr) {
+    launchBatchLog("ERROR", {
+      productId,
+      batchId,
+      stage: "advanceLaunch",
+      error: launchErr && launchErr.message ? String(launchErr.message) : String(launchErr),
+    });
     console.warn("[recomputeAndSyncParent] launch advance:", launchErr && launchErr.message ? launchErr.message : launchErr);
+  }
+
+  try {
+    const pRoll = await productRef.get();
+    const pRollData = pRoll.exists ? pRoll.data() || {} : {};
+    logOfficialAssetBatchRollup({
+      productId,
+      batchId,
+      completed: assetsProgress.completed,
+      total: assetsProgress.total,
+      batchStatus: status,
+      assetsStatus,
+      launchStatus: pRollData.launchStatus != null ? pRollData.launchStatus : null,
+    });
+  } catch (rollErr) {
+    console.warn("[recomputeAndSyncParent] OFFICIAL_ASSET_BATCH:ROLLUP:", rollErr && rollErr.message ? rollErr.message : rollErr);
   }
 }
 
-async function on8394FlatPipelineFinishedForBatch({
+/**
+ * Update one official asset role on `rp_product_asset_batches` (driven by `rp_generation_jobs`).
+ */
+async function markOfficialAssetRoleTerminal({
   db,
   admin,
   sanitizeForFirestore,
-  parentId,
-  productVariantId,
-  succeeded,
+  productId,
+  batchId,
+  colorKey,
+  role,
+  ok,
   errorMessage,
+  jobId,
 }) {
-  const variantRef = db.collection("rp_products").doc(parentId).collection("variants").doc(productVariantId);
-  const vSnap = await variantRef.get();
-  if (!vSnap.exists) return;
-  const v = vSnap.data() || {};
-  const batchId = v.productAssetBatchId && String(v.productAssetBatchId).trim() ? String(v.productAssetBatchId).trim() : null;
-  const colorKey =
-    v.productAssetColorKey && String(v.productAssetColorKey).trim()
-      ? String(v.productAssetColorKey).trim()
-      : v.blankVariantId && String(v.blankVariantId).trim()
-        ? String(v.blankVariantId).trim()
-        : null;
-  if (!batchId || !colorKey) return;
-
   const batchRef = db.collection("rp_product_asset_batches").doc(batchId);
   const batchSnap = await batchRef.get();
   if (!batchSnap.exists) return;
@@ -217,22 +306,29 @@ async function on8394FlatPipelineFinishedForBatch({
   const colorBlock = { ...(colors[colorKey] || {}) };
   const roles = { ...(colorBlock.roles || {}) };
 
-  for (const role of DEFAULT_8394_ASSET_PLAN) {
-    if (succeeded) {
-      roles[role] = {
-        status: "done",
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      };
-    } else {
-      roles[role] = {
-        status: "failed",
-        error: errorMessage ? String(errorMessage).slice(0, 500) : "flat_pipeline_failed",
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      };
-    }
+  if (ok) {
+    roles[role] = {
+      status: "done",
+      generationJobId: jobId || null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+  } else {
+    const err = errorMessage ? String(errorMessage).slice(0, 500) : "failed";
+    roles[role] = {
+      status: "failed",
+      error: err,
+      generationJobId: jobId || null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    launchBatchLog("ROLE_MARK_FAILED", {
+      batchId,
+      blankVariantId: colorKey,
+      role,
+      reason: err,
+    });
   }
+
   colorBlock.roles = roles;
-  colorBlock.primaryVariantId = productVariantId;
   colors[colorKey] = colorBlock;
 
   await batchRef.update(
@@ -242,11 +338,24 @@ async function on8394FlatPipelineFinishedForBatch({
     })
   );
 
-  if (succeeded) {
-    await applyPrimaryVariantMediaInheritance({ db, admin, parentId, primaryVariantId: productVariantId });
-  }
+  launchBatchLog("ROLE_FINISH", {
+    productId,
+    batchId,
+    blankVariantId: colorKey,
+    role,
+    status: ok ? "done" : "failed",
+    generationJobId: jobId || null,
+  });
 
-  await recomputeAndSyncParent({ db, admin, sanitizeForFirestore, productId: parentId, batchId });
+  await recomputeAndSyncParent({ db, admin, sanitizeForFirestore, productId, batchId });
+}
+
+/**
+ * 8394 mock/flat is secondary: refresh sibling media only — does not drive asset batch / launch gates.
+ */
+async function on8394SecondaryPipelineMediaInheritance({ db, admin, parentId, productVariantId, succeeded }) {
+  if (!succeeded) return;
+  await applyPrimaryVariantMediaInheritance({ db, admin, parentId, primaryVariantId: productVariantId });
 }
 
 async function supersedeOpenBatchesForProduct({ db, admin, sanitizeForFirestore, productId, userId }) {
@@ -270,6 +379,7 @@ async function supersedeOpenBatchesForProduct({ db, admin, sanitizeForFirestore,
 }
 
 module.exports = {
+  DEFAULT_ASSET_PLAN,
   DEFAULT_8394_ASSET_PLAN,
   emptyRoleMap,
   deriveBatchStatus,
@@ -277,6 +387,8 @@ module.exports = {
   assetsProgressFromColors,
   applyPrimaryVariantMediaInheritance,
   recomputeAndSyncParent,
-  on8394FlatPipelineFinishedForBatch,
+  markOfficialAssetRoleTerminal,
+  on8394SecondaryPipelineMediaInheritance,
   supersedeOpenBatchesForProduct,
+  launchBatchLog,
 };

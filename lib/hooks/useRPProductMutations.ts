@@ -244,6 +244,77 @@ export function useLaunchProductsFromDesign() {
   return { launchProductsFromDesign };
 }
 
+/** Bulk review gate + Shopify sync + asset retry (callable limits: 100 / 50 / 25 ids). */
+export function useBulkProductOps() {
+  const { mutate } = useSWRConfig();
+
+  const invalidateProducts = useCallback(async () => {
+    await mutate(
+      (key) => typeof key === "string" && key.startsWith("rp_product"),
+      undefined,
+      { revalidate: true }
+    );
+  }, [mutate]);
+
+  const bulkMarkProductsReviewed = useCallback(
+    async (input: { productIds: string[]; action: "approve" | "hold" }) => {
+      if (!functions) throw new Error("Cloud Functions not initialized");
+      const fn = httpsCallable(functions, "bulkMarkProductsReviewed");
+      const result = await fn(input);
+      await invalidateProducts();
+      return result.data as {
+        ok: boolean;
+        results: Array<{
+          productId: string;
+          ok: boolean;
+          reason?: string;
+          launchStatus?: string | null;
+        }>;
+      };
+    },
+    [invalidateProducts]
+  );
+
+  const bulkSyncProductsToShopify = useCallback(
+    async (input: { productIds: string[] }) => {
+      if (!functions) throw new Error("Cloud Functions not initialized");
+      const fn = httpsCallable(functions, "bulkSyncProductsToShopify");
+      const result = await fn(input);
+      await invalidateProducts();
+      return result.data as {
+        ok: boolean;
+        jobIds?: string[];
+        results: Array<{
+          productId: string;
+          ok: boolean;
+          reason?: string;
+          jobId?: string;
+          launchStatus?: string | null;
+        }>;
+      };
+    },
+    [invalidateProducts]
+  );
+
+  const bulkRetryProductAssets = useCallback(
+    async (input: { productIds: string[] }) => {
+      if (!functions) throw new Error("Cloud Functions not initialized");
+      const fn = httpsCallable(functions, "bulkRetryProductAssets", {
+        timeout: CREATE_VARIANTS_CALLABLE_TIMEOUT_MS,
+      });
+      const result = await fn(input);
+      await invalidateProducts();
+      return result.data as {
+        ok: boolean;
+        results: Array<{ productId: string; ok: boolean; error?: string; detail?: unknown }>;
+      };
+    },
+    [invalidateProducts]
+  );
+
+  return { bulkMarkProductsReviewed, bulkSyncProductsToShopify, bulkRetryProductAssets };
+}
+
 /** Re-run server-side merchandising resolution (same as create) for an existing product. */
 export function useRefreshProductMerchandisingFromSources() {
   const { mutate } = useSWRConfig();
