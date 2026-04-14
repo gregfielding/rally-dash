@@ -20,7 +20,7 @@ body {
   font-family: Arial, Helvetica, sans-serif;
 }
 
-/* Headings: keep readable on white cards/modals (don’t inherit washed-out body color in dark OS theme). */
+/* Headings: keep readable on white cards/modals (do not inherit washed-out body color in dark OS theme). */
 @layer base {
   h4 {
     @apply text-gray-900;
@@ -34,7 +34,7 @@ body {
 }
 
 /* Ensure input text is always dark and readable - high specificity to override Tailwind */
-/* HTML default type is text, but omitting `type` leaves no [type] attr — those inputs were inheriting light body color on white in dark OS theme */
+/* HTML default type is text, but omitting `type` leaves no [type] attr - those inputs were inheriting light body color on white in dark OS theme */
 input:not([type]):not([disabled]),
 input[type="text"]:not([disabled]),
 input[type="search"]:not([disabled]),

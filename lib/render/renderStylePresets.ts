@@ -24,10 +24,10 @@ export const RENDER_STYLE_TO_SIMPLE_8394: Record<
   RenderStylePresetId,
   { realism: number; inkStrength: number }
 > = {
-  clean: { realism: 14, inkStrength: 82 },
-  soft_print: { realism: 72, inkStrength: 70 },
-  vintage_fade: { realism: 90, inkStrength: 48 },
-  bold_print: { realism: 26, inkStrength: 94 },
+  clean: { realism: 16, inkStrength: 99 },
+  soft_print: { realism: 40, inkStrength: 94 },
+  vintage_fade: { realism: 60, inkStrength: 77 },
+  bold_print: { realism: 22, inkStrength: 100 },
 };
 
 /** Non-8394: direct zone blend (matches dashboard brief). */

@@ -6,8 +6,8 @@
 import type { RP8394SizePreset, RPPlacementSimpleRenderControls8394 } from "@/lib/types/firestore";
 
 export const DEFAULT_SIMPLE_RENDER_CONTROLS_8394 = {
-  realism: 55,
-  inkStrength: 78,
+  realism: 52,
+  inkStrength: 95,
   sizePreset: "medium" as RP8394SizePreset,
 };
 
@@ -43,7 +43,7 @@ export function mapRealismToBlend(realism: number): { blendMode: string; blendOp
   else if (r < 76) blendMode = "overlay";
   else blendMode = "multiply";
   const t = r / 100;
-  const blendOpacity = clamp(1 - t * 0.26, 0.62, 1);
+  const blendOpacity = clamp(1 - t * 0.16, 0.74, 1);
   return { blendMode, blendOpacity };
 }
 
@@ -55,7 +55,7 @@ export function mapInkStrengthToFactors(inkStrength: number): {
   contrastPercent: number;
 } {
   const i = clamp(inkStrength, 0, 100) / 100;
-  const designOpacityMultiplier = clamp(0.38 + 0.62 * i, 0.2, 1);
+  const designOpacityMultiplier = clamp(0.45 + 0.55 * i, 0.35, 1);
   const contrastPercent = clamp(88 + i * 32, 88, 125);
   return { designOpacityMultiplier, contrastPercent };
 }

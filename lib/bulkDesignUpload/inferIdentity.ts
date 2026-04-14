@@ -48,7 +48,7 @@ export function inferIdentityFromDesignKey(designKey: string): InferredIdentity 
   const leagueCode = leagueToken.toUpperCase();
   const n = tokens.length;
 
-  // ..._city_<digits>  (City 69 style)
+  // ..._city_<digits>  (City 69 style, explicit)
   if (n >= 4 && tokens[n - 2]!.toLowerCase() === "city" && /^\d+$/.test(tokens[n - 1]!)) {
     const series = tokens[n - 1]!;
     const teamSlugCandidate = tokens.slice(1, n - 2).join("_");
@@ -62,6 +62,23 @@ export function inferIdentityFromDesignKey(designKey: string): InferredIdentity 
       designType: "city_69",
       themeDisplayName: `City ${series}`,
     };
+  }
+
+  // ..._69 shorthand (e.g. mlb_baltimore_orioles_69) — City 69 theme; other numeric tails stay generic
+  if (n >= 3 && tokens[n - 1] === "69") {
+    const series = "69";
+    const teamSlugCandidate = tokens.slice(1, n - 1).join("_");
+    if (teamSlugCandidate) {
+      return {
+        leagueToken,
+        leagueCode,
+        teamSlugCandidate,
+        themeSlugCandidate: "city_69",
+        designSeriesCandidate: series,
+        designType: "city_69",
+        themeDisplayName: "City 69",
+      };
+    }
   }
 
   // Generic: last token = loose "team nickname" in old parser; treat tail as theme slug

@@ -520,7 +520,9 @@ function parseBulkDesignUploadPreviewImpl(db, storage) {
       id: d.id,
       slug: d.data().slug,
       name: d.data().name,
+      teamName: d.data().teamName,
       teamCode: d.data().teamCode,
+      league: d.data().league,
       leagueCode: d.data().leagueCode || d.data().leagueId,
       leagueId: d.data().leagueId,
     }));

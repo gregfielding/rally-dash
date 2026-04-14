@@ -3,6 +3,10 @@
  */
 
 import { getPlacementRowForSide } from "@/lib/products/resolveProductRenderProfile";
+import {
+  resolveLeagueCodeRawForProductIdentity,
+  resolveTeamCodeRawForProductIdentity,
+} from "@/lib/products/productIdentityCodes";
 import { buildParentProductIdentityKey, buildProductIdentityKey } from "@/lib/products/staleness";
 import { designHasUsablePng } from "@/lib/designs/designHelpers";
 import { isTeamEligibleForVariant } from "@/lib/teams/teamProductMatrixHints";
@@ -54,8 +58,8 @@ export function computeProductIdentityKeyForCatalogRow(
   blank: RPBlank,
   variantIdOrLegacy: string
 ): string {
-  const leagueCodeRaw = design.leagueCode || team.leagueId || team.league || "";
-  const teamCodeRaw = design.teamCode || team.teamCode || team.id || design.teamId || "";
+  const leagueCodeRaw = resolveLeagueCodeRawForProductIdentity(design, team);
+  const teamCodeRaw = resolveTeamCodeRawForProductIdentity(design, team);
   return buildProductIdentityKey({
     leagueCode: leagueCodeRaw,
     teamCode: teamCodeRaw,
@@ -70,8 +74,8 @@ export function computeParentProductIdentityKeyForCatalogRow(
   team: DesignTeam,
   blank: RPBlank
 ): string {
-  const leagueCodeRaw = design.leagueCode || team.leagueId || team.league || "";
-  const teamCodeRaw = design.teamCode || team.teamCode || team.id || design.teamId || "";
+  const leagueCodeRaw = resolveLeagueCodeRawForProductIdentity(design, team);
+  const teamCodeRaw = resolveTeamCodeRawForProductIdentity(design, team);
   return buildParentProductIdentityKey({
     leagueCode: leagueCodeRaw,
     teamCode: teamCodeRaw,

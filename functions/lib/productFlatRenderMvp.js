@@ -177,8 +177,8 @@ function pickDesignPngForVariant(design, blankVariantRow, productVariantDoc) {
 
 function normalizeSimple8394(s) {
   if (!s || typeof s !== "object") return null;
-  const realism = Math.max(0, Math.min(100, Math.round(Number(s.realism) || 55)));
-  const inkStrength = Math.max(0, Math.min(100, Math.round(Number(s.inkStrength) || 78)));
+  const realism = Math.max(0, Math.min(100, Math.round(Number(s.realism) || 52)));
+  const inkStrength = Math.max(0, Math.min(100, Math.round(Number(s.inkStrength) || 95)));
   const presets = new Set(["small", "medium", "large", "fill_safe"]);
   const sizePreset = presets.has(s.sizePreset) ? s.sizePreset : "medium";
   return { realism, inkStrength, sizePreset };
@@ -192,13 +192,13 @@ function mapRealism8394(realism) {
   else if (r < 76) blendMode = "overlay";
   else blendMode = "multiply";
   const t = r / 100;
-  const blendOpacity = Math.max(0.62, Math.min(1, 1 - t * 0.26));
+  const blendOpacity = Math.max(0.74, Math.min(1, 1 - t * 0.16));
   return { blendMode, blendOpacity };
 }
 
 function mapInk8394(inkStrength) {
   const i = Math.max(0, Math.min(100, inkStrength)) / 100;
-  const designOpacityMultiplier = Math.max(0.2, Math.min(1, 0.38 + 0.62 * i));
+  const designOpacityMultiplier = Math.max(0.35, Math.min(1, 0.45 + 0.55 * i));
   const contrastPercent = Math.min(125, 88 + i * 32);
   return { designOpacityMultiplier, contrastPercent };
 }
@@ -664,9 +664,37 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
         renderTypes = DEFAULT_RENDER_TYPES.slice();
       }
 
+      const sr = blank.supportedRenderViews;
+      /**
+       * supportedRenderViews gates *printed / composited* outputs per side, not display-only garment images.
+       * - Back: flat_blended_back + model_blended_back composite design → respect "back" in supportedRenderViews.
+       * - Front: flat_clean_front + model_clean_front are clean pass-through display images (no design layer);
+       *   they are NOT blocked when front printing is disabled.
+       * If we add front design compositing render types later, gate those with blankAllowsFront here.
+       */
+      const blankAllowsFront =
+        !Array.isArray(sr) || sr.length === 0 || sr.includes("front");
+      const blankAllowsBack =
+        !Array.isArray(sr) || sr.length === 0 || sr.includes("back");
+      const BACK_DESIGN_COMPOSITE_TYPES = new Set(["flat_blended_back", "model_blended_back"]);
+      const renderTypesPreSidePolicy = renderTypes.slice();
+      renderTypes = renderTypes.filter((t) => {
+        if (BACK_DESIGN_COMPOSITE_TYPES.has(t) && !blankAllowsBack) return false;
+        return true;
+      });
+      const sidePolicySkipLines = [];
+      for (const t of renderTypesPreSidePolicy) {
+        if (renderTypes.includes(t)) continue;
+        if (BACK_DESIGN_COMPOSITE_TYPES.has(t) && !blankAllowsBack) {
+          sidePolicySkipLines.push(`${t}: skipped — back_disabled`);
+        }
+      }
+
       const renderSelectionLog = [];
       if (rtRaw && rtRaw.length) {
-        renderSelectionLog.push("Explicit renderTypes from request: " + renderTypes.join(", "));
+        renderSelectionLog.push(
+          "Explicit renderTypes from request: " + renderTypesPreSidePolicy.join(", ")
+        );
       } else {
         renderSelectionLog.push("Auto-expanded (no renderTypes in request)");
         renderSelectionLog.push(
@@ -689,13 +717,26 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
             ? "model_clean_front: included — modelFront URL present"
             : "model_clean_front: skipped — no modelFront URL"
         );
-        renderSelectionLog.push("Resolved renderTypes: " + renderTypes.join(", "));
+        renderSelectionLog.push("Resolved renderTypes: " + renderTypesPreSidePolicy.join(", "));
         if (usedDefaultRenderTypes) {
           renderSelectionLog.push(
             "Note: auto list was empty — applied DEFAULT " + DEFAULT_RENDER_TYPES.join(", ")
           );
         }
       }
+      for (const line of sidePolicySkipLines) {
+        renderSelectionLog.push(line);
+      }
+      if (sidePolicySkipLines.length) {
+        renderSelectionLog.push(
+          "Blank print sides policy: supportedRenderViews=" +
+            (Array.isArray(sr) && sr.length ? sr.join(", ") : "unset (both print sides allowed)")
+        );
+        renderSelectionLog.push(
+          "Note: flat_clean_front and model_clean_front are display-only (no design composite); not gated by front print side."
+        );
+      }
+      renderSelectionLog.push("Effective renderTypes: " + renderTypes.join(", "));
       console.info(
         JSON.stringify({
           tag: "flat8394_render_target_selection",
@@ -713,6 +754,12 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
       const anyRequested =
         wantBlendedBack || wantModelBlendedBack || wantFrontClean || wantModelFrontClean;
       if (!anyRequested) {
+        if (renderTypesPreSidePolicy.length && !renderTypes.length) {
+          throw new functions.https.HttpsError(
+            "invalid-argument",
+            "All render types were skipped: blank supportedRenderViews may disable back design compositing (see renderSelectionLog: back_disabled)."
+          );
+        }
         throw new functions.https.HttpsError(
           "invalid-argument",
           "renderTypes must include at least one of: flat_blended_back, model_blended_back, flat_clean_front, model_clean_front"

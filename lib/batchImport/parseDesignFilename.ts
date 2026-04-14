@@ -10,8 +10,12 @@
  * - `_front_` / `_back_` are **legacy metadata only**; they do not override blank placement rules
  *
  * Examples:
- * - mlb_sf_giants_city_69_light.png  → canonical
+ * - mlb_sf_giants_city_69_light.png  → canonical (city_69 theme; team slug from tokens before `city`)
  * - mlb_sf_giants_city_69_back_dark.png → legacy (filenameLegacySide = back)
+ *
+ * **Shorthand:** `mlb_baltimore_orioles_69_light` (digits only after team) is treated like City 69: `designFamily`
+ * becomes `city_69` and the team slug is `baltimore_orioles` (full identity). Prefer explicit
+ * `…_city_69_light` when ambiguous.
  */
 
 import { designFileKindFromSideToneExt, designFileKindFromToneExt } from "@/lib/designs/designAssetKinds";
@@ -95,6 +99,16 @@ function splitMiddleForTeamAndFamily(middle: string[]): { designFamily: string; 
     return {
       designFamily: theme,
       team: identity.length ? identity[identity.length - 1]! : "",
+    };
+  }
+
+  /** `…_baltimore_orioles_69` — trailing `69` without `city` (City 69 theme). Other trailing digits stay generic. */
+  const isTrailing69Series = middle.length >= 2 && middle[middle.length - 1] === "69";
+  if (isTrailing69Series) {
+    const identity = middle.slice(0, -1);
+    return {
+      designFamily: "city_69",
+      team: identity.join("_"),
     };
   }
 

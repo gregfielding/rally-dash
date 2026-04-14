@@ -3,14 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev -p 3000",
+    "dev:clean": "rm -rf .next && next dev -p 3000",
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
     "firebase": "firebase",
     "deploy:functions": "firebase deploy --only functions",
     "deploy:firestore:rules": "firebase deploy --only firestore:rules",
-    "deploy:storage:rules": "firebase deploy --only storage"
+    "deploy:storage:rules": "firebase deploy --only storage",
+    "migrate:city69": "node scripts/migrate-city69-theme.js"
   },
   "dependencies": {
     "@emotion/react": "^11.13.0",

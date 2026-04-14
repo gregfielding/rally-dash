@@ -33,8 +33,8 @@ function legacyZoneBlendToBlend01(z) {
 function rowToBlend01(row, styleCode) {
   const sc = String(styleCode || "").trim();
   if (sc === "8394" && row.view === "back" && row.simpleRenderControls8394) {
-    const r = row.simpleRenderControls8394.realism != null ? row.simpleRenderControls8394.realism : 55;
-    const i = row.simpleRenderControls8394.inkStrength != null ? row.simpleRenderControls8394.inkStrength : 78;
+    const r = row.simpleRenderControls8394.realism != null ? row.simpleRenderControls8394.realism : 52;
+    const i = row.simpleRenderControls8394.inkStrength != null ? row.simpleRenderControls8394.inkStrength : 95;
     return { fabricFeel: clamp(r, 0, 100) / 100, printStrength: clamp(i, 0, 100) / 100 };
   }
   const z = row.renderZoneDefaults;
@@ -129,8 +129,8 @@ function variantSliceToRenderTargetSettingsPatch(slice, row, styleCode) {
   const sc = String(styleCode || "").trim();
   const blend = {};
   if (sc === "8394" && row.view === "back" && slice.simpleRenderControls8394) {
-    const r = slice.simpleRenderControls8394.realism != null ? slice.simpleRenderControls8394.realism : 55;
-    const i = slice.simpleRenderControls8394.inkStrength != null ? slice.simpleRenderControls8394.inkStrength : 78;
+    const r = slice.simpleRenderControls8394.realism != null ? slice.simpleRenderControls8394.realism : 52;
+    const i = slice.simpleRenderControls8394.inkStrength != null ? slice.simpleRenderControls8394.inkStrength : 95;
     blend.fabricFeel = clamp(r, 0, 100) / 100;
     blend.printStrength = clamp(i, 0, 100) / 100;
   }

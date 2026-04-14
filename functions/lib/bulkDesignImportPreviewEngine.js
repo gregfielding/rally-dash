@@ -39,6 +39,14 @@ function splitMiddleForTeamAndFamily(middle) {
       team: identity.length ? identity[identity.length - 1] : "",
     };
   }
+  const isTrailing69Series = middle.length >= 2 && middle[middle.length - 1] === "69";
+  if (isTrailing69Series) {
+    const identity = middle.slice(0, -1);
+    return {
+      designFamily: "city_69",
+      team: identity.join("_"),
+    };
+  }
   const team = middle[middle.length - 1];
   const designFamily = middle.slice(0, -1).join("_");
   return { designFamily, team };
@@ -180,6 +188,20 @@ function inferIdentityFromDesignKey(designKey) {
       themeDisplayName: `City ${series}`,
     };
   }
+  if (n >= 3 && tokens[n - 1] === "69") {
+    const teamSlugCandidate = tokens.slice(1, n - 1).join("_");
+    if (teamSlugCandidate) {
+      return {
+        leagueToken,
+        leagueCode,
+        teamSlugCandidate,
+        themeSlugCandidate: "city_69",
+        designSeriesCandidate: "69",
+        designType: "city_69",
+        themeDisplayName: "City 69",
+      };
+    }
+  }
   const teamSlugCandidate = tokens.slice(1, -1).join("_");
   const themeToken = tokens[n - 1];
   return {
@@ -210,17 +232,66 @@ function normKey(s) {
   return String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function matchDesignTeam(teamSlugCandidate, teams) {
+const TEAM_SLUG_ALIASES = {
+  newyork_yankees: "ny_yankees",
+  new_york_yankees: "ny_yankees",
+  newyork_mets: "ny_mets",
+  new_york_mets: "ny_mets",
+  sanfrancisco_giants: "sf_giants",
+  san_francisco_giants: "sf_giants",
+  losangeles_dodgers: "los_angeles_dodgers",
+  los_angeles_dodgers: "los_angeles_dodgers",
+  losangeles_angels: "los_angeles_angels",
+  los_angeles_angels: "los_angeles_angels",
+};
+
+function leagueMatchesTeam(t, leagueHint) {
+  if (leagueHint == null || String(leagueHint).trim() === "") return true;
+  const h = String(leagueHint)
+    .trim()
+    .toUpperCase();
+  const lc = String(t.leagueCode || t.leagueId || t.league || "")
+    .trim()
+    .toUpperCase();
+  return !lc || lc === h;
+}
+
+function resolveTeamSlugForMatch(parsedTeam, inferred) {
+  if (inferred.designType === "city_69") {
+    return inferred.teamSlugCandidate;
+  }
+  const pt = String(parsedTeam ?? "").trim();
+  const inf = String(inferred.teamSlugCandidate ?? "").trim();
+  if (/^\d+$/.test(pt) && inf.length > 0) {
+    return inf;
+  }
+  return pt || inf;
+}
+
+function matchDesignTeam(teamSlugCandidate, teams, options) {
   const warnings = [];
   const cand = String(teamSlugCandidate).trim();
   if (!cand) return { team: null, warnings: ["Missing team slug in identity"] };
   const candNorm = normKey(cand);
+  const leagueHint = options && options.leagueHint;
+
+  const aliasTarget = TEAM_SLUG_ALIASES[cand.toLowerCase()];
+  if (aliasTarget) {
+    for (const t of teams) {
+      if (t.id === aliasTarget) {
+        warnings.push(`Team matched via filename alias → ${aliasTarget}`);
+        return { team: t, warnings };
+      }
+    }
+  }
+
   for (const t of teams) {
     if (t.id === cand || t.id.toLowerCase() === cand.toLowerCase()) return { team: t, warnings };
   }
   for (const t of teams) {
     if (t.slug && normKey(t.slug) === candNorm) return { team: t, warnings };
     if (t.teamCode && normKey(t.teamCode) === candNorm) return { team: t, warnings };
+    if (t.name && normKey(t.name) === candNorm) return { team: t, warnings };
   }
   for (const t of teams) {
     if (normKey(t.id).includes(candNorm) || candNorm.includes(normKey(t.id))) {
@@ -235,6 +306,20 @@ function matchDesignTeam(teamSlugCandidate, teams) {
     if (hit) {
       warnings.push(`Team matched by name tokens: ${t.name}`);
       return { team: t, warnings };
+    }
+  }
+  const lastTok = candParts.length ? candParts[candParts.length - 1] : "";
+  if (lastTok.length > 2) {
+    const nick = normKey(lastTok);
+    const byNick = teams.filter(
+      t =>
+        leagueMatchesTeam(t, leagueHint) &&
+        t.teamName &&
+        normKey(t.teamName) === nick
+    );
+    if (byNick.length === 1) {
+      warnings.push(`Team matched by nickname + league: ${byNick[0].teamName}`);
+      return { team: byNick[0], warnings };
     }
   }
   warnings.push(`No design_teams match for slug "${teamSlugCandidate}"`);
@@ -447,11 +532,10 @@ function buildPreviewItems(descriptors, designRows, teamRows, options) {
     const groupKey = row.designKey;
     const inferred = inferIdentityFromDesignKey(groupKey);
     const parsed = row.parsed;
-    const teamSlugForMatch =
-      inferred.designType === "city_69"
-        ? inferred.teamSlugCandidate
-        : parsed.team || inferred.teamSlugCandidate;
-    const { team, warnings: teamWarnings } = matchDesignTeam(teamSlugForMatch, teamRows);
+    const teamSlugForMatch = resolveTeamSlugForMatch(parsed.team, inferred);
+    const { team, warnings: teamWarnings } = matchDesignTeam(teamSlugForMatch, teamRows, {
+      leagueHint: inferred.leagueCode,
+    });
 
     const teamDisplay = team ? team.name : null;
     const teamId = team ? team.id : null;
@@ -471,12 +555,17 @@ function buildPreviewItems(descriptors, designRows, teamRows, options) {
       inferred.designSeriesCandidate || (parsed.designFamily === "city_69" ? "69" : null);
 
     let designName;
+    const familyHuman = humanizeSlug(parsed.designFamily || "");
     if (inferred.designType === "city_69") {
       const teamLabel = teamDisplay || humanizeSlug(parsed.team || inferred.teamSlugCandidate);
       designName = `${teamLabel} ${inferred.themeDisplayName}`.trim();
+    } else if (teamDisplay && familyHuman && familyHuman.toLowerCase() === String(teamDisplay).toLowerCase()) {
+      designName = inferred.themeDisplayName
+        ? `${teamDisplay} ${inferred.themeDisplayName}`.trim()
+        : teamDisplay;
     } else {
       designName = teamDisplay
-        ? `${teamDisplay} ${humanizeSlug(parsed.designFamily || "")}`.trim()
+        ? `${teamDisplay} ${familyHuman}`.trim()
         : humanizeSlug(`${parsed.designFamily}_${parsed.team}`.replace(/^_+|_+$/g, ""));
     }
 

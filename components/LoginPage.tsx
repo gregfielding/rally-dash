@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/providers/AuthProvider";
 import { signInWithEmail, createAccountWithEmail } from "@/lib/firebase/auth";
+import { getMissingFirebasePublicEnvKeys } from "@/lib/firebase/config";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -71,6 +72,8 @@ export default function LoginPage() {
     return null;
   }
 
+  const missingFirebaseKeys = getMissingFirebasePublicEnvKeys();
+
   return (
     <div className="flex items-center justify-center min-h-screen bg-gray-50">
       <div className="max-w-md w-full p-8 bg-white rounded-lg shadow-md">
@@ -87,6 +90,19 @@ export default function LoginPage() {
             {mode === "signin" ? "Sign in to continue" : "Create an account"}
           </p>
         </div>
+
+        {missingFirebaseKeys.length > 0 && (
+          <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded text-amber-950 text-sm space-y-2">
+            <p className="font-medium">Firebase env is not loaded in the browser.</p>
+            <p className="text-xs text-amber-900">
+              Missing: <span className="font-mono">{missingFirebaseKeys.join(", ")}</span>
+            </p>
+            <p className="text-xs text-amber-900">
+              Copy <span className="font-mono">.env.example</span> to <span className="font-mono">.env.local</span>, paste
+              your web SDK values from the Firebase Console, then restart <span className="font-mono">npm run dev</span>.
+            </p>
+          </div>
+        )}
 
         {error && (
           <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded text-red-700 text-sm">
@@ -131,7 +147,7 @@ export default function LoginPage() {
 
           <button
             type="submit"
-            disabled={loading}
+            disabled={loading || missingFirebaseKeys.length > 0}
             className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors font-medium"
           >
             {loading ? "Please wait..." : mode === "signin" ? "Sign In" : "Create Account"}
@@ -149,7 +165,7 @@ export default function LoginPage() {
 
         <button
           onClick={handleGoogleSignIn}
-          disabled={loading}
+          disabled={loading || missingFirebaseKeys.length > 0}
           className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
         >
           <svg

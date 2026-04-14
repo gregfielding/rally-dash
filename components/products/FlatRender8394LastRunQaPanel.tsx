@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo } from "react";
+import { get8394EngineQaMetrics } from "@/lib/blanks";
 import {
   buildOrdered8394OutputRows,
   type FlatRender8394UrlPayload,
@@ -31,6 +32,33 @@ export type FlatRender8394VariantQaSnapshot = {
 function fmt3(n: number | null | undefined) {
   if (n == null || typeof n !== "number" || !Number.isFinite(n)) return "—";
   return n.toFixed(3);
+}
+
+function Qa8394EngineMetricsDl({ fabricFeel, printStrength }: { fabricFeel: number; printStrength: number }) {
+  const m = get8394EngineQaMetrics(fabricFeel, printStrength);
+  return (
+    <dl className="grid grid-cols-2 gap-x-3 gap-y-0.5 font-mono text-[10px] text-gray-900 mt-1">
+      <div className="flex justify-between gap-2">
+        <dt className="text-gray-600 font-sans">realism (0–100)</dt>
+        <dd>{m.realism0to100}</dd>
+      </div>
+      <div className="flex justify-between gap-2">
+        <dt className="text-gray-600 font-sans">ink (0–100)</dt>
+        <dd>{m.inkStrength0to100}</dd>
+      </div>
+      <div className="flex justify-between gap-2">
+        <dt className="text-gray-600 font-sans">blend opacity</dt>
+        <dd>{m.effectiveBlendOpacity.toFixed(3)}</dd>
+      </div>
+      <div className="flex justify-between gap-2">
+        <dt className="text-gray-600 font-sans">ink multiplier</dt>
+        <dd>{m.effectiveInkMultiplier.toFixed(3)}</dd>
+      </div>
+      <div className="col-span-2 text-[9px] text-gray-500 font-sans pt-0.5">
+        blend mode <span className="font-mono">{m.blendMode}</span>
+      </div>
+    </dl>
+  );
 }
 
 function fmtSnapshotLine(s: FlatRender8394VariantQaSnapshot | null | undefined) {
@@ -93,6 +121,7 @@ export function FlatRender8394LastRunQaPanel({
   );
 
   const tuning = useMemo(() => parseRenderTargetTuningFromSelectionLog(lines), [lines]);
+  const flatBack = tuning.flat_back;
   const modelBack = tuning.model_back;
 
   const heroBack = useMemo(() => resolveHeroBackSource8394(variant), [variant]);
@@ -237,6 +266,47 @@ export function FlatRender8394LastRunQaPanel({
           </div>
         </dl>
       </div>
+
+      {hasRunData && (flatBack || modelBack) ? (
+        <div className="rounded-lg border border-sky-300/90 bg-sky-50/40 p-3 shadow-sm">
+          <h3 className="text-[11px] font-bold uppercase tracking-wide text-sky-950 mb-2">
+            8394 realism pair — engine curve (last log)
+          </h3>
+          <p className="text-[10px] text-sky-900/80 mb-2 font-sans leading-snug">
+            From <code className="bg-white/80 px-1 rounded text-[9px]">blend.fabricFeel</code> /{" "}
+            <code className="bg-white/80 px-1 rounded text-[9px]">printStrength</code> in each target’s resolved tuning
+            line — same mapping as compositor (QA only).
+          </p>
+          {flatBack?.blend && typeof flatBack.blend.fabricFeel === "number" && typeof flatBack.blend.printStrength === "number" ? (
+            <div className="mb-3 pb-3 border-b border-sky-200/80">
+              <p className="text-[10px] font-semibold text-sky-900">flat_back</p>
+              <Qa8394EngineMetricsDl
+                fabricFeel={flatBack.blend.fabricFeel}
+                printStrength={flatBack.blend.printStrength}
+              />
+            </div>
+          ) : null}
+          {modelBack?.blend && typeof modelBack.blend.fabricFeel === "number" && typeof modelBack.blend.printStrength === "number" ? (
+            <div>
+              <p className="text-[10px] font-semibold text-sky-900">model_back</p>
+              <Qa8394EngineMetricsDl
+                fabricFeel={modelBack.blend.fabricFeel}
+                printStrength={modelBack.blend.printStrength}
+              />
+            </div>
+          ) : null}
+          {!(
+            (flatBack?.blend &&
+              typeof flatBack.blend.fabricFeel === "number" &&
+              typeof flatBack.blend.printStrength === "number") ||
+            (modelBack?.blend &&
+              typeof modelBack.blend.fabricFeel === "number" &&
+              typeof modelBack.blend.printStrength === "number")
+          ) ? (
+            <p className="text-[11px] text-sky-900/80">No blend.fabricFeel / printStrength in log for these targets.</p>
+          ) : null}
+        </div>
+      ) : null}
 
       {hasRunData ? (
         <div className="rounded-lg border border-emerald-300/90 bg-emerald-50/50 p-3 shadow-sm">

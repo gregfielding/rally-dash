@@ -163,8 +163,8 @@ function resolvePlacementKeyForSide(product, variant, side) {
 
 function normalizeSimple8394(s) {
   if (!s || typeof s !== "object") return null;
-  const realism = Math.max(0, Math.min(100, Math.round(Number(s.realism) || 55)));
-  const inkStrength = Math.max(0, Math.min(100, Math.round(Number(s.inkStrength) || 78)));
+  const realism = Math.max(0, Math.min(100, Math.round(Number(s.realism) || 52)));
+  const inkStrength = Math.max(0, Math.min(100, Math.round(Number(s.inkStrength) || 95)));
   const presets = new Set(["small", "medium", "large", "fill_safe"]);
   const sizePreset = presets.has(s.sizePreset) ? s.sizePreset : "medium";
   return { realism, inkStrength, sizePreset };
@@ -503,6 +503,13 @@ function resolveEffectiveRenderTargetSettings(product, blank, variant, target) {
   const rows = blank && Array.isArray(blank.placements) ? blank.placements : [];
   const persisted = blank && blank.renderProfile && blank.renderProfile.renderTargets;
   const blankHad = !!(persisted && persisted[target] && typeof persisted[target] === "object");
+  const vid = variant && variant.variantId;
+  const byColor =
+    vid && blank && blank.renderProfile && blank.renderProfile.renderTargetsByColor
+      ? blank.renderProfile.renderTargetsByColor[vid]
+      : null;
+  const colorMatrixCell = byColor && byColor[target];
+  const colorMatrixCellExisted = !!(colorMatrixCell && typeof colorMatrixCell === "object");
 
   const baseMap = buildRenderTargetSettingsMap(persisted, rows, styleCode);
   let settings = baseMap[target];
@@ -533,6 +540,12 @@ function resolveEffectiveRenderTargetSettings(product, blank, variant, target) {
     variantSliceToRenderTargetSettingsPatch(vSlice, fallbackRow, styleCode)
   );
 
+  let primaryTuningLayer = blankHad ? "blank_renderTargets" : "placement_defaults";
+  if (colorMatrixCellExisted) {
+    settings = mergeRenderTargetSettings(settings, colorMatrixCell);
+    primaryTuningLayer = "color_matrix";
+  }
+
   const prodPatch = productPlacementToRenderTargetSettingsPatch(product, side);
   const productPlacementApplied = !!(prodPatch.placement && Object.keys(prodPatch.placement).length > 0);
   settings = mergeRenderTargetSettings(settings, prodPatch);
@@ -544,13 +557,33 @@ function resolveEffectiveRenderTargetSettings(product, blank, variant, target) {
       blankTuningExisted: blankHad,
       variantTargetOverrideExisted: variantRenderTargetSliceIsMeaningful(vSlice),
       productPlacementApplied,
+      primaryTuningLayer,
+      colorMatrixCellExisted,
     },
   };
 }
 
 function resolveEngineBlendForRenderTarget(product, blank, variant, target, tuningBlend) {
   const side = renderTargetToSide(target);
-  const fromTuning = blendSettingsToEngineBlend(tuningBlend);
+  const styleCode = String((blank && blank.styleCode) || "").trim();
+  let fromTuning;
+  if (styleCode === "8394") {
+    const tb = tuningBlend || {};
+    const ff =
+      typeof tb.fabricFeel === "number" && Number.isFinite(tb.fabricFeel) ? tb.fabricFeel : 0.52;
+    const clamped = Math.max(0, Math.min(1, ff));
+    const r = Math.round(clamped * 100);
+    let blendMode;
+    if (r < 28) blendMode = "normal";
+    else if (r < 52) blendMode = "soft-light";
+    else if (r < 76) blendMode = "overlay";
+    else blendMode = "multiply";
+    const t = r / 100;
+    const blendOpacity = Math.max(0.74, Math.min(1, 1 - t * 0.16));
+    fromTuning = { blendMode, blendOpacity };
+  } else {
+    fromTuning = blendSettingsToEngineBlend(tuningBlend);
+  }
   let modeRaw = fromTuning.blendMode;
   let opRaw = fromTuning.blendOpacity;
   let source = "blank";

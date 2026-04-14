@@ -1042,6 +1042,51 @@ export interface RpProductVariantSummary {
   isDefault: boolean;
 }
 
+/** Initial 8394 team-product asset roles (orchestrator + batch doc). Canonical display order. */
+export type Rp8394InitialAssetRole =
+  | "model_back_designed"
+  | "flat_front_clean"
+  | "flat_back_designed"
+  | "model_front_clean";
+
+/** Aggregated per-role status on parent `rp_products` (worst color wins). */
+export type RpParentAssetRoleState = "idle" | "queued" | "running" | "done" | "failed";
+
+/** `rp_product_asset_batches/{batchId}` — per-color / per-role progress for initial assets. */
+export interface RpProductAssetBatch {
+  id?: string;
+  productId: string;
+  blankId: string;
+  designId: string;
+  teamId?: string | null;
+  status: "queued" | "running" | "complete" | "failed" | "partial" | "superseded";
+  /** When true, asset completion advances `rp_products.launchStatus` / Shopify flags. */
+  launchPipeline?: boolean;
+  launchOptions?: { autoSyncShopify?: boolean } | null;
+  resolvedModelIdentityId?: string | null;
+  colors: Record<
+    string,
+    {
+      blankVariantId: string;
+      colorName?: string | null;
+      primaryVariantId?: string | null;
+      roles: Partial<
+        Record<
+          Rp8394InitialAssetRole,
+          { status: "queued" | "running" | "done" | "failed"; error?: string; updatedAt?: Timestamp }
+        >
+      >;
+    }
+  >;
+  assetsProgress?: { completed: number; total: number };
+  createdAt?: Timestamp;
+  updatedAt?: Timestamp;
+  createdBy?: string;
+  updatedBy?: string;
+  supersededAt?: Timestamp | null;
+  supersededBy?: string | null;
+}
+
 /** Parent-only cache for list/cards; variant `media` remains source of truth for PDP. */
 export interface RpProductDisplayMediaCache {
   heroUrl?: string;
@@ -1080,9 +1125,46 @@ export interface RpProduct {
   /** Phase 1: must equal `defaultVariantId`. */
   heroVariantId?: string | null;
   variantSummary?: RpProductVariantSummary[];
+  /** Sellable variant subdocs under `variants/` (Color × Size rows). */
   variantCount?: number;
+  /** Distinct blank color lines (unique `blankVariantId` on variant subdocs). */
+  colorVariantCount?: number;
   /** Cache only — not authoritative for PDP imagery. */
   displayMedia?: RpProductDisplayMediaCache | null;
+
+  /** Initial 8394 asset batch — summary; detail in `rp_product_asset_batches/{assetsBatchId}`. */
+  assetsStatus?: "idle" | "queued" | "running" | "complete" | "failed" | "partial";
+  assetsBatchId?: string | null;
+  assetsProgress?: { completed: number; total: number };
+  assetsRoles?: Partial<Record<Rp8394InitialAssetRole, RpParentAssetRoleState>>;
+  assetsUpdatedAt?: Timestamp | null;
+
+  /** One-click launch pipeline (operator-facing). Lower-level `assets*` tracks image batch. */
+  launchStatus?:
+    | "draft"
+    | "materializing"
+    | "generating_assets"
+    | "assembling_metadata"
+    | "shopify_ready"
+    | "syncing_shopify"
+    | "live"
+    | "failed";
+  launchSource?: "one_click" | string;
+  launchStartedAt?: Timestamp | null;
+  launchUpdatedAt?: Timestamp | null;
+  launchPipelineVersion?: number;
+  launchNote?: string | null;
+  /** Denormalized gallery slot order for default PDP / Shopify (8394 roles). */
+  defaultGalleryRoleOrder?: Rp8394InitialAssetRole[];
+  heroSelectionRule?: string | null;
+  featuredImagePreference?: string | null;
+  linkedBlankId?: string | null;
+  linkedDesignId?: string | null;
+  linkedTeamId?: string | null;
+  launchMetadataFilledAt?: Timestamp | null;
+  /** Server evaluation vs `shopifySync.readinessCheck` (variant matrix). */
+  shopifyReady?: boolean;
+  shopifyReadinessMissing?: string[] | null;
 
   /** Alt-image system: denormalized counts / by-kind (optional; canonical data in `rp_product_assets`). */
   sceneAssetSummary?: {
@@ -1416,6 +1498,13 @@ export interface RpProductVariant {
   assetPipeline?: RpVariantAssetPipeline8394 | null;
   /** When due, scheduled retry runs missing 8394 base assets. */
   variant8394NextRetryAt?: Timestamp | null;
+  /** One primary size per color receives generation; other sizes inherit media from this variant. */
+  isPrimaryForColor?: boolean;
+  inheritsMediaFromVariantId?: string | null;
+  /** Active `rp_product_asset_batches` id for orchestration callbacks (primary variant only). */
+  productAssetBatchId?: string | null;
+  /** Blank color key matching batch.colors (usually `blankVariantId`). */
+  productAssetColorKey?: string | null;
   createdAt: Timestamp;
   updatedAt: Timestamp;
   createdBy: string;
@@ -2180,6 +2269,11 @@ export interface RpRenderTargetSettings {
  */
 export interface RPBlankRenderProfile {
   renderTargets?: Partial<Record<RpRenderTarget, RpRenderTargetSettings>>;
+  /**
+   * Per-color (variantId) × per-render-target tuning. Merged on top of `renderTargets[target]` for that blank.
+   * Used for 8394 master blanks so each garment color can tune flat/model placement independently.
+   */
+  renderTargetsByColor?: Partial<Record<string, Partial<Record<RpRenderTarget, RpRenderTargetSettings>>>>;
 }
 
 export type RPBlankVariantRenderTargetOverrides = Partial<
@@ -2489,6 +2583,8 @@ export interface RPBlank {
    * Product page resolves: blank → team → design → central config.
    */
   generationDefaults?: RPBlankGenerationDefaults | null;
+  /** Optional `rp_identities` id for default on-model generation (orchestrator / Generate tab). */
+  defaultModelId?: string | null;
   /**
    * Default placement driver for new products: which garment side(s) are intended for print.
    * Inferred from `garmentCategory` when unset (e.g. panty/thong → back_only, tank/crewneck → front_only).
@@ -2626,6 +2722,8 @@ export interface DesignTeam {
   slug?: string | null;
   /** Mirror of leagueId for templates/filters (e.g. MLB, NFL). */
   leagueCode?: string | null;
+  /** Optional `rp_identities` id for default on-model generation (orchestrator / Generate tab). */
+  defaultModelId?: string | null;
   /**
    * Default model + on-model preset for generation when design does not override.
    * Product page resolves: blank → **team** → design → config.

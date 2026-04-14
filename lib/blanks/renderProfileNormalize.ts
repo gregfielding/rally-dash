@@ -104,6 +104,24 @@ function normalizeTargetSettings(o: unknown): RpRenderTargetSettings | null {
   return out;
 }
 
+function normalizeRenderTargetsByColor(
+  raw: unknown
+): Partial<Record<string, Partial<Record<RpRenderTarget, RpRenderTargetSettings>>>> | undefined {
+  if (raw == null || typeof raw !== "object") return undefined;
+  const out: Partial<Record<string, Partial<Record<RpRenderTarget, RpRenderTargetSettings>>>> = {};
+  for (const [vid, map] of Object.entries(raw as Record<string, unknown>)) {
+    if (!vid || typeof vid !== "string") continue;
+    if (map == null || typeof map !== "object") continue;
+    const inner: Partial<Record<RpRenderTarget, RpRenderTargetSettings>> = {};
+    for (const key of RENDER_TARGETS) {
+      const slice = normalizeTargetSettings((map as Record<string, unknown>)[key]);
+      if (slice) inner[key] = slice;
+    }
+    if (Object.keys(inner).length) out[vid] = inner;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 /**
  * Returns `null` when absent, invalid, or empty after normalization.
  */
@@ -112,13 +130,17 @@ export function normalizeRPBlankRenderProfile(input: unknown): RPBlankRenderProf
   if (typeof input !== "object") return null;
   const root = input as Record<string, unknown>;
   const rtRaw = root.renderTargets;
-  if (rtRaw == null || typeof rtRaw !== "object") return null;
-
   const renderTargets: Partial<Record<RpRenderTarget, RpRenderTargetSettings>> = {};
-  for (const key of RENDER_TARGETS) {
-    const slice = normalizeTargetSettings((rtRaw as Record<string, unknown>)[key]);
-    if (slice) renderTargets[key] = slice;
+  if (rtRaw != null && typeof rtRaw === "object") {
+    for (const key of RENDER_TARGETS) {
+      const slice = normalizeTargetSettings((rtRaw as Record<string, unknown>)[key]);
+      if (slice) renderTargets[key] = slice;
+    }
   }
-  if (Object.keys(renderTargets).length === 0) return null;
-  return { renderTargets };
+  const renderTargetsByColor = normalizeRenderTargetsByColor(root.renderTargetsByColor);
+  if (Object.keys(renderTargets).length === 0 && !renderTargetsByColor) return null;
+  const out: RPBlankRenderProfile = {};
+  if (Object.keys(renderTargets).length) out.renderTargets = renderTargets;
+  if (renderTargetsByColor) out.renderTargetsByColor = renderTargetsByColor;
+  return out;
 }

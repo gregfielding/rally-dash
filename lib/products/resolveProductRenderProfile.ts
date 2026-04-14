@@ -21,15 +21,22 @@ import type {
   RpProduct,
   RpProductPlacementOverrideSlice,
   RpProductRenderOverrideSlice,
+  RpRenderTarget,
   RpRenderTargetKey,
   RpRenderTargetSettings,
 } from "@/lib/types/firestore";
 import { DEFAULT_GARMENT_SAFE_AREA } from "@/lib/render/designArtboardSpec";
-import { normalizeSimpleControls8394, derivePlacementEngineFields8394 } from "@/lib/blanks/simpleRenderControls8394";
+import {
+  normalizeSimpleControls8394,
+  derivePlacementEngineFields8394,
+  mapRealismToBlend,
+} from "@/lib/blanks/simpleRenderControls8394";
 import type { PlacementRowLike } from "@/lib/render/renderTargetTuning";
 import {
+  RENDER_TARGETS,
   blendSettingsToEngineBlend,
   buildRenderTargetSettingsMap,
+  cloneRenderTargetSettings,
   getDefaultRenderTargetSettings,
   mergeRenderTargetSettings,
   variantRenderTargetSliceIsMeaningful,
@@ -573,16 +580,23 @@ function productPlacementToRenderTargetSettingsPatch(
   return { placement: p as RpPlacementSettings };
 }
 
+export type RenderProfileTuningLayer = "color_matrix" | "blank_renderTargets" | "placement_defaults";
+
 export type ResolveRenderTargetSettingsQa = {
   target: RpRenderTargetKey;
   blankTuningExisted: boolean;
   variantTargetOverrideExisted: boolean;
   productPlacementApplied: boolean;
+  /** Highest-precedence blank-owned layer that contributed tuning (before legacy variant + product patches). */
+  primaryTuningLayer: RenderProfileTuningLayer;
+  colorMatrixCellExisted: boolean;
 };
 
 /**
- * Effective per-render-target tuning: blank `renderProfile.renderTargets[target]` → variant `renderTargetOverrides[target]`
- * → product placement override (x/y/scale only for now). Geometry (safe area) stays on `placements[]`.
+ * Effective per-render-target tuning (merge order — later wins):
+ * placement row defaults → blank `renderProfile.renderTargets[target]` → legacy `variant.renderTargetOverrides[target]`
+ * → **`renderProfile.renderTargetsByColor[variantId][target]`** (matrix wins over legacy variant for the same fields)
+ * → product placement override (x/y/scale only). Geometry (safe area) stays on `placements[]`.
  * Product blend override is applied in `resolveEngineBlendForRenderTarget` (not merged into `settings.blend` here).
  */
 export function resolveEffectiveRenderTargetSettings(
@@ -595,6 +609,10 @@ export function resolveEffectiveRenderTargetSettings(
   const rows = (blank.placements ?? []) as PlacementRowLike[];
   const persisted = blank.renderProfile?.renderTargets;
   const blankHad = Boolean(persisted?.[target] && typeof persisted[target] === "object");
+  const vid = variant?.variantId;
+  const byColor = vid ? blank.renderProfile?.renderTargetsByColor?.[vid] : undefined;
+  const colorMatrixCell = byColor?.[target];
+  const colorMatrixCellExisted = Boolean(colorMatrixCell && typeof colorMatrixCell === "object");
 
   const baseMap = buildRenderTargetSettingsMap(persisted, rows, styleCode);
   let settings = baseMap[target];
@@ -631,11 +649,23 @@ export function resolveEffectiveRenderTargetSettings(
     );
   }
 
+  /**
+   * Legacy per-color `variant.renderTargetOverrides` merges first, then
+   * `renderTargetsByColor[variantId][target]` wins — matrix is authoritative for 8394 tuning.
+   */
   const vSlice = variantSliceForRenderTarget(variant, target);
   settings = mergeRenderTargetSettings(
     settings,
     variantSliceToRenderTargetSettingsPatch(vSlice, fallbackRow, styleCode)
   );
+
+  let primaryTuningLayer: RenderProfileTuningLayer = blankHad
+    ? "blank_renderTargets"
+    : "placement_defaults";
+  if (colorMatrixCellExisted) {
+    settings = mergeRenderTargetSettings(settings, colorMatrixCell!);
+    primaryTuningLayer = "color_matrix";
+  }
 
   const prodPatch = productPlacementToRenderTargetSettingsPatch(product, side);
   const productPlacementApplied = Boolean(prodPatch.placement && Object.keys(prodPatch.placement).length > 0);
@@ -648,14 +678,33 @@ export function resolveEffectiveRenderTargetSettings(
       blankTuningExisted: blankHad,
       variantTargetOverrideExisted: variantRenderTargetSliceIsMeaningful(vSlice),
       productPlacementApplied,
+      primaryTuningLayer,
+      colorMatrixCellExisted,
     },
   };
+}
+
+/** Editor / preview: full map of effective tuning per target (blank + optional color variant overrides). */
+export function buildEffectiveRenderTargetSettingsMap(
+  blank: RPBlank,
+  variant: RPBlankVariant | null | undefined
+): Record<RpRenderTarget, RpRenderTargetSettings> {
+  const out = {} as Record<RpRenderTarget, RpRenderTargetSettings>;
+  for (const t of RENDER_TARGETS) {
+    const { settings } = resolveEffectiveRenderTargetSettings(null, blank, variant ?? null, t);
+    out[t] = cloneRenderTargetSettings(settings);
+  }
+  return out;
 }
 
 /**
  * Sharp / compositor blend: start from resolved target tuning (`fabricFeel` / `printStrength` / `mode`), then apply
  * variant global `renderOverrides` and product / legacy blend overrides (same precedence as `resolveEffectiveRenderSettingsForRenderTarget`).
  */
+function clamp01(n: number): number {
+  return Math.min(1, Math.max(0, n));
+}
+
 export function resolveEngineBlendForRenderTarget(
   product: RpProduct | null | undefined,
   _blank: RPBlank,
@@ -664,7 +713,13 @@ export function resolveEngineBlendForRenderTarget(
   tuningBlend: RpBlendSettings
 ): EffectiveRenderSettings {
   const side = renderTargetToSide(target);
-  const fromTuning = blendSettingsToEngineBlend(tuningBlend);
+  const styleCode = String(_blank.styleCode || "").trim();
+  const fromTuning =
+    styleCode === "8394"
+      ? mapRealismToBlend(
+          Math.round(clamp01(typeof tuningBlend.fabricFeel === "number" ? tuningBlend.fabricFeel : 0.52) * 100)
+        )
+      : blendSettingsToEngineBlend(tuningBlend);
   let modeRaw = fromTuning.blendMode;
   let opRaw = fromTuning.blendOpacity;
   let source: PlacementResolutionSource = "blank";

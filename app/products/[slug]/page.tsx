@@ -6,6 +6,7 @@ import Link from "next/link";
 import { addDoc, collection, deleteDoc, doc, getDoc, getDocs, query, serverTimestamp, updateDoc, where, writeBatch } from "firebase/firestore";
 import { db } from "@/lib/firebase/config";
 import ProtectedRoute from "@/components/ProtectedRoute";
+import { useAuth } from "@/lib/providers/AuthProvider";
 import { useProductBySlug, useProducts } from "@/lib/hooks/useRPProducts";
 import { getRelatedProducts } from "@/lib/products/relatedProducts";
 import { useProductDesigns } from "@/lib/hooks/useRPProductDesigns";
@@ -31,7 +32,7 @@ import { useDesignConcepts } from "@/lib/hooks/useDesignConcepts";
 import { useCreateProductDesign, useCreateDesignFromConcept, useCreateDesignBrief } from "@/lib/hooks/useDesignMutations";
 import { useDesign, useDesigns } from "@/lib/hooks/useDesignAssets";
 import { useBlank, useBlanks } from "@/lib/hooks/useBlanks";
-import { getVariantById, inferDefaultPrintSides } from "@/lib/blanks";
+import { get8394EngineQaMetrics, getVariantById, inferDefaultPrintSides } from "@/lib/blanks";
 import { designSupportsGarmentSide, getDesignPreviewUrl } from "@/lib/designs/designHelpers";
 import {
   computeProductFlatRenderFingerprintAsync,
@@ -82,6 +83,7 @@ import {
 import {
   hasProductPlacementOverride,
   resolveEffectivePlacement,
+  resolveEffectiveRenderTargetSettings,
 } from "@/lib/products/resolveProductRenderProfile";
 import { HANGER_CREWNECK_SCENE_TEMPLATE } from "@/lib/scenes/sceneTemplates";
 import { pickFlatBlendedUrlForScene } from "@/lib/scenes/sceneRenderHelpers";
@@ -1789,7 +1791,7 @@ function ProductDetailContent() {
   const router = useRouter();
   const slug = (params?.slug as string) || "";
   const [activeTab, setActiveTab] = useState<
-    "product" | "images" | "shopifyPreview" | "order" | "metrics"
+    "product" | "images" | "generate" | "shopifyPreview" | "order" | "metrics"
   >("product");
   const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const mockupPollCancelledRef = useRef(false);
@@ -1810,6 +1812,15 @@ function ProductDetailContent() {
 
   const [productVariants, setProductVariants] = useState<ProductVariantRow[]>([]);
   const [productVariantsLoading, setProductVariantsLoading] = useState(false);
+  /** Raw `variants` subcollection doc count from `getDocs` (before variantSummary fallback merge). */
+  const [variantSubcollectionDocCount, setVariantSubcollectionDocCount] = useState<number | null>(null);
+  const [variantSubdocSampleIds, setVariantSubdocSampleIds] = useState<string[]>([]);
+
+  const { adminUser } = useAuth();
+  const showProductVariantDebugPanel =
+    process.env.NODE_ENV === "development" ||
+    adminUser?.role === "admin" ||
+    adminUser?.role === "ops";
 
   const treatsAsParentProduct = useMemo(() => isParentProductRow(product), [
     product?.id,
@@ -1855,6 +1866,8 @@ function ProductDetailContent() {
       if (!db || !product?.id || !treatsAsParentProduct) {
         if (!cancelled) {
           setProductVariants([]);
+          setVariantSubcollectionDocCount(null);
+          setVariantSubdocSampleIds([]);
           setProductVariantsLoading(false);
         }
         if (product?.id && !treatsAsParentProduct) {
@@ -1923,6 +1936,7 @@ function ProductDetailContent() {
           }));
         }
 
+        const distinctBv = [...new Set(rows.map((r) => r.blankVariantId).filter(Boolean))];
         console.info("[ProductDetail][variants-debug] subcollection result", {
           parentDocId: parentId,
           queriedPath: variantsPath,
@@ -1931,8 +1945,30 @@ function ProductDetailContent() {
           variantSummaryLen: product.variantSummary?.length ?? 0,
           effectiveRowCountAfterMerge: rows.length,
         });
+        console.info(
+          "[PRODUCT_IMAGES:READ]",
+          JSON.stringify({
+            productId: parentId,
+            routeSlug: slug,
+            treatsAsParentProduct,
+            variantDocsFound: snap.docs.length,
+            distinctBlankVariantIds: distinctBv,
+            firstFewVariantDocs: snap.docs.slice(0, 8).map((d) => {
+              const v = d.data() as { blankVariantId?: string | null; optionValues?: { size?: string | null } };
+              return {
+                docId: d.id,
+                blankVariantId: v.blankVariantId ?? null,
+                size: v.optionValues?.size ?? null,
+              };
+            }),
+          })
+        );
 
-        if (!cancelled) setProductVariants(rows);
+        if (!cancelled) {
+          setVariantSubcollectionDocCount(snap.docs.length);
+          setVariantSubdocSampleIds(snap.docs.slice(0, 5).map((d) => d.id));
+          setProductVariants(rows);
+        }
       } catch (err) {
         console.error("[ProductDetail] Failed to load variants:", err);
         const fallback =
@@ -1949,7 +1985,11 @@ function ProductDetailContent() {
               size: s.sizeCode ?? product.availableSizes?.[0] ?? null,
             },
           })) ?? [];
-        if (!cancelled) setProductVariants(fallback);
+        if (!cancelled) {
+          setVariantSubcollectionDocCount(null);
+          setVariantSubdocSampleIds([]);
+          setProductVariants(fallback);
+        }
       } finally {
         if (!cancelled) setProductVariantsLoading(false);
       }
@@ -2121,22 +2161,16 @@ function ProductDetailContent() {
     };
 
     if (treatsAsParentProduct && productVariants.length > 0) {
-      const tryList = [
-        shopifyPreviewVariantDoc,
-        product.heroVariantId ? productVariants.find((x) => x.id === product.heroVariantId) : undefined,
-        product.defaultVariantId ? productVariants.find((x) => x.id === product.defaultVariantId) : undefined,
-        productVariants[0],
-      ];
-      for (const row of tryList) {
-        const urls = urlsFromVariant(row);
-        if (urls.length > 0) {
-          for (const u of urls) add(u);
-          appendSceneExtras();
-          return out;
-        }
+      // Only the selected variant row — never substitute hero/default/first variant images or parent
+      // displayMedia when the selection has no URLs yet (that showed another color’s mock in Shopify preview).
+      const row = shopifyPreviewVariantDoc;
+      if (row) {
+        for (const u of urlsFromVariant(row)) add(u);
       }
-      appendParentFallback();
       appendSceneExtras();
+      if (out.length === 0 && !imagesTabVariantId) {
+        appendParentFallback();
+      }
       return out;
     }
 
@@ -2374,6 +2408,18 @@ function ProductDetailContent() {
       sizePresetLabel,
     };
   }, [is8394ProductContext, currentBlank, designForFlatRender, product?.blankVariantId]);
+
+  /** QA: same 8394 realism / ink curves as compositor for resolved flat_back (blank + variant + product). */
+  const mvp8394FlatBackEngineQa = useMemo(() => {
+    if (!is8394ProductContext || !currentBlank || !product?.blankVariantId) return null;
+    const v = getVariantById(currentBlank, product.blankVariantId);
+    if (!v) return null;
+    const eff = resolveEffectiveRenderTargetSettings(product, currentBlank, v, "flat_back");
+    const ff = eff.settings.blend.fabricFeel;
+    const ps = eff.settings.blend.printStrength;
+    if (typeof ff !== "number" || typeof ps !== "number") return null;
+    return get8394EngineQaMetrics(ff, ps);
+  }, [is8394ProductContext, currentBlank, product, product?.blankVariantId]);
 
   /** Same blank → quick jump while tuning 8394 across colorways. */
   const [linked8394Nav, setLinked8394Nav] = useState<{ id: string; slug: string; name: string }[]>([]);
@@ -3465,6 +3511,7 @@ function ProductDetailContent() {
   const tabs = [
     { id: "product", label: "Product" },
     { id: "images", label: "Images" },
+    { id: "generate", label: "Generate" },
     { id: "shopifyPreview", label: "Shopify preview" },
     { id: "order", label: "Order / production" },
     { id: "metrics", label: "Metrics" },
@@ -3544,6 +3591,17 @@ function ProductDetailContent() {
           {" · "}
           {product.baseProductKey} · {product.colorway?.name ?? "—"}
         </p>
+        {showProductVariantDebugPanel && product?.id && (
+          <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-mono text-amber-950 space-y-1">
+            <div className="font-semibold text-amber-900">Variant load debug (ops / dev)</div>
+            <div>productId: {product.id}</div>
+            <div>isParentProductRow: {String(treatsAsParentProduct)}</div>
+            <div>variantSummary.length: {product.variantSummary?.length ?? 0}</div>
+            <div>colorVariantCount: {product.colorVariantCount ?? "—"}</div>
+            <div>queried variant subdoc count: {variantSubcollectionDocCount ?? "—"}</div>
+            <div>first 5 variant subdoc IDs: {variantSubdocSampleIds.length ? variantSubdocSampleIds.join(", ") : "—"}</div>
+          </div>
+        )}
         {show8394VariantReadinessUi && (
           <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50/90 px-4 py-3 text-sm text-slate-800">
             <p className="font-semibold text-slate-900">8394 variant assets</p>
@@ -4060,6 +4118,17 @@ function ProductDetailContent() {
 
         {activeTab === "images" && (
           <div className="space-y-6">
+            <p className="text-xs text-gray-600 rounded-md border border-gray-200 bg-slate-50/90 px-3 py-2 leading-snug">
+              <span className="font-medium text-gray-800">Images</span> — color selection, source assets, and gallery.{" "}
+              <button
+                type="button"
+                className="text-blue-600 font-semibold hover:underline"
+                onClick={() => setActiveTab("generate")}
+              >
+                Generate tab
+              </button>{" "}
+              has mockups, flat/model batches, and advanced overrides.
+            </p>
             {treatsAsParentProduct && (
               <div className="rounded-lg border border-gray-200 bg-white p-4">
                 <h2 className="text-sm font-semibold text-gray-900 mb-1">Color variant</h2>
@@ -4589,52 +4658,86 @@ function ProductDetailContent() {
                 )}
 
                 {mvp8394VerifyPanel && (
-                  <div className="mb-4 rounded-lg border border-indigo-100 bg-white/80 px-3 py-2 text-xs text-gray-700 grid sm:grid-cols-2 lg:grid-cols-3 gap-x-4 gap-y-2">
-                    <div>
-                      <span className="font-semibold text-gray-500 uppercase tracking-wide">Position</span>
-                      <p className="mt-0.5 text-gray-700">
-                        Set on the blank (drag the print in Render profile). This product uses the saved placement for the back
-                        zone.
-                      </p>
+                  <div className="mb-4 rounded-lg border border-indigo-100 bg-white/80 px-3 py-2 text-xs text-gray-700 space-y-3">
+                    <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-x-4 gap-y-2">
+                      <div>
+                        <span className="font-semibold text-gray-500 uppercase tracking-wide">Position</span>
+                        <p className="mt-0.5 text-gray-700">
+                          Set on the blank (drag the print in Render profile). This product uses the saved placement for the back
+                          zone.
+                        </p>
+                      </div>
+                      <div>
+                        <span className="font-semibold text-gray-500 uppercase tracking-wide">Realism · Ink strength · Size</span>
+                        <p className="mt-0.5">
+                          {mvp8394VerifyPanel.simple8394 ? (
+                            <>
+                              Realism <strong>{mvp8394VerifyPanel.simple8394.realism}</strong> · Ink strength{" "}
+                              <strong>{mvp8394VerifyPanel.simple8394.inkStrength}</strong> · Size{" "}
+                              <strong>{mvp8394VerifyPanel.sizePresetLabel}</strong>
+                            </>
+                          ) : (
+                            <span className="text-amber-800">Not set on blank — open Render profile and save.</span>
+                          )}
+                        </p>
+                      </div>
+                      <div className="sm:col-span-2 lg:col-span-1">
+                        <span className="font-semibold text-gray-500 uppercase tracking-wide">This product</span>
+                        <p className="mt-0.5 break-all">
+                          Color: <strong>{mvp8394VerifyPanel.variantLabel}</strong>
+                          <br />
+                          Garment photo (back):{" "}
+                          {mvp8394VerifyPanel.variantBackUrl ? (
+                            <a href={mvp8394VerifyPanel.variantBackUrl} className="text-indigo-600 underline" target="_blank" rel="noreferrer">
+                              View
+                            </a>
+                          ) : (
+                            <span className="text-red-600">Missing</span>
+                          )}
+                          <br />
+                          Design PNG ({mvp8394VerifyPanel.designPick.ref}):{" "}
+                          {mvp8394VerifyPanel.designPick.url ? (
+                            <a href={mvp8394VerifyPanel.designPick.url} className="text-indigo-600 underline" target="_blank" rel="noreferrer">
+                              Open
+                            </a>
+                          ) : (
+                            <span className="text-red-600">Missing</span>
+                          )}
+                        </p>
+                      </div>
                     </div>
-                    <div>
-                      <span className="font-semibold text-gray-500 uppercase tracking-wide">Realism · Ink strength · Size</span>
-                      <p className="mt-0.5">
-                        {mvp8394VerifyPanel.simple8394 ? (
-                          <>
-                            Realism <strong>{mvp8394VerifyPanel.simple8394.realism}</strong> · Ink strength{" "}
-                            <strong>{mvp8394VerifyPanel.simple8394.inkStrength}</strong> · Size{" "}
-                            <strong>{mvp8394VerifyPanel.sizePresetLabel}</strong>
-                          </>
-                        ) : (
-                          <span className="text-amber-800">Not set on blank — open Render profile and save.</span>
-                        )}
-                      </p>
-                    </div>
-                    <div className="sm:col-span-2 lg:col-span-1">
-                      <span className="font-semibold text-gray-500 uppercase tracking-wide">This product</span>
-                      <p className="mt-0.5 break-all">
-                        Color: <strong>{mvp8394VerifyPanel.variantLabel}</strong>
-                        <br />
-                        Garment photo (back):{" "}
-                        {mvp8394VerifyPanel.variantBackUrl ? (
-                          <a href={mvp8394VerifyPanel.variantBackUrl} className="text-indigo-600 underline" target="_blank" rel="noreferrer">
-                            View
-                          </a>
-                        ) : (
-                          <span className="text-red-600">Missing</span>
-                        )}
-                        <br />
-                        Design PNG ({mvp8394VerifyPanel.designPick.ref}):{" "}
-                        {mvp8394VerifyPanel.designPick.url ? (
-                          <a href={mvp8394VerifyPanel.designPick.url} className="text-indigo-600 underline" target="_blank" rel="noreferrer">
-                            Open
-                          </a>
-                        ) : (
-                          <span className="text-red-600">Missing</span>
-                        )}
-                      </p>
-                    </div>
+                    {mvp8394FlatBackEngineQa ? (
+                      <div className="pt-2 border-t border-indigo-100">
+                        <span className="font-semibold text-gray-500 uppercase tracking-wide">
+                          Resolved 8394 engine (flat_back)
+                        </span>
+                        <p className="text-[10px] text-gray-500 mt-0.5 mb-1.5 font-sans leading-snug">
+                          From <code className="bg-indigo-50/80 px-1 rounded">renderProfile.renderTargets.flat_back</code> merge
+                          (QA — same curves as compositor).
+                        </p>
+                        <dl className="grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-1 font-mono text-[10px] text-gray-900">
+                          <div className="flex justify-between gap-2">
+                            <dt className="text-gray-600 font-sans">Realism (0–100)</dt>
+                            <dd>{mvp8394FlatBackEngineQa.realism0to100}</dd>
+                          </div>
+                          <div className="flex justify-between gap-2">
+                            <dt className="text-gray-600 font-sans">Ink (0–100)</dt>
+                            <dd>{mvp8394FlatBackEngineQa.inkStrength0to100}</dd>
+                          </div>
+                          <div className="flex justify-between gap-2">
+                            <dt className="text-gray-600 font-sans">Blend opacity</dt>
+                            <dd>{mvp8394FlatBackEngineQa.effectiveBlendOpacity.toFixed(3)}</dd>
+                          </div>
+                          <div className="flex justify-between gap-2">
+                            <dt className="text-gray-600 font-sans">Ink multiplier</dt>
+                            <dd>{mvp8394FlatBackEngineQa.effectiveInkMultiplier.toFixed(3)}</dd>
+                          </div>
+                        </dl>
+                        <p className="text-[9px] text-gray-500 mt-1 font-sans">
+                          Layer mode <span className="font-mono">{mvp8394FlatBackEngineQa.blendMode}</span>
+                        </p>
+                      </div>
+                    ) : null}
                   </div>
                 )}
 
@@ -4918,7 +5021,11 @@ function ProductDetailContent() {
                       {gallery.length > 0 ? (
                         <img src={gallery[safeIdx]} alt="" className="max-w-full max-h-full object-contain" />
                       ) : (
-                        <span className="text-sm text-gray-400">No images yet — add heroes or a mockup on the Images tab</span>
+                        <span className="text-sm text-gray-400 text-center px-4">
+                          {treatsAsParentProduct && productVariants.length > 0
+                            ? "No images for this color/size yet — run Generate on the Images tab for this variant, or wait for assets to finish."
+                            : "No images yet — add heroes or a mockup on the Images tab"}
+                        </span>
                       )}
                     </div>
                     {gallery.length > 1 && (
@@ -5732,12 +5839,18 @@ function ProductDetailContent() {
                 </div>
               ) : null}
 
-              <div className="space-y-6 border-t border-gray-200 pt-8">
+            </div>
+          </>
+        )}
+
+        {activeTab === "generate" && (
+          <>
+            <div className="space-y-6 pt-1">
             <div>
               <h2 className="text-lg font-semibold text-gray-900 mb-2">Generate</h2>
               <p className="text-sm text-gray-500 mb-4">
-                Review outputs above, then run generation using <strong>resolved defaults</strong> (Blank → Team → Design →
-                config) or expand <strong>Advanced overrides</strong> for a one-off run.
+                Run mockups, flat renders, and on-model batches. Defaults follow Blank → Team → Design → preset. Use{" "}
+                <strong className="text-gray-700">Advanced overrides</strong> for one-off runs.
               </p>
 
               <div className="space-y-3 mb-6">
@@ -6484,7 +6597,6 @@ function ProductDetailContent() {
               </div>
             </div>
           </div>
-            </div>
           </>
         )}
 

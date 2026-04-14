@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback } from "react";
+import { getApp } from "firebase/app";
 import { httpsCallable } from "firebase/functions";
 import { functions } from "@/lib/firebase/config";
 import { useSWRConfig } from "swr";
@@ -46,7 +47,12 @@ export function useCreateProductFromDesignBlank() {
       }
       const fn = httpsCallable(functions, "createProductFromDesignBlank");
       const result = await fn(input);
-      await mutate("rp_products", undefined, { revalidate: true });
+      // SWR keys are `rp_products:${JSON.stringify(filters)}` and `rp_product:${slug}` — not the bare string `rp_products`.
+      await mutate(
+        (key) => typeof key === "string" && key.startsWith("rp_product"),
+        undefined,
+        { revalidate: true }
+      );
       return result.data as {
         ok: boolean;
         productId: string;
@@ -61,6 +67,26 @@ export function useCreateProductFromDesignBlank() {
   return { createProductFromDesignBlank };
 }
 
+/** Client-side timeout for multi-color variant creation (default SDK timeout is 70s). */
+const CREATE_VARIANTS_CALLABLE_TIMEOUT_MS = 180000;
+
+function logTeamProductGen(stage: string, payload: Record<string, unknown>) {
+  console.info(
+    `[TEAM_PRODUCT_GEN:UI:CALLABLE] ${stage}`,
+    JSON.stringify({ ...payload, t: new Date().toISOString() })
+  );
+}
+
+function logCallableError(context: string, err: unknown) {
+  const e = err as { code?: string; message?: string; details?: unknown };
+  logTeamProductGen("ERROR", {
+    context,
+    code: e?.code ?? null,
+    message: e?.message ?? String(err),
+    details: e?.details ?? null,
+  });
+}
+
 /**
  * One Cloud Function call: parent + many variants (team catalog / bulk color adds).
  * Prefer over looping `createProductFromDesignBlank` so the parent is created once server-side.
@@ -73,13 +99,76 @@ export function useCreateProductVariantsFromDesignBlank() {
       if (!functions) {
         throw new Error("Cloud Functions not initialized");
       }
-      const fn = httpsCallable(functions, "createProductVariantsFromDesignBlank");
-      const result = await fn(input);
-      await mutate("rp_products", undefined, { revalidate: true });
+      let projectId: string | null = null;
+      try {
+        projectId = getApp().options.projectId ?? null;
+      } catch {
+        projectId = null;
+      }
+      const t0 = typeof performance !== "undefined" ? performance.now() : Date.now();
+      logTeamProductGen("REQUEST", {
+        projectId,
+        region: functions.region,
+        name: "createProductVariantsFromDesignBlank",
+        timeoutMs: CREATE_VARIANTS_CALLABLE_TIMEOUT_MS,
+        designId: input.designId,
+        blankId: input.blankId,
+        blankVariantIds: input.blankVariantIds,
+        variantCount: input.blankVariantIds.length,
+      });
+      const fn = httpsCallable(functions, "createProductVariantsFromDesignBlank", {
+        timeout: CREATE_VARIANTS_CALLABLE_TIMEOUT_MS,
+      });
+      let result;
+      try {
+        result = await fn(input);
+      } catch (err) {
+        logCallableError("createProductVariantsFromDesignBlank", err);
+        throw err;
+      }
+      const elapsedMs =
+        (typeof performance !== "undefined" ? performance.now() : Date.now()) - t0;
+      const data = result.data as {
+        ok?: boolean;
+        parentProductId?: string | null;
+        createdColorCount?: number;
+        variantSubdocCountVerified?: number | null;
+      };
+      logTeamProductGen("RESPONSE", {
+        projectId,
+        elapsedMs: Math.round(elapsedMs),
+        ok: data?.ok !== false,
+        parentProductId: data?.parentProductId ?? null,
+        createdColorCount: data?.createdColorCount ?? null,
+        variantSubdocCountVerified: data?.variantSubdocCountVerified ?? null,
+      });
+      await mutate(
+        (key) => typeof key === "string" && key.startsWith("rp_product"),
+        undefined,
+        { revalidate: true }
+      );
       return result.data as {
         ok: boolean;
         productId: string | null;
         slug: string | null;
+        /** Echoed for runtime proof — compare to `[TEAM_PRODUCT_GEN:SERVER:FIRESTORE_VERIFY]`. */
+        parentProductId: string | null;
+        createdColorCount: number;
+        createdSkuCount: number;
+        variantSubdocCountVerified: number | null;
+        assetsBatchId?: string | null;
+        assetsStatus?: string | null;
+        queuedColorCount?: number | null;
+        queuedRoleCount?: number | null;
+        assetBatch?: {
+          ok?: boolean;
+          assetsBatchId?: string;
+          assetsStatus?: string;
+          queuedColorCount?: number;
+          queuedRoleCount?: number;
+          code?: string;
+          skipped?: boolean;
+        } | null;
         results: Array<{
           blankVariantId: string;
           variantFirestoreId?: string;
@@ -97,6 +186,62 @@ export function useCreateProductVariantsFromDesignBlank() {
   );
 
   return { createProductVariantsFromDesignBlank };
+}
+
+/** One-click launch: variants + metadata defaults + asset batch + `launchStatus` (use for Generate Products). */
+export function useLaunchProductsFromDesign() {
+  const { mutate } = useSWRConfig();
+
+  const launchProductsFromDesign = useCallback(
+    async (input: {
+      designId: string;
+      blankId: string;
+      blankVariantIds: string[];
+      forceAssetBatch?: boolean;
+      autoSyncShopify?: boolean;
+    }) => {
+      if (!functions) {
+        throw new Error("Cloud Functions not initialized");
+      }
+      const fn = httpsCallable(functions, "launchProductsFromDesign", {
+        timeout: CREATE_VARIANTS_CALLABLE_TIMEOUT_MS,
+      });
+      const result = await fn(input);
+      await mutate(
+        (key) => typeof key === "string" && key.startsWith("rp_product"),
+        undefined,
+        { revalidate: true }
+      );
+      return result.data as {
+        ok: boolean;
+        productId: string | null;
+        slug: string | null;
+        parentProductId: string | null;
+        createdColorCount: number;
+        createdSkuCount: number;
+        variantSubdocCountVerified: number | null;
+        assetsBatchId?: string | null;
+        assetsStatus?: string | null;
+        launchMode?: boolean;
+        autoSyncShopify?: boolean;
+        assetBatch?: Record<string, unknown> | null;
+        results: Array<{
+          blankVariantId: string;
+          variantFirestoreId?: string;
+          variantFirestoreIds?: string[];
+          productId?: string | null;
+          slug?: string | null;
+          created?: boolean;
+          skipped?: boolean;
+          message?: string;
+        }>;
+        errors?: Array<{ blankVariantId: string; message: string }>;
+      };
+    },
+    [mutate]
+  );
+
+  return { launchProductsFromDesign };
 }
 
 /** Re-run server-side merchandising resolution (same as create) for an existing product. */

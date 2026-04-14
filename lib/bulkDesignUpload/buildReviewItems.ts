@@ -6,7 +6,7 @@ import type { DesignDoc } from "@/lib/types/firestore";
 import type { DesignTeam } from "@/lib/types/firestore";
 import { groupParsedFiles, parseDesignFilename, type ParseResult } from "@/lib/batchImport/parseDesignFilename";
 import { inferIdentityFromDesignKey, identityKeyToSlug } from "@/lib/bulkDesignUpload/inferIdentity";
-import { matchDesignTeam } from "@/lib/bulkDesignUpload/matchTeam";
+import { matchDesignTeam, resolveTeamSlugForMatch } from "@/lib/bulkDesignUpload/matchTeam";
 import {
   coverageFromKind,
   emptyCoverage,
@@ -158,11 +158,10 @@ export function buildBulkReviewItems(
     const groupKey = row.designKey;
     const inferred = inferIdentityFromDesignKey(groupKey);
     const parsed = row.parsed;
-    const teamSlugForMatch =
-      inferred.designType === "city_69"
-        ? inferred.teamSlugCandidate
-        : parsed.team || inferred.teamSlugCandidate;
-    const { team, warnings: teamWarnings } = matchDesignTeam(teamSlugForMatch, teams);
+    const teamSlugForMatch = resolveTeamSlugForMatch(parsed.team, inferred);
+    const { team, warnings: teamWarnings } = matchDesignTeam(teamSlugForMatch, teams, {
+      leagueHint: inferred.leagueCode,
+    });
 
     const teamDisplay = team?.name ?? null;
     const teamId = team?.id ?? null;
@@ -181,12 +180,17 @@ export function buildBulkReviewItems(
     const designSeries =
       inferred.designSeriesCandidate || (parsed.designFamily === "city_69" ? "69" : null);
 
+    const familyHuman = humanizeSlug(parsed.designFamily || "");
     const designName =
       inferred.designType === "city_69"
         ? buildDesignName(inferred, parsed.team, teamDisplay)
-        : teamDisplay
-          ? `${teamDisplay} ${humanizeSlug(parsed.designFamily || "")}`.trim()
-          : humanizeSlug(`${parsed.designFamily}_${parsed.team}`.replace(/^_+|_+$/g, ""));
+        : teamDisplay && familyHuman && familyHuman.toLowerCase() === teamDisplay.toLowerCase()
+          ? inferred.themeDisplayName
+            ? `${teamDisplay} ${inferred.themeDisplayName}`.trim()
+            : teamDisplay
+          : teamDisplay
+            ? `${teamDisplay} ${familyHuman}`.trim()
+            : humanizeSlug(`${parsed.designFamily}_${parsed.team}`.replace(/^_+|_+$/g, ""));
 
     const slug = identityKeyToSlug(groupKey);
 

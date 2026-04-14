@@ -30,6 +30,9 @@ const shopifySmartCollections = require("./lib/shopifySmartCollections");
 const { resolveBlankTemplates, stripUnresolvedTemplateArtifacts } = require("./lib/resolveBlankTemplates");
 const merchandisingAtCreate = require("./lib/merchandisingAtCreate");
 const runCreateProductFromDesignBlankCore = require("./lib/runCreateProductFromDesignBlankCore");
+const { startInitialProductAssetBatch } = require("./lib/startInitialProductAssetBatch");
+const { executeTeamProductVariantCreation } = require("./lib/executeTeamProductVariantCreation");
+const { launchProductsFromDesign } = require("./lib/launchProductsFromDesign");
 const { createRegisterGenerateProductFlatRenders } = require("./lib/productFlatRenderMvp");
 const { createRegisterGenerateProductSceneRender } = require("./lib/productSceneRenderMvp");
 const { normalizeColorsForFirestore } = require("./lib/standardPrintInks");
@@ -1718,7 +1721,7 @@ exports.createProductFromDesignBlank = functions.https.onCall(async (data, conte
     throw new functions.https.HttpsError("invalid-argument", "blankId is required");
   }
 
-  return runCreateProductFromDesignBlankCore({
+  const out = await runCreateProductFromDesignBlankCore({
     db,
     admin,
     functions,
@@ -1738,6 +1741,26 @@ exports.createProductFromDesignBlank = functions.https.onCall(async (data, conte
     blankVariantId,
     userId: context.auth.uid,
   });
+
+  let assetBatch = null;
+  if (out && out.ok && out.productId && Array.isArray(out.variantIds) && out.variantIds.length > 0) {
+    try {
+      assetBatch = await startInitialProductAssetBatch({
+        db,
+        admin,
+        sanitizeForFirestore,
+        deriveSizesForProductMatrix,
+        productId: out.productId,
+        variantIds: out.variantIds,
+        userId: context.auth.uid,
+        force: (data || {}).forceAssetBatch === true,
+      });
+    } catch (e) {
+      console.error("[createProductFromDesignBlank] startInitialProductAssetBatch:", e && e.message ? e.message : e);
+    }
+  }
+
+  return { ...out, assetBatch };
 });
 
 /**
@@ -1773,79 +1796,141 @@ exports.createProductVariantsFromDesignBlank = functions.https.onCall(async (dat
     throw new functions.https.HttpsError("invalid-argument", "No valid blankVariantIds after dedupe");
   }
 
-  const results = [];
-  const errors = [];
-  let lastProductId = null;
-  let lastSlug = null;
-
-  for (const blankVariantId of uniqueIds) {
-    try {
-      const out = await runCreateProductFromDesignBlankCore({
-        db,
-        admin,
-        functions,
-        designPngUrlForProcessing,
-        buildInitialRenderSetupForProduct,
-        resolveBlankVariantForProduct,
-        buildProductIdentityKey,
-        buildParentProductIdentityKey,
-        MASTER_BLANK_SCHEMA_VERSION,
-        sanitizeForFirestore,
-        deriveAvailableSizesFromBlank,
-        deriveSizesForProductMatrix,
-        merchandisingAtCreate,
-        resolveBlankTemplates,
-        designId,
-        blankId,
-        blankVariantId,
-        userId: uid,
-      });
-      lastProductId = out.productId;
-      lastSlug = out.slug;
-      results.push({
-        blankVariantId,
-        variantFirestoreId: out.variantId,
-        variantFirestoreIds: out.variantIds,
-        productId: out.productId,
-        slug: out.slug,
-        created: true,
-      });
-    } catch (e) {
-      if (e instanceof functions.https.HttpsError && e.code === "already-exists") {
-        const det = e.details && typeof e.details === "object" ? e.details : {};
-        const pid = det.productId || lastProductId;
-        const slug = det.slug || lastSlug;
-        if (pid) lastProductId = pid;
-        if (slug) lastSlug = slug;
-        results.push({
-          blankVariantId,
-          created: false,
-          skipped: true,
-          productId: pid || null,
-          slug: slug || null,
-          message: e.message,
-        });
-      } else {
-        const msg = e instanceof Error ? e.message : String(e);
-        errors.push({ blankVariantId, message: msg });
-      }
-    }
+  const blankSnap = await db.collection("rp_blanks").doc(blankId).get();
+  const blankData = blankSnap.exists ? blankSnap.data() : null;
+  const blankVariantIdsAll = Array.isArray(blankData?.variants)
+    ? blankData.variants.map((v) => v.variantId).filter(Boolean)
+    : [];
+  const blankVariantIdsActive = Array.isArray(blankData?.variants)
+    ? blankData.variants.filter((v) => v.isActive !== false).map((v) => v.variantId).filter(Boolean)
+    : [];
+  let blankSizes = [];
+  try {
+    blankSizes = blankData ? deriveSizesForProductMatrix(blankData) : [];
+  } catch (e) {
+    blankSizes = [];
   }
 
-  if (results.length === 0 && errors.length > 0) {
+  console.log(
+    JSON.stringify({
+      tag: "[TEAM_PRODUCT_GEN:SERVER:ENTRY]",
+      callable: "createProductVariantsFromDesignBlank",
+      designId,
+      blankId,
+      selectedBlankVariantIds: uniqueIds,
+      selectedCount: uniqueIds.length,
+      userId: uid,
+      timestamp: new Date().toISOString(),
+    })
+  );
+  console.log(
+    JSON.stringify({
+      tag: "[TEAM_PRODUCT_GEN:SERVER:BLANK]",
+      blankId,
+      blankExists: blankSnap.exists,
+      styleCode: blankData?.styleCode ?? null,
+      blankVariantIdsAll,
+      blankVariantIdsActive,
+      blankSizes,
+    })
+  );
+
+  return executeTeamProductVariantCreation({
+    db,
+    admin,
+    functions,
+    runCreateProductFromDesignBlankCore,
+    designPngUrlForProcessing,
+    buildInitialRenderSetupForProduct,
+    resolveBlankVariantForProduct,
+    buildProductIdentityKey,
+    buildParentProductIdentityKey,
+    MASTER_BLANK_SCHEMA_VERSION,
+    sanitizeForFirestore,
+    deriveAvailableSizesFromBlank,
+    deriveSizesForProductMatrix,
+    merchandisingAtCreate,
+    resolveBlankTemplates,
+    designId,
+    blankId,
+    uniqueIds,
+    blankData,
+    uid,
+    forceAssetBatch: (data || {}).forceAssetBatch === true,
+  });
+});
+
+/**
+ * One-click product launch: materialize variants, metadata defaults, initial assets, and (when complete) Shopify readiness.
+ */
+exports.launchProductsFromDesign = functions.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
+  }
+
+  const { designId, blankId, blankVariantIds, forceAssetBatch, autoSyncShopify } = data || {};
+  if (!designId || typeof designId !== "string") {
+    throw new functions.https.HttpsError("invalid-argument", "designId is required");
+  }
+  if (!blankId || typeof blankId !== "string") {
+    throw new functions.https.HttpsError("invalid-argument", "blankId is required");
+  }
+  if (!Array.isArray(blankVariantIds) || blankVariantIds.length === 0) {
     throw new functions.https.HttpsError(
-      "failed-precondition",
-      errors.map((x) => `${x.blankVariantId}: ${x.message}`).join(" | ")
+      "invalid-argument",
+      "blankVariantIds must be a non-empty array of variant ids"
     );
   }
+  if (blankVariantIds.length > 48) {
+    throw new functions.https.HttpsError("invalid-argument", "Too many variants (max 48 per request)");
+  }
 
-  return {
-    ok: true,
-    productId: lastProductId,
-    slug: lastSlug,
-    results,
-    errors: errors.length ? errors : undefined,
-  };
+  const uid = context.auth.uid;
+  const uniqueIds = [...new Set(blankVariantIds.map((x) => String(x || "").trim()).filter(Boolean))];
+  if (uniqueIds.length === 0) {
+    throw new functions.https.HttpsError("invalid-argument", "No valid blankVariantIds after dedupe");
+  }
+
+  const blankSnap = await db.collection("rp_blanks").doc(blankId).get();
+  const blankData = blankSnap.exists ? blankSnap.data() : null;
+
+  console.log(
+    JSON.stringify({
+      tag: "[LAUNCH_PRODUCTS:SERVER:ENTRY]",
+      callable: "launchProductsFromDesign",
+      designId,
+      blankId,
+      selectedBlankVariantIds: uniqueIds,
+      autoSyncShopify: autoSyncShopify === true,
+      userId: uid,
+      timestamp: new Date().toISOString(),
+    })
+  );
+
+  return launchProductsFromDesign({
+    db,
+    admin,
+    functions,
+    runCreateProductFromDesignBlankCore,
+    designPngUrlForProcessing,
+    buildInitialRenderSetupForProduct,
+    resolveBlankVariantForProduct,
+    buildProductIdentityKey,
+    buildParentProductIdentityKey,
+    MASTER_BLANK_SCHEMA_VERSION,
+    sanitizeForFirestore,
+    deriveAvailableSizesFromBlank,
+    deriveSizesForProductMatrix,
+    merchandisingAtCreate,
+    resolveBlankTemplates,
+    designId,
+    blankId,
+    uniqueIds,
+    blankData,
+    uid,
+    forceAssetBatch: forceAssetBatch === true,
+    autoSyncShopify: autoSyncShopify === true,
+  });
 });
 
 /**
@@ -2490,6 +2575,25 @@ async function findOrCreateProductForBulk(designId, blankId, userId) {
       blankVariantId,
       userId: userId || "system",
     });
+    try {
+      if (out && out.productId && Array.isArray(out.variantIds) && out.variantIds.length > 0) {
+        await startInitialProductAssetBatch({
+          db,
+          admin,
+          sanitizeForFirestore,
+          deriveSizesForProductMatrix,
+          productId: out.productId,
+          variantIds: out.variantIds,
+          userId: userId || "system",
+          force: false,
+        });
+      }
+    } catch (assetErr) {
+      console.error(
+        "[findOrCreateProductForBulk] startInitialProductAssetBatch:",
+        assetErr && assetErr.message ? assetErr.message : assetErr
+      );
+    }
     return { productId: out.productId };
   } catch (e) {
     if (e instanceof functions.https.HttpsError && e.code === "already-exists") {
@@ -5790,55 +5894,79 @@ exports.backfillBlankDefaultPrintSides = functions.https.onCall(async (data, con
   return { ok: true, dryRun: false, force, updated };
 });
 
-/** Admin write sanitizer for `rp_blanks.renderProfile` (per-render-target tuning only). */
+const RENDER_TARGET_KEYS = ["flat_front", "flat_back", "model_front", "model_back"];
+
+/** Admin write sanitizer for one `RpRenderTargetSettings` row. */
+function sanitizeRenderTargetSettingsRow(v) {
+  if (v == null || typeof v !== "object") return null;
+  const BLEND_MODES = new Set(["clean", "soft", "vintage", "bold"]);
+  const pl = v.placement;
+  const bl = v.blend;
+  if (!pl || typeof pl !== "object" || !bl || typeof bl !== "object") return null;
+  const scale = pl.scale != null ? Number(pl.scale) : NaN;
+  const x = pl.x != null ? Number(pl.x) : NaN;
+  const y = pl.y != null ? Number(pl.y) : NaN;
+  if (!Number.isFinite(scale) || !Number.isFinite(x) || !Number.isFinite(y)) return null;
+  const fabricFeel = bl.fabricFeel != null ? Number(bl.fabricFeel) : NaN;
+  const printStrength = bl.printStrength != null ? Number(bl.printStrength) : NaN;
+  if (!Number.isFinite(fabricFeel) || !Number.isFinite(printStrength)) return null;
+  const row = {
+    placement: { scale, x, y },
+    blend: { fabricFeel, printStrength },
+  };
+  if (pl.safeArea === true) row.placement.safeArea = true;
+  else if (pl.safeArea === false) row.placement.safeArea = false;
+  if (typeof bl.mode === "string" && BLEND_MODES.has(bl.mode)) row.blend.mode = bl.mode;
+  if (v.warp && typeof v.warp === "object" && (v.warp.enabled === true || v.warp.enabled === false)) {
+    row.warp = { enabled: v.warp.enabled };
+    for (const [wk, wv] of [
+      ["warpStrength", v.warp.warpStrength],
+      ["verticalStretch", v.warp.verticalStretch],
+      ["horizontalWarp", v.warp.horizontalWarp],
+    ]) {
+      if (wv != null && Number.isFinite(Number(wv))) row.warp[wk] = Number(wv);
+    }
+  }
+  if (v.mask && typeof v.mask === "object" && (v.mask.enabled === true || v.mask.enabled === false)) {
+    row.mask = { enabled: v.mask.enabled };
+    if (v.mask.feather != null && Number.isFinite(Number(v.mask.feather)))
+      row.mask.feather = Number(v.mask.feather);
+    if (v.mask.edgeFade != null && Number.isFinite(Number(v.mask.edgeFade)))
+      row.mask.edgeFade = Number(v.mask.edgeFade);
+  }
+  return row;
+}
+
+/** Admin write sanitizer for `rp_blanks.renderProfile` (per-render-target tuning + optional per-color matrix). */
 function sanitizeBlankRenderProfileForWrite(rp) {
   if (rp == null || typeof rp !== "object") return null;
-  const ALLOWED = new Set(["flat_front", "flat_back", "model_front", "model_back"]);
-  const BLEND_MODES = new Set(["clean", "soft", "vintage", "bold"]);
-  const rtRaw = rp.renderTargets;
-  if (!rtRaw || typeof rtRaw !== "object") return null;
+  const ALLOWED = new Set(RENDER_TARGET_KEYS);
   const renderTargets = {};
-  for (const key of ALLOWED) {
-    const v = rtRaw[key];
-    if (v == null || typeof v !== "object") continue;
-    const pl = v.placement;
-    const bl = v.blend;
-    if (!pl || typeof pl !== "object" || !bl || typeof bl !== "object") continue;
-    const scale = pl.scale != null ? Number(pl.scale) : NaN;
-    const x = pl.x != null ? Number(pl.x) : NaN;
-    const y = pl.y != null ? Number(pl.y) : NaN;
-    if (!Number.isFinite(scale) || !Number.isFinite(x) || !Number.isFinite(y)) continue;
-    const fabricFeel = bl.fabricFeel != null ? Number(bl.fabricFeel) : NaN;
-    const printStrength = bl.printStrength != null ? Number(bl.printStrength) : NaN;
-    if (!Number.isFinite(fabricFeel) || !Number.isFinite(printStrength)) continue;
-    const row = {
-      placement: { scale, x, y },
-      blend: { fabricFeel, printStrength },
-    };
-    if (pl.safeArea === true) row.placement.safeArea = true;
-    else if (pl.safeArea === false) row.placement.safeArea = false;
-    if (typeof bl.mode === "string" && BLEND_MODES.has(bl.mode)) row.blend.mode = bl.mode;
-    if (v.warp && typeof v.warp === "object" && (v.warp.enabled === true || v.warp.enabled === false)) {
-      row.warp = { enabled: v.warp.enabled };
-      for (const [wk, wv] of [
-        ["warpStrength", v.warp.warpStrength],
-        ["verticalStretch", v.warp.verticalStretch],
-        ["horizontalWarp", v.warp.horizontalWarp],
-      ]) {
-        if (wv != null && Number.isFinite(Number(wv))) row.warp[wk] = Number(wv);
-      }
+  const rtRaw = rp.renderTargets;
+  if (rtRaw && typeof rtRaw === "object") {
+    for (const key of ALLOWED) {
+      const row = sanitizeRenderTargetSettingsRow(rtRaw[key]);
+      if (row) renderTargets[key] = row;
     }
-    if (v.mask && typeof v.mask === "object" && (v.mask.enabled === true || v.mask.enabled === false)) {
-      row.mask = { enabled: v.mask.enabled };
-      if (v.mask.feather != null && Number.isFinite(Number(v.mask.feather)))
-        row.mask.feather = Number(v.mask.feather);
-      if (v.mask.edgeFade != null && Number.isFinite(Number(v.mask.edgeFade)))
-        row.mask.edgeFade = Number(v.mask.edgeFade);
-    }
-    renderTargets[key] = row;
   }
-  if (Object.keys(renderTargets).length === 0) return null;
-  return { renderTargets };
+  const renderTargetsByColor = {};
+  const byColorRaw = rp.renderTargetsByColor;
+  if (byColorRaw && typeof byColorRaw === "object") {
+    for (const [vid, map] of Object.entries(byColorRaw)) {
+      if (typeof vid !== "string" || vid.length < 1 || vid.length > 200) continue;
+      if (!map || typeof map !== "object") continue;
+      const inner = {};
+      for (const key of ALLOWED) {
+        const row = sanitizeRenderTargetSettingsRow(map[key]);
+        if (row) inner[key] = row;
+      }
+      if (Object.keys(inner).length) renderTargetsByColor[vid] = inner;
+    }
+  }
+  const out = {};
+  if (Object.keys(renderTargets).length) out.renderTargets = renderTargets;
+  if (Object.keys(renderTargetsByColor).length) out.renderTargetsByColor = renderTargetsByColor;
+  return Object.keys(out).length ? out : null;
 }
 
 /**
@@ -6174,13 +6302,28 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
       colorName: v.colorName,
       colorHex: v.colorHex ?? null,
       colorFamily: v.colorFamily || deriveColorFamilyFromName(v.colorName),
+      preferredArtworkTone:
+        v.preferredArtworkTone === "light" ||
+        v.preferredArtworkTone === "dark" ||
+        v.preferredArtworkTone === "white"
+          ? v.preferredArtworkTone
+          : null,
       vendorColorName: v.vendorColorName ?? null,
       vendorColorCode: v.vendorColorCode ?? null,
       vendorSku: v.vendorSku ?? null,
       isActive: v.isActive !== false,
       sortOrder: v.sortOrder != null ? Number(v.sortOrder) : null,
       images: v.images || { front: null, back: null, detail: null },
+      marketingImages: Array.isArray(v.marketingImages) ? v.marketingImages : null,
       renderOverrides: v.renderOverrides ?? null,
+      renderProfileOverrides:
+        v.renderProfileOverrides && typeof v.renderProfileOverrides === "object"
+          ? v.renderProfileOverrides
+          : null,
+      renderTargetOverrides:
+        v.renderTargetOverrides && typeof v.renderTargetOverrides === "object"
+          ? v.renderTargetOverrides
+          : null,
       eligibilityOverride:
         v.eligibilityOverride && typeof v.eligibilityOverride === "object"
           ? {
@@ -6439,12 +6582,38 @@ function sideHasNestedPng(files, side) {
 }
 
 function resolveDefaultSide(files, supportedSides) {
-  const ss = (supportedSides || []).map(s => String(s).trim().toLowerCase());
+  // Must be a real array: merged design docs can have `supportedSides` as a Firestore FieldValue
+  // (e.g. delete sentinel) after spreading update payloads — `(x || []).map` treats that as truthy and throws.
+  const ss = Array.isArray(supportedSides)
+    ? supportedSides.map((s) => String(s).trim().toLowerCase())
+    : [];
   if (ss.length === 1 && ss[0] === "front") return "front";
   if (ss.length === 1 && ss[0] === "back") return "back";
   if (sideHasNestedPng(files, "back") && !sideHasNestedPng(files, "front")) return "back";
   if (sideHasNestedPng(files, "front") && !sideHasNestedPng(files, "back")) return "front";
   return "back";
+}
+
+/** Plain value for in-memory merge (never FieldValue) — used by computeDesignIsComplete / resolveDesignAssetUrls. */
+function effectiveSupportedSidesAfterUpdate(supportedSidesFromRequest, currentSides) {
+  if (supportedSidesFromRequest === undefined) {
+    return Array.isArray(currentSides) ? currentSides : undefined;
+  }
+  if (supportedSidesFromRequest === null) {
+    return undefined;
+  }
+  if (!Array.isArray(supportedSidesFromRequest)) {
+    return Array.isArray(currentSides) ? currentSides : undefined;
+  }
+  const allowed = new Set(["front", "back"]);
+  const cleaned = [
+    ...new Set(
+      supportedSidesFromRequest
+        .map((s) => String(s).trim().toLowerCase())
+        .filter((s) => allowed.has(s))
+    ),
+  ];
+  return cleaned.length > 0 ? cleaned : undefined;
 }
 
 function buildSideAssetsFromFiles(sideFiles) {
@@ -7293,7 +7462,11 @@ exports.updateDesignAsset = functions.https.onCall(async (data, context) => {
     updateData.colorCount = normalizedColors.length;
   }
 
-  // Regenerate search keywords
+  // Regenerate search keywords (never call .toLowerCase on null/undefined — that caused INTERNAL 500s)
+  const kwLower = (v) => {
+    if (v == null || v === "") return null;
+    return String(v).toLowerCase();
+  };
   const finalName = updateData.name || currentData.name;
   const finalTags = updateData.tags || currentData.tags || [];
   const finalColors = updateData.colors || currentData.colors || [];
@@ -7304,22 +7477,23 @@ exports.updateDesignAsset = functions.https.onCall(async (data, context) => {
     updateData.designSeries !== undefined ? updateData.designSeries : currentData.designSeries;
 
   updateData.searchKeywords = [
-    finalName.toLowerCase(),
-    teamName.toLowerCase(),
-    currentData.teamId.toLowerCase(),
-    finalDesignType,
-    finalSeries && String(finalSeries).toLowerCase(),
-    finalLeague && String(finalLeague).toLowerCase(),
-    currentData.teamCityCache && String(currentData.teamCityCache).toLowerCase(),
-    currentData.teamStateCache && String(currentData.teamStateCache).toLowerCase(),
-    currentData.teamNicknameCache && String(currentData.teamNicknameCache).toLowerCase(),
-    ...finalTags.map(t => t.toLowerCase()),
-    ...finalColors.map(c => c.name?.toLowerCase()).filter(Boolean),
-    ...finalColors.map(c => c.hex.toLowerCase()),
-    ...finalColors.map(c => (c.role && String(c.role).toLowerCase())),
+    kwLower(finalName),
+    kwLower(teamName),
+    kwLower(currentData.teamId),
+    finalDesignType != null && finalDesignType !== "" ? String(finalDesignType).toLowerCase() : null,
+    finalSeries != null && finalSeries !== "" ? String(finalSeries).toLowerCase() : null,
+    finalLeague != null && finalLeague !== "" ? String(finalLeague).toLowerCase() : null,
+    currentData.teamCityCache != null ? String(currentData.teamCityCache).toLowerCase() : null,
+    currentData.teamStateCache != null ? String(currentData.teamStateCache).toLowerCase() : null,
+    currentData.teamNicknameCache != null ? String(currentData.teamNicknameCache).toLowerCase() : null,
+    ...finalTags.map((t) => kwLower(t)).filter(Boolean),
+    ...finalColors.map((c) => kwLower(c.name)).filter(Boolean),
+    ...finalColors.map((c) => (c.hex != null ? String(c.hex).toLowerCase() : null)).filter(Boolean),
+    ...finalColors.map((c) => (c.role != null && c.role !== "" ? String(c.role).toLowerCase() : null)).filter(Boolean),
   ].filter(Boolean);
 
-  // Update completion status (merged files + metadata)
+  // Update completion status (merged files + metadata). Do not pass Firestore FieldValue sentinels
+  // (e.g. supportedSides: delete()) into computeDesignIsComplete — that crashes URL resolution.
   const merged = {
     ...currentData,
     ...updateData,
@@ -7328,10 +7502,29 @@ exports.updateDesignAsset = functions.https.onCall(async (data, context) => {
     designType: finalDesignType,
     teamId: currentData.teamId,
     status: updateData.status !== undefined ? updateData.status : currentData.status,
+    supportedSides: effectiveSupportedSidesAfterUpdate(supportedSides, currentData.supportedSides),
   };
-  updateData.isComplete = computeDesignIsComplete(merged);
 
-  await designRef.update(updateData);
+  try {
+    updateData.isComplete = computeDesignIsComplete(merged);
+  } catch (e) {
+    console.error("[updateDesignAsset] computeDesignIsComplete failed:", e);
+    updateData.isComplete = false;
+  }
+
+  try {
+    const payload = {};
+    for (const [k, v] of Object.entries(updateData)) {
+      if (v !== undefined) payload[k] = v;
+    }
+    await designRef.update(payload);
+  } catch (e) {
+    console.error("[updateDesignAsset] Firestore update failed:", e);
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      e && e.message ? String(e.message) : "Firestore update failed"
+    );
+  }
 
   console.log("[updateDesignAsset] Updated design:", designId);
 
@@ -8047,6 +8240,7 @@ exports.onMockJobCreated = functions
                   productVariantId,
                   jobId,
                   createdByUid: job.createdByUid,
+                  sanitizeForFirestore,
                 });
               }
             }

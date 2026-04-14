@@ -89,16 +89,6 @@
       ]
     },
     {
-      "collectionGroup": "rp_bulk_generation_job_items",
-      "queryScope": "COLLECTION",
-      "fields": [
-        {
-          "fieldPath": "bulkJobId",
-          "order": "ASCENDING"
-        }
-      ]
-    },
-    {
       "collectionGroup": "rp_mock_jobs",
       "queryScope": "COLLECTION",
       "fields": [
@@ -125,37 +115,48 @@
           "order": "DESCENDING"
         }
       ]
+    }
+  ],
+  "fieldOverrides": [
+    {
+      "collectionGroup": "rp_bulk_generation_job_items",
+      "fieldPath": "bulkJobId",
+      "indexes": [
+        {
+          "order": "ASCENDING",
+          "queryScope": "COLLECTION"
+        }
+      ]
     },
     {
       "collectionGroup": "rp_products",
-      "queryScope": "COLLECTION",
-      "fields": [
+      "fieldPath": "productIdentityKey",
+      "indexes": [
         {
-          "fieldPath": "productIdentityKey",
-          "order": "ASCENDING"
+          "order": "ASCENDING",
+          "queryScope": "COLLECTION"
         }
       ]
     },
     {
       "collectionGroup": "variants",
-      "queryScope": "COLLECTION_GROUP",
-      "fields": [
+      "fieldPath": "variant8394NextRetryAt",
+      "indexes": [
         {
-          "fieldPath": "variant8394NextRetryAt",
-          "order": "ASCENDING"
+          "order": "ASCENDING",
+          "queryScope": "COLLECTION_GROUP"
         }
       ]
     },
     {
       "collectionGroup": "variants",
-      "queryScope": "COLLECTION_GROUP",
-      "fields": [
+      "fieldPath": "sku",
+      "indexes": [
         {
-          "fieldPath": "sku",
-          "order": "ASCENDING"
+          "order": "ASCENDING",
+          "queryScope": "COLLECTION_GROUP"
         }
       ]
     }
-  ],
-  "fieldOverrides": []
+  ]
 }

@@ -6,7 +6,10 @@ import ProtectedRoute from "@/components/ProtectedRoute";
 import { TableSkeleton } from "@/components/Skeleton";
 import Modal from "@/components/Modal";
 import { useProducts } from "@/lib/hooks/useRPProducts";
-import { useCreateProductFromDesignBlank } from "@/lib/hooks/useRPProductMutations";
+import {
+  useCreateProductFromDesignBlank,
+  useLaunchProductsFromDesign,
+} from "@/lib/hooks/useRPProductMutations";
 import { useBatchGeneration } from "@/lib/hooks/useBatchGeneration";
 import { useDesigns, useDesignTeams } from "@/lib/hooks/useDesignAssets";
 import GenerateTeamProductsModal from "@/components/products/GenerateTeamProductsModal";
@@ -60,6 +63,8 @@ function ProductsContent() {
   const [designBlankDesignId, setDesignBlankDesignId] = useState("");
   const [designBlankBlankId, setDesignBlankBlankId] = useState("");
   const [designBlankVariantId, setDesignBlankVariantId] = useState("");
+  /** When set, create only one color row; otherwise master blanks materialize all active blank colors. */
+  const [designBlankSingleColorOnly, setDesignBlankSingleColorOnly] = useState(false);
   const [designBlankCreating, setDesignBlankCreating] = useState(false);
   const [designBlankError, setDesignBlankError] = useState<string | null>(null);
   
@@ -71,6 +76,7 @@ function ProductsContent() {
   const [batchName, setBatchName] = useState("");
 
   const { createProductFromDesignBlank } = useCreateProductFromDesignBlank();
+  const { launchProductsFromDesign } = useLaunchProductsFromDesign();
   const { createJob: createMockJob } = useCreateMockJob();
   const { batchGenerate } = useBatchGeneration();
   const { presets } = useRPScenePresets({ isActive: true });
@@ -135,6 +141,25 @@ function ProductsContent() {
 
   const { products, loading, error, refetch } = useProducts(filters);
 
+  useEffect(() => {
+    if (loading) return;
+    const sample = products.slice(0, 25).map((p) => {
+      const derivedDistinctBlankVariantIds = p.variantSummary?.length
+        ? new Set(p.variantSummary.map((s) => s.blankVariantId).filter(Boolean)).size
+        : 0;
+      return {
+        productId: p.id,
+        slug: p.slug,
+        productKind: p.productKind,
+        colorVariantCount: p.colorVariantCount ?? null,
+        variantCount: p.variantCount ?? null,
+        derivedDistinctBlankVariantIds,
+        variantSummaryLength: p.variantSummary?.length ?? 0,
+      };
+    });
+    console.info("[PRODUCT_LIST:READ]", JSON.stringify({ total: products.length, sample }));
+  }, [products, loading]);
+
   const handleCreateFromDesignBlank = async (e: FormEvent) => {
     e.preventDefault();
     setDesignBlankError(null);
@@ -145,19 +170,66 @@ function ProductsContent() {
     const selBlank = blanks.find((b) => b.blankId === designBlankBlankId);
     if (selBlank && isMasterBlank(selBlank)) {
       const active = getBlankVariants(selBlank).filter((v) => v.isActive !== false);
-      if (active.length > 0 && !designBlankVariantId) {
-        setDesignBlankError("Select a color variant for this master blank.");
+      if (active.length === 0) {
+        setDesignBlankError("This master blank has no active color variants.");
+        return;
+      }
+      if (designBlankSingleColorOnly && !designBlankVariantId) {
+        setDesignBlankError("Select a color variant, or turn off “single color only” to create all active colors.");
         return;
       }
     }
     try {
       setDesignBlankCreating(true);
-      const result = await createProductFromDesignBlank({
-        designId: designBlankDesignId,
-        blankId: designBlankBlankId,
-        blankVariantId:
-          selBlank && isMasterBlank(selBlank) && designBlankVariantId ? designBlankVariantId : undefined,
-      });
+      let result: {
+        productId: string;
+        slug: string;
+        variantId?: string;
+      };
+
+      if (selBlank && isMasterBlank(selBlank)) {
+        const active = getBlankVariants(selBlank).filter((v) => v.isActive !== false);
+        const blankVariantIds = designBlankSingleColorOnly
+          ? designBlankVariantId
+            ? [designBlankVariantId]
+            : []
+          : active.map((v) => v.variantId);
+        if (blankVariantIds.length === 0) {
+          setDesignBlankError("No blank variant ids to create.");
+          setDesignBlankCreating(false);
+          return;
+        }
+        const batch = await launchProductsFromDesign({
+          designId: designBlankDesignId,
+          blankId: designBlankBlankId,
+          blankVariantIds,
+          autoSyncShopify: false,
+        });
+        const pid =
+          batch.productId ||
+          batch.results?.find((r) => r.productId)?.productId ||
+          "";
+        const slug =
+          batch.slug ||
+          batch.results?.find((r) => r.slug)?.slug ||
+          "";
+        const firstWithVariant = batch.results?.find((r) => r.variantFirestoreId);
+        result = {
+          productId: pid,
+          slug,
+          variantId: firstWithVariant?.variantFirestoreId,
+        };
+        if (!pid || !slug) {
+          throw new Error(batch.errors?.map((e) => e.message).join(" ") || "Product creation did not return a parent id.");
+        }
+      } else {
+        const single = await createProductFromDesignBlank({
+          designId: designBlankDesignId,
+          blankId: designBlankBlankId,
+          blankVariantId: undefined,
+        });
+        result = single;
+      }
       const useBack = selBlank ? inferDefaultPrintSides(selBlank) === "back_only" : false;
       const jobId = await createMockJob({
         designId: designBlankDesignId,
@@ -324,12 +396,16 @@ function ProductsContent() {
           setDesignBlankDesignId("");
           setDesignBlankBlankId("");
           setDesignBlankVariantId("");
+          setDesignBlankSingleColorOnly(false);
         }}
         title="Create One-off Product"
       >
         <form onSubmit={handleCreateFromDesignBlank} className="space-y-4">
           <p className="text-sm text-gray-600">
-            Advanced/QA path: select one design + blank to create a single parent product entry, then kick off an initial mockup job.
+            Creates a <strong>parent</strong> in <code className="text-xs bg-gray-100 px-1 rounded">rp_products</code> and
+            sellable rows under <code className="text-xs bg-gray-100 px-1 rounded">variants/</code>. For <strong>master blanks</strong>,{" "}
+            <strong>all active garment colors</strong> are materialized by default (each color × sizes from the blank). Then a
+            draft mockup job starts for the first variant.
           </p>
           {designBlankError && (
             <div className="bg-red-50 border border-red-200 rounded p-3 text-red-700 text-sm">
@@ -383,22 +459,45 @@ function ProductsContent() {
             </select>
           </div>
           {designBlankVariantOptions.length > 0 && (
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Blank color variant *</label>
-              <select
-                value={designBlankVariantId}
-                onChange={(e) => setDesignBlankVariantId(e.target.value)}
-                required
-                className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
-              >
-                {designBlankVariantOptions.map((v) => (
-                  <option key={v.variantId} value={v.variantId}>
-                    {v.colorName}
-                    {v.vendorSku ? ` (${v.vendorSku})` : ""}
-                  </option>
-                ))}
-              </select>
-              <p className="text-xs text-gray-500 mt-1">Master blanks require a variant; color resolves into the product and templates.</p>
+            <div className="space-y-3 rounded-lg border border-gray-200 bg-gray-50/80 px-3 py-3">
+              <label className="flex items-start gap-2 text-sm text-gray-800 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={designBlankSingleColorOnly}
+                  onChange={(e) => setDesignBlankSingleColorOnly(e.target.checked)}
+                  className="mt-0.5 rounded border-gray-300"
+                />
+                <span>
+                  <span className="font-medium">Single color only</span>{" "}
+                  <span className="text-gray-600">
+                    (advanced — create one color row + sizes instead of every active blank color)
+                  </span>
+                </span>
+              </label>
+              {designBlankSingleColorOnly ? (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Blank color variant *</label>
+                  <select
+                    value={designBlankVariantId}
+                    onChange={(e) => setDesignBlankVariantId(e.target.value)}
+                    required={designBlankSingleColorOnly}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 bg-white"
+                  >
+                    {designBlankVariantOptions.map((v) => (
+                      <option key={v.variantId} value={v.variantId}>
+                        {v.colorName}
+                        {v.vendorSku ? ` (${v.vendorSku})` : ""}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ) : (
+                <p className="text-xs text-gray-600">
+                  Will create{" "}
+                  <strong>{designBlankVariantOptions.length} color line{designBlankVariantOptions.length === 1 ? "" : "s"}</strong>{" "}
+                  × sizes (e.g. XS–XL) — matching active colors on the blank.
+                </p>
+              )}
             </div>
           )}
           {designBlankDesignId && !designs.find((d) => d.id === designBlankDesignId)?.hasPng && (
@@ -540,7 +639,13 @@ function ProductsContent() {
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-gray-200">
-                {products.map((product) => (
+                {products.map((product) => {
+                  const derivedColorLines =
+                    product.colorVariantCount ??
+                    (product.variantSummary?.length
+                      ? new Set(product.variantSummary.map((s) => s.blankVariantId).filter(Boolean)).size
+                      : null);
+                  return (
                   <tr key={product.id} className={`hover:bg-gray-50 ${selectedProducts.has(product.id || "") ? "bg-blue-50" : ""}`}>
                     <td className="px-6 py-4 whitespace-nowrap">
                       <div className="flex items-center gap-3">
@@ -571,8 +676,17 @@ function ProductsContent() {
                             </span>
                           )}
                           <p className="text-xs text-gray-500 mt-1">
-                            {product.productKind === "parent" && product.variantCount != null
-                              ? `${product.variantCount} color${product.variantCount === 1 ? "" : "s"}`
+                            {product.productKind === "parent" && (derivedColorLines != null || product.variantCount != null)
+                              ? [
+                                  derivedColorLines != null
+                                    ? `${derivedColorLines} color${derivedColorLines === 1 ? "" : "s"}`
+                                    : null,
+                                  product.variantCount != null
+                                    ? `${product.variantCount} SKU${product.variantCount === 1 ? "" : "s"}`
+                                    : null,
+                                ]
+                                  .filter(Boolean)
+                                  .join(" · ")
                               : product.colorway?.name ?? "—"}
                           </p>
                         </div>
@@ -636,7 +750,8 @@ function ProductsContent() {
                       </div>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>

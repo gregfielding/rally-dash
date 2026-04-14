@@ -111,3 +111,45 @@ export function resolveBackRenderTreatment(
   if (t === "white" || t === "light") return "clean";
   return "blended";
 }
+
+export type BlendedPreview8394Adjust = {
+  blendMode: string;
+  blendOpacity: number;
+  /** True when preview blend differs from base realism curve so operators know browser ≠ Sharp 1:1. */
+  previewAdjusted: boolean;
+};
+
+/**
+ * 8394 render profile **browser** blended preview: `mix-blend-mode: multiply` matches the Sharp pipeline poorly for
+ * dark-on-dark (mud) and white/light on dark (multiply wipes highlights). Align with `resolveBackRenderTreatment`:
+ * clean-style comps use **normal**; dark ink on dark fabric uses **screen** as a legible stand-in for “fabric blended” dark ink.
+ */
+export function resolveBlendedPreviewBlend8394(
+  garmentFamily: RPBlankColorFamily,
+  previewArtworkMode: "light" | "dark" | "white",
+  baseZoneBlend: { blendMode: string; blendOpacity: number }
+): BlendedPreview8394Adjust {
+  const op = baseZoneBlend.blendOpacity;
+  const t = previewArtworkMode;
+
+  if (garmentFamily === "dark") {
+    if (t === "light" || t === "white") {
+      return { blendMode: "normal", blendOpacity: Math.min(1, op), previewAdjusted: true };
+    }
+    return {
+      blendMode: "screen",
+      blendOpacity: Math.min(1, op * 1.08),
+      previewAdjusted: true,
+    };
+  }
+
+  if (t === "white" || t === "light") {
+    return { blendMode: "normal", blendOpacity: op, previewAdjusted: true };
+  }
+
+  return {
+    blendMode: baseZoneBlend.blendMode,
+    blendOpacity: op,
+    previewAdjusted: false,
+  };
+}

@@ -266,9 +266,12 @@ async function runCreateProductFromDesignBlankCore(ctx) {
     designId,
   });
 
-  let parentRef;
-  let parentSlug;
-  let parentId;
+  /** Parent row (existing or created after SKU precheck). New parents must not be written until SKU checks pass — otherwise a duplicate SKU error leaves an orphan parent with zero variant subdocs. */
+  let parentRef = null;
+  let parentSlug = null;
+  let parentId = null;
+  /** Firestore payload for a brand-new parent; `.add()` runs only after assertSkusUnusedInDatastore succeeds. */
+  let pendingNewParentPayload = null;
 
   if (parentDocExisting) {
     parentRef = parentDocExisting.ref;
@@ -283,7 +286,7 @@ async function runCreateProductFromDesignBlankCore(ctx) {
     const handle = slug;
     parentSlug = slug;
 
-    const parentData = {
+    pendingNewParentPayload = {
       productKind: "parent",
       schemaVersion: 1,
       parentProductIdentityKey,
@@ -353,16 +356,14 @@ async function runCreateProductFromDesignBlankCore(ctx) {
       createdBy: userId,
       updatedBy: userId,
     };
-
-    parentRef = await db.collection("rp_products").add(sanitizeForFirestore(parentData));
-    parentId = parentRef.id;
-    console.log("[createProductFromDesignBlank] Created parent product:", parentId, slug);
   }
 
   const blankVariantFk = isV2Master ? variantRow.variantId : blankVariantId || "legacy";
   const sizesList = deriveSizesForProductMatrix(blank);
 
-  const existingForColorSnap = await parentRef.collection("variants").where("blankVariantId", "==", blankVariantFk).get();
+  const existingForColorSnap = parentRef
+    ? await parentRef.collection("variants").where("blankVariantId", "==", blankVariantFk).get()
+    : { docs: [], empty: true };
 
   const existingBySize = new Map();
   let legacyNoSizeDoc = null;
@@ -446,11 +447,45 @@ async function runCreateProductFromDesignBlankCore(ctx) {
     try {
       await assertSkusUnusedInDatastore(db, skusToRegister);
     } catch (skuErr) {
-      throw new functions.https.HttpsError(
-        "already-exists",
-        skuErr && skuErr.message ? String(skuErr.message) : "Duplicate SKU"
+      const msg = skuErr && skuErr.message ? String(skuErr.message) : "SKU check failed";
+      /** Only our explicit duplicate message should map to already-exists. Firestore index/query errors often look like `9 FAILED_PRECONDITION:` and were wrongly classified as duplicate SKU skips. */
+      const isKnownDuplicate = /SKU already in use/i.test(msg);
+      if (!isKnownDuplicate) {
+        console.error(
+          JSON.stringify({
+            tag: "[TEAM_PRODUCT_GEN:SERVER:SKU_CHECK_FIRESTORE_ERROR]",
+            blankVariantId: blankVariantFk,
+            message: msg,
+            code: skuErr && skuErr.code != null ? skuErr.code : null,
+          })
+        );
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          `SKU uniqueness check failed (Firestore). Deploy indexes if you have not: firebase deploy --only firestore:indexes. Detail: ${msg}`
+        );
+      }
+      console.log(
+        JSON.stringify({
+          tag: "[TEAM_PRODUCT_GEN:SERVER:SKIP_REASON]",
+          reason: "duplicate_sku_precheck",
+          blankVariantId: blankVariantFk,
+          productId: parentId,
+          slug: parentSlug || null,
+          message: msg,
+        })
       );
+      throw new functions.https.HttpsError("already-exists", msg, {
+        productId: parentId,
+        slug: parentSlug || null,
+        reason: "duplicate_sku",
+      });
     }
+  }
+
+  if (pendingNewParentPayload && !parentRef) {
+    parentRef = await db.collection("rp_products").add(sanitizeForFirestore(pendingNewParentPayload));
+    parentId = parentRef.id;
+    console.log("[createProductFromDesignBlank] Created parent product:", parentId, parentSlug);
   }
 
   if (legacyLeadPatch) {
@@ -577,6 +612,9 @@ async function runCreateProductFromDesignBlankCore(ctx) {
     isDefault: i === 0,
   }));
 
+  const uniqueBlankVariantKeys = [...new Set(sortRows.map((r) => r.blankVariantId).filter(Boolean))];
+  const colorVariantCount = uniqueBlankVariantKeys.length;
+
   const parentAfter = (await parentRef.get()).data() || {};
   const prevDefaultId = parentAfter.defaultVariantId;
   const stillExists = prevDefaultId && allVariantsSnap.docs.some((d) => d.id === prevDefaultId);
@@ -585,6 +623,7 @@ async function runCreateProductFromDesignBlankCore(ctx) {
   const parentUpdate = {
     variantSummary,
     variantCount: variantSummary.length,
+    colorVariantCount,
     updatedAt: now,
     updatedBy: userId,
     availableSizes: deriveSizesForProductMatrix(blank),
@@ -596,32 +635,33 @@ async function runCreateProductFromDesignBlankCore(ctx) {
   }
   await parentRef.update(sanitizeForFirestore(parentUpdate));
 
-  let primaryVariantIdFor8394 = null;
+  let primaryVariantIdForColor = null;
   for (const d of postSnap.docs) {
     const v = d.data();
     if ((v.optionValues && v.optionValues.size) === sizesList[0]) {
-      primaryVariantIdFor8394 = d.id;
+      primaryVariantIdForColor = d.id;
       break;
     }
   }
-  if (!primaryVariantIdFor8394 && postSnap.docs.length > 0) {
-    primaryVariantIdFor8394 = postSnap.docs[0].id;
+  if (!primaryVariantIdForColor && postSnap.docs.length > 0) {
+    primaryVariantIdForColor = postSnap.docs[0].id;
   }
 
-  if (String(blank.styleCode || "").trim() === "8394" && primaryVariantIdFor8394 && wroteAnyVariant) {
-    try {
-      const { queueVariant8394BaseAssets } = require("./queueVariant8394BaseAssets");
-      await queueVariant8394BaseAssets({
-        db,
-        admin,
-        sanitizeForFirestore,
-        parentId,
-        variantId: primaryVariantIdFor8394,
-        userId,
-      });
-    } catch (qe) {
-      console.error("[createProductFromDesignBlank] queueVariant8394BaseAssets failed:", qe && qe.message);
+  if (primaryVariantIdForColor && postSnap.docs.length > 0) {
+    const inhBatch = db.batch();
+    for (const d of postSnap.docs) {
+      const isPrimary = d.id === primaryVariantIdForColor;
+      inhBatch.update(
+        d.ref,
+        sanitizeForFirestore({
+          isPrimaryForColor: isPrimary,
+          inheritsMediaFromVariantId: isPrimary ? null : primaryVariantIdForColor,
+          updatedAt: now,
+          updatedBy: userId,
+        })
+      );
     }
+    await inhBatch.commit();
   }
 
   const variantIdsThisColor = postSnap.docs.map((d) => d.id);
@@ -636,12 +676,30 @@ async function runCreateProductFromDesignBlankCore(ctx) {
   }
   if (!returnVariantId) returnVariantId = postSnap.docs[0] ? postSnap.docs[0].id : null;
 
+  console.log(
+    JSON.stringify({
+      tag: "[TEAM_PRODUCT_GEN:SERVER:CORE_SUMMARY]",
+      parentProductId: parentId,
+      parentSlug: parentSlug || null,
+      blankVariantId: blankVariantFk,
+      colorName: colorNameForProduct || null,
+      sizesToCreateCount: sizesToCreate.length,
+      wroteAnyVariant,
+      variantFirestoreIdsThisColor: variantIdsThisColor,
+      variantSubdocCountForColor: postSnap.docs.length,
+      parentVariantSummaryLength: variantSummary.length,
+      colorVariantCountWritten: colorVariantCount,
+    })
+  );
+
   return {
     ok: true,
     productId: parentId,
     slug: parentSlug,
     variantId: returnVariantId,
     variantIds: variantIdsThisColor,
+    /** True if parent `rp_products` doc already existed before this run (team gen / multi-color). */
+    parentExisted: !!parentDocExisting,
   };
 }
 

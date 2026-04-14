@@ -203,6 +203,9 @@ export function BlankVariantsManager({
             <tr>
               <th className="px-3 py-2">Color</th>
               <th className="px-3 py-2">Family</th>
+              <th className="px-3 py-2 whitespace-nowrap" title="Preview / print tone override (light, dark, or white artwork slot)">
+                Art tone
+              </th>
               <th className="px-3 py-2">Active</th>
               <th className="px-3 py-2">Images</th>
               {is8394Master ? <th className="px-3 py-2 whitespace-nowrap">8394 render QA</th> : null}
@@ -233,6 +236,13 @@ export function BlankVariantsManager({
                       <div className="text-xs text-gray-600 font-mono mt-0.5">{v.variantId}</div>
                     </td>
                     <td className="px-3 py-2 text-gray-900 font-medium capitalize">{v.colorFamily ?? "—"}</td>
+                    <td className="px-3 py-2 text-xs text-gray-800">
+                      {v.preferredArtworkTone ? (
+                        <span className="font-semibold capitalize">{v.preferredArtworkTone}</span>
+                      ) : (
+                        <span className="text-gray-500">Auto</span>
+                      )}
+                    </td>
                     <td className="px-3 py-2 text-gray-900 font-medium">{v.isActive === false ? "No" : "Yes"}</td>
                     <td className="px-3 py-2 text-xs text-gray-900">
                       Ff:{mf ? "✓" : "—"} Fb:{mb ? "✓" : "—"} Mf:{mmf ? "✓" : "—"} Mb:{mmb ? "✓" : "—"} D:

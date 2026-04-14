@@ -107,9 +107,10 @@ service firebase.storage {
       allow write: if isAdmin();
     }
 
-    // Bulk design import: raw uploads before server commit (path matches Functions + dashboard uploader).
+    // Bulk design import: temp uploads under each job (path matches Functions + dashboard uploader).
+    // Use {allPaths=**} so every segment under the job id is covered (avoids rule mismatch on nested paths).
     // TODO: lifecycle cleanup for stale objects under rp_design_imports/ (scheduled job or TTL).
-    match /rp_design_imports/{uid}/{jobId}/raw/{fileName} {
+    match /rp_design_imports/{uid}/{jobId}/{allPaths=**} {
       allow read: if isAuthenticated() && request.auth.uid == uid;
       allow write: if isAuthenticated() && request.auth.uid == uid;
     }

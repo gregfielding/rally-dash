@@ -16,6 +16,8 @@
     "seed:taxonomy": "node scripts/seed-taxonomy.js",
     "seed:design-teams": "node scripts/seed-design-teams-phase1.js",
     "seed:design-teams:merge": "node scripts/seed-design-teams-phase1.js --merge",
+    "backfill:design-teams-giants-yankees": "node scripts/backfill-design-teams-giants-yankees.js",
+    "backfill:design-teams-giants-yankees:dry": "node scripts/backfill-design-teams-giants-yankees.js --dry-run",
     "export:design-teams-json": "node scripts/seed-design-teams-phase1.js --export-json",
     "patch:sf-team-display-names": "node scripts/patch-sf-design-team-display-names.js",
     "materialize:mlb-verified-colors": "node scripts/materialize-mlb-verified-brand-colors.js",

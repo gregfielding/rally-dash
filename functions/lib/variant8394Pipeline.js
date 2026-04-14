@@ -45,7 +45,7 @@ function nextRetryAt(admin) {
  * `generateProductFlatRenders` (flat_blended_back + flat_clean_front) on the variant doc — mock → flat for stability.
  */
 async function queueVariant8394BaseAssets(ctx) {
-  const { db, admin, sanitizeForFirestore, parentId, variantId, userId } = ctx;
+  const { db, admin, sanitizeForFirestore, parentId, variantId, userId, productAssetBatchId, productAssetColorKey } = ctx;
   const fetchFn = typeof global.fetch === "function" ? global.fetch.bind(global) : null;
   if (!fetchFn) {
     console.warn("[queueVariant8394BaseAssets] global fetch unavailable; skip auto assets");
@@ -128,6 +128,8 @@ async function queueVariant8394BaseAssets(ctx) {
     productId: parentId,
     productVariantId: variantId,
     heroSlot: null,
+    productAssetBatchId: productAssetBatchId || null,
+    productAssetColorKey: productAssetColorKey || null,
     input: {
       blankImageUrl: variantBackUrl,
       designPngUrl,
@@ -162,7 +164,9 @@ async function queueVariant8394BaseAssets(ctx) {
  * Called from onMockJobCreated after back mock is saved to the variant (draft path).
  */
 async function run8394FlatAfterVariantMock(ctx) {
-  const { admin, db, parentId, productVariantId, jobId, createdByUid } = ctx;
+  const { admin, db, parentId, productVariantId, jobId, createdByUid, sanitizeForFirestore: sanitizeFn } = ctx;
+  const sanitizeForFirestore = typeof sanitizeFn === "function" ? sanitizeFn : (x) => x;
+  const { on8394FlatPipelineFinishedForBatch } = require("./productAssetBatchHelpers");
   const crypto = require("crypto");
   const fetchFn = typeof global.fetch === "function" ? global.fetch.bind(global) : null;
   if (!fetchFn) {
@@ -217,6 +221,18 @@ async function run8394FlatAfterVariantMock(ctx) {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedBy: uid,
     });
+    try {
+      await on8394FlatPipelineFinishedForBatch({
+        db,
+        admin,
+        sanitizeForFirestore,
+        parentId,
+        productVariantId,
+        succeeded: true,
+      });
+    } catch (batchErr) {
+      console.warn("[run8394FlatAfterVariantMock] batch progress:", batchErr && batchErr.message ? batchErr.message : batchErr);
+    }
   } catch (err) {
     const msg =
       err && err.message
@@ -234,6 +250,19 @@ async function run8394FlatAfterVariantMock(ctx) {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedBy: uid,
     });
+    try {
+      await on8394FlatPipelineFinishedForBatch({
+        db,
+        admin,
+        sanitizeForFirestore,
+        parentId,
+        productVariantId,
+        succeeded: false,
+        errorMessage: msg,
+      });
+    } catch (batchErr) {
+      console.warn("[run8394FlatAfterVariantMock] batch progress (fail):", batchErr && batchErr.message ? batchErr.message : batchErr);
+    }
   }
 }
 
@@ -298,6 +327,14 @@ async function retryVariant8394PipelineCore(ctx) {
     if (!designPngUrl || !variantBackUrl) throw new Error("Missing design PNG or back URL");
 
     const placement = resolveMockPlacementForProduct(placementProduct, blank, "back", "back_center", variantRow);
+    const batchId =
+      variantDoc.productAssetBatchId && String(variantDoc.productAssetBatchId).trim()
+        ? String(variantDoc.productAssetBatchId).trim()
+        : null;
+    const colorKey =
+      variantDoc.productAssetColorKey && String(variantDoc.productAssetColorKey).trim()
+        ? String(variantDoc.productAssetColorKey).trim()
+        : blankVariantId || null;
     const jobData = {
       designId,
       blankId,
@@ -307,6 +344,8 @@ async function retryVariant8394PipelineCore(ctx) {
       productId: parentId,
       productVariantId: variantId,
       heroSlot: null,
+      productAssetBatchId: batchId,
+      productAssetColorKey: colorKey,
       input: {
         blankImageUrl: variantBackUrl,
         designPngUrl,
