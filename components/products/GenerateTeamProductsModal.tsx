@@ -366,6 +366,7 @@ export default function GenerateTeamProductsModal({
             blankId,
             blankVariantIds,
             autoSyncShopify: false,
+            queue8394Secondary: false,
           })) as VariantsBatchResult & { ok?: boolean };
 
           const parent = deriveParentFromBatch(batch);

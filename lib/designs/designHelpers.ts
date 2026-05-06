@@ -500,6 +500,46 @@ export function pickDesignPngUrlForVariant(
   );
 }
 
+/**
+ * Firestore field path for the winning PNG (nested `assets`/`files` per side, else legacy root) — matches blank editor / `pickDesignPngUrlForVariant`.
+ */
+export function describeDesignSidePngSourcePath(
+  design: DesignDoc,
+  side: GarmentSide,
+  tone: ArtworkToneSlot,
+  resolvedUrl: string | null | undefined
+): string | null {
+  if (!resolvedUrl || !tone) return null;
+  const u = String(resolvedUrl).trim();
+  if (!u) return null;
+  const a = design.assets?.[side];
+  const f = design.files?.[side];
+  const key = tone === "light" ? "lightPng" : tone === "dark" ? "darkPng" : "whitePng";
+  if (a?.[key] != null && String(a[key]).trim() === u) {
+    return `assets.${side}.${key}`;
+  }
+  const node = f?.[key as "lightPng"] as { downloadUrl?: string } | undefined;
+  if (node?.downloadUrl != null && String(node.downloadUrl).trim() === u) {
+    return `files.${side}.${key}.downloadUrl`;
+  }
+  const flat = resolveLegacyFlatAssetUrls(design);
+  const leg = key === "light" ? flat.lightPng : key === "dark" ? flat.darkPng : flat.whitePng;
+  if (leg != null && String(leg).trim() === u) {
+    return legacyFlatTargetsSide(design, side) ? `assets.${key} (legacy flat → ${side})` : `assets.${key}`;
+  }
+  const fRoot = design.files;
+  if (key === "lightPng" && fRoot?.lightPng?.downloadUrl && String(fRoot.lightPng.downloadUrl).trim() === u) {
+    return "files.lightPng.downloadUrl";
+  }
+  if (key === "darkPng" && fRoot?.darkPng?.downloadUrl && String(fRoot.darkPng.downloadUrl).trim() === u) {
+    return "files.darkPng.downloadUrl";
+  }
+  if (key === "whitePng" && fRoot?.whitePng?.downloadUrl && String(fRoot.whitePng.downloadUrl).trim() === u) {
+    return "files.whitePng.downloadUrl";
+  }
+  return `resolved.${tone} (path unresolved)`;
+}
+
 export function pickDesignAssetUrlForGarment(
   design: DesignDoc | null | undefined,
   garmentColorFamily: string | null | undefined,

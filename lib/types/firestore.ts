@@ -781,6 +781,33 @@ export type RpFlatRenderView = "front" | "back";
 /**
  * One persisted flat render slot on the product (canonical URLs on doc for UI).
  */
+/** Traceability back to the master blank recipe used at compose time (official 8394 flats / model handoff). */
+export interface RpOfficialAssetRecipeProvenance {
+  resolvedFromBlankId: string;
+  resolvedFromBlankVariantId: string;
+  resolvedRenderTarget: string;
+  resolvedPlacementId: string;
+  resolvedTone: string | null;
+  resolvedDesignUrl: string | null;
+  sourcePathUsed: string | null;
+  /** Garment / model raster URL from the saved blank variant (same as debug `garmentImageUrl`). */
+  resolvedGarmentImageUrl?: string | null;
+  /** `blank_native` = deterministic compose from master blank; `ai_identity` = generation job (optional). */
+  compositionSource?: "blank_native" | "ai_identity" | string | null;
+  /** True when `flat_front_clean` was saved as garment PNG only (no artwork compositing). */
+  garmentOnlyCleanFront?: boolean | null;
+  /** Alias for policy / storefront checks (`garment_only` in product spec). */
+  garmentOnly?: boolean | null;
+  /** `garment_only_clean_front` vs `design_composite_8394` for official 8394 flat roles. */
+  renderPath?: string | null;
+  /** `rp_blanks.version` when present. */
+  blankRenderProfileVersion?: number | null;
+  /** Blank doc `updatedAt` when available. */
+  blankDocUpdatedAt?: Timestamp | null;
+  tuningLayer?: string | null;
+  recipeProvenanceSchemaVersion: 1;
+}
+
 export interface RpProductFlatRenderSlot {
   url: string;
   storagePath?: string | null;
@@ -794,6 +821,8 @@ export interface RpProductFlatRenderSlot {
   inputFingerprint: string;
   width?: number;
   height?: number;
+  /** When set, official pipeline wrote this slot from `resolveSavedBlankRenderProfile` + compose. */
+  recipeProvenance?: RpOfficialAssetRecipeProvenance | null;
 }
 
 /**
@@ -817,7 +846,10 @@ export type RpVariantGeneratedRenderOutputRole =
 
 export interface RpVariantGeneratedRenderOutput {
   role: RpVariantGeneratedRenderOutputRole;
-  sourceType: "variant_render_source";
+  sourceType:
+    | "variant_render_source"
+    | "official_generation"
+    | "official_deterministic_generation";
   sourceImageRole?: string | null;
   url: string;
   storagePath?: string | null;
@@ -827,6 +859,7 @@ export interface RpVariantGeneratedRenderOutput {
   createdAt?: Timestamp | null;
   lookType?: string | null;
   view?: RpFlatRenderView | null;
+  recipeProvenance?: RpOfficialAssetRecipeProvenance | null;
 }
 
 /** One deterministic scene output (non-AI composite). */
@@ -1050,7 +1083,14 @@ export type Rp8394InitialAssetRole =
   | "model_front_clean";
 
 /** Aggregated per-role status on parent `rp_products` (worst color wins). */
-export type RpParentAssetRoleState = "idle" | "queued" | "running" | "done" | "failed";
+export type RpParentAssetRoleState =
+  | "idle"
+  | "queued"
+  | "running"
+  | "done"
+  | "failed"
+  | "skipped_no_identity"
+  | "optional_failed";
 
 /** Parent-level fulfillment snapshot (`rp_products.fulfillmentSummary`). */
 export interface RpProductFulfillmentSummary {
@@ -1105,18 +1145,49 @@ export interface RpProductAssetBatch {
   status: "queued" | "running" | "complete" | "failed" | "partial" | "superseded";
   /** When true, asset completion advances `rp_products.launchStatus` / Shopify flags. */
   launchPipeline?: boolean;
-  launchOptions?: { autoSyncShopify?: boolean } | null;
+  launchOptions?: { autoSyncShopify?: boolean; queue8394Secondary?: boolean } | null;
+  /**
+   * Same `resolvePrintSidesForProductBuild(blank, design)` as readiness — used so `flat_front_clean` failures
+   * become `optional_failed` when commerce is back-only (`effectiveBack && !effectiveFront`).
+   */
+  readinessPrintSides?: {
+    effectiveFront?: boolean;
+    effectiveBack?: boolean;
+    primaryPlacementSide?: string | null;
+    blankMode?: string | null;
+    designMode?: string | null;
+  } | null;
   resolvedModelIdentityId?: string | null;
+  /** When true, model_back / model_front official jobs were enqueued for this batch. */
+  officialModelRolesEnabled?: boolean;
   colors: Record<
     string,
     {
       blankVariantId: string;
       colorName?: string | null;
       primaryVariantId?: string | null;
+      /** Snapshot from `resolveBlankProductImagePlan` at batch creation (blank color row). */
+      officialPlan?: {
+        enabledOfficialRolesOrdered: Rp8394InitialAssetRole[];
+        requiredLaunchOfficialRoles: Rp8394InitialAssetRole[];
+        requiredShopifyOfficialRoles: Rp8394InitialAssetRole[] | null;
+        galleryOrderOfficialRoles: Rp8394InitialAssetRole[];
+      } | null;
       roles: Partial<
         Record<
           Rp8394InitialAssetRole,
-          { status: "queued" | "running" | "done" | "failed"; error?: string; updatedAt?: Timestamp }
+          {
+            status:
+              | "queued"
+              | "running"
+              | "done"
+              | "failed"
+              | "skipped_no_identity"
+              | "optional_failed";
+            reason?: string;
+            error?: string;
+            updatedAt?: Timestamp;
+          }
         >
       >;
     }
@@ -1172,6 +1243,11 @@ export interface RpProduct {
   variantCount?: number;
   /** Distinct blank color lines (unique `blankVariantId` on variant subdocs). */
   colorVariantCount?: number;
+  /**
+   * Inherited from blank at creation. Drives Shopify `productSet` shape (see `functions/shopifySync.js`).
+   * Omitted on older docs: legacy sync (full Color × Size, unchanged).
+   */
+  shopifyVariantMode?: ShopifyVariantMode | null;
   /** Cache only — not authoritative for PDP imagery. */
   displayMedia?: RpProductDisplayMediaCache | null;
 
@@ -1181,6 +1257,8 @@ export interface RpProduct {
   assetsProgress?: { completed: number; total: number };
   assetsRoles?: Partial<Record<Rp8394InitialAssetRole, RpParentAssetRoleState>>;
   assetsUpdatedAt?: Timestamp | null;
+  /** Operator hint when model official jobs were skipped (no identity). */
+  officialAssetsNote?: string | null;
 
   /** One-click launch pipeline (operator-facing). Lower-level `assets*` tracks image batch. */
   launchStatus?:
@@ -2149,6 +2227,9 @@ export type RPBlankArtworkTone = "light" | "dark" | "white";
 /** Garment-level default for which sides receive print in product generation (orthogonal to design artwork inventory). */
 export type RPBlankDefaultPrintSides = "front_only" | "back_only" | "both";
 
+/** How Shopify variant rows/options are built at sync (blank → product inheritance). */
+export type ShopifyVariantMode = "color" | "color_size";
+
 /**
  * Letter sizes for apparel (blank-level). Phase 1: configure on `rp_blanks` only.
  * Future: Shopify product variants can combine **Color** (from blank color variants) × **Size** (from this list)
@@ -2327,6 +2408,46 @@ export interface RpRenderTargetSettings {
 }
 
 /**
+ * 8394 MVP `generateProductFlatRenders` slots (Cloud Functions + variant `flatRenders` / `generatedRenderOutputs` roles).
+ * Order matches default gallery / hero priority within the shot plan.
+ */
+export type RpBlankProductImageGenerationKey =
+  | "model_blended_back"
+  | "flat_clean_front"
+  | "flat_blended_back"
+  | "model_clean_front";
+
+/**
+ * Blank-defined row for one catalog shot: whether it exists for this color, launch / Shopify gates, ordering, source photo, artwork expectation.
+ * When `productImageTargets` is omitted on the blank variant, the pipeline infers enabled slots from `images.*` URLs (legacy).
+ */
+export interface RPBlankProductImageTarget {
+  /** When false, this slot is never generated. */
+  enabled?: boolean;
+  requiredForLaunch?: boolean;
+  requiredForShopify?: boolean;
+  /** Lower sorts earlier in PDP / preview galleries when using blank-driven ordering. */
+  galleryOrder?: number | null;
+  /** Overrides `images.flatBack` / `modelBack` / etc. for this shot’s source photograph. */
+  sourcePhotoUrl?: string | null;
+  /**
+   * For back design-composite slots only (`flat_blended_back`, `model_blended_back`).
+   * When false, the pipeline emits garment-only output (no design fetch). Front clean slots are always garment-only.
+   */
+  expectsArtwork?: boolean;
+  /** Merged on top of blank `renderProfile` tuning for this render target after base resolution. */
+  renderSettings?: Partial<RpRenderTargetSettings> | null;
+}
+
+/** Default `galleryOrder` when a target omits it (lower = earlier). */
+export const RP_BLANK_PRODUCT_IMAGE_DEFAULT_GALLERY_ORDER: Record<RpBlankProductImageGenerationKey, number> = {
+  model_blended_back: 10,
+  flat_clean_front: 20,
+  flat_blended_back: 30,
+  model_clean_front: 40,
+};
+
+/**
  * Per-render-target tuning on the blank (placement scale/position hints, blend, warp, mask).
  * **Zone geometry and safe-area shape** remain on `RPBlank.placements[]` only.
  */
@@ -2413,6 +2534,11 @@ export interface RPBlankVariant {
    * `flat_*` merges with legacy `renderProfileOverrides.{front|back}`; `model_*` does not inherit legacy side overrides.
    */
   renderTargetOverrides?: RPBlankVariantRenderTargetOverrides | null;
+  /**
+   * Which product-image passes exist for this garment color, their launch/Shopify requirements, gallery order, and overrides.
+   * Drives `generateProductFlatRenders`, PDP gallery ordering, and variant readiness when provided.
+   */
+  productImageTargets?: Partial<Record<RpBlankProductImageGenerationKey, RPBlankProductImageTarget>> | null;
   sortOrder?: number | null;
   eligibilityOverride?: RPBlankVariantEligibilityOverride | null;
 }
@@ -2576,6 +2702,12 @@ export interface RPBlank {
 
   // —— Master model: color variants ——
   variants?: RPBlankVariant[] | null;
+
+  /**
+   * Shopify variant matrix: `color` = one sellable variant per color (sizes share that Shopify variant id);
+   * `color_size` = Color × Size options with one Shopify row per Rally variant. Omitted / legacy: pre-field sync behavior.
+   */
+  shopifyVariantMode?: ShopifyVariantMode | null;
 
   /**
    * Which garment sizes this style carries (master blank). Canonical for **Size** Shopify option.

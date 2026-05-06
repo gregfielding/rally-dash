@@ -18,7 +18,7 @@
 const fs = require("fs");
 const path = require("path");
 const admin = require("firebase-admin");
-const { DEFAULT_ASSET_PLAN } = require("../lib/defaultAssetPlan");
+const { LEGACY_DEFAULT_ASSET_PLAN, resolveBlankProductImagePlan } = require("../lib/defaultAssetPlan");
 
 /**
  * Without an explicit projectId, `app.options.projectId` is often missing under user ADC,
@@ -313,12 +313,17 @@ async function logSlugDebugWhenNoMatch(routeSegment, triedQueries) {
   console.log("");
 }
 
+/**
+ * Progress counts from actual `colors[ck].roles` keys (blank-driven batch), not a fixed 4-role list.
+ */
 function aggregateOfficialRolesFromBatch(b) {
   const colors = (b && b.colors) || {};
   const o = { done: 0, failed: 0, running: 0, queued: 0 };
   for (const ck of Object.keys(colors)) {
     const roles = (colors[ck] && colors[ck].roles) || {};
-    for (const r of DEFAULT_ASSET_PLAN) {
+    const roleKeys = Object.keys(roles);
+    if (roleKeys.length === 0) continue;
+    for (const r of roleKeys) {
       const st = roles[r] && roles[r].status ? String(roles[r].status) : "queued";
       if (st === "done") o.done += 1;
       else if (st === "failed") o.failed += 1;
@@ -327,6 +332,74 @@ function aggregateOfficialRolesFromBatch(b) {
     }
   }
   return o;
+}
+
+/**
+ * Re-resolve the blank color matrix from `rp_blanks` so expectations match preview / enqueue.
+ * Legacy fallback only when blank id or master doc is missing (smoke tests / broken fixtures).
+ */
+async function resolveExpectedPlanFromBlank(db, product, batchData) {
+  const blankId = product.blankId && String(product.blankId).trim();
+  if (!blankId) {
+    return {
+      source: "legacy_fallback",
+      reason: "no_blank_id_on_product",
+      enabledUnionOrdered: [...LEGACY_DEFAULT_ASSET_PLAN],
+      perColor: null,
+    };
+  }
+  const bSnap = await db.collection("rp_blanks").doc(blankId).get();
+  if (!bSnap.exists) {
+    return {
+      source: "legacy_fallback",
+      reason: "rp_blanks_doc_missing",
+      enabledUnionOrdered: [...LEGACY_DEFAULT_ASSET_PLAN],
+      perColor: null,
+    };
+  }
+  const blank = bSnap.data() || {};
+  const colors = (batchData && batchData.colors) || {};
+  /** @type {Record<string, { blankVariantId: string; enabledOfficialRolesOrdered: string[]; requiredLaunchOfficialRoles: string[]; requiredShopifyOfficialRoles: string[] | null; galleryOrderOfficialRoles: string[] }>} */
+  const perColor = {};
+  const union = new Set();
+  for (const ck of Object.keys(colors)) {
+    const block = colors[ck] || {};
+    const bvId = String(block.blankVariantId || ck).trim();
+    const vr = Array.isArray(blank.variants) ? blank.variants.find((v) => v && String(v.variantId) === bvId) : null;
+    if (vr) {
+      const resolved = resolveBlankProductImagePlan(blank, vr);
+      perColor[ck] = {
+        blankVariantId: bvId,
+        enabledOfficialRolesOrdered: resolved.enabledOfficialRolesOrdered,
+        requiredLaunchOfficialRoles: resolved.requiredLaunchOfficialRoles,
+        requiredShopifyOfficialRoles: resolved.requiredShopifyOfficialRoles,
+        galleryOrderOfficialRoles: resolved.galleryOrderOfficialRoles,
+      };
+      resolved.enabledOfficialRolesOrdered.forEach((r) => union.add(r));
+    }
+  }
+  const enabledUnionOrdered = union.size ? Array.from(union) : [...LEGACY_DEFAULT_ASSET_PLAN];
+  return {
+    source: "blank_plan",
+    reason: null,
+    enabledUnionOrdered,
+    perColor,
+  };
+}
+
+function jsonEqual(a, b) {
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
+/** Same multiset of strings (order-independent). */
+function sameRoleKeySet(roleKeys, officialOrdered) {
+  const a = [...roleKeys].sort().join("\0");
+  const b = [...officialOrdered].sort().join("\0");
+  return a === b;
 }
 
 async function countJobsLinkedToAssetBatch(batchId) {
@@ -385,10 +458,15 @@ async function validateProduct(doc) {
     batchStatus: null,
     batchAssetsProgress: null,
     launchPipeline: null,
-    officialRolesExpected: [...DEFAULT_ASSET_PLAN],
+    officialRolesExpected: [...LEGACY_DEFAULT_ASSET_PLAN],
+    officialRolesExpectedSource: "legacy_fallback",
+    officialRolesExpectedReason: "batch_not_loaded",
     officialRoleSlotsExpected: null,
     officialRoleProgress: null,
     batchJobCounts: null,
+    /** `match` | `fallback` | `mismatch` — batch `officialPlan` vs re-resolved blank plan per color key. */
+    planParityStatus: "fallback",
+    planParityByColor: null,
   };
   if (batchId) {
     const bSnap = await db.collection("rp_product_asset_batches").doc(batchId).get();
@@ -398,9 +476,52 @@ async function validateProduct(doc) {
       batchDiag.batchStatus = b.status ?? null;
       batchDiag.batchAssetsProgress = b.assetsProgress ?? null;
       batchDiag.launchPipeline = b.launchPipeline === true;
-      const colorKeys = Object.keys(b.colors || {});
-      batchDiag.officialRoleSlotsExpected = colorKeys.length * DEFAULT_ASSET_PLAN.length;
+      let slotTotal = 0;
+      for (const ck of Object.keys(b.colors || {})) {
+        const roles = (b.colors[ck] && b.colors[ck].roles) || {};
+        slotTotal += Object.keys(roles).length;
+      }
+      batchDiag.officialRoleSlotsExpected = slotTotal;
       batchDiag.officialRoleProgress = aggregateOfficialRolesFromBatch(b);
+
+      const expected = await resolveExpectedPlanFromBlank(db, p, b);
+      batchDiag.officialRolesExpected = expected.enabledUnionOrdered;
+      batchDiag.officialRolesExpectedSource = expected.source;
+      batchDiag.officialRolesExpectedReason = expected.reason;
+
+      /** @type {Record<string, string>} */
+      const parityByColor = {};
+      const colors = b.colors || {};
+      for (const ck of Object.keys(colors)) {
+        const block = colors[ck] || {};
+        const snap = block.officialPlan;
+        const resolved = expected.perColor && expected.perColor[ck];
+        if (!snap || !resolved) {
+          parityByColor[ck] = "fallback";
+          anyFallback = true;
+          continue;
+        }
+        const keys = Object.keys(block.roles || {});
+        const keysMatch = sameRoleKeySet(keys, resolved.enabledOfficialRolesOrdered);
+
+        const enabledOk = jsonEqual(snap.enabledOfficialRolesOrdered, resolved.enabledOfficialRolesOrdered);
+        const launchOk = jsonEqual(snap.requiredLaunchOfficialRoles, resolved.requiredLaunchOfficialRoles);
+        const galleryOk = jsonEqual(snap.galleryOrderOfficialRoles, resolved.galleryOrderOfficialRoles);
+        const shopOk =
+          (snap.requiredShopifyOfficialRoles == null && resolved.requiredShopifyOfficialRoles == null) ||
+          jsonEqual(snap.requiredShopifyOfficialRoles || [], resolved.requiredShopifyOfficialRoles || []);
+
+        const ok = enabledOk && launchOk && galleryOk && shopOk && keysMatch;
+        parityByColor[ck] = ok ? "match" : "mismatch";
+        if (!ok) anyMismatch = true;
+      }
+      batchDiag.planParityByColor = parityByColor;
+      const parityVals = Object.values(parityByColor);
+      if (parityVals.length === 0) batchDiag.planParityStatus = "fallback";
+      else if (parityVals.some((s) => s === "mismatch")) batchDiag.planParityStatus = "mismatch";
+      else if (parityVals.some((s) => s === "fallback")) batchDiag.planParityStatus = "fallback";
+      else batchDiag.planParityStatus = "match";
+
       batchDiag.batchJobCounts = await countJobsLinkedToAssetBatch(batchId);
     }
   }
@@ -524,10 +645,19 @@ async function main() {
     console.log(
       `  batch doc exists: ${row.batchDiag.batchDocExists} | batch status: ${row.batchDiag.batchStatus ?? "—"} | batch progress: ${JSON.stringify(row.batchDiag.batchAssetsProgress)} | launchPipeline on batch: ${row.batchDiag.launchPipeline}`
     );
-    console.log(`  official roles expected (per color): ${JSON.stringify(row.batchDiag.officialRolesExpected)}`);
+    console.log(
+      `  official roles expected (${row.batchDiag.officialRolesExpectedSource}): ${JSON.stringify(row.batchDiag.officialRolesExpected)}`
+    );
+    if (row.batchDiag.officialRolesExpectedReason) {
+      console.log(`  official roles expected note: ${row.batchDiag.officialRolesExpectedReason}`);
+    }
     console.log(
       `  official role slots expected: ${row.batchDiag.officialRoleSlotsExpected ?? "—"} | progress: ${JSON.stringify(row.batchDiag.officialRoleProgress)}`
     );
+    console.log(`  plan parity (batch.officialPlan vs blank re-resolve): ${row.batchDiag.planParityStatus}`);
+    if (row.batchDiag.planParityByColor) {
+      console.log(`  plan parity by color: ${JSON.stringify(row.batchDiag.planParityByColor)}`);
+    }
     if (row.batchDiag.batchJobCounts) {
       console.log(
         `  jobs linked to batch: rp_generation_jobs=${row.batchDiag.batchJobCounts.rp_generation_jobs} (official primary) | rp_mock_jobs=${row.batchDiag.batchJobCounts.rp_mock_jobs} (8394 secondary, if any)`

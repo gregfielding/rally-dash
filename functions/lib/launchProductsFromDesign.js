@@ -37,10 +37,13 @@ async function launchProductsFromDesign(ctx) {
     uid,
     forceAssetBatch,
     autoSyncShopify,
+    queue8394Secondary,
   } = ctx;
 
   const launchOptions = {
     autoSyncShopify: autoSyncShopify === true,
+    /** `true` = enqueue legacy `rp_mock_jobs` + `variant_render_source` flats after official batch (non-canonical). Default off. */
+    queue8394Secondary: queue8394Secondary === true,
   };
 
   let materializingSet = false;

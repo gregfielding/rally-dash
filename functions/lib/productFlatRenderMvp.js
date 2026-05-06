@@ -42,7 +42,12 @@ const {
   getVariantModelBackUrl,
   getVariantModelFrontUrl,
 } = require("./variantRenderSources");
-const { pickRasterUrlForVariant, resolveBackRenderTreatment } = require("./artworkToneResolution");
+const {
+  pickRasterUrlForVariant,
+  resolveBackRenderTreatment,
+  resolveBlendedPreviewBlend8394,
+} = require("./artworkToneResolution");
+const { resizeInsideDimensions8394 } = require("./resizeInside8394");
 const {
   applyDesignWarp8394,
   applyDesignMask8394,
@@ -50,6 +55,12 @@ const {
   snapshotWarp,
   snapshotMask,
 } = require("./compositor8394");
+const {
+  resolve8394ProductImagePlan,
+  enabledGenerationKeysInPlanOrder,
+  expectsArtworkForPlanKey,
+} = require("./blankProductImagePlan");
+const { mergeRenderTargetSettings } = require("./renderTargetTuning");
 
 const MASTER_BLANK_SCHEMA_VERSION = 2;
 const MVP_STYLE_CODE = "8394";
@@ -149,6 +160,28 @@ function resolveBackSidePngUrls(design) {
 }
 
 /**
+ * PNG URLs for **front** placement (8394). Matches nested `design.assets.front` / legacy flat files.
+ */
+function resolveFrontSidePngUrls(design) {
+  const a = design.assets || {};
+  const f = design.files || {};
+  const nsA = a.front || {};
+  const nsF = f.front || {};
+  let lightPng = nsA.lightPng || (nsF.lightPng && nsF.lightPng.downloadUrl) || null;
+  let darkPng = nsA.darkPng || (nsF.darkPng && nsF.darkPng.downloadUrl) || null;
+  let whitePng = nsA.whitePng || (nsF.whitePng && nsF.whitePng.downloadUrl) || null;
+  const legL = a.lightPng || (f.lightPng && f.lightPng.downloadUrl) || (f.png && f.png.downloadUrl) || null;
+  const legD = a.darkPng || (f.darkPng && f.darkPng.downloadUrl) || null;
+  const legW = a.whitePng || (f.whitePng && f.whitePng.downloadUrl) || null;
+  if (legacyFlatTargetsSide(design, "front")) {
+    lightPng = lightPng != null && lightPng !== "" ? lightPng : legL;
+    darkPng = darkPng != null && darkPng !== "" ? darkPng : legD;
+    whitePng = whitePng != null && whitePng !== "" ? whitePng : legW;
+  }
+  return { lightPng, darkPng, whitePng };
+}
+
+/**
  * @param {object} design
  * @param {object} blankVariantRow — `rp_blanks.variants[]` row
  * @param {object} [productVariantDoc] — `rp_products/.../variants/*`; merges colorName (and optional colorFamily / preferredArtworkTone when present)
@@ -175,6 +208,31 @@ function pickDesignPngForVariant(design, blankVariantRow, productVariantDoc) {
   );
 }
 
+/**
+ * Front-side design PNG for 8394 compositing (official flat_front_clean).
+ */
+function pickDesignPngForVariantFront(design, blankVariantRow, productVariantDoc) {
+  const colorName =
+    (productVariantDoc &&
+      typeof productVariantDoc.colorName === "string" &&
+      productVariantDoc.colorName.trim()) ||
+    blankVariantRow.colorName;
+  const pvFam = productVariantDoc && productVariantDoc.colorFamily;
+  const fam = getEffectiveColorFamily(
+    pvFam === "light" || pvFam === "dark" ? pvFam : blankVariantRow.colorFamily,
+    colorName
+  );
+  const pvPref = productVariantDoc && productVariantDoc.preferredArtworkTone;
+  const pref =
+    pvPref === "light" || pvPref === "dark" || pvPref === "white" ? pvPref : blankVariantRow.preferredArtworkTone;
+  const u = resolveFrontSidePngUrls(design);
+  return pickRasterUrlForVariant(
+    { lightPng: u.lightPng, darkPng: u.darkPng, whitePng: u.whitePng },
+    fam,
+    pref
+  );
+}
+
 function normalizeSimple8394(s) {
   if (!s || typeof s !== "object") return null;
   const realism = Math.max(0, Math.min(100, Math.round(Number(s.realism) || 52)));
@@ -184,22 +242,24 @@ function normalizeSimple8394(s) {
   return { realism, inkStrength, sizePreset };
 }
 
+/** Matches `lib/blanks/preview8394` `mapRealismToBlendPreview`. */
 function mapRealism8394(realism) {
   const r = Math.max(0, Math.min(100, realism));
   let blendMode;
-  if (r < 28) blendMode = "normal";
-  else if (r < 52) blendMode = "soft-light";
-  else if (r < 76) blendMode = "overlay";
+  if (r < 22) blendMode = "normal";
+  else if (r < 46) blendMode = "soft-light";
+  else if (r < 70) blendMode = "overlay";
   else blendMode = "multiply";
   const t = r / 100;
-  const blendOpacity = Math.max(0.74, Math.min(1, 1 - t * 0.16));
+  const blendOpacity = Math.min(0.97, Math.max(0.4, 0.44 + (1 - t) * 0.52));
   return { blendMode, blendOpacity };
 }
 
+/** Matches `lib/blanks/preview8394` `mapInkStrengthToFactorsPreview` (contrast/sat only for Sharp). */
 function mapInk8394(inkStrength) {
   const i = Math.max(0, Math.min(100, inkStrength)) / 100;
-  const designOpacityMultiplier = Math.max(0.35, Math.min(1, 0.45 + 0.55 * i));
-  const contrastPercent = Math.min(125, 88 + i * 32);
+  const designOpacityMultiplier = Math.min(1, Math.max(0.12, 0.18 + 0.82 * i));
+  const contrastPercent = Math.min(132, Math.max(58, 64 + i * 58));
   return { designOpacityMultiplier, contrastPercent };
 }
 
@@ -299,6 +359,142 @@ async function pipeWarpMaskForDesignLayer(buf, sharpLib, tuningSettings) {
   };
 }
 
+const ARTWORK_BOUNDS_ALPHA_THRESHOLD_V = 5;
+
+async function measureAlphaBoundsInRgbaPngBuffer(buf, sharp) {
+  const { data, info } = await sharp(buf).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const w = info.width;
+  const h = info.height;
+  const stride = w * 4;
+  let minX = w;
+  let minY = h;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < h; y++) {
+    const row = y * stride;
+    for (let x = 0; x < w; x++) {
+      const a = data[row + x * 4 + 3];
+      if (a > ARTWORK_BOUNDS_ALPHA_THRESHOLD_V) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < minX) {
+    return { empty: true, minX: 0, minY: 0, maxX: w - 1, maxY: h - 1, w, h };
+  }
+  return {
+    empty: false,
+    minX,
+    minY,
+    maxX,
+    maxY,
+    w: maxX - minX + 1,
+    h: maxY - minY + 1,
+  };
+}
+
+function mergeSafeAreaNorm8394(layoutPlacement) {
+  const base = { ...DEFAULT_GARMENT_SAFE_AREA };
+  const s = layoutPlacement && layoutPlacement.safeArea;
+  if (s && typeof s === "object") {
+    if (s.x != null && Number.isFinite(Number(s.x))) base.x = Number(s.x);
+    if (s.y != null && Number.isFinite(Number(s.y))) base.y = Number(s.y);
+    if (s.w != null && Number.isFinite(Number(s.w))) base.w = Number(s.w);
+    if (s.h != null && Number.isFinite(Number(s.h))) base.h = Number(s.h);
+  }
+  return base;
+}
+
+/** Same centering as clean/blended composite in this file (slot vs actual layer WxH). */
+function compositeTopLeft8394(left0, top0, resizedWidth, resizedHeight, layerW, layerH, blankWidth, blankHeight) {
+  const left = Math.max(0, Math.min(Math.round(left0 + (resizedWidth - layerW) / 2), blankWidth - layerW));
+  const top = Math.max(0, Math.min(Math.round(top0 + (resizedHeight - layerH) / 2), blankHeight - layerH));
+  return { x: left, y: top };
+}
+
+const DRIFT_CLASSIFY_EPSILON_PY = 0.5;
+
+function classifyVerticalDrift8394(warpDyPy, treatmentDyPy, renderTreatment) {
+  const w = Math.abs(warpDyPy) >= DRIFT_CLASSIFY_EPSILON_PY;
+  const t = Math.abs(treatmentDyPy) >= DRIFT_CLASSIFY_EPSILON_PY;
+  if (renderTreatment === "clean") {
+    if (!w) return "neither";
+    return "warp_only";
+  }
+  if (!w && !t) return "neither";
+  if (w && !t) return "warp_only";
+  if (!w && t) return "treatment_only";
+  return "warp_and_treatment";
+}
+
+/**
+ * Garment-space vertical metrics for one design-layer buffer (alpha scan + composite TL in slot).
+ */
+/** One row for [8394_VISIBLE_CENTER_MATRIX] (official pass: preview/delta columns null). */
+function official8394VisibleCenterMatrixRowFromTelemetry(v) {
+  if (!v) return null;
+  const finalY = v.final && v.final.visibleCenterY != null ? v.final.visibleCenterY : v.visibleCenterY;
+  return {
+    "preview.visibleCenterY": null,
+    "official.preWarp.visibleCenterY": v.preWarp ? v.preWarp.visibleCenterY : null,
+    "official.postWarp.visibleCenterY": v.postWarp ? v.postWarp.visibleCenterY : null,
+    "official.postTreatment.visibleCenterY": v.postTreatment != null ? v.postTreatment.visibleCenterY : null,
+    "official.final.visibleCenterY": finalY,
+    "official.visibleCenterY - preview.visibleCenterY": null,
+    driftSourceVsPreWarp: v.driftSourceVsPreWarp != null ? v.driftSourceVsPreWarp : null,
+  };
+}
+
+async function garmentVisibleMetricsSlice8394({
+  sharp,
+  stageLabel,
+  blankWidth,
+  blankHeight,
+  left0,
+  top0,
+  resizedWidth,
+  resizedHeight,
+  buf,
+  safeAreaNorm,
+}) {
+  const meta = await sharp(buf).metadata();
+  const layerW = meta.width || 0;
+  const layerH = meta.height || 0;
+  const placed = compositeTopLeft8394(left0, top0, resizedWidth, resizedHeight, layerW, layerH, blankWidth, blankHeight);
+  const alphaBounds = await measureAlphaBoundsInRgbaPngBuffer(buf, sharp);
+  const bottomExclusive =
+    alphaBounds.empty || alphaBounds.maxY < alphaBounds.minY
+      ? placed.y + layerH
+      : placed.y + alphaBounds.maxY + 1;
+  const visibleHeightPx = alphaBounds.h;
+  const visibleCenterY = bottomExclusive - visibleHeightPx / 2;
+  const safeBottomY = (safeAreaNorm.y + safeAreaNorm.h) * blankHeight;
+  return {
+    stageLabel,
+    bitmapPx: { w: layerW, h: layerH },
+    compositeTopLeftPx: placed,
+    alphaBoundsInPlacedBitmapPx: {
+      minX: alphaBounds.minX,
+      minY: alphaBounds.minY,
+      maxX: alphaBounds.maxX,
+      maxY: alphaBounds.maxY,
+      w: alphaBounds.w,
+      h: alphaBounds.h,
+    },
+    visibleBottomEdgeYExclusivePx: bottomExclusive,
+    visibleHeightPx,
+    visibleCenterY,
+    garmentRasterHeightPx: blankHeight,
+    distanceVisibleBottomToGarmentBottomPx: blankHeight - bottomExclusive,
+    safeAreaNormMerged: safeAreaNorm,
+    safeAreaBottomY_px: safeBottomY,
+    distanceVisibleBottomToSafeAreaBottomPx: safeBottomY - bottomExclusive,
+  };
+}
+
 /**
  * Shared 8394 compositor: crop design, layout, warp/mask, clean + blended PNG buffers on garment.
  */
@@ -315,7 +511,10 @@ async function render8394DesignOnGarmentSharp(options) {
     target,
     renderTreatment,
     renderSelectionLog,
+    debugArtifacts,
   } = options;
+
+  let artwork8394VisibleVerticalMetrics = null;
 
   const layoutPlacement =
     effPl && placementRow
@@ -325,6 +524,12 @@ async function render8394DesignOnGarmentSharp(options) {
           defaultY: tuning.settings.placement.y,
           defaultScale: tuning.settings.placement.scale,
           safeArea: effPl.safeArea,
+          artboardBase:
+            effPl.artboardBase != null && Number.isFinite(Number(effPl.artboardBase))
+              ? Number(effPl.artboardBase)
+              : placementRow.artboardBase != null && Number.isFinite(Number(placementRow.artboardBase))
+                ? Number(placementRow.artboardBase)
+                : ART_BASE,
         }
       : placementRow;
 
@@ -335,12 +540,24 @@ async function render8394DesignOnGarmentSharp(options) {
     throw new functions.https.HttpsError("internal", "Invalid blank image dimensions");
   }
 
+  const designMetaOriginal = await sharp(designBuffer).metadata();
+  const designOriginalPx = {
+    w: designMetaOriginal.width || null,
+    h: designMetaOriginal.height || null,
+  };
+
   const cropped = await cropDesignToArtworkBounds8394(designBuffer, sharp);
   const designBufferC = cropped.buffer;
   const designWidth = cropped.width;
   const designHeight = cropped.height;
+  const alphaCropRectPx = {
+    x: cropped.left != null ? cropped.left : 0,
+    y: cropped.top != null ? cropped.top : 0,
+    w: designWidth,
+    h: designHeight,
+  };
 
-  const { left: left0, top: top0, resizedWidth, resizedHeight } = computeLayout(
+  const { left: left0, top: top0, resizedWidth, resizedHeight } = computeLayout8394(
     blankWidth,
     blankHeight,
     layoutPlacement,
@@ -354,8 +571,23 @@ async function render8394DesignOnGarmentSharp(options) {
     .png()
     .toBuffer();
 
+  const pngPreWarp = Buffer.from(resizedBasePng);
+
+  const metaResizedBeforeWarp = await sharp(resizedBasePng).metadata();
+  const resizedBitmapBeforeWarpPx = {
+    w: metaResizedBeforeWarp.width || resizedWidth,
+    h: metaResizedBeforeWarp.height || resizedHeight,
+  };
+
   const wm = await pipeWarpMaskForDesignLayer(resizedBasePng, sharp, tuning.settings);
   resizedBasePng = wm.buffer;
+  const pngPostWarp = Buffer.from(resizedBasePng);
+
+  const metaAfterWarpMask = await sharp(resizedBasePng).metadata();
+  const bitmapDimensionsAfterWarpMaskPx = {
+    w: metaAfterWarpMask.width || resizedWidth,
+    h: metaAfterWarpMask.height || resizedHeight,
+  };
 
   const view = String(target).includes("back") ? "back" : "front";
   const slotHint =
@@ -390,6 +622,12 @@ async function render8394DesignOnGarmentSharp(options) {
 
   let flatCleanBuffer;
   let flatBlendedBuffer;
+  let mergedSimple8394 = null;
+  let d8394Engine = null;
+  /** Pixel placement audit (matches canvas: center anchor + fitted top-left; warp recenters in slot). */
+  let placement8394PixelAudit = null;
+  /** Blended path only: design bitmap WxH after apply8394DesignTreatmentPng (before clean opacity / blend stack). */
+  let bitmapDimensionsAfterTreatmentPx = null;
 
   if (renderTreatment === "clean") {
     const cleanMeta = await sharp(resizedBasePng).metadata();
@@ -403,12 +641,86 @@ async function render8394DesignOnGarmentSharp(options) {
       .png()
       .toBuffer();
     flatBlendedBuffer = flatCleanBuffer;
+    placement8394PixelAudit = {
+      cleanCompositeTopLeftPx: { x: leftClean, y: topClean },
+      blendedCompositeTopLeftPx: { x: leftClean, y: topClean },
+      layerPxClean: { w: cw, h: ch },
+      layerPxBlended: { w: cw, h: ch },
+    };
+    {
+      const safeNorm = mergeSafeAreaNorm8394(layoutPlacement);
+      const mPre = await garmentVisibleMetricsSlice8394({
+        sharp,
+        stageLabel: "preWarp_resizeInside_only",
+        blankWidth: blankWidth,
+        blankHeight: blankHeight,
+        left0,
+        top0,
+        resizedWidth,
+        resizedHeight,
+        buf: pngPreWarp,
+        safeAreaNorm: safeNorm,
+      });
+      const mPost = await garmentVisibleMetricsSlice8394({
+        sharp,
+        stageLabel: "postWarp_after_warp_mask",
+        blankWidth: blankWidth,
+        blankHeight: blankHeight,
+        left0,
+        top0,
+        resizedWidth,
+        resizedHeight,
+        buf: pngPostWarp,
+        safeAreaNorm: safeNorm,
+      });
+      const warpDy = mPost.visibleCenterY - mPre.visibleCenterY;
+      const preWarp = { visibleCenterY: mPre.visibleCenterY };
+      const postWarp = { visibleCenterY: mPost.visibleCenterY };
+      const postTreatment = null;
+      const final = { visibleCenterY: mPost.visibleCenterY };
+      artwork8394VisibleVerticalMetrics = {
+        kind: "official",
+        renderTarget: target,
+        renderTreatment: "clean",
+        layerScannedForAlpha: "postWarp_resizedBasePng",
+        preWarp,
+        postWarp,
+        postTreatment,
+        final,
+        placedBitmapTopLeftPx: mPost.compositeTopLeftPx,
+        placedBitmapHeightPx: mPost.bitmapPx.h,
+        alphaBoundsInPlacedBitmapPx: mPost.alphaBoundsInPlacedBitmapPx,
+        visibleBottomEdgeYExclusivePx: mPost.visibleBottomEdgeYExclusivePx,
+        visibleHeightPx: mPost.visibleHeightPx,
+        visibleCenterY: final.visibleCenterY,
+        garmentRasterHeightPx: mPost.garmentRasterHeightPx,
+        distanceVisibleBottomToGarmentBottomPx: mPost.distanceVisibleBottomToGarmentBottomPx,
+        safeAreaNormMerged: safeNorm,
+        safeAreaBottomY_px: mPost.safeAreaBottomY_px,
+        distanceVisibleBottomToSafeAreaBottomPx: mPost.distanceVisibleBottomToSafeAreaBottomPx,
+        visibleCenterDeltaYVersusPreview: null,
+        stagesGarmentSpace: { preWarp: mPre, postWarp: mPost },
+        verticalDriftPy: { warp: warpDy, treatment: null },
+        driftSourceVsPreWarp: classifyVerticalDrift8394(warpDy, 0, "clean"),
+        pipelineDimensionHintsPx: {
+          resizedBitmapBeforeWarpPx,
+          bitmapDimensionsAfterWarpMaskPx,
+          bitmapDimensionsAfterTreatmentPx: null,
+        },
+      };
+    }
   } else {
-    const mergedSimple = mergeSimple8394ForTarget(placementRow, variant, target);
-    const d8394 = derive8394Engine(mergedSimple);
+    mergedSimple8394 = mergeSimple8394ForTarget(placementRow, variant, target);
+    d8394Engine = derive8394Engine(mergedSimple8394);
+    const d8394 = d8394Engine;
     let processedPng = resizedBasePng;
     if (d8394) {
       processedPng = await apply8394DesignTreatmentPng(processedPng, sharp, d8394);
+      const mt = await sharp(processedPng).metadata();
+      bitmapDimensionsAfterTreatmentPx = {
+        w: mt.width || 0,
+        h: mt.height || 0,
+      };
     }
 
     let resizedCleanPng = processedPng;
@@ -464,35 +776,358 @@ async function render8394DesignOnGarmentSharp(options) {
       ])
       .png()
       .toBuffer();
+    placement8394PixelAudit = {
+      cleanCompositeTopLeftPx: { x: leftClean, y: topClean },
+      blendedCompositeTopLeftPx: { x: leftBlend, y: topBlend },
+      layerPxClean: { w: cw, h: ch },
+      layerPxBlended: { w: actualW, h: actualH },
+    };
+    {
+      const safeNorm = mergeSafeAreaNorm8394(layoutPlacement);
+      const mPre = await garmentVisibleMetricsSlice8394({
+        sharp,
+        stageLabel: "preWarp_resizeInside_only",
+        blankWidth: blankWidth,
+        blankHeight: blankHeight,
+        left0,
+        top0,
+        resizedWidth,
+        resizedHeight,
+        buf: pngPreWarp,
+        safeAreaNorm: safeNorm,
+      });
+      const mPostW = await garmentVisibleMetricsSlice8394({
+        sharp,
+        stageLabel: "postWarp_after_warp_mask",
+        blankWidth: blankWidth,
+        blankHeight: blankHeight,
+        left0,
+        top0,
+        resizedWidth,
+        resizedHeight,
+        buf: pngPostWarp,
+        safeAreaNorm: safeNorm,
+      });
+      const mPostT = await garmentVisibleMetricsSlice8394({
+        sharp,
+        stageLabel: "postTreatment_before_blend_premultiply",
+        blankWidth: blankWidth,
+        blankHeight: blankHeight,
+        left0,
+        top0,
+        resizedWidth,
+        resizedHeight,
+        buf: processedPng,
+        safeAreaNorm: safeNorm,
+      });
+      const warpDy = mPostW.visibleCenterY - mPre.visibleCenterY;
+      const treatDy = mPostT.visibleCenterY - mPostW.visibleCenterY;
+      const preWarp = { visibleCenterY: mPre.visibleCenterY };
+      const postWarp = { visibleCenterY: mPostW.visibleCenterY };
+      const postTreatment = { visibleCenterY: mPostT.visibleCenterY };
+      const final = { visibleCenterY: mPostT.visibleCenterY };
+      artwork8394VisibleVerticalMetrics = {
+        kind: "official",
+        renderTarget: target,
+        renderTreatment,
+        layerScannedForAlpha: "processedPng_after_treatment_before_blend_premultiply",
+        preWarp,
+        postWarp,
+        postTreatment,
+        final,
+        placedBitmapTopLeftPx: mPostT.compositeTopLeftPx,
+        placedBitmapHeightPx: mPostT.bitmapPx.h,
+        alphaBoundsInPlacedBitmapPx: mPostT.alphaBoundsInPlacedBitmapPx,
+        visibleBottomEdgeYExclusivePx: mPostT.visibleBottomEdgeYExclusivePx,
+        visibleHeightPx: mPostT.visibleHeightPx,
+        visibleCenterY: final.visibleCenterY,
+        garmentRasterHeightPx: mPostT.garmentRasterHeightPx,
+        distanceVisibleBottomToGarmentBottomPx: mPostT.distanceVisibleBottomToGarmentBottomPx,
+        safeAreaNormMerged: safeNorm,
+        safeAreaBottomY_px: mPostT.safeAreaBottomY_px,
+        distanceVisibleBottomToSafeAreaBottomPx: mPostT.distanceVisibleBottomToSafeAreaBottomPx,
+        visibleCenterDeltaYVersusPreview: null,
+        stagesGarmentSpace: { preWarp: mPre, postWarp: mPostW, postTreatment: mPostT },
+        verticalDriftPy: { warp: warpDy, treatment: treatDy },
+        driftSourceVsPreWarp: classifyVerticalDrift8394(warpDy, treatDy, renderTreatment),
+        pipelineDimensionHintsPx: {
+          resizedBitmapBeforeWarpPx,
+          bitmapDimensionsAfterWarpMaskPx,
+          bitmapDimensionsAfterTreatmentPx,
+        },
+      };
+    }
   }
 
-  return { flatCleanBuffer, flatBlendedBuffer, wm };
+  const garmentBlendModeMapped =
+    renderTreatment === "clean" ? "over" : mapBlendMode(blend && blend.blendMode);
+  const inkMultForBlend = d8394Engine ? d8394Engine.designOpacityMultiplier : 1;
+
+  const postEffectBitmapDimensionsPx8394 = placement8394PixelAudit
+    ? {
+        clean: { w: placement8394PixelAudit.layerPxClean.w, h: placement8394PixelAudit.layerPxClean.h },
+        blended: { w: placement8394PixelAudit.layerPxBlended.w, h: placement8394PixelAudit.layerPxBlended.h },
+      }
+    : null;
+
+  const official8394StrictParity = {
+    kind: "official",
+    renderTarget: target,
+    /** Same pass as dashboard preview mode: "clean" | "blended". */
+    renderPipelineMode: renderTreatment,
+    renderTreatment,
+    garmentNaturalPx: { w: blankWidth, h: blankHeight },
+    designNaturalPx: designOriginalPx,
+    alphaCropRectPx,
+    fittedSlotTopLeftPx: { x: left0, y: top0 },
+    fittedSlotDimensionsPx: { w: resizedWidth, h: resizedHeight },
+    resizedBitmapBeforeWarpPx,
+    bitmapDimensionsAfterWarpMaskPx,
+    bitmapDimensionsAfterTreatmentPx,
+    postEffectBitmapDimensionsPx: postEffectBitmapDimensionsPx8394,
+    finalCompositeTopLeftPx: placement8394PixelAudit
+      ? {
+          clean: placement8394PixelAudit.cleanCompositeTopLeftPx,
+          blended: placement8394PixelAudit.blendedCompositeTopLeftPx,
+        }
+      : null,
+    sharpBlendModeUsed: garmentBlendModeMapped,
+    blendModeInput: blend && blend.blendMode,
+    blendOpacityInput: blend && blend.blendOpacity,
+    effectiveOpacityOnRaster:
+      renderTreatment === "clean" ? null : blend && blend.blendOpacity * inkMultForBlend,
+    treatmentEngine: d8394Engine
+      ? {
+          contrastPercent: d8394Engine.contrastPercent,
+          realism: d8394Engine.realism,
+          designOpacityMultiplier: d8394Engine.designOpacityMultiplier,
+        }
+      : null,
+    warpApplied: wm.warpApplied,
+    maskApplied: wm.maskApplied,
+  };
+
+  if (
+    process.env.OFFICIAL8394_STRICT_PARITY === "1" ||
+    process.env.OFFICIAL8394_STRICT_PARITY === "true"
+  ) {
+    console.log(`[OFFICIAL8394_STRICT_PARITY] ${JSON.stringify(official8394StrictParity)}`);
+  }
+
+  const abUsed =
+    layoutPlacement &&
+    layoutPlacement.artboardBase != null &&
+    Number.isFinite(Number(layoutPlacement.artboardBase))
+      ? Number(layoutPlacement.artboardBase)
+      : ART_BASE;
+  const plx = layoutPlacement?.defaultX ?? tuning?.settings?.placement?.x ?? 0.5;
+  const ply = layoutPlacement?.defaultY ?? tuning?.settings?.placement?.y ?? 0.5;
+  const centerPointPx = { x: Math.round(plx * blankWidth), y: Math.round(ply * blankHeight) };
+  const placement8394LayoutDebug = {
+    renderTarget: target,
+    warpEnabledEffective: wm.warpApplied,
+    maskEnabledEffective: wm.maskApplied,
+    coordinateSpace: "normalized_0_1_defaultXY_on_full_blank_raster",
+    anchorReference:
+      "center_of_art_box_at_defaultXY_times_blank_size; CSS_equivalent_left_top_percent_plus_translate_-50pct",
+    garmentBounds: "full_blank_image_pixels_safeArea_visual_only",
+    scaleThenTranslateOrder: "max_fit_design_inside_artboardBase_times_scale_box_then_top_left_plus_clamp",
+    artboardBaseUsed: abUsed,
+    centerPointPx,
+    blankPx: { w: blankWidth, h: blankHeight },
+    preWarpSlotRectPx: { x: left0, y: top0, w: resizedWidth, h: resizedHeight },
+    croppedDesignWxH: { w: designWidth, h: designHeight },
+    postWarpBitmapDimensionsPx: postEffectBitmapDimensionsPx8394,
+    finalCompositeTopLeftPx: placement8394PixelAudit
+      ? {
+          clean: placement8394PixelAudit.cleanCompositeTopLeftPx,
+          blended: placement8394PixelAudit.blendedCompositeTopLeftPx,
+        }
+      : null,
+    deltaBlendedVsPreWarpSlotTopLeftPx: placement8394PixelAudit
+      ? {
+          x: placement8394PixelAudit.blendedCompositeTopLeftPx.x - left0,
+          y: placement8394PixelAudit.blendedCompositeTopLeftPx.y - top0,
+        }
+      : null,
+    preWarpDesignSlotPx: {
+      fittedTopLeft: { x: left0, y: top0 },
+      fittedWxH: { w: resizedWidth, h: resizedHeight },
+      croppedDesignWxH: { w: designWidth, h: designHeight },
+    },
+    postWarpCompositePx: placement8394PixelAudit,
+  };
+  const parityLine = {
+    kind: "official",
+    renderTarget: target,
+    warpEnabledEffective: wm.warpApplied,
+    artboardBaseUsed: abUsed,
+    centerPointPx,
+    preWarpSlotRectPx: { x: left0, y: top0, w: resizedWidth, h: resizedHeight },
+    postWarpBitmapDimensionsPx: placement8394LayoutDebug.postWarpBitmapDimensionsPx,
+    finalCompositeTopLeftBlendedPx: placement8394PixelAudit && placement8394PixelAudit.blendedCompositeTopLeftPx,
+  };
+  if (
+    process.env.OFFICIAL_PLACEMENT_PARITY_LOG === "1" ||
+    process.env.OFFICIAL_PLACEMENT_PARITY_LOG === "true"
+  ) {
+    console.log(`[PLACEMENT8394_PARITY] ${JSON.stringify(parityLine)}`);
+  }
+  if (
+    process.env.OFFICIAL_PLACEMENT_DEBUG === "1" ||
+    process.env.OFFICIAL_PLACEMENT_DEBUG === "true"
+  ) {
+    console.log("[render8394DesignOnGarmentSharp] PLACEMENT8394_DEBUG", JSON.stringify(placement8394LayoutDebug, null, 2));
+  }
+
+  const finalBlendedMeta = await sharp(flatBlendedBuffer).metadata();
+  const finalCleanMeta = await sharp(flatCleanBuffer).metadata();
+  const garmentWidth = blankWidth;
+  const garmentHeight = blankHeight;
+  const finalImageWidth = finalBlendedMeta.width ?? blankWidth;
+  const finalImageHeight = finalBlendedMeta.height ?? blankHeight;
+  const garment8394CoordinateSpaceAudit = {
+    baseGarmentInputPx: { w: blankWidth, h: blankHeight },
+    finalCompositeOutputPx: {
+      blended: { w: finalBlendedMeta.width ?? null, h: finalBlendedMeta.height ?? null },
+      clean: { w: finalCleanMeta.width ?? null, h: finalCleanMeta.height ?? null },
+    },
+    outputMatchesInputGarment:
+      finalBlendedMeta.width === blankWidth &&
+      finalBlendedMeta.height === blankHeight &&
+      finalCleanMeta.width === blankWidth &&
+      finalCleanMeta.height === blankHeight,
+    postCompositeOnGarmentRaster: {
+      trim: false,
+      extract: false,
+      resize: false,
+      note:
+        "Pipeline ends at sharp(blankBuffer).composite([...]).png().toBuffer() — no trim/extract/resize after composite.",
+    },
+    placementCoordinateSpace:
+      "normalized defaultX/defaultY × full decoded blank raster (blankWidth × blankHeight) — same as baseGarmentInputPx",
+    designSide: {
+      originalFetchPx: designOriginalPx,
+      afterArtworkAlphaCropPx: { w: designWidth, h: designHeight },
+      artworkCropUsesSharpExtract: true,
+      note: "cropDesignToArtworkBounds8394 applies extract() on the design PNG only; garment buffer is never cropped for placement.",
+    },
+  };
+
+  const composeTelemetry = {
+    renderTarget: target,
+    renderTreatment,
+    engineBlendInput: {
+      blendMode: blend && blend.blendMode,
+      blendOpacity: blend && blend.blendOpacity,
+      fabricFeel: blend && blend.fabricFeel,
+      printStrength: blend && blend.printStrength,
+    },
+    garmentComposite: {
+      sharpBlendMode: garmentBlendModeMapped,
+      blendOpacity: blend && blend.blendOpacity,
+      inkMultiplierDesignOpacity: inkMultForBlend,
+      effectiveOpacityOnGarmentPixels:
+        renderTreatment === "clean" ? null : blend.blendOpacity * inkMultForBlend,
+    },
+    tuningPlacement: tuning && tuning.settings && tuning.settings.placement,
+    tuningBlend01: tuning && tuning.settings && tuning.settings.blend,
+    tuningWarp: tuning && tuning.settings && tuning.settings.warp,
+    tuningMask: tuning && tuning.settings && tuning.settings.mask,
+    warpOn: wm.warpApplied,
+    maskOn: wm.maskApplied,
+    resolvedWarp: wm.resolvedWarp,
+    resolvedMask: wm.resolvedMask,
+    simple8394Merged: mergedSimple8394,
+    derived8394Engine: d8394Engine,
+    treatmentPng:
+      d8394Engine && renderTreatment !== "clean"
+        ? {
+            contrastPercent: d8394Engine.contrastPercent,
+            realism: d8394Engine.realism,
+            saturationModulate: Math.min(1.12, (d8394Engine.contrastPercent / 100) * 0.95 + 0.1),
+            blurRadiusIfRealismGt52:
+              d8394Engine.realism > 52 ? 0.25 + (d8394Engine.realism / 100) * 0.35 : 0,
+            designOpacityMultiplier: d8394Engine.designOpacityMultiplier,
+          }
+        : null,
+    placement8394LayoutDebug,
+    garment8394CoordinateSpaceAudit,
+    official8394StrictParity,
+    artwork8394VisibleVerticalMetrics,
+  };
+
+  if (
+    process.env.OFFICIAL8394_VISIBLE_CONTENT_V === "1" ||
+    process.env.OFFICIAL8394_VISIBLE_CONTENT_V === "true"
+  ) {
+    console.log("[8394_VISIBLE_CONTENT_V]", JSON.stringify(artwork8394VisibleVerticalMetrics));
+    console.log(
+      "[8394_VISIBLE_CENTER_MATRIX]",
+      JSON.stringify({
+        source: "official",
+        renderTarget: target,
+        row: official8394VisibleCenterMatrixRowFromTelemetry(artwork8394VisibleVerticalMetrics),
+      })
+    );
+  }
+
+  if (
+    process.env.OFFICIAL_GARMENT8394_COORD_AUDIT === "1" ||
+    process.env.OFFICIAL_GARMENT8394_COORD_AUDIT === "true"
+  ) {
+    console.log(
+      "[GARMENT8394_COORD_AUDIT]",
+      JSON.stringify({ kind: "official", renderTarget: target, ...garment8394CoordinateSpaceAudit })
+    );
+  }
+
+  let debugArtifactUrls = [];
+  if (debugArtifacts && debugArtifacts.bucket && debugArtifacts.pathPrefix) {
+    try {
+      const prefix = String(debugArtifacts.pathPrefix).replace(/\/$/, "");
+      const rawCopy = Buffer.from(designBuffer);
+      const finalOut = renderTreatment === "clean" ? flatCleanBuffer : flatBlendedBuffer;
+      const steps = [
+        ["01_raw_design_fetched.png", rawCopy],
+        ["02_overlay_after_warp_mask.png", resizedBasePng],
+        ["03_final_composite.png", finalOut],
+      ];
+      for (const [name, buf] of steps) {
+        if (!buf) continue;
+        const storagePath = `${prefix}/${name}`;
+        const url = await savePngAndReadableUrl(debugArtifacts.bucket, storagePath, buf);
+        debugArtifactUrls.push({ name, storagePath, url });
+      }
+    } catch (err) {
+      console.warn("[render8394DesignOnGarmentSharp] OFFICIAL_FLAT debug artifact save failed:", err && err.message);
+    }
+  }
+
+  return { flatCleanBuffer, flatBlendedBuffer, wm, composeTelemetry, debugArtifactUrls };
 }
 
 /**
  * Compute placement box + resized design dimensions (matches VisualPlacementEditor / onMockJobCreated).
+ * Uses `placement.artboardBase` when set (same as canvas `artBase`); else 0.5 (`ART_BASE`).
  */
-function computeLayout(blankWidth, blankHeight, placement, designWidth, designHeight) {
+function computeLayout8394(blankWidth, blankHeight, placement, designWidth, designHeight) {
   const x = placement.defaultX ?? 0.5;
   const y = placement.defaultY ?? 0.5;
   const effectiveScale = placement.defaultScale ?? 0.6;
+  const ab =
+    placement && placement.artboardBase != null && Number.isFinite(Number(placement.artboardBase))
+      ? Number(placement.artboardBase)
+      : ART_BASE;
   const centerXpx = Math.round(x * blankWidth);
   const centerYpx = Math.round(y * blankHeight);
-  const artBoxPxW = Math.round(blankWidth * ART_BASE * effectiveScale);
-  const artBoxPxH = Math.round(blankHeight * ART_BASE * effectiveScale);
+  const artBoxPxW = Math.round(blankWidth * ab * effectiveScale);
+  const artBoxPxH = Math.round(blankHeight * ab * effectiveScale);
   const left0 = Math.round(centerXpx - artBoxPxW / 2);
   const top0 = Math.round(centerYpx - artBoxPxH / 2);
-  const designAspect = designWidth / designHeight;
-  const boxAspect = artBoxPxW / artBoxPxH;
-  let resizedWidth;
-  let resizedHeight;
-  if (designAspect >= boxAspect) {
-    resizedWidth = artBoxPxW;
-    resizedHeight = Math.round(artBoxPxW / designAspect);
-  } else {
-    resizedHeight = artBoxPxH;
-    resizedWidth = Math.round(artBoxPxH * designAspect);
-  }
+  const fitted = resizeInsideDimensions8394(designWidth, designHeight, artBoxPxW, artBoxPxH);
+  const resizedWidth = fitted.w;
+  const resizedHeight = fitted.h;
   const left = Math.round(left0 + (artBoxPxW - resizedWidth) / 2);
   const top = Math.round(top0 + (artBoxPxH - resizedHeight) / 2);
   const leftClamped = Math.max(0, Math.min(left, blankWidth - resizedWidth));
@@ -635,32 +1270,30 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
         throw new functions.https.HttpsError("failed-precondition", "Variant is inactive");
       }
 
+      const imagePlan = resolve8394ProductImagePlan(blank, variant);
+
       const variantFlatBackUrlBase =
+        imagePlan.flat_blended_back.resolvedSourcePhotoUrl ||
         (variantDoc &&
           variantDoc.renderSetup &&
           variantDoc.renderSetup.back &&
           variantDoc.renderSetup.back.blankImageUrl) ||
         getVariantFlatBackUrl(blank, variant);
       const variantFlatFrontUrlBase =
+        imagePlan.flat_clean_front.resolvedSourcePhotoUrl ||
         (variantDoc &&
           variantDoc.renderSetup &&
           variantDoc.renderSetup.front &&
           variantDoc.renderSetup.front.blankImageUrl) ||
         getVariantFlatFrontUrl(blank, variant);
-      const variantModelBackUrlBase = getVariantModelBackUrl(blank, variant);
-      const variantModelFrontUrlBase = getVariantModelFrontUrl(blank, variant);
+      const variantModelBackUrlBase =
+        imagePlan.model_blended_back.resolvedSourcePhotoUrl || getVariantModelBackUrl(blank, variant);
+      const variantModelFrontUrlBase =
+        imagePlan.model_clean_front.resolvedSourcePhotoUrl || getVariantModelFrontUrl(blank, variant);
 
-      /* Priority-aligned default set: model_back (hero) → flat_front → flat_back → model_front */
-      const autoExpandedTypes = [
-        ...(variantModelBackUrlBase ? ["model_blended_back"] : []),
-        ...(variantFlatFrontUrlBase ? ["flat_clean_front"] : []),
-        ...(variantFlatBackUrlBase ? ["flat_blended_back"] : []),
-        ...(variantModelFrontUrlBase ? ["model_clean_front"] : []),
-      ];
-      let renderTypes =
-        rtRaw && rtRaw.length ? rtRaw.map((x) => String(x).trim()) : autoExpandedTypes.slice();
-      const usedDefaultRenderTypes = !renderTypes.length;
-      if (usedDefaultRenderTypes) {
+      const planOrderedEnabled = enabledGenerationKeysInPlanOrder(imagePlan);
+      let renderTypes = rtRaw && rtRaw.length ? rtRaw.map((x) => String(x).trim()) : planOrderedEnabled.slice();
+      if (!renderTypes.length) {
         renderTypes = DEFAULT_RENDER_TYPES.slice();
       }
 
@@ -718,11 +1351,9 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
             : "model_clean_front: skipped — no modelFront URL"
         );
         renderSelectionLog.push("Resolved renderTypes: " + renderTypesPreSidePolicy.join(", "));
-        if (usedDefaultRenderTypes) {
-          renderSelectionLog.push(
-            "Note: auto list was empty — applied DEFAULT " + DEFAULT_RENDER_TYPES.join(", ")
-          );
-        }
+        renderSelectionLog.push(
+          "Blank shot plan (8394): enabled in gallery order = " + planOrderedEnabled.join(", ")
+        );
       }
       for (const line of sidePolicySkipLines) {
         renderSelectionLog.push(line);
@@ -751,6 +1382,10 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
       const wantModelBlendedBack = renderTypes.includes("model_blended_back");
       const wantFrontClean = renderTypes.includes("flat_clean_front");
       const wantModelFrontClean = renderTypes.includes("model_clean_front");
+      const expectsArtworkFlatBack = wantBlendedBack ? expectsArtworkForPlanKey(imagePlan, "flat_blended_back") : false;
+      const expectsArtworkModelBack = wantModelBlendedBack
+        ? expectsArtworkForPlanKey(imagePlan, "model_blended_back")
+        : false;
       const anyRequested =
         wantBlendedBack || wantModelBlendedBack || wantFrontClean || wantModelFrontClean;
       if (!anyRequested) {
@@ -866,30 +1501,8 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
       let modelBlended = null;
 
       if (wantBlendedBack || wantModelBlendedBack) {
-        const designId =
-          (variantDoc && variantDoc.designIdBack && String(variantDoc.designIdBack).trim()) ||
-          (product.designIdBack && String(product.designIdBack).trim()) ||
-          (variantDoc && variantDoc.designId) ||
-          product.designId;
-        if (!designId) {
-          throw new functions.https.HttpsError("failed-precondition", "Product has no designId (or designIdBack)");
-        }
-
-        const designSnap = await db.collection("designs").doc(designId).get();
-        if (!designSnap.exists) {
-          throw new functions.https.HttpsError("not-found", `Design ${designId} not found`);
-        }
-        const design = designSnap.data();
-        sharedDesignDoc = design;
-        sharedDesignIdLoaded = designId;
-
-        const { url: designPngUrl, ref: resolvedToneRef } = pickDesignPngForVariant(design, variant, variantDoc);
-        if (!designPngUrl) {
-          throw new functions.https.HttpsError(
-            "failed-precondition",
-            "Design missing usable PNG for this garment (light/dark)"
-          );
-        }
+        const needsBackDesignArt =
+          (wantBlendedBack && expectsArtworkFlatBack) || (wantModelBlendedBack && expectsArtworkModelBack);
 
         const colorNameForFam =
           (variantDoc && typeof variantDoc.colorName === "string" && variantDoc.colorName.trim()) ||
@@ -899,12 +1512,115 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
           pvFam === "light" || pvFam === "dark" ? pvFam : variant.colorFamily,
           colorNameForFam
         );
-        const renderTreatment = resolveBackRenderTreatment(garmentFam, resolvedToneRef);
 
+        let designPngUrl = null;
+        let resolvedToneRef = "garment_only";
+        let renderTreatment = "clean";
         let designBufferCached = null;
 
+        if (needsBackDesignArt) {
+          const designId =
+            (variantDoc && variantDoc.designIdBack && String(variantDoc.designIdBack).trim()) ||
+            (product.designIdBack && String(product.designIdBack).trim()) ||
+            (variantDoc && variantDoc.designId) ||
+            product.designId;
+          if (!designId) {
+            throw new functions.https.HttpsError("failed-precondition", "Product has no designId (or designIdBack)");
+          }
+
+          const designSnap = await db.collection("designs").doc(designId).get();
+          if (!designSnap.exists) {
+            throw new functions.https.HttpsError("not-found", `Design ${designId} not found`);
+          }
+          const design = designSnap.data();
+          sharedDesignDoc = design;
+          sharedDesignIdLoaded = designId;
+
+          const picked = pickDesignPngForVariant(design, variant, variantDoc);
+          designPngUrl = picked.url;
+          resolvedToneRef = picked.ref;
+          if (!designPngUrl) {
+            throw new functions.https.HttpsError(
+              "failed-precondition",
+              "Design missing usable PNG for this garment (light/dark)"
+            );
+          }
+          renderTreatment = resolveBackRenderTreatment(garmentFam, resolvedToneRef);
+        } else {
+          renderSelectionLog.push(
+            "Shot plan: back composite targets are garment-only (expectsArtwork=false) — design fetch skipped."
+          );
+        }
+
         if (wantBlendedBack) {
-        const tuningFlat = resolveEffectiveRenderTargetSettings(placementProduct, blank, variant, "flat_back");
+        if (!expectsArtworkFlatBack) {
+          const blankRespG = await fetch(variantFlatBackUrl);
+          if (!blankRespG.ok) {
+            throw new functions.https.HttpsError("internal", `Failed to fetch blank back image: ${blankRespG.status}`);
+          }
+          const bufG = Buffer.from(await blankRespG.arrayBuffer());
+          const primaryUp = await uploadPng("flat_back_garment_only", bufG);
+          const dimsG = await sharp(bufG).metadata();
+          const slotBackFlatG = (lookType, view, url, storagePath, fp, designRef, dims) => {
+            const o = {
+              url,
+              storagePath,
+              generatedAt: now,
+              lookType,
+              view,
+              sourceBlankVariantId: blankVariantId,
+              sourceDesignAssetRef: designRef,
+              inputFingerprint: fp || inputFingerprintFlat,
+            };
+            if (dims && dims.width) o.width = dims.width;
+            if (dims && dims.height) o.height = dims.height;
+            return o;
+          };
+          const fpG = fingerprintFromPayload(
+            {
+              scope: "step10_mvp_8394_back_garment_only_flat",
+              blankId,
+              blankVariantId,
+              variantBackUrl: variantFlatBackUrl,
+            },
+            crypto
+          );
+          inputFingerprintFlat = fpG;
+          clean = primaryUp;
+          blended = primaryUp;
+          flatCleanBackSlot = slotBackFlatG(
+            "flat_clean",
+            "back",
+            primaryUp.url,
+            primaryUp.storagePath,
+            fpG,
+            "garment_only",
+            dimsG
+          );
+          flatBlendedBackSlot = slotBackFlatG(
+            "flat_blended",
+            "back",
+            primaryUp.url,
+            primaryUp.storagePath,
+            fpG,
+            "garment_only",
+            dimsG
+          );
+        } else {
+        if (!designPngUrl) {
+          throw new functions.https.HttpsError(
+            "failed-precondition",
+            "flat_blended_back expects artwork but no design PNG was resolved for this run"
+          );
+        }
+        let tuningFlat = resolveEffectiveRenderTargetSettings(placementProduct, blank, variant, "flat_back");
+        const shotPatchFlat = imagePlan.flat_blended_back && imagePlan.flat_blended_back.renderSettings;
+        if (shotPatchFlat && typeof shotPatchFlat === "object") {
+          tuningFlat = {
+            ...tuningFlat,
+            settings: mergeRenderTargetSettings(tuningFlat.settings, shotPatchFlat),
+          };
+        }
         const blend = resolveEngineBlendForRenderTarget(
           placementProduct,
           blank,
@@ -912,6 +1628,11 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
           "flat_back",
           tuningFlat.settings.blend
         );
+        let compositeBlend = blend;
+        if (renderTreatment === "blended") {
+          const adj = resolveBlendedPreviewBlend8394(garmentFam, resolvedToneRef, blend);
+          compositeBlend = { blendMode: adj.blendMode, blendOpacity: adj.blendOpacity };
+        }
         renderSelectionLog.push(
           JSON.stringify({
             tag: "render_target_tuning_resolved",
@@ -924,6 +1645,7 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
             variantTargetOverrideExisted: tuningFlat.qa.variantTargetOverrideExisted,
             productPlacementApplied: tuningFlat.qa.productPlacementApplied,
             engineBlend: blend,
+            compositeBlend8394: renderTreatment === "blended" ? compositeBlend : blend,
           })
         );
 
@@ -934,13 +1656,13 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
           blankVariantId,
           blankVersion: getBlankVersionValue(blank),
           placementBack: placementFingerprintFlat,
-          backBlend: blend,
+          backBlend: compositeBlend,
           targetTuningQa: tuningFlat.qa,
           targetTuningPlacement: tuningFlat.settings.placement,
           targetTuningBlend01: tuningFlat.settings.blend,
           variantBackUrl: variantFlatBackUrl,
-          designId,
-          designVersion: getDesignVersionValue(design),
+          designId: sharedDesignIdLoaded,
+          designVersion: sharedDesignDoc ? getDesignVersionValue(sharedDesignDoc) : null,
           garmentFamily: garmentFam,
           renderTreatment,
           resolvedTone: resolvedToneRef,
@@ -985,7 +1707,7 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
           blankBuffer,
           designBuffer: designBufferRaw,
           tuning: tuningFlat,
-          blend,
+          blend: compositeBlend,
           placementRow: placementRowFlat,
           effPl,
           variant,
@@ -1074,151 +1796,229 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
           );
         }
         }
+        }
 
         if (wantModelBlendedBack) {
-          const tuningModel = resolveEffectiveRenderTargetSettings(placementProduct, blank, variant, "model_back");
-          const blendM = resolveEngineBlendForRenderTarget(
-            placementProduct,
-            blank,
-            variant,
-            "model_back",
-            tuningModel.settings.blend
-          );
-          renderSelectionLog.push(
-            JSON.stringify({
-              tag: "render_target_tuning_resolved",
-              renderTarget: "model_back",
-              placement: tuningModel.settings.placement,
-              blend: tuningModel.settings.blend,
-              warp: tuningModel.settings.warp,
-              mask: tuningModel.settings.mask,
-              blankTuningExisted: tuningModel.qa.blankTuningExisted,
-              variantTargetOverrideExisted: tuningModel.qa.variantTargetOverrideExisted,
-              productPlacementApplied: tuningModel.qa.productPlacementApplied,
-              engineBlend: blendM,
-            })
-          );
-          const fingerprintPayloadM = {
-            scope: "step10_mvp_8394_back_v6_model_target",
-            renderTarget: "model_back",
-            blankId,
-            blankVariantId,
-            blankVersion: getBlankVersionValue(blank),
-            placementBack: placementFingerprintModel,
-            backBlend: blendM,
-            targetTuningQa: tuningModel.qa,
-            targetTuningPlacement: tuningModel.settings.placement,
-            targetTuningBlend01: tuningModel.settings.blend,
-            variantBackUrl: variantModelBackUrl,
-            designId,
-            designVersion: getDesignVersionValue(design),
-            garmentFamily: garmentFam,
-            renderTreatment,
-            resolvedTone: resolvedToneRef,
-            designAssetRef: resolvedToneRef,
-            designAssetUrl: designPngUrl,
-          };
-          inputFingerprintModel = fingerprintFromPayload(fingerprintPayloadM, crypto);
-
-          const blankRespM = await fetch(variantModelBackUrl);
-          if (!blankRespM.ok) {
-            throw new functions.https.HttpsError(
-              "internal",
-              `Failed to fetch model back blank image: ${blankRespM.status}`
-            );
-          }
-          const blankBufferM = Buffer.from(await blankRespM.arrayBuffer());
-
-          let designBufferForModel = designBufferCached;
-          if (designBufferForModel == null) {
-            const designRespM = await fetch(designPngUrl);
-            if (!designRespM.ok) {
-              throw new functions.https.HttpsError("internal", `Failed to fetch design PNG: ${designRespM.status}`);
+          if (!expectsArtworkModelBack) {
+            const blankRespMG = await fetch(variantModelBackUrl);
+            if (!blankRespMG.ok) {
+              throw new functions.https.HttpsError(
+                "internal",
+                `Failed to fetch model back blank image: ${blankRespMG.status}`
+              );
             }
-            designBufferForModel = Buffer.from(await designRespM.arrayBuffer());
-          }
-
-          const effPlM = resolveEffectivePlacementForRenderTarget(placementProduct, blank, variant, "model_back");
-
-          const slotBackModel = (lookType, view, url, storagePath, fp, designRef, dims) => {
-            const o = {
-              url,
-              storagePath,
-              generatedAt: now,
-              lookType,
-              view,
-              sourceBlankVariantId: blankVariantId,
-              sourceDesignAssetRef: designRef,
-              inputFingerprint: fp || inputFingerprintModel,
+            const bufMG = Buffer.from(await blankRespMG.arrayBuffer());
+            const primaryUpMG = await uploadPng("model_back_garment_only", bufMG);
+            const dimsMG = await sharp(bufMG).metadata();
+            const slotBackModelG = (lookType, view, url, storagePath, fp, designRef, dims) => {
+              const o = {
+                url,
+                storagePath,
+                generatedAt: now,
+                lookType,
+                view,
+                sourceBlankVariantId: blankVariantId,
+                sourceDesignAssetRef: designRef,
+                inputFingerprint: fp || inputFingerprintModel,
+              };
+              if (dims && dims.width) o.width = dims.width;
+              if (dims && dims.height) o.height = dims.height;
+              return o;
             };
-            if (dims && dims.width) o.width = dims.width;
-            if (dims && dims.height) o.height = dims.height;
-            return o;
-          };
-
-          const { flatCleanBuffer: modelCleanBuf, flatBlendedBuffer: modelBlendedBuf } =
-            await render8394DesignOnGarmentSharp({
-              sharp,
-              blankBuffer: blankBufferM,
-              designBuffer: designBufferForModel,
-              tuning: tuningModel,
-              blend: blendM,
-              placementRow: placementRowModel,
-              effPl: effPlM,
-              variant,
-              target: "model_back",
-              renderTreatment,
-              renderSelectionLog,
-            });
-
-          if (renderTreatment === "clean") {
-            const primaryUpM = await uploadPng("model_back_primary_clean", modelCleanBuf);
-            modelClean = primaryUpM;
-            modelBlended = primaryUpM;
-            const dimsM = await sharp(modelCleanBuf).metadata();
-            modelCleanBackSlot = slotBackModel(
+            const fpMG = fingerprintFromPayload(
+              {
+                scope: "step10_mvp_8394_back_garment_only_model",
+                blankId,
+                blankVariantId,
+                variantBackUrl: variantModelBackUrl,
+              },
+              crypto
+            );
+            inputFingerprintModel = fpMG;
+            modelClean = primaryUpMG;
+            modelBlended = primaryUpMG;
+            modelCleanBackSlot = slotBackModelG(
               "model_clean",
               "back",
-              primaryUpM.url,
-              primaryUpM.storagePath,
-              inputFingerprintModel,
-              resolvedToneRef,
-              dimsM
+              primaryUpMG.url,
+              primaryUpMG.storagePath,
+              fpMG,
+              "garment_only",
+              dimsMG
             );
-            modelBlendedBackSlot = slotBackModel(
+            modelBlendedBackSlot = slotBackModelG(
               "model_blended",
               "back",
-              primaryUpM.url,
-              primaryUpM.storagePath,
-              inputFingerprintModel,
-              resolvedToneRef,
-              dimsM
+              primaryUpMG.url,
+              primaryUpMG.storagePath,
+              fpMG,
+              "garment_only",
+              dimsMG
             );
           } else {
-            modelClean = await uploadPng("model_clean_back", modelCleanBuf);
-            modelBlended = await uploadPng("model_blended_back", modelBlendedBuf);
-
-            const cleanDimsM = await sharp(modelCleanBuf).metadata();
-            const blendedDimsM = await sharp(modelBlendedBuf).metadata();
-
-            modelCleanBackSlot = slotBackModel(
-              "model_clean",
-              "back",
-              modelClean.url,
-              modelClean.storagePath,
-              inputFingerprintModel,
-              resolvedToneRef,
-              cleanDimsM
+            if (!designPngUrl) {
+              throw new functions.https.HttpsError(
+                "failed-precondition",
+                "model_blended_back expects artwork but no design PNG was resolved for this run"
+              );
+            }
+            let tuningModel = resolveEffectiveRenderTargetSettings(placementProduct, blank, variant, "model_back");
+            const shotPatchModel = imagePlan.model_blended_back && imagePlan.model_blended_back.renderSettings;
+            if (shotPatchModel && typeof shotPatchModel === "object") {
+              tuningModel = {
+                ...tuningModel,
+                settings: mergeRenderTargetSettings(tuningModel.settings, shotPatchModel),
+              };
+            }
+            const blendM = resolveEngineBlendForRenderTarget(
+              placementProduct,
+              blank,
+              variant,
+              "model_back",
+              tuningModel.settings.blend
             );
-            modelBlendedBackSlot = slotBackModel(
-              "model_blended",
-              "back",
-              modelBlended.url,
-              modelBlended.storagePath,
-              inputFingerprintModel,
-              resolvedToneRef,
-              blendedDimsM
+            let compositeBlendM = blendM;
+            if (renderTreatment === "blended") {
+              const adjM = resolveBlendedPreviewBlend8394(garmentFam, resolvedToneRef, blendM);
+              compositeBlendM = { blendMode: adjM.blendMode, blendOpacity: adjM.blendOpacity };
+            }
+            renderSelectionLog.push(
+              JSON.stringify({
+                tag: "render_target_tuning_resolved",
+                renderTarget: "model_back",
+                placement: tuningModel.settings.placement,
+                blend: tuningModel.settings.blend,
+                warp: tuningModel.settings.warp,
+                mask: tuningModel.settings.mask,
+                blankTuningExisted: tuningModel.qa.blankTuningExisted,
+                variantTargetOverrideExisted: tuningModel.qa.variantTargetOverrideExisted,
+                productPlacementApplied: tuningModel.qa.productPlacementApplied,
+                engineBlend: blendM,
+                compositeBlend8394: renderTreatment === "blended" ? compositeBlendM : blendM,
+              })
             );
+            const fingerprintPayloadM = {
+              scope: "step10_mvp_8394_back_v6_model_target",
+              renderTarget: "model_back",
+              blankId,
+              blankVariantId,
+              blankVersion: getBlankVersionValue(blank),
+              placementBack: placementFingerprintModel,
+              backBlend: compositeBlendM,
+              targetTuningQa: tuningModel.qa,
+              targetTuningPlacement: tuningModel.settings.placement,
+              targetTuningBlend01: tuningModel.settings.blend,
+              variantBackUrl: variantModelBackUrl,
+              designId: sharedDesignIdLoaded,
+              designVersion: sharedDesignDoc ? getDesignVersionValue(sharedDesignDoc) : null,
+              garmentFamily: garmentFam,
+              renderTreatment,
+              resolvedTone: resolvedToneRef,
+              designAssetRef: resolvedToneRef,
+              designAssetUrl: designPngUrl,
+            };
+            inputFingerprintModel = fingerprintFromPayload(fingerprintPayloadM, crypto);
+
+            const blankRespM = await fetch(variantModelBackUrl);
+            if (!blankRespM.ok) {
+              throw new functions.https.HttpsError(
+                "internal",
+                `Failed to fetch model back blank image: ${blankRespM.status}`
+              );
+            }
+            const blankBufferM = Buffer.from(await blankRespM.arrayBuffer());
+
+            let designBufferForModel = designBufferCached;
+            if (designBufferForModel == null) {
+              const designRespM = await fetch(designPngUrl);
+              if (!designRespM.ok) {
+                throw new functions.https.HttpsError("internal", `Failed to fetch design PNG: ${designRespM.status}`);
+              }
+              designBufferForModel = Buffer.from(await designRespM.arrayBuffer());
+            }
+
+            const effPlM = resolveEffectivePlacementForRenderTarget(placementProduct, blank, variant, "model_back");
+
+            const slotBackModel = (lookType, view, url, storagePath, fp, designRef, dims) => {
+              const o = {
+                url,
+                storagePath,
+                generatedAt: now,
+                lookType,
+                view,
+                sourceBlankVariantId: blankVariantId,
+                sourceDesignAssetRef: designRef,
+                inputFingerprint: fp || inputFingerprintModel,
+              };
+              if (dims && dims.width) o.width = dims.width;
+              if (dims && dims.height) o.height = dims.height;
+              return o;
+            };
+
+            const { flatCleanBuffer: modelCleanBuf, flatBlendedBuffer: modelBlendedBuf } =
+              await render8394DesignOnGarmentSharp({
+                sharp,
+                blankBuffer: blankBufferM,
+                designBuffer: designBufferForModel,
+                tuning: tuningModel,
+                blend: compositeBlendM,
+                placementRow: placementRowModel,
+                effPl: effPlM,
+                variant,
+                target: "model_back",
+                renderTreatment,
+                renderSelectionLog,
+              });
+
+            if (renderTreatment === "clean") {
+              const primaryUpM = await uploadPng("model_back_primary_clean", modelCleanBuf);
+              modelClean = primaryUpM;
+              modelBlended = primaryUpM;
+              const dimsM = await sharp(modelCleanBuf).metadata();
+              modelCleanBackSlot = slotBackModel(
+                "model_clean",
+                "back",
+                primaryUpM.url,
+                primaryUpM.storagePath,
+                inputFingerprintModel,
+                resolvedToneRef,
+                dimsM
+              );
+              modelBlendedBackSlot = slotBackModel(
+                "model_blended",
+                "back",
+                primaryUpM.url,
+                primaryUpM.storagePath,
+                inputFingerprintModel,
+                resolvedToneRef,
+                dimsM
+              );
+            } else {
+              modelClean = await uploadPng("model_clean_back", modelCleanBuf);
+              modelBlended = await uploadPng("model_blended_back", modelBlendedBuf);
+
+              const cleanDimsM = await sharp(modelCleanBuf).metadata();
+              const blendedDimsM = await sharp(modelBlendedBuf).metadata();
+
+              modelCleanBackSlot = slotBackModel(
+                "model_clean",
+                "back",
+                modelClean.url,
+                modelClean.storagePath,
+                inputFingerprintModel,
+                resolvedToneRef,
+                cleanDimsM
+              );
+              modelBlendedBackSlot = slotBackModel(
+                "model_blended",
+                "back",
+                modelBlended.url,
+                modelBlended.storagePath,
+                inputFingerprintModel,
+                resolvedToneRef,
+                blendedDimsM
+              );
+            }
           }
         }
       }
@@ -1482,4 +2282,9 @@ module.exports = {
   createRegisterGenerateProductFlatRenders,
   executeProductFlatRender8394Mvp,
   pickDesignPngForVariant,
+  pickDesignPngForVariantFront,
+  resolveFrontSidePngUrls,
+  render8394DesignOnGarmentSharp,
+  savePngAndReadableUrl,
+  computeLayout8394,
 };

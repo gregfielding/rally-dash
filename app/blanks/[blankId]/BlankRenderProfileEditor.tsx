@@ -11,7 +11,6 @@ import {
 } from "react";
 import type {
   RPBlank,
-  RPBlankVariantRenderProfileSideOverride,
   RPPlacement,
   RpRenderTarget,
   RpRenderTargetSettings,
@@ -46,6 +45,28 @@ import {
   mapInkStrengthToFactorsPreview,
   mapRealismToBlendPreview,
 } from "@/lib/blanks/preview8394";
+import { computePlacement8394Layout } from "@/lib/blanks/placement8394Layout";
+import {
+  buildPreview8394TargetAuditRow,
+  computePreview8394VisibleVerticalMetrics,
+  getArtworkAlphaCropRectFromImageUrl,
+  logPreview8394SideBySideReport,
+  measureArtworkAlphaBoundsFromImageUrl,
+  PREVIEW8394_COORD_AUDIT_NOTE,
+  type Preview8394SideBySideReport,
+} from "@/lib/blanks/preview8394CoordinateAudit";
+import {
+  compose8394NaturalPixelPreview,
+  loadImageElement,
+  mergeDisplayScaleIntoTelemetry,
+  type Preview8394ParityTelemetry,
+} from "@/lib/blanks/preview8394NaturalComposite";
+import {
+  buildPreview8394StrictSnapshotFromTelemetry,
+  compare8394StrictParity,
+  parseOfficial8394StrictParityJson,
+  type StrictParityComparison,
+} from "@/lib/blanks/preview8394StrictParity";
 import {
   buildEffectiveRenderTargetSettingsMap,
   resolveEffectiveRenderTargetSettings,
@@ -57,6 +78,7 @@ import {
   DESIGN_ARTBOARD_HEIGHT_PX,
   DESIGN_ARTBOARD_WIDTH_PX,
 } from "@/lib/render/designArtboardSpec";
+import { proxiedImageUrlForCanvas } from "@/lib/storageImageProxyUrl";
 import {
   RENDER_STYLE_PRESET_LABELS,
   RENDER_STYLE_PRESET_ORDER,
@@ -73,13 +95,11 @@ import {
   buildRenderTargetSettingsMap,
   cloneRenderTargetSettings,
   defaultRenderTargetForZoneView,
-  diffSettingsToVariantRenderTargetOverride,
   getDefaultRenderTargetSettings,
   getRenderTargetPreviewUrl,
   blendSettingsToEngineBlend,
   legacyZoneBlendToBlend01,
   mergeRenderTargetSettings,
-  mergeVariantRenderTargetOverrides,
   pickRowForRenderTarget,
   renderTargetToGarmentSide,
 } from "@/lib/render/renderTargetTuning";
@@ -151,7 +171,7 @@ function zoneBlendToApproxCustomSliders(z: {
 type GarmentPreviewCanvasProps = {
   garmentUrl: string;
   side: "front" | "back";
-  imgRef?: LegacyRef<HTMLImageElement>;
+  imgRef?: LegacyRef<HTMLImageElement | HTMLCanvasElement | null>;
   showSafeArea: boolean;
   showClipHint: boolean;
   sx: number;
@@ -175,6 +195,23 @@ type GarmentPreviewCanvasProps = {
   onPointerDownOverlay: (e: React.PointerEvent) => void;
   maxHeightClass: string;
   emptyOverlay?: React.ReactNode;
+  /**
+   * 8394: natural-pixel canvas composite (`computePlacement8394Layout`) then CSS-scale to this box.
+   * Legacy display-space % overlay when false.
+   */
+  pixelFaithful8394?: boolean;
+  /** 8394 natural canvas only: clean vs blended composite (matches preview mode). */
+  composite8394Kind?: "clean" | "blended";
+  /** 8394 natural canvas: render target label for telemetry. */
+  renderTarget8394?: RpRenderTarget;
+  blendMode8394?: string;
+  blendOpacity8394?: number;
+  designOpacityMultiplier8394?: number;
+  canvasFilter8394?: string;
+  warpEnabled8394?: boolean;
+  maskEnabled8394?: boolean;
+  /** Fires when natural canvas telemetry updates (resize or recompose). */
+  on8394ParityTelemetry?: (t: Preview8394ParityTelemetry | null) => void;
 };
 
 function GarmentPreviewCanvas({
@@ -201,24 +238,196 @@ function GarmentPreviewCanvas({
   onPointerDownOverlay,
   maxHeightClass,
   emptyOverlay,
+  pixelFaithful8394 = false,
+  composite8394Kind = "blended",
+  renderTarget8394 = "flat_back",
+  blendMode8394 = "multiply",
+  blendOpacity8394 = 1,
+  designOpacityMultiplier8394 = 1,
+  canvasFilter8394,
+  warpEnabled8394 = false,
+  maskEnabled8394 = false,
+  on8394ParityTelemetry,
 }: GarmentPreviewCanvasProps) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const last8394TelemetryRef = useRef<Preview8394ParityTelemetry | null>(null);
+  const [naturalComposeError, setNaturalComposeError] = useState<string | null>(null);
   const showArt = Boolean(overlayArtUrl);
+  const useNatural8394Canvas = Boolean(pixelFaithful8394 && showArt);
   const overlayTransform =
     overlayWarpTransform && overlayWarpTransform.trim() !== ""
       ? `translate(-50%, -50%) ${overlayWarpTransform}`
       : "translate(-50%, -50%)";
+
+  const logGarment8394CoordAudit = useCallback(() => {
+    const coordDebugOn =
+      process.env.NEXT_PUBLIC_DEBUG_8394_COORD_SPACE === "1" ||
+      (typeof window !== "undefined" && window.localStorage?.getItem("DEBUG_8394_COORD_SPACE") === "1");
+    if (!coordDebugOn) return;
+    const el =
+      (wrapRef.current?.querySelector("canvas[data-natural-8394-canvas]") as HTMLCanvasElement | null) ||
+      (wrapRef.current?.querySelector("img[alt^='Garment']") as HTMLImageElement | null);
+    if (!el) return;
+    const nw = "naturalWidth" in el && el.naturalWidth ? el.naturalWidth : el.width;
+    const nh = "naturalHeight" in el && el.naturalHeight ? el.naturalHeight : el.height;
+    if (!nw || !nh) return;
+    const cw = el.clientWidth;
+    const ch = el.clientHeight;
+    const payload = {
+      kind: "preview",
+      coordinateBasis: useNatural8394Canvas ? "natural_pixel_canvas_scaled" : "display_percent_overlay",
+      baseGarmentNaturalPx: { w: nw, h: nh },
+      baseGarmentDisplayPx: { w: cw, h: ch },
+      displayScale: { x: cw / nw, y: ch / nh },
+      compareToOfficial:
+        useNatural8394Canvas
+          ? "Composition uses computePlacement8394Layout at natural garment WxH; canvas element is scaled by CSS only."
+          : "CSS % overlay — placement math is display-box relative (differs from official when scaled).",
+    };
+    console.log("[GARMENT8394_COORD_AUDIT]", JSON.stringify(payload));
+  }, [useNatural8394Canvas]);
+
+  useEffect(() => {
+    if (!useNatural8394Canvas || !on8394ParityTelemetry) return;
+    const el = canvasRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      const c = canvasRef.current;
+      const t = last8394TelemetryRef.current;
+      if (!c?.width || !t) return;
+      const next = mergeDisplayScaleIntoTelemetry(t, c);
+      last8394TelemetryRef.current = next;
+      on8394ParityTelemetry(next);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [useNatural8394Canvas, on8394ParityTelemetry, garmentUrl, overlayArtUrl]);
+
+  useEffect(() => {
+    if (!useNatural8394Canvas) {
+      last8394TelemetryRef.current = null;
+      on8394ParityTelemetry?.(null);
+      return;
+    }
+    let cancelled = false;
+    setNaturalComposeError(null);
+    (async () => {
+      try {
+        let crop = await getArtworkAlphaCropRectFromImageUrl(overlayArtUrl);
+        if (!crop) {
+          const d = await loadImageElement(overlayArtUrl);
+          crop = { x: 0, y: 0, w: d.naturalWidth, h: d.naturalHeight };
+        }
+        const { canvas, telemetry } = await compose8394NaturalPixelPreview({
+          garmentUrl,
+          designUrl: overlayArtUrl,
+          designCrop: crop,
+          defaultX: px,
+          defaultY: py,
+          defaultScale: scale,
+          artboardBase: artBase,
+          compositeKind: composite8394Kind,
+          blendMode: blendMode8394,
+          blendOpacity: blendOpacity8394,
+          designOpacityMultiplier: designOpacityMultiplier8394,
+          canvasFilter: canvasFilter8394 ?? "none",
+          warpEnabled: warpEnabled8394,
+          maskEnabled: maskEnabled8394,
+          renderTarget: renderTarget8394,
+        });
+        if (cancelled) return;
+        const dest = canvasRef.current;
+        if (!dest) return;
+        dest.width = canvas.width;
+        dest.height = canvas.height;
+        const ctx = dest.getContext("2d");
+        if (!ctx) throw new Error("Canvas unsupported");
+        ctx.drawImage(canvas, 0, 0);
+        if (imgRef && typeof imgRef === "object" && "current" in imgRef) {
+          (imgRef as React.MutableRefObject<HTMLCanvasElement | HTMLImageElement | null>).current = dest;
+        }
+        const merged = mergeDisplayScaleIntoTelemetry(telemetry, dest);
+        last8394TelemetryRef.current = merged;
+        on8394ParityTelemetry?.(merged);
+        logGarment8394CoordAudit();
+      } catch (e) {
+        if (!cancelled) {
+          setNaturalComposeError(e instanceof Error ? e.message : "Compose failed");
+          on8394ParityTelemetry?.(null);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    useNatural8394Canvas,
+    garmentUrl,
+    overlayArtUrl,
+    px,
+    py,
+    scale,
+    artBase,
+    composite8394Kind,
+    blendMode8394,
+    blendOpacity8394,
+    designOpacityMultiplier8394,
+    canvasFilter8394,
+    warpEnabled8394,
+    maskEnabled8394,
+    renderTarget8394,
+    imgRef,
+    on8394ParityTelemetry,
+    logGarment8394CoordAudit,
+  ]);
+
+  useEffect(() => {
+    const coordDebugOn =
+      process.env.NEXT_PUBLIC_DEBUG_8394_COORD_SPACE === "1" ||
+      (typeof window !== "undefined" && window.localStorage?.getItem("DEBUG_8394_COORD_SPACE") === "1");
+    if (!coordDebugOn || typeof ResizeObserver === "undefined") return;
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const ro = new ResizeObserver(() => logGarment8394CoordAudit());
+    ro.observe(wrap);
+    return () => ro.disconnect();
+  }, [garmentUrl, logGarment8394CoordAudit, useNatural8394Canvas]);
+
   return (
     <div
+      ref={wrapRef}
       data-garment-preview
-      className="relative inline-block w-full border border-gray-200 rounded-xl bg-neutral-100 overflow-hidden shadow-inner"
+      data-pixel-faithful-8394={useNatural8394Canvas ? "true" : undefined}
+      className={`relative inline-block w-full border border-gray-200 rounded-xl bg-neutral-100 shadow-inner ${
+        useNatural8394Canvas ? "overflow-hidden" : "overflow-hidden"
+      }`}
     >
-      <img
-        ref={imgRef}
-        src={garmentUrl}
-        alt={`Garment ${side}`}
-        className={`block ${maxHeightClass} w-auto max-w-full mx-auto select-none`}
-        draggable={false}
-      />
+      {useNatural8394Canvas ? (
+        <>
+          <canvas
+            ref={canvasRef}
+            data-natural-8394-canvas
+            width={1}
+            height={1}
+            className={`block ${maxHeightClass} w-auto max-w-full mx-auto select-none touch-none cursor-grab active:cursor-grabbing`}
+            onPointerDown={onPointerDownOverlay}
+            aria-label={`Garment ${side} preview`}
+          />
+          {naturalComposeError ? (
+            <p className="text-xs text-red-700 px-2 py-1">{naturalComposeError}</p>
+          ) : null}
+        </>
+      ) : (
+        <img
+          ref={imgRef as LegacyRef<HTMLImageElement>}
+          src={garmentUrl}
+          alt={`Garment ${side}`}
+          className={`block ${maxHeightClass} w-auto max-w-full mx-auto select-none`}
+          draggable={false}
+          onLoad={logGarment8394CoordAudit}
+        />
+      )}
       <div className="absolute inset-0 pointer-events-none">
         {showSafeArea && (
           <div
@@ -240,7 +449,7 @@ function GarmentPreviewCanvas({
           </div>
         )}
         {emptyOverlay}
-        {showArt ? (
+        {!useNatural8394Canvas && showArt ? (
           <div
             className="absolute pointer-events-auto touch-none cursor-grab active:cursor-grabbing will-change-transform [transform-style:preserve-3d]"
             style={{
@@ -453,6 +662,56 @@ function toFirestorePlacement(p: ProfileRow, styleCode?: string | null): RPPlace
   };
 }
 
+/** Same shell as GarmentPreviewCanvas: max-h ≈ min(72vh,720px), max-w-full, off-DOM for audit. */
+async function measure8394GarmentDisplayForUrl(
+  url: string,
+  shellWidthPx: number
+): Promise<{ natural: { w: number; h: number }; display: { w: number; h: number } }> {
+  const maxH = typeof window !== "undefined" ? Math.min(window.innerHeight * 0.72, 720) : 720;
+  const shell = document.createElement("div");
+  shell.style.cssText = `position:fixed;left:-9999px;top:0;width:${shellWidthPx}px;pointer-events:none;visibility:hidden`;
+  const img = document.createElement("img");
+  img.crossOrigin = "anonymous";
+  img.style.display = "block";
+  img.style.marginLeft = "auto";
+  img.style.marginRight = "auto";
+  img.style.width = "auto";
+  img.style.maxWidth = "100%";
+  img.style.maxHeight = `${maxH}px`;
+  shell.appendChild(img);
+  document.body.appendChild(shell);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error("Garment image failed to load for audit"));
+      img.src = proxiedImageUrlForCanvas(url);
+    });
+    return {
+      natural: { w: img.naturalWidth, h: img.naturalHeight },
+      display: { w: img.clientWidth, h: img.clientHeight },
+    };
+  } finally {
+    shell.remove();
+  }
+}
+
+async function resolveDesignBoundsFor8394Audit(artUrl: string): Promise<{
+  w: number;
+  h: number;
+  source: "alpha_scan_canvas" | "full_image_natural";
+}> {
+  const cropped = await measureArtworkAlphaBoundsFromImageUrl(artUrl);
+  if (cropped) return { w: cropped.w, h: cropped.h, source: "alpha_scan_canvas" };
+  const img = new Image();
+  img.crossOrigin = "anonymous";
+  await new Promise<void>((resolve, reject) => {
+    img.onload = () => resolve();
+    img.onerror = () => reject(new Error("Design image failed to load for audit"));
+    img.src = proxiedImageUrlForCanvas(artUrl);
+  });
+  return { w: img.naturalWidth, h: img.naturalHeight, source: "full_image_natural" };
+}
+
 export function BlankRenderProfileEditor({
   blank,
   updateBlank,
@@ -529,8 +788,14 @@ export function BlankRenderProfileEditor({
     )
   );
 
-  const imgRef = useRef<HTMLImageElement>(null);
+  const imgRef = useRef<HTMLImageElement | HTMLCanvasElement>(null);
+  const preview8394ColumnRef = useRef<HTMLDivElement>(null);
   const dragOffsetRef = useRef<{ x: number; y: number } | null>(null);
+  /** Default on: natural-pixel canvas composite (official placement basis). */
+  const [pixelAccurate8394Preview, setPixelAccurate8394Preview] = useState(true);
+  const [preview8394Parity, setPreview8394Parity] = useState<Preview8394ParityTelemetry | null>(null);
+  /** Paste one line from Cloud Functions: `[OFFICIAL8394_STRICT_PARITY] { ... }` (set OFFICIAL8394_STRICT_PARITY=1). */
+  const [official8394StrictPaste, setOfficial8394StrictPaste] = useState("");
 
   const is8394 = useMemo(() => String(blank.styleCode || "").trim() === "8394", [blank.styleCode]);
 
@@ -751,6 +1016,14 @@ export function BlankRenderProfileEditor({
   const previewGarmentUrl = previewVariant
     ? getRenderTargetPreviewUrl(blank, previewVariant, selectedRenderTarget)
     : null;
+  const flatBackPreviewUrl = useMemo(
+    () => (previewVariant ? getRenderTargetPreviewUrl(blank, previewVariant, "flat_back") : null),
+    [blank, previewVariant]
+  );
+  const modelBackPreviewUrl = useMemo(
+    () => (previewVariant ? getRenderTargetPreviewUrl(blank, previewVariant, "model_back") : null),
+    [blank, previewVariant]
+  );
   const previewSide = renderTargetToGarmentSide(selectedRenderTarget);
   /**
    * Printed-side permission (supportedRenderViews): when false, no design overlay on that side in this UI.
@@ -840,6 +1113,124 @@ export function BlankRenderProfileEditor({
   }, [previewDesignId, previewDesign, previewArtworkMode, previewVariant]);
 
   const effectiveOverlayArtUrl = previewSideAllowsPrinting ? overlayArtUrl : "";
+
+  const run8394CoordinateAudit = useCallback(async () => {
+    if (String(blank.styleCode || "").trim() !== "8394") return;
+    if (!previewVariant || !effectiveOverlayArtUrl) {
+      showToast("Select a design with artwork for coordinate audit.", "error");
+      return;
+    }
+    if (!flatBackPreviewUrl || !modelBackPreviewUrl) {
+      showToast("This variant needs flat back and model back preview URLs.", "error");
+      return;
+    }
+    const row = rows[selectedIndex];
+    if (!row) {
+      showToast("No placement row selected.", "error");
+      return;
+    }
+    const tun =
+      targetSettingsMap[selectedRenderTarget] ??
+      getDefaultRenderTargetSettings(selectedRenderTarget, row, blank.styleCode);
+    const pxx = tun.placement.x;
+    const pyy = tun.placement.y;
+    const sc = tun.placement.scale;
+    const ab = row.artboardBase ?? 0.5;
+    const shellW = preview8394ColumnRef.current?.clientWidth ?? 640;
+    try {
+      const designBounds = await resolveDesignBoundsFor8394Audit(effectiveOverlayArtUrl);
+      const [flatM, modelM] = await Promise.all([
+        measure8394GarmentDisplayForUrl(flatBackPreviewUrl, shellW),
+        measure8394GarmentDisplayForUrl(modelBackPreviewUrl, shellW),
+      ]);
+      const rowFlat = buildPreview8394TargetAuditRow({
+        renderTarget: "flat_back",
+        naturalWidth: flatM.natural.w,
+        naturalHeight: flatM.natural.h,
+        overlayPercentBasisWidth: flatM.display.w,
+        overlayPercentBasisHeight: flatM.display.h,
+        defaultX: pxx,
+        defaultY: pyy,
+        defaultScale: sc,
+        artboardBase: ab,
+        designCropWidth: designBounds.w,
+        designCropHeight: designBounds.h,
+        designBoundsSource: designBounds.source,
+      });
+      const rowModel = buildPreview8394TargetAuditRow({
+        renderTarget: "model_back",
+        naturalWidth: modelM.natural.w,
+        naturalHeight: modelM.natural.h,
+        overlayPercentBasisWidth: modelM.display.w,
+        overlayPercentBasisHeight: modelM.display.h,
+        defaultX: pxx,
+        defaultY: pyy,
+        defaultScale: sc,
+        artboardBase: ab,
+        designCropWidth: designBounds.w,
+        designCropHeight: designBounds.h,
+        designBoundsSource: designBounds.source,
+      });
+      const safeAreaNorm = row.safeArea ?? undefined;
+      const [vFlat, vModel] = await Promise.all([
+        computePreview8394VisibleVerticalMetrics({
+          renderTarget: "flat_back",
+          artUrl: effectiveOverlayArtUrl,
+          blankWidthPx: flatM.natural.w,
+          blankHeightPx: flatM.natural.h,
+          defaultX: pxx,
+          defaultY: pyy,
+          defaultScale: sc,
+          artboardBase: ab,
+          safeAreaNorm,
+        }),
+        computePreview8394VisibleVerticalMetrics({
+          renderTarget: "model_back",
+          artUrl: effectiveOverlayArtUrl,
+          blankWidthPx: modelM.natural.w,
+          blankHeightPx: modelM.natural.h,
+          defaultX: pxx,
+          defaultY: pyy,
+          defaultScale: sc,
+          artboardBase: ab,
+          safeAreaNorm,
+        }),
+      ]);
+      const report: Preview8394SideBySideReport = {
+        generatedAt: new Date().toISOString(),
+        coordinateSpace: PREVIEW8394_COORD_AUDIT_NOTE,
+        flat_back: rowFlat,
+        model_back: rowModel,
+        visibleContentVertical: {
+          flat_back: vFlat,
+          model_back: vModel,
+        },
+        notes: [
+          "Measured display box uses the same max-height rule as the preview canvas (off‑DOM).",
+          "overlayPercentBasis = that client box; official uses natural garment PNG dimensions.",
+          "[8394_VISIBLE_CONTENT_V] preview: alpha mapped through fitted bitmap (uniform scale of tight crop); compare to official log with OFFICIAL8394_VISIBLE_CONTENT_V=1.",
+        ],
+      };
+      logPreview8394SideBySideReport(report);
+      showToast(
+        "8394 audit logged to console: [8394_COORD_AUDIT_REPORT], [8394_VISIBLE_CONTENT_V] (preview vertical metrics).",
+        "success"
+      );
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : "Coordinate audit failed", "error");
+    }
+  }, [
+    blank.styleCode,
+    rows,
+    selectedIndex,
+    selectedRenderTarget,
+    targetSettingsMap,
+    previewVariant,
+    effectiveOverlayArtUrl,
+    flatBackPreviewUrl,
+    modelBackPreviewUrl,
+    showToast,
+  ]);
 
   const previewDesignLabel = previewDesign
     ? `${previewDesign.teamNameCache ? `${previewDesign.teamNameCache} — ` : ""}${previewDesign.name ?? previewDesignId}`
@@ -1047,7 +1438,10 @@ export function BlankRenderProfileEditor({
       e.stopPropagation();
       if (!previewSideAllowsPrinting) return;
       const wrap = (e.currentTarget as HTMLElement).closest("[data-garment-preview]");
-      const img = (wrap?.querySelector("img") as HTMLImageElement | null) || imgRef.current;
+      const img =
+        (wrap?.querySelector("canvas[data-natural-8394-canvas]") as HTMLCanvasElement | null) ||
+        (wrap?.querySelector("img[alt^='Garment']") as HTMLImageElement | null) ||
+        imgRef.current;
       if (!img || !selected || !tuning) return;
       const r = img.getBoundingClientRect();
       const mx = e.clientX - r.left;
@@ -1113,10 +1507,14 @@ export function BlankRenderProfileEditor({
       if (supportedFront) supportedRenderViews.push("front");
       if (supportedBack) supportedRenderViews.push("back");
 
-      const savingColorVariant = isMasterBlank(blank) && Boolean(variantId);
-
-      /** 8394 master: one cell = variantId × renderTarget in `renderProfile.renderTargetsByColor`. */
-      if (is8394 && isMasterBlank(blank) && variantId) {
+      /**
+       * Master blank + selected variant: one cell = variantId × renderTarget in
+       * `renderProfile.renderTargetsByColor`. Used for 8394 _and_ all other
+       * master blanks (e.g. TR3008, HF07) — the legacy `variant.renderTargetOverrides`
+       * diff path silently dropped `fabricFeel` / `printStrength` for non-8394
+       * blanks, so we always go through the matrix to preserve full slider precision.
+       */
+      if (isMasterBlank(blank) && variantId) {
         const tuningForSave = targetSettingsMap[selectedRenderTarget];
         if (!tuningForSave) {
           showToast("Nothing to save for this render target.", "error");
@@ -1131,12 +1529,12 @@ export function BlankRenderProfileEditor({
           },
         };
         const v = getVariantById(blank, variantId);
-        console.log("variantId used (save):", variantId);
-        console.log("[8394 SAVE RESULT]", {
+        console.log("[matrix cell SAVE]", {
           blankId: blank.blankId,
+          styleCode: blank.styleCode,
           variantIdUsed: variantId,
           target: selectedRenderTarget,
-          savedTo: "renderTargetsByColor",
+          savedTo: "renderProfile.renderTargetsByColor",
           deepMergeOtherColorIds: Object.keys(nextByColor).filter((id) => id !== variantId),
           otherTargetsUntouchedForThisColor: Object.keys(nextByColor[variantId] ?? {}).filter(
             (t) => t !== selectedRenderTarget
@@ -1164,9 +1562,6 @@ export function BlankRenderProfileEditor({
           supportedBack,
           preferredFlatLook8394,
         });
-        console.log(
-          "[8394 VERIFY READ] After save, check the next [8394 CELL READ] log once Firestore client updates blank.renderProfile."
-        );
         showToast(`Saved ${v?.colorName ?? "color"} × ${RENDER_TARGET_LABELS[selectedRenderTarget]}.`, "success");
         return;
       }
@@ -1249,49 +1644,10 @@ export function BlankRenderProfileEditor({
         return;
       }
 
-      if (savingColorVariant && !is8394) {
-        const normalizedRows = normalizeProfileRows(blank.placements, blank.styleCode);
-        const blankBase = buildRenderTargetSettingsMap(
-          blank.renderProfile?.renderTargets,
-          normalizedRows,
-          blank.styleCode
-        );
-        const patch: Partial<Record<RpRenderTarget, RPBlankVariantRenderProfileSideOverride | null>> = {};
-        for (const t of RENDER_TARGETS) {
-          const row = pickRowForRenderTarget(normalizedRows, t);
-          if (!row) continue;
-          patch[t] = diffSettingsToVariantRenderTargetOverride(
-            targetSettingsMap[t]!,
-            blankBase[t]!,
-            row,
-            blank.styleCode
-          );
-        }
-        const mergedVariants = mergeVariantRenderTargetOverrides(getBlankVariants(blank), variantId, patch);
-        console.log("[renderProfile save] variant overrides (non-8394 master)", {
-          blankId: blank.blankId,
-          variantId,
-          patch,
-        });
-        await updateBlank({
-          blankId: blank.blankId,
-          variants: mergedVariants,
-          renderProfileStatus,
-          renderProfileNotes: renderProfileNotes.trim() || null,
-          supportedRenderViews: supportedRenderViews.length ? supportedRenderViews : null,
-          preferredFlatLook8394: undefined,
-        });
-        await refetchBlank();
-        setBaselineMeta({
-          renderProfileStatus,
-          renderProfileNotes,
-          supportedFront,
-          supportedBack,
-          preferredFlatLook8394,
-        });
-        showToast("Saved placement overrides for this color.", "success");
-        return;
-      }
+      // (Legacy non-8394 master+variantId branch removed: it routed through
+      // diffSettingsToVariantRenderTargetOverride, which silently dropped
+      // fabricFeel / printStrength changes for any non-8394-back target. The
+      // master+variantId case above now handles all styleCodes via the matrix.)
 
       const renderTargets = Object.fromEntries(
         RENDER_TARGETS.map((t) => [t, targetSettingsMap[t]!])
@@ -1431,6 +1787,100 @@ export function BlankRenderProfileEditor({
     applyRenderStylePreset(lastExplicitRenderStyle);
   }, [applyRenderStylePreset, lastExplicitRenderStyle]);
 
+  const scale = tuning?.placement.scale ?? selected?.defaultScale ?? 0.6;
+  const artBase = selected?.artboardBase ?? 0.5;
+  const sx = selected?.safeArea?.x ?? DEFAULT_GARMENT_SAFE_AREA.x;
+  const sy = selected?.safeArea?.y ?? DEFAULT_GARMENT_SAFE_AREA.y;
+  const sw = selected?.safeArea?.w ?? DEFAULT_GARMENT_SAFE_AREA.w;
+  const sh = selected?.safeArea?.h ?? DEFAULT_GARMENT_SAFE_AREA.h;
+  const px = tuning?.placement.x ?? selected?.defaultX ?? 0.5;
+  const py = tuning?.placement.y ?? selected?.defaultY ?? 0.5;
+
+  useEffect(() => {
+    if (String(blank.styleCode || "").trim() !== "8394") return;
+    if (!previewGarmentUrl || !effectiveOverlayArtUrl) return;
+    let cancelled = false;
+    const garment = new Image();
+    const design = new Image();
+    garment.crossOrigin = "anonymous";
+    design.crossOrigin = "anonymous";
+    const run = () => {
+      if (cancelled) return;
+      if (!garment.naturalWidth || !design.naturalWidth) return;
+      const layout = computePlacement8394Layout({
+        blankWidthPx: garment.naturalWidth,
+        blankHeightPx: garment.naturalHeight,
+        defaultX: px,
+        defaultY: py,
+        defaultScale: scale,
+        artboardBase: artBase,
+        designWidthPx: design.naturalWidth,
+        designHeightPx: design.naturalHeight,
+      });
+      const dbg =
+        process.env.NEXT_PUBLIC_DEBUG_8394_PLACEMENT === "1" ||
+        (typeof window !== "undefined" && window.localStorage?.getItem("DEBUG_8394_PLACEMENT") === "1");
+      if (dbg) {
+        console.debug("[8394 placement preview] same formula as render8394DesignOnGarmentSharp computeLayout", layout);
+      }
+      const parityDbg =
+        process.env.NEXT_PUBLIC_DEBUG_8394_PLACEMENT_PARITY === "1" ||
+        (typeof window !== "undefined" && window.localStorage?.getItem("DEBUG_8394_PLACEMENT_PARITY") === "1");
+      if (parityDbg) {
+        const warpOn = tuning?.warp?.enabled === true;
+        const parityPreview = {
+          kind: "preview",
+          renderTarget: selectedRenderTarget,
+          warpEnabled: warpOn,
+          artboardBaseUsed: artBase,
+          centerPointPx: layout.centerPx,
+          preWarpSlotRectPx: {
+            x: layout.designFittedPx.leftClamped,
+            y: layout.designFittedPx.topClamped,
+            w: layout.designFittedPx.width,
+            h: layout.designFittedPx.height,
+          },
+          postWarpBitmapDimensionsPx: warpOn
+            ? null
+            : {
+                clean: { w: layout.designFittedPx.width, h: layout.designFittedPx.height },
+                blended: { w: layout.designFittedPx.width, h: layout.designFittedPx.height },
+              },
+          finalCompositeTopLeftBlendedPx_ifWarpOffMatchesSharp: {
+            x: layout.designFittedPx.leftClamped,
+            y: layout.designFittedPx.topClamped,
+          },
+          note: warpOn
+            ? "CSS 3D warp does not expose Sharp bitmap size — compare [PLACEMENT8394_PARITY] official logs for post-warp dims."
+            : "Warp off: compare to official finalCompositeTopLeftPx.blended (should match if mask/crop parity).",
+        };
+        console.log(`[PLACEMENT8394_PARITY] ${JSON.stringify(parityPreview)}`);
+      }
+    };
+    let loaded = 0;
+    const tick = () => {
+      loaded += 1;
+      if (loaded >= 2) run();
+    };
+    garment.onload = tick;
+    design.onload = tick;
+    garment.src = proxiedImageUrlForCanvas(previewGarmentUrl);
+    design.src = proxiedImageUrlForCanvas(effectiveOverlayArtUrl);
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    blank.styleCode,
+    previewGarmentUrl,
+    effectiveOverlayArtUrl,
+    px,
+    py,
+    scale,
+    artBase,
+    selectedRenderTarget,
+    tuning?.warp?.enabled,
+  ]);
+
   if (!rows.length) {
     return (
       <div>
@@ -1443,15 +1893,6 @@ export function BlankRenderProfileEditor({
       </div>
     );
   }
-
-  const scale = tuning?.placement.scale ?? selected?.defaultScale ?? 0.6;
-  const artBase = selected?.artboardBase ?? 0.5;
-  const sx = selected?.safeArea?.x ?? DEFAULT_GARMENT_SAFE_AREA.x;
-  const sy = selected?.safeArea?.y ?? DEFAULT_GARMENT_SAFE_AREA.y;
-  const sw = selected?.safeArea?.w ?? DEFAULT_GARMENT_SAFE_AREA.w;
-  const sh = selected?.safeArea?.h ?? DEFAULT_GARMENT_SAFE_AREA.h;
-  const px = tuning?.placement.x ?? selected?.defaultX ?? 0.5;
-  const py = tuning?.placement.y ?? selected?.defaultY ?? 0.5;
 
   const zoneBlendMode = selected?.renderZoneDefaults?.blendMode ?? "";
   const zoneBlendOpacity = selected?.renderZoneDefaults?.blendOpacity;
@@ -1528,6 +1969,37 @@ export function BlankRenderProfileEditor({
   const zonesFront = rows.some((r) => r.view === "front" || placementSide(r.placementId) === "front");
   const zonesBack = rows.some((r) => r.view === "back" || placementSide(r.placementId) === "back");
   const zonesLabel = [zonesFront ? "Front" : null, zonesBack ? "Back" : null].filter(Boolean).join(" · ") || "—";
+
+  const official8394Parsed = useMemo(
+    () => parseOfficial8394StrictParityJson(official8394StrictPaste.trim()),
+    [official8394StrictPaste]
+  );
+
+  const preview8394StrictSnapshot = useMemo(() => {
+    if (!preview8394Parity) return null;
+    return buildPreview8394StrictSnapshotFromTelemetry(preview8394Parity, {
+      contrastPercent: designTreatment8394.contrastPercent,
+      saturatePercent: designTreatment8394.saturatePercent,
+      note: "Canvas filter mirrors ink/contrast; Sharp uses apply8394DesignTreatmentPng.",
+    });
+  }, [preview8394Parity, designTreatment8394]);
+
+  const strict8394ParityCompare: StrictParityComparison | null = useMemo(() => {
+    if (!preview8394StrictSnapshot || !official8394Parsed) return null;
+    return compare8394StrictParity(preview8394StrictSnapshot, official8394Parsed);
+  }, [preview8394StrictSnapshot, official8394Parsed]);
+
+  const strictTargetMismatch =
+    official8394Parsed &&
+    preview8394StrictSnapshot &&
+    official8394Parsed.renderTarget &&
+    preview8394StrictSnapshot.renderTarget !== official8394Parsed.renderTarget;
+
+  const strictPipelineMismatch =
+    official8394Parsed &&
+    preview8394StrictSnapshot &&
+    official8394Parsed.renderPipelineMode &&
+    official8394Parsed.renderPipelineMode !== preview8394StrictSnapshot.compositeKind;
 
   return (
     <div className="space-y-8">
@@ -2769,7 +3241,7 @@ export function BlankRenderProfileEditor({
         </aside>
 
         {/* —— C: Preview (~60%) —— sticky on desktop so controls can scroll on the page */}
-        <div className="flex-1 min-w-0 space-y-4 lg:sticky lg:top-24 lg:self-start">
+        <div ref={preview8394ColumnRef} className="flex-1 min-w-0 space-y-4 lg:sticky lg:top-24 lg:self-start">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <p className="text-sm text-neutral-600">
               {previewDesignLabel ? (
@@ -2816,6 +3288,166 @@ export function BlankRenderProfileEditor({
               </p>
             ) : null}
           </div>
+
+          {is8394 ? (
+            <div className="flex flex-wrap items-center gap-3 rounded-lg border border-dashed border-neutral-300 bg-white px-3 py-2 text-xs text-neutral-800">
+              <label className="inline-flex items-center gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  className="rounded border-neutral-300"
+                  checked={pixelAccurate8394Preview}
+                  onChange={(e) => setPixelAccurate8394Preview(e.target.checked)}
+                />
+                <span>Natural-pixel canvas (official placement basis)</span>
+              </label>
+              <button
+                type="button"
+                onClick={() => void run8394CoordinateAudit()}
+                className="px-2.5 py-1 rounded-md border border-neutral-300 bg-neutral-50 hover:bg-neutral-100 font-medium text-neutral-900"
+              >
+                Log coordinate audit (flat_back vs model_back)
+              </button>
+            </div>
+          ) : null}
+
+          {/* NATURAL PREVIEW — STRICT TELEMETRY PANEL HIDDEN — flip `false` to `true` below to re-enable. */}
+          {false && is8394 && preview8394Parity ? (
+            <div
+              className="rounded-lg border border-emerald-200 bg-emerald-50/95 px-3 py-2 text-[11px] text-emerald-950 space-y-2"
+              role="region"
+              aria-label="8394 preview strict parity"
+            >
+              <p className="font-sans font-semibold text-emerald-900 text-xs">Natural preview — strict telemetry</p>
+              <div className="font-mono tabular-nums leading-relaxed text-emerald-950/95 text-[10px] space-y-0.5">
+                <p>
+                  <span className="text-emerald-700">garmentNaturalPx </span>
+                  {preview8394Parity.garmentNaturalPx.w}×{preview8394Parity.garmentNaturalPx.h}
+                  <span className="text-emerald-700"> · designNaturalPx </span>
+                  {preview8394Parity.designNaturalPx.w}×{preview8394Parity.designNaturalPx.h}
+                </p>
+                <p>
+                  <span className="text-emerald-700">alphaCropRectPx </span>
+                  {preview8394Parity.alphaCropRectPx.x},{preview8394Parity.alphaCropRectPx.y} +{" "}
+                  {preview8394Parity.alphaCropRectPx.w}×{preview8394Parity.alphaCropRectPx.h}
+                </p>
+                <p>
+                  <span className="text-emerald-700">preWarpSlotRectPx </span>
+                  {preview8394Parity.preWarpSlotRectPx.x},{preview8394Parity.preWarpSlotRectPx.y} ·{" "}
+                  {preview8394Parity.preWarpSlotRectPx.w}×{preview8394Parity.preWarpSlotRectPx.h}
+                </p>
+                <p>
+                  <span className="text-emerald-700">resizedBeforeWarp </span>
+                  {preview8394Parity.resizedBitmapBeforeWarpPx.w}×{preview8394Parity.resizedBitmapBeforeWarpPx.h}
+                  <span className="text-emerald-700"> · afterWarpMask </span>
+                  {preview8394Parity.bitmapDimensionsAfterWarpMaskPx.w}×
+                  {preview8394Parity.bitmapDimensionsAfterWarpMaskPx.h}
+                </p>
+                <p>
+                  <span className="text-emerald-700">postEffect WxH </span>
+                  clean {preview8394Parity.postEffectBitmapDimensionsPx.clean.w}×
+                  {preview8394Parity.postEffectBitmapDimensionsPx.clean.h} · blended{" "}
+                  {preview8394Parity.postEffectBitmapDimensionsPx.blended.w}×
+                  {preview8394Parity.postEffectBitmapDimensionsPx.blended.h}
+                </p>
+                <p>
+                  <span className="text-emerald-700">finalCompositeTopLeftPx </span>
+                  {preview8394Parity.compositeKind === "blended"
+                    ? `${preview8394Parity.finalCompositeTopLeftPx.blended.x},${preview8394Parity.finalCompositeTopLeftPx.blended.y}`
+                    : `${preview8394Parity.finalCompositeTopLeftPx.clean.x},${preview8394Parity.finalCompositeTopLeftPx.clean.y}`}
+                  <span className="text-emerald-700"> · displayedTL </span>
+                  {preview8394Parity.displayedFinalCompositeTopLeftPx
+                    ? `${preview8394Parity.displayedFinalCompositeTopLeftPx.x.toFixed(1)},${preview8394Parity.displayedFinalCompositeTopLeftPx.y.toFixed(1)}`
+                    : "—"}
+                </p>
+                <p>
+                  <span className="text-emerald-700">composite </span>
+                  {preview8394Parity.compositeKind}
+                  <span className="text-emerald-700"> · blend </span>
+                  {preview8394Parity.blendModeEffective}
+                  <span className="text-emerald-700"> · opacity </span>
+                  {preview8394Parity.effectiveOpacityOnRaster.toFixed(4)} (in×{preview8394Parity.designOpacityMultiplier.toFixed(3)})
+                </p>
+                <p>
+                  <span className="text-emerald-700">filter </span>
+                  {preview8394Parity.canvasFilterApplied === "none" ? "none" : preview8394Parity.canvasFilterApplied}
+                </p>
+                <p className="text-emerald-800/85">
+                  {preview8394Parity.renderTarget} · warp {preview8394Parity.warpEnabledEffective ? "on" : "off"} · mask{" "}
+                  {preview8394Parity.maskEnabledEffective ? "on" : "off"} · Logs:{" "}
+                  <code className="text-[9px]">[PREVIEW8394_STRICT_PARITY]</code>{" "}
+                  <code className="text-[9px]">NEXT_PUBLIC_DEBUG_8394_STRICT_PARITY=1</code>
+                </p>
+              </div>
+
+              <div className="border-t border-emerald-200/80 pt-2 space-y-1.5">
+                <p className="font-sans font-semibold text-emerald-900 text-xs">
+                  Natural preview vs official final parity
+                </p>
+                <label className="block text-[10px] text-emerald-800 font-sans">
+                  Paste one <code className="text-[9px]">[OFFICIAL8394_STRICT_PARITY]</code> JSON object from Cloud
+                  Logs (deploy with <code className="text-[9px]">OFFICIAL8394_STRICT_PARITY=1</code>)
+                </label>
+                <textarea
+                  value={official8394StrictPaste}
+                  onChange={(e) => setOfficial8394StrictPaste(e.target.value)}
+                  rows={3}
+                  placeholder='{"kind":"official","renderTarget":"flat_back",...}'
+                  className="w-full text-[10px] font-mono rounded border border-emerald-300 bg-white px-2 py-1.5 text-neutral-900 placeholder:text-neutral-400"
+                />
+                {strictTargetMismatch ? (
+                  <p className="text-[10px] text-amber-800 font-sans">
+                    Render target mismatch: preview {preview8394StrictSnapshot?.renderTarget} vs pasted{" "}
+                    {official8394Parsed?.renderTarget}
+                  </p>
+                ) : null}
+                {strictPipelineMismatch ? (
+                  <p className="text-[10px] text-amber-800 font-sans">
+                    Pipeline mode mismatch: preview {preview8394StrictSnapshot?.compositeKind} vs official{" "}
+                    {official8394Parsed?.renderPipelineMode} — paste the log from the same clean/blended pass.
+                  </p>
+                ) : null}
+                {strict8394ParityCompare ? (
+                  <ul className="grid grid-cols-1 sm:grid-cols-2 gap-1 text-[10px] font-sans">
+                    {(
+                      [
+                        ["Placement TL + size", strict8394ParityCompare.placementParity],
+                        ["Bitmap WxH (layer)", strict8394ParityCompare.bitmapSizeParity],
+                        ["Alpha crop rect", strict8394ParityCompare.cropParity],
+                        ["Blend mode", strict8394ParityCompare.blendParity],
+                        ["Opacity / treatment", strict8394ParityCompare.treatmentParity],
+                      ] as const
+                    ).map(([label, ok]) => (
+                      <li
+                        key={label}
+                        className={`flex items-center justify-between gap-2 rounded px-2 py-1 border ${
+                          ok ? "border-emerald-300 bg-emerald-100/50 text-emerald-950" : "border-red-300 bg-red-50 text-red-950"
+                        }`}
+                      >
+                        <span>{label}</span>
+                        <span className="font-semibold">{ok ? "match" : "diff"}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : official8394StrictPaste.trim() ? (
+                  <p className="text-[10px] text-red-700 font-sans">Could not parse official JSON.</p>
+                ) : (
+                  <p className="text-[10px] text-emerald-800/80 font-sans">Paste official JSON to compare.</p>
+                )}
+                {strict8394ParityCompare && !strict8394ParityCompare.placementParity && strict8394ParityCompare.details.placementDeltaPx ? (
+                  <p className="text-[9px] font-mono text-neutral-700">
+                    Δ placement px: {strict8394ParityCompare.details.placementDeltaPx.x.toFixed(2)},{" "}
+                    {strict8394ParityCompare.details.placementDeltaPx.y.toFixed(2)}
+                  </p>
+                ) : null}
+                {strict8394ParityCompare?.likelyCanvasVsSharpRenderingOnly ? (
+                  <p className="text-[9px] text-amber-900 font-sans bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                    Likely warp/mask or post-treatment size shift on Sharp — not a coordinate-basis bug. See preview{" "}
+                    <code className="text-[9px]">notes</code> in console.
+                  </p>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
 
           {is8394 ? (
             <div
@@ -2946,6 +3578,19 @@ export function BlankRenderProfileEditor({
                 overlayArtUrl=""
                 onPointerDownOverlay={handlePointerDownOverlay}
                 maxHeightClass="max-h-[min(72vh,720px)]"
+                pixelFaithful8394={is8394 && pixelAccurate8394Preview}
+                {...(is8394 && tuning
+                  ? {
+                      renderTarget8394: selectedRenderTarget,
+                      blendMode8394: zoneBlendFor8394BlendedPreview.blendMode,
+                      blendOpacity8394: zoneBlendFor8394BlendedPreview.blendOpacity,
+                      designOpacityMultiplier8394: designTreatment8394.designOpacityMultiplier,
+                      canvasFilter8394: "none",
+                      warpEnabled8394: tuning.warp?.enabled === true,
+                      maskEnabled8394: tuning.mask?.enabled === true,
+                      composite8394Kind: "clean",
+                    }
+                  : {})}
                 emptyOverlay={
                   <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10 px-6">
                     <p className="text-sm font-medium text-neutral-600 bg-white/90 border border-neutral-200 rounded-lg px-4 py-3 shadow-sm text-center">
@@ -2998,6 +3643,20 @@ export function BlankRenderProfileEditor({
                     overlayArtUrl={effectiveOverlayArtUrl}
                     onPointerDownOverlay={handlePointerDownOverlay}
                     maxHeightClass="max-h-[min(48vh,440px)]"
+                    pixelFaithful8394={is8394 && pixelAccurate8394Preview}
+                    {...(is8394 && tuning
+                      ? {
+                          renderTarget8394: selectedRenderTarget,
+                          blendMode8394: zoneBlendFor8394BlendedPreview.blendMode,
+                          blendOpacity8394: zoneBlendFor8394BlendedPreview.blendOpacity,
+                          designOpacityMultiplier8394: designTreatment8394.designOpacityMultiplier,
+                          canvasFilter8394: blended ? previewFilter : "none",
+                          warpEnabled8394: tuning.warp?.enabled === true,
+                          maskEnabled8394: tuning.mask?.enabled === true,
+                          composite8394Kind: blended ? ("blended" as const) : ("clean" as const),
+                          on8394ParityTelemetry: blended ? setPreview8394Parity : undefined,
+                        }
+                      : {})}
                   />
                 </div>
               ))}
@@ -3028,6 +3687,20 @@ export function BlankRenderProfileEditor({
               overlayArtUrl={effectiveOverlayArtUrl}
               onPointerDownOverlay={handlePointerDownOverlay}
               maxHeightClass="max-h-[min(72vh,720px)]"
+              pixelFaithful8394={is8394 && pixelAccurate8394Preview}
+              {...(is8394 && tuning
+                ? {
+                    renderTarget8394: selectedRenderTarget,
+                    blendMode8394: zoneBlendFor8394BlendedPreview.blendMode,
+                    blendOpacity8394: zoneBlendFor8394BlendedPreview.blendOpacity,
+                    designOpacityMultiplier8394: designTreatment8394.designOpacityMultiplier,
+                    canvasFilter8394: useBlendedCanvas ? previewFilter : "none",
+                    warpEnabled8394: tuning.warp?.enabled === true,
+                    maskEnabled8394: tuning.mask?.enabled === true,
+                    composite8394Kind: useBlendedCanvas ? ("blended" as const) : ("clean" as const),
+                    on8394ParityTelemetry: setPreview8394Parity,
+                  }
+                : {})}
             />
           )}
         </div>

@@ -27,14 +27,15 @@ export function fallbackChainForPreferredTone(preferred: RPBlankArtworkTone): Ar
 }
 
 /**
- * Default chain when `preferredArtworkTone` is null/undefined: garment family only
- * (classic contrast: dark shirt → light artwork; light shirt → dark artwork), then white, then last resort.
- * - Dark garment → light → white → dark
- * - Light garment → dark → white → light
+ * Default chain when `preferredArtworkTone` is null/undefined: garment family only.
+ * Slots match **target garment** in Merch naming: `lightPng` for light garments, `darkPng` for dark garments,
+ * then `white`, then remaining fallback.
+ * - Dark garment → dark → white → light
+ * - Light garment → light → white → dark
  */
 export function fallbackChainForGarmentFamily(garmentColorFamily: RPBlankColorFamily): ArtworkToneSlot[] {
-  if (garmentColorFamily === "dark") return ["light", "white", "dark"];
-  return ["dark", "white", "light"];
+  if (garmentColorFamily === "dark") return ["dark", "white", "light"];
+  return ["light", "white", "dark"];
 }
 
 /** Generic light / dark / white slots (PNG, SVG, or PDF URLs for one side). */

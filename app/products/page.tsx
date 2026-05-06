@@ -267,6 +267,7 @@ function ProductsContent() {
           blankId: designBlankBlankId,
           blankVariantIds,
           autoSyncShopify: false,
+          queue8394Secondary: false,
         });
         const pid =
           batch.productId ||

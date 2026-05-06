@@ -1,9 +1,11 @@
 /**
  * 8394 back MVP: non-designer controls → engine params (blend, opacity, ink, scale).
  * UI exposes sliders/presets only; Firestore stores `simpleRenderControls8394` + derived `renderZoneDefaults`.
+ * Realism→blend and ink curves match `preview8394` so Sharp output matches the blank editor preview.
  */
 
 import type { RP8394SizePreset, RPPlacementSimpleRenderControls8394 } from "@/lib/types/firestore";
+import { mapInkStrengthToFactorsPreview, mapRealismToBlendPreview } from "@/lib/blanks/preview8394";
 
 export const DEFAULT_SIMPLE_RENDER_CONTROLS_8394 = {
   realism: 52,
@@ -36,15 +38,7 @@ export function sizePresetToDefaultScale(preset: RP8394SizePreset | string | nul
  * Maps to blend mode + base layer opacity (before ink).
  */
 export function mapRealismToBlend(realism: number): { blendMode: string; blendOpacity: number } {
-  const r = clamp(realism, 0, 100);
-  let blendMode: string;
-  if (r < 28) blendMode = "normal";
-  else if (r < 52) blendMode = "soft-light";
-  else if (r < 76) blendMode = "overlay";
-  else blendMode = "multiply";
-  const t = r / 100;
-  const blendOpacity = clamp(1 - t * 0.16, 0.74, 1);
-  return { blendMode, blendOpacity };
+  return mapRealismToBlendPreview(realism);
 }
 
 /**
@@ -54,10 +48,8 @@ export function mapInkStrengthToFactors(inkStrength: number): {
   designOpacityMultiplier: number;
   contrastPercent: number;
 } {
-  const i = clamp(inkStrength, 0, 100) / 100;
-  const designOpacityMultiplier = clamp(0.45 + 0.55 * i, 0.35, 1);
-  const contrastPercent = clamp(88 + i * 32, 88, 125);
-  return { designOpacityMultiplier, contrastPercent };
+  const p = mapInkStrengthToFactorsPreview(Math.round(clamp(inkStrength, 0, 100)));
+  return { designOpacityMultiplier: p.designOpacityMultiplier, contrastPercent: p.contrastPercent };
 }
 
 export function normalizeSimpleControls8394(

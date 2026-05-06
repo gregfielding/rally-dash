@@ -1,8 +1,14 @@
 "use strict";
 
 const shopifySync = require("../shopifySync");
-const { DEFAULT_ASSET_PLAN } = require("./defaultAssetPlan");
+const { LEGACY_DEFAULT_ASSET_PLAN, resolveBlankProductImagePlan } = require("./defaultAssetPlan");
 const { buildFulfillmentPackage } = require("./buildFulfillmentPackage");
+const { resolvePrintSidesForProductBuild } = require("./resolveDefaultPrintSides");
+const {
+  describe8394ReadinessRoles,
+  primaryVariantImageUrlForShopify,
+  mergeInheritedMediaForReadiness8394,
+} = require("./variantShopifyMedia");
 const {
   PIPELINE_STAGE,
   pipelineFailurePatch,
@@ -39,6 +45,34 @@ function launchBatchLog(tag, payload) {
 }
 
 /**
+ * @param {{ db: import("firebase-admin").firestore.Firestore; product: Record<string, unknown> }} ctx
+ */
+async function resolvePrintSidesPayloadForProduct({ db, product }) {
+  if (product.fulfillmentSummary && product.fulfillmentSummary.printSides) {
+    return product.fulfillmentSummary.printSides;
+  }
+  const blankId = product.blankId;
+  const designId = product.designId;
+  if (!blankId || !designId) return null;
+  const [bSnap, dSnap] = await Promise.all([
+    db.collection("rp_blanks").doc(String(blankId)).get(),
+    db.collection("designs").doc(String(designId)).get(),
+  ]);
+  const sideRes = resolvePrintSidesForProductBuild(
+    bSnap.exists ? bSnap.data() || {} : {},
+    dSnap.exists ? dSnap.data() || {} : {}
+  );
+  return {
+    blankMode: sideRes.blankMode,
+    designMode: sideRes.designMode,
+    effectiveFront: sideRes.effectiveFront,
+    effectiveBack: sideRes.effectiveBack,
+    primaryPlacementSide: sideRes.primaryPlacementSide,
+    canGenerate: sideRes.canGenerate,
+  };
+}
+
+/**
  * First touch when parent exists during one-click launch (first color materialized).
  */
 async function setLaunchStatusMaterializing({ db, admin, sanitizeForFirestore, productId, userId }) {
@@ -70,8 +104,22 @@ async function applyLaunchMetadataDefaults({ db, admin, sanitizeForFirestore, pr
   const blank = bSnap && bSnap.exists ? bSnap.data() || {} : {};
   const styleCode = String(p.blankStyleCode || blank.styleCode || "").trim();
 
+  const bvKey = String(p.blankVariantId || "").trim();
+  const blankRow =
+    bvKey && Array.isArray(blank.variants) ? blank.variants.find((v) => v && String(v.variantId || "").trim() === bvKey) : null;
+  const fallbackRow = Array.isArray(blank.variants) && blank.variants[0] ? blank.variants[0] : null;
+  const rowForGallery = blankRow || fallbackRow;
+  const resolvedGallery =
+    rowForGallery && Object.keys(blank).length
+      ? resolveBlankProductImagePlan(blank, rowForGallery)
+      : null;
+  const galleryOrder =
+    resolvedGallery && resolvedGallery.galleryOrderOfficialRoles.length
+      ? [...resolvedGallery.galleryOrderOfficialRoles]
+      : [...LEGACY_DEFAULT_ASSET_PLAN];
+
   const patch = {
-    defaultGalleryRoleOrder: [...DEFAULT_ASSET_PLAN],
+    defaultGalleryRoleOrder: galleryOrder,
     launchPipelineVersion: 1,
     launchMetadataFilledAt: admin.firestore.FieldValue.serverTimestamp(),
     launchUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -135,7 +183,43 @@ async function advanceLaunchAfterAssetBatchComplete({ db, admin, sanitizeForFire
     console.warn("[advanceLaunchAfterAssetBatchComplete] fulfillment:", fulfillmentThrown);
   }
 
-  const readiness = shopifySync.readinessCheck(product, { variantDocs });
+  let printSidesPayload =
+    fulfillmentResult && fulfillmentResult.ok && fulfillmentResult.fulfillmentSummary
+      ? fulfillmentResult.fulfillmentSummary.printSides || null
+      : null;
+  if (!printSidesPayload) {
+    printSidesPayload = await resolvePrintSidesPayloadForProduct({ db, product });
+  }
+
+  const readiness = shopifySync.readinessCheck(product, { variantDocs, printSides: printSidesPayload });
+
+  const styleForLog = String(product.blankStyleCode || "").trim();
+  if (styleForLog === "8394" && variantDocs.length > 0) {
+    const byId = new Map(variantDocs.filter((v) => v.id).map((v) => [String(v.id), v]));
+    const sample = variantDocs[0];
+    const sampleMerged = sample ? mergeInheritedMediaForReadiness8394(sample, byId) : null;
+    const primaryUrl = sampleMerged
+      ? primaryVariantImageUrlForShopify(sampleMerged, product.blankStyleCode, printSidesPayload)
+      : "";
+    const fr = sampleMerged && sampleMerged.flatRenders;
+    launchBatchLog("SHOPIFY_READINESS_CONTEXT", {
+      productId,
+      blankStyleCode: product.blankStyleCode || null,
+      printSides: printSidesPayload,
+      rolePolicy: describe8394ReadinessRoles(printSidesPayload),
+      sampleVariantId: sample && sample.id,
+      primaryStorefrontImageUrl: primaryUrl || null,
+      fulfillmentPrintRefsSample: sampleMerged
+        ? {
+            flat_clean_front: fr && fr.flat_clean && fr.flat_clean.front ? fr.flat_clean.front.url : null,
+            flat_blended_back: fr && fr.flat_blended && fr.flat_blended.back ? fr.flat_blended.back.url : null,
+            heroFront: sampleMerged.media && sampleMerged.media.heroFront,
+            heroBack: sampleMerged.media && sampleMerged.media.heroBack,
+            mockupUrl: sampleMerged.mockupUrl || null,
+          }
+        : null,
+    });
+  }
 
   const patch = {
     launchUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -213,6 +297,17 @@ async function advanceLaunchAfterAssetBatchComplete({ db, admin, sanitizeForFire
     nextLaunchStatus: patch.launchStatus || null,
   });
 
+  launchBatchLog("PROOF_LAUNCH_ADVANCE", {
+    productId,
+    launchStatus: patch.launchStatus || null,
+    shopifyReady: patch.shopifyReady === true,
+    shopifyReadinessMissing: readiness.missing || [],
+    fulfillmentSummaryWritten: !!(fulfillmentResult && fulfillmentResult.ok && fs),
+    fulfillmentReady: fs ? fs.fulfillmentReady === true : null,
+    fulfillmentThrown: fulfillmentThrown || null,
+    opsReviewStatus: patch.opsReviewStatus != null ? patch.opsReviewStatus : null,
+  });
+
   await productRef.set(sanitizeForFirestore(patch), { merge: true });
 
   const autoSync = options && options.autoSyncShopify === true;
@@ -249,8 +344,17 @@ async function advanceLaunchAfterAssetBatchComplete({ db, admin, sanitizeForFire
 
 /**
  * Partial / failed asset batch → operator-friendly status.
+ * @param {string} [firstRoleErrorMessage] — first failed role's `error` from batch colors (root cause); preferred over generic text.
  */
-async function advanceLaunchAfterAssetBatchTerminal({ db, admin, sanitizeForFirestore, productId, batchStatus, userId }) {
+async function advanceLaunchAfterAssetBatchTerminal({
+  db,
+  admin,
+  sanitizeForFirestore,
+  productId,
+  batchStatus,
+  userId,
+  firstRoleErrorMessage,
+}) {
   const productRef = db.collection("rp_products").doc(productId);
   const patch = {
     launchUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -258,14 +362,11 @@ async function advanceLaunchAfterAssetBatchTerminal({ db, admin, sanitizeForFire
   };
   if (batchStatus === "failed") {
     patch.launchStatus = LAUNCH_STATUS.FAILED;
-    Object.assign(
-      patch,
-      pipelineFailurePatch(
-        admin,
-        "Initial asset batch finished with status: failed",
-        PIPELINE_STAGE.GENERATING_ASSETS
-      )
-    );
+    const detail =
+      firstRoleErrorMessage && String(firstRoleErrorMessage).trim()
+        ? String(firstRoleErrorMessage).trim()
+        : "Initial asset batch finished with status: failed";
+    Object.assign(patch, pipelineFailurePatch(admin, detail, PIPELINE_STAGE.GENERATING_ASSETS));
   } else if (batchStatus === "partial") {
     patch.launchStatus = LAUNCH_STATUS.GENERATING_ASSETS;
     Object.assign(
@@ -283,7 +384,7 @@ async function advanceLaunchAfterAssetBatchTerminal({ db, admin, sanitizeForFire
 module.exports = {
   LAUNCH_STATUS,
   PIPELINE_STAGE,
-  DEFAULT_ASSET_PLAN,
+  DEFAULT_ASSET_PLAN: LEGACY_DEFAULT_ASSET_PLAN,
   skipReviewGate,
   setLaunchStatusMaterializing,
   applyLaunchMetadataDefaults,

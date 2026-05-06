@@ -287,14 +287,23 @@ async function seedPresets() {
     }
 
     try {
-      await presetsRef.add({
-        ...preset,
-        createdAt: now,
-        updatedAt: now,
-        createdBy: userId,
-        updatedBy: userId,
-      });
-      console.log(`✅ Created "${preset.name}" with mode: ${preset.mode}, safetyProfile: ${preset.safetyProfile || "general_safe"}`);
+      // Deterministic id for 8394 official on-model jobs (Functions fallback: slug lookup → this doc id).
+      const docId =
+        preset.slug === "underwear-studio-on-model" ? "underwear-studio-on-model" : null;
+      const ref = docId ? presetsRef.doc(docId) : presetsRef.doc();
+      await ref.set(
+        {
+          ...preset,
+          createdAt: now,
+          updatedAt: now,
+          createdBy: userId,
+          updatedBy: userId,
+        },
+        { merge: true }
+      );
+      console.log(
+        `✅ Created "${preset.name}" (${ref.id}) with mode: ${preset.mode}, safetyProfile: ${preset.safetyProfile || "general_safe"}`
+      );
       created++;
     } catch (error) {
       console.error(`❌ Failed to create "${preset.name}":`, error.message);

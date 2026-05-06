@@ -17,6 +17,7 @@ import {
   RPBlankRenderDefaults,
   type RPBlankGarmentSizeCode,
   type RPBlankDefaultPrintSides,
+  type ShopifyVariantMode,
 } from "@/lib/types/firestore";
 import { useAuth } from "@/lib/providers/AuthProvider";
 import {
@@ -204,18 +205,71 @@ function GarmentSizesSection({ blank, updateBlank, refetchBlank, showToast }: { 
 
 function ShopifyDefaultsSection({ blank, updateBlank, refetchBlank, showToast }: { blank: RPBlank; updateBlank: (i: UpdateBlankInput) => Promise<unknown>; refetchBlank: () => void; showToast: (m: string, t: "success" | "error") => void }) {
   const sd = blank.shopifyDefaults;
+  const is8394Blank = String(blank.styleCode || "").trim() === "8394";
+  const storedVariantMode = blank.shopifyVariantMode;
+  const effectiveVariantMode: ShopifyVariantMode = storedVariantMode ?? "color";
+
   const [productType, setProductType] = useState(sd?.productType ?? "");
   const [brand, setBrand] = useState(sd?.brand ?? sd?.vendor ?? "");
   const [productCategory, setProductCategory] = useState(sd?.productCategory ?? "");
   const [collectionHandles, setCollectionHandles] = useState((sd?.collectionHandles ?? []).join(", "));
   const [sizeOptionName, setSizeOptionName] = useState(sd?.sizeOptionName ?? "");
+  const [variantStructure, setVariantStructure] = useState<ShopifyVariantMode>(() => blank.shopifyVariantMode ?? "color");
   const [saving, setSaving] = useState(false);
   useEffect(() => {
     setSizeOptionName(blank.shopifyDefaults?.sizeOptionName ?? "");
   }, [blank.blankId, blank.shopifyDefaults?.sizeOptionName]);
+  useEffect(() => {
+    setVariantStructure(blank.shopifyVariantMode ?? "color");
+  }, [blank.blankId, blank.shopifyVariantMode]);
   return (
     <div className="space-y-4 max-w-lg">
       <p className="text-sm text-gray-700">Shopify merchandising defaults (style-level). Supplier/sourcing is not duplicated here—use Sourcing.</p>
+      <div>
+        <label className="block text-sm font-medium text-gray-800 mb-1">Variant structure</label>
+        <div className="mb-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-800 space-y-1.5">
+          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+            <span className="font-semibold text-slate-900">Effective mode (read):</span>
+            <code className="rounded bg-white px-1.5 py-0.5 font-mono text-slate-900 border border-slate-200">{effectiveVariantMode}</code>
+            {storedVariantMode == null ? (
+              <span className="text-amber-800">
+                — field not set on blank; treated as <code className="font-mono">color</code> until you save
+              </span>
+            ) : (
+              <span className="text-emerald-800">— stored on <code className="font-mono">rp_blanks</code></span>
+            )}
+          </div>
+          <div className="text-slate-600">
+            {effectiveVariantMode === "color" ? (
+              <>
+                <strong>color</strong>: one Shopify variant per color (all sizes for that color share the same Shopify variant id at sync).
+              </>
+            ) : (
+              <>
+                <strong>color_size</strong>: Color × Size options; one Shopify variant row per Rally variant (full matrix).
+              </>
+            )}
+          </div>
+          {is8394Blank && storedVariantMode == null ? (
+            <p className="text-amber-900 border-t border-amber-200/80 pt-1.5 mt-1">
+              <strong>8394:</strong> Click <strong>Save</strong> to write <code className="font-mono">shopifyVariantMode: &quot;color&quot;</code> on this blank so
+              inheritance is explicit for new products (recommended).
+            </p>
+          ) : null}
+        </div>
+        <p className="text-xs text-gray-500 mb-1">
+          How Shopify builds variants at sync. <strong>Color only</strong> = one Shopify variant per color (all sizes share the same Shopify variant id).{" "}
+          <strong>Color + Size</strong> = Color × Size matrix with one Shopify row per Rally variant (recommended when every size has its own SKU).
+        </p>
+        <select
+          value={variantStructure}
+          onChange={(e) => setVariantStructure(e.target.value as ShopifyVariantMode)}
+          className={BLANK_FIELD_SELECT}
+        >
+          <option value="color">Color only (default)</option>
+          <option value="color_size">Color + Size (recommended)</option>
+        </select>
+      </div>
       <div>
         <label className="block text-sm font-medium text-gray-800 mb-1">Size option name (Shopify)</label>
         <p className="text-xs text-gray-500 mb-1">
@@ -252,6 +306,7 @@ function ShopifyDefaultsSection({ blank, updateBlank, refetchBlank, showToast }:
           try {
             await updateBlank({
               blankId: blank.blankId,
+              shopifyVariantMode: variantStructure,
               shopifyDefaults: {
                 productType: productType.trim() || null,
                 brand: brand.trim() || null,

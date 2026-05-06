@@ -2,21 +2,44 @@
 
 const { resolvePrintSidesForProductBuild } = require("./resolveDefaultPrintSides");
 const { PIPELINE_STAGE, pipelineFailurePatch } = require("./pipelineReporting");
+const { mergeInheritedMediaForReadiness8394 } = require("./variantShopifyMedia");
 
+function isOfficialGenRow(o) {
+  if (!o) return false;
+  const t = String(o.sourceType || "");
+  return t === "official_deterministic_generation" || t === "official_generation";
+}
+
+function urlFromGeneratedRole(v, role, lookType) {
+  const outs = v.generatedRenderOutputs;
+  if (!Array.isArray(outs)) return null;
+  const match = (o) => {
+    if (!o || String(o.role || "") !== role) return false;
+    if (!o.url || !String(o.url).trim()) return false;
+    if (lookType && String(o.lookType || "") !== lookType) return false;
+    return true;
+  };
+  const official = outs.find((o) => match(o) && isOfficialGenRow(o));
+  if (official && official.url) return String(official.url).trim();
+  const any = outs.find((o) => match(o));
+  return any && any.url ? String(any.url).trim() : null;
+}
+
+/** Same slots as variant docs; falls back to official `generatedRenderOutputs` when slots omitted. */
 function pickPrintFileRefs8394(v) {
   const fr = v.flatRenders || {};
   return {
-    flat_clean_front: fr.flat_clean?.front?.url || null,
-    flat_blended_back: fr.flat_blended?.back?.url || null,
-    model_clean_front: fr.model_clean?.front?.url || null,
-    model_blended_back: fr.model_blended?.back?.url || null,
+    flat_clean_front: fr.flat_clean?.front?.url || urlFromGeneratedRole(v, "flat_front", "flat_clean") || null,
+    flat_blended_back: fr.flat_blended?.back?.url || urlFromGeneratedRole(v, "flat_back", "flat_blended") || null,
+    model_clean_front: fr.model_clean?.front?.url || urlFromGeneratedRole(v, "model_front", "model_clean") || null,
+    model_blended_back: fr.model_blended?.back?.url || urlFromGeneratedRole(v, "model_back", "model_blended") || null,
     heroFront: v.media?.heroFront || null,
     heroBack: v.media?.heroBack || null,
     mockupUrl: v.mockupUrl || null,
   };
 }
 
-function variantFulfillmentMissing(v, blankStyleCode) {
+function variantFulfillmentMissing(v, blankStyleCode, printSides) {
   const missing = [];
   if (!String(v.sku || "").trim()) missing.push("sku");
   const opt = v.optionValues || {};
@@ -24,7 +47,36 @@ function variantFulfillmentMissing(v, blankStyleCode) {
   if (!String(opt.size || "").trim()) missing.push("size");
   const is8394 = String(blankStyleCode || "").trim() === "8394";
   const refs = pickPrintFileRefs8394(v);
-  const hasAnyImage = !!(refs.heroBack || refs.heroFront || refs.mockupUrl || refs.flat_blended_back);
+  let hasAnyImage;
+  if (
+    is8394 &&
+    printSides &&
+    printSides.effectiveBack === true &&
+    printSides.effectiveFront === false
+  ) {
+    hasAnyImage = !!(
+      refs.heroBack ||
+      refs.mockupUrl ||
+      refs.flat_blended_back ||
+      refs.model_blended_back
+    );
+  } else if (
+    is8394 &&
+    printSides &&
+    printSides.effectiveFront === true &&
+    printSides.effectiveBack === false
+  ) {
+    hasAnyImage = !!(
+      refs.heroFront ||
+      refs.mockupUrl ||
+      refs.flat_clean_front ||
+      refs.model_clean_front
+    );
+  } else if (is8394) {
+    hasAnyImage = !!(refs.heroBack || refs.heroFront || refs.mockupUrl || refs.flat_blended_back);
+  } else {
+    hasAnyImage = true;
+  }
   if (is8394 && !hasAnyImage) missing.push("variant_image_or_flat");
   return missing;
 }
@@ -101,11 +153,15 @@ async function buildFulfillmentPackage(ctx) {
     colorLines.get(bk).variantDocCount += 1;
   }
 
+  const allRows = vSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  const byId = new Map(allRows.filter((r) => r.id).map((r) => [String(r.id), r]));
+
   const variantPayloads = [];
   let allVariantsReady = true;
   for (const d of vSnap.docs) {
-    const v = d.data() || {};
-    const vm = variantFulfillmentMissing(v, blankStyleCode);
+    const raw = { id: d.id, ...d.data() };
+    const v = mergeInheritedMediaForReadiness8394(raw, byId);
+    const vm = variantFulfillmentMissing(v, blankStyleCode, printSides);
     if (vm.length > 0) allVariantsReady = false;
     variantPayloads.push({
       ref: d.ref,

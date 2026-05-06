@@ -18,7 +18,10 @@ const fetch = (...args) =>
   import("node-fetch").then(({ default: fetchFn }) => fetchFn(...args));
 
 const { buildShopifyTags } = require("./buildShopifyTags");
-const { primaryVariantImageUrlForShopify } = require("./lib/variantShopifyMedia");
+const {
+  primaryVariantImageUrlForShopify,
+  mergeInheritedMediaForReadiness8394,
+} = require("./lib/variantShopifyMedia");
 
 const SHOPIFY_API_VERSION = "2024-07";
 
@@ -60,7 +63,7 @@ function toShopifyGid(id, kind) {
 /**
  * Server-side readiness — keep aligned with `lib/shopify/isProductReadyForShopify.ts`.
  * @param {object} product
- * @param {{ variantDocs?: object[]; mediaFallback?: { heroFront?: string; heroBack?: string; mockupUrl?: string } }} [options]
+ * @param {{ variantDocs?: object[]; mediaFallback?: { heroFront?: string; heroBack?: string; mockupUrl?: string }; printSides?: { effectiveFront?: boolean; effectiveBack?: boolean } | null }} [options]
  * @returns {{ ready: boolean, missing: string[] }}
  */
 function readinessCheck(product, options = {}) {
@@ -68,6 +71,23 @@ function readinessCheck(product, options = {}) {
   if (!product) return { ready: false, missing: ["Product"] };
 
   const variantDocs = Array.isArray(options.variantDocs) ? options.variantDocs : [];
+  const printSides =
+    options.printSides != null
+      ? options.printSides
+      : product.fulfillmentSummary && product.fulfillmentSummary.printSides
+        ? product.fulfillmentSummary.printSides
+        : null;
+
+  const normalizedVariants = variantDocs.map((v) => ({
+    ...v,
+    id:
+      v.id != null
+        ? String(v.id)
+        : v.firestoreDocId != null
+          ? String(v.firestoreDocId)
+          : "",
+  }));
+  const byId = new Map(normalizedVariants.filter((v) => v.id).map((v) => [v.id, v]));
 
   if (!product.title?.trim()) missing.push("Title");
   if (!product.handle?.trim()) missing.push("Handle");
@@ -97,7 +117,10 @@ function readinessCheck(product, options = {}) {
         const c = String((v.optionValues && v.optionValues.color) || "").trim();
         const sz = String((v.optionValues && v.optionValues.size) || "").trim();
         if (!c || !sz) needOpts = true;
-        if (!primaryVariantImageUrlForShopify(v, product.blankStyleCode)) needImg = true;
+        const vid =
+          v.id != null ? String(v.id) : v.firestoreDocId != null ? String(v.firestoreDocId) : "";
+        const merged = mergeInheritedMediaForReadiness8394(vid ? { ...v, id: vid } : v, byId);
+        if (!primaryVariantImageUrlForShopify(merged, product.blankStyleCode, printSides)) needImg = true;
       }
       if (needSku) missing.push("SKU on every active variant");
       if (needOpts) missing.push("Color × Size on every active variant");
@@ -115,7 +138,13 @@ function readinessCheck(product, options = {}) {
     if (is8394) {
       const hasHeroBack = !!effHeroBack || !!effMockup;
       const hasHeroFront = !!effHeroFront;
-      if (!hasHeroBack && !hasHeroFront) {
+      const backOnly =
+        printSides && printSides.effectiveBack === true && printSides.effectiveFront === false;
+      if (backOnly) {
+        if (!hasHeroBack) {
+          missing.push("Hero back or mockup (8394 back-only)");
+        }
+      } else if (!hasHeroBack && !hasHeroFront) {
         missing.push("Hero back or hero front (8394 is back-print; use back blended or blank front)");
       }
     } else if (!effHeroFront) {
@@ -201,12 +230,29 @@ async function runProductSync(product, variantDocs, store, accessToken) {
   if (product.productKind === "parent" && !useMatrix) {
     throw new Error("Parent products require variant subdocuments; Rally child variants are the SKU source of truth.");
   }
+  const printSides =
+    product.fulfillmentSummary && product.fulfillmentSummary.printSides
+      ? product.fulfillmentSummary.printSides
+      : null;
   const activeVariants = useMatrix
     ? variantDocs.filter((v) => v.status !== "archived")
     : [buildLegacySyntheticVariant(product)];
 
   if (!activeVariants.length) {
     throw new Error("No active variants to sync");
+  }
+
+  /** Same as readiness: size rows may inherit media from the primary size before fanout completes. */
+  const byIdForSync = new Map();
+  for (const v of activeVariants) {
+    const id =
+      v.firestoreDocId != null ? String(v.firestoreDocId) : v.id != null ? String(v.id) : "";
+    if (id) byIdForSync.set(id, { ...v, id });
+  }
+  function mergeVariantForSync(v) {
+    const id =
+      v.firestoreDocId != null ? String(v.firestoreDocId) : v.id != null ? String(v.id) : "";
+    return mergeInheritedMediaForReadiness8394(id ? { ...v, id } : v, byIdForSync);
   }
 
   activeVariants.sort((a, b) => {
@@ -238,7 +284,7 @@ async function runProductSync(product, variantDocs, store, accessToken) {
   /** @type {Map<string, { originalSource: string, contentType: string, alt: string, filename: string }>} */
   const filesByUrl = new Map();
   for (const v of activeVariants) {
-    const url = primaryVariantImageUrlForShopify(v, product.blankStyleCode);
+    const url = primaryVariantImageUrlForShopify(mergeVariantForSync(v), product.blankStyleCode, printSides);
     if (!url) continue;
     if (filesByUrl.has(url)) continue;
     const sku = String(v.sku || "img").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
@@ -328,20 +374,42 @@ async function runProductSync(product, variantDocs, store, accessToken) {
     });
   }
 
-  const variants = [];
-  let pos = 0;
+  const rawVariantMode = product.shopifyVariantMode;
+  /** @type {"legacy"|"color"|"color_size"} */
+  const syncMode =
+    rawVariantMode === "color"
+      ? "color"
+      : rawVariantMode === "color_size"
+        ? "color_size"
+        : "legacy";
+
+  /** First variant row per color (stable order) — used when syncMode === "color". */
+  const byColorFirst = new Map();
   for (const v of activeVariants) {
-    pos += 1;
+    const c = String((v.optionValues && v.optionValues.color) || "").trim();
+    if (!c) continue;
+    if (!byColorFirst.has(c)) byColorFirst.set(c, v);
+  }
+  const collapsedByColor = [...byColorFirst.values()].sort((a, b) => {
+    const ca = String((a.optionValues && a.optionValues.color) || "");
+    const cb = String((b.optionValues && b.optionValues.color) || "");
+    return ca.localeCompare(cb);
+  });
+
+  /**
+   * @param {object} v
+   * @param {{ colorSizeOptions: boolean, variantTitle?: string | null }} shape
+   */
+  function buildVariantRow(v, shape) {
     const color = String((v.optionValues && v.optionValues.color) || "").trim();
     const size = String((v.optionValues && v.optionValues.size) || "").trim();
     const sku = String(v.sku || "").trim();
-    const imgUrl = primaryVariantImageUrlForShopify(v, product.blankStyleCode);
+    const imgUrl = primaryVariantImageUrlForShopify(mergeVariantForSync(v), product.blankStyleCode, printSides);
     const pricing = resolveVariantPricing(v, product);
     const shipping = resolveVariantShipping(v, product);
     const grams = Number(shipping.defaultWeightGrams || 0);
     const gid = toShopifyGid(v.shopify && v.shopify.variantId, "ProductVariant");
 
-    /** @type {Record<string, unknown>} */
     const inventoryItem = {
       tracked: false,
       requiresShipping: shipping.requiresShipping !== false,
@@ -352,7 +420,6 @@ async function runProductSync(product, variantDocs, store, accessToken) {
       };
     }
 
-    /** @type {object[]} */
     const vMetas = [];
     if (v.blankVariantId) {
       vMetas.push({
@@ -375,17 +442,23 @@ async function runProductSync(product, variantDocs, store, accessToken) {
     /** @type {Record<string, unknown>} */
     const row = {
       id: gid,
-      position: pos,
       sku,
       price: String(Number(pricing.basePrice).toFixed(2)),
       taxable: v.taxable !== false,
-      optionValues: [
-        { optionName: "Color", name: color },
-        { optionName: "Size", name: size },
-      ],
       inventoryItem,
       inventoryPolicy: "CONTINUE",
     };
+    if (shape.variantTitle && String(shape.variantTitle).trim()) {
+      row.title = String(shape.variantTitle).trim().slice(0, 255);
+    }
+    if (shape.colorSizeOptions) {
+      row.optionValues = [
+        { optionName: "Color", name: color },
+        { optionName: "Size", name: size },
+      ];
+    } else {
+      row.optionValues = [{ optionName: "Color", name: color }];
+    }
     if (typeof pricing.compareAtPrice === "number" && Number.isFinite(pricing.compareAtPrice)) {
       row.compareAtPrice = String(Number(pricing.compareAtPrice).toFixed(2));
     }
@@ -400,7 +473,56 @@ async function runProductSync(product, variantDocs, store, accessToken) {
       }
     }
     if (vMetas.length) row.metafields = vMetas;
-    variants.push(row);
+    return row;
+  }
+
+  const variants = [];
+  let pos = 0;
+
+  if (syncMode === "color") {
+    for (const v of collapsedByColor) {
+      pos += 1;
+      const color = String((v.optionValues && v.optionValues.color) || "").trim();
+      const row = buildVariantRow(v, { colorSizeOptions: false, variantTitle: color });
+      row.position = pos;
+      variants.push(row);
+    }
+  } else {
+    for (const v of activeVariants) {
+      pos += 1;
+      const color = String((v.optionValues && v.optionValues.color) || "").trim();
+      const size = String((v.optionValues && v.optionValues.size) || "").trim();
+      const title =
+        syncMode === "color_size" && color && size ? `${color} / ${size}`.slice(0, 255) : null;
+      const row = buildVariantRow(v, { colorSizeOptions: true, variantTitle: title || undefined });
+      row.position = pos;
+      variants.push(row);
+    }
+  }
+
+  let productOptions;
+  if (syncMode === "color") {
+    productOptions = [{ name: "Color", position: 1, values: uniqueColors.map((name) => ({ name })) }];
+  } else {
+    productOptions = [
+      { name: "Color", position: 1, values: uniqueColors.map((name) => ({ name })) },
+      { name: "Size", position: 2, values: uniqueSizes.map((name) => ({ name })) },
+    ];
+  }
+
+  try {
+    console.log(
+      "[SHOPIFY_VARIANT_MODE]",
+      JSON.stringify({
+        productId: product.id || null,
+        shopifyVariantMode: rawVariantMode != null ? rawVariantMode : null,
+        effectiveMode: syncMode,
+        variantCount: variants.length,
+        optionStructure: syncMode === "color" ? "Color" : "Color+Size",
+      })
+    );
+  } catch (_) {
+    /* ignore */
   }
 
   const input = {
@@ -418,10 +540,7 @@ async function runProductSync(product, variantDocs, store, accessToken) {
       .slice(0, 250)
       .map((t) => String(t).slice(0, 255)),
     files,
-    productOptions: [
-      { name: "Color", position: 1, values: uniqueColors.map((name) => ({ name })) },
-      { name: "Size", position: 2, values: uniqueSizes.map((name) => ({ name })) },
-    ],
+    productOptions,
     variants,
   };
 
@@ -473,17 +592,50 @@ async function runProductSync(product, variantDocs, store, accessToken) {
     const s = node.sku && String(node.sku).trim();
     if (s) bySku.set(s.toUpperCase(), node.id);
   }
-  for (const v of activeVariants) {
-    const sku = String(v.sku || "").trim();
-    const shopifyVariantId = bySku.get(sku.toUpperCase()) || null;
-    if (!shopifyVariantId) {
-      throw new Error(`Shopify did not return variant id for SKU ${sku}`);
+
+  function rallyIdFromVariantDoc(v) {
+    if (v.id != null && String(v.id).trim()) return String(v.id).trim();
+    if (v.firestoreDocId != null && String(v.firestoreDocId).trim()) return String(v.firestoreDocId).trim();
+    return null;
+  }
+
+  if (syncMode === "color") {
+    const colorToGid = new Map();
+    for (const v of collapsedByColor) {
+      const sku = String(v.sku || "").trim();
+      const shopifyVariantId = bySku.get(sku.toUpperCase()) || null;
+      if (!shopifyVariantId) {
+        throw new Error(`Shopify did not return variant id for SKU ${sku} (color mode)`);
+      }
+      const color = String((v.optionValues && v.optionValues.color) || "").trim();
+      colorToGid.set(color, shopifyVariantId);
     }
-    variantLinks.push({
-      rallyDocId: v.firestoreDocId != null ? String(v.firestoreDocId) : null,
-      sku,
-      shopifyVariantId,
-    });
+    for (const v of activeVariants) {
+      const sku = String(v.sku || "").trim();
+      const color = String((v.optionValues && v.optionValues.color) || "").trim();
+      const shopifyVariantId = colorToGid.get(color) || null;
+      if (!shopifyVariantId) {
+        throw new Error(`Shopify variant mapping missing for color "${color}" (SKU ${sku})`);
+      }
+      variantLinks.push({
+        rallyDocId: rallyIdFromVariantDoc(v),
+        sku,
+        shopifyVariantId,
+      });
+    }
+  } else {
+    for (const v of activeVariants) {
+      const sku = String(v.sku || "").trim();
+      const shopifyVariantId = bySku.get(sku.toUpperCase()) || null;
+      if (!shopifyVariantId) {
+        throw new Error(`Shopify did not return variant id for SKU ${sku}`);
+      }
+      variantLinks.push({
+        rallyDocId: rallyIdFromVariantDoc(v),
+        sku,
+        shopifyVariantId,
+      });
+    }
   }
 
   return {

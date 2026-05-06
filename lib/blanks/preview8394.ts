@@ -1,7 +1,6 @@
 /**
- * Browser-only 8394 blank render profile preview helpers.
- * Intentionally stronger / wider curves than `simpleRenderControls8394` (Sharp/compositor) so operators
- * see slider movement in the dashboard; production pipelines keep using `mapRealismToBlend` / `mapInkStrengthToFactors`.
+ * 8394 blank render profile preview curves (browser CSS) — same numeric mapping as `simpleRenderControls8394`
+ * `mapRealismToBlend` / `mapInkStrengthToFactors` so Sharp matches the dashboard blended preview.
  */
 
 import type { CSSProperties } from "react";

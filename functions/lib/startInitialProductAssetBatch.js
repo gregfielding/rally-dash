@@ -1,10 +1,11 @@
 "use strict";
 
-const { DEFAULT_ASSET_PLAN } = require("./defaultAssetPlan");
+const { LEGACY_DEFAULT_ASSET_PLAN, resolveBlankProductImagePlan } = require("./defaultAssetPlan");
+const { resolvePrintSidesForProductBuild } = require("./resolveDefaultPrintSides");
 const { createCreateGenerationJob } = require("./createGenerationJobCore");
 const { resolveModelIdentity } = require("./resolveModelIdentity");
 const { queueVariant8394BaseAssets } = require("./variant8394Pipeline");
-const { enqueueOfficialProductImages, resolveOfficialScenePresetId } = require("./officialProductImageJobs");
+const { enqueueOfficialProductImages, resolveOfficialScenePresetIdForEnqueue } = require("./officialProductImageJobs");
 const { logOfficialAssetBatchStart } = require("./officialAssetPipelineLog");
 const {
   emptyRoleMap,
@@ -12,6 +13,7 @@ const {
   supersedeOpenBatchesForProduct,
   launchBatchLog,
 } = require("./productAssetBatchHelpers");
+const { getVariantModelBackUrl, getVariantModelFrontUrl } = require("./variantRenderSources");
 
 const SIZE_ORDER = { XS: 0, S: 1, M: 2, L: 3, XL: 4, XXL: 5, "2XL": 6, "3XL": 7 };
 
@@ -36,6 +38,12 @@ function variantSourceImageFlags(vr) {
 /**
  * Single orchestration entry for initial team-product 8394 assets (primary size per color).
  *
+ * **Launch architecture:** Products are derivable from **blank** (operational/render template) +
+ * **design** (creative input) only. Model identity / LoRA / manual Generate actions are optional
+ * enhancements — they must not block creation or this batch. When identity is missing, model
+ * official roles are skipped; flats still run; `launchPipeline` still advances readiness when
+ * the batch completes successfully.
+ *
  * @param {object} ctx
  * @param {FirebaseFirestore.Firestore} ctx.db
  * @param {typeof import("firebase-admin")} ctx.admin
@@ -45,7 +53,7 @@ function variantSourceImageFlags(vr) {
  * @param {string} ctx.userId
  * @param {string[]} [ctx.variantIds] — optional filter; defaults to all variants on product
  * @param {boolean} [ctx.force]
- * @param {{ autoSyncShopify?: boolean }} [ctx.launchOptions] — stored on batch for post-complete Shopify step
+ * @param {{ autoSyncShopify?: boolean; queue8394Secondary?: boolean }} [ctx.launchOptions] — merged with defaults; stored on batch for post-complete Shopify step
  * @returns {Promise<object>}
  */
 async function startInitialProductAssetBatch(ctx) {
@@ -60,6 +68,11 @@ async function startInitialProductAssetBatch(ctx) {
     force,
     launchOptions,
   } = ctx;
+
+  const resolvedLaunchOptions =
+    launchOptions && typeof launchOptions === "object" && !Array.isArray(launchOptions)
+      ? launchOptions
+      : { autoSyncShopify: false, queue8394Secondary: false };
 
   const productRef = db.collection("rp_products").doc(productId);
   const productSnap = await productRef.get();
@@ -91,6 +104,8 @@ async function startInitialProductAssetBatch(ctx) {
 
   const designSnap = await db.collection("designs").doc(designId).get();
   const design = designSnap.exists ? designSnap.data() || {} : {};
+  /** Same print-side resolution as readiness / compose — stored on batch for terminal role rules. */
+  const readinessPrintSides = resolvePrintSidesForProductBuild(blank, design);
   const teamId = design.teamId && String(design.teamId).trim() ? String(design.teamId).trim() : null;
 
   const existingBatches = await db.collection("rp_product_asset_batches").where("productId", "==", productId).limit(40).get();
@@ -141,14 +156,29 @@ async function startInitialProductAssetBatch(ctx) {
   }
 
   const resolvedModelIdentityId = await resolveModelIdentity({ db, teamId, blankId, designId });
+  const identityIdStr =
+    resolvedModelIdentityId && String(resolvedModelIdentityId).trim() ? String(resolvedModelIdentityId).trim() : "";
+  let identityDocExists = false;
+  if (identityIdStr) {
+    const idSnap = await db.collection("rp_identities").doc(identityIdStr).get();
+    identityDocExists = idSnap.exists;
+  }
+  /** Identity id + Firestore doc — required for **AI** on-model jobs; blank-native model URLs use deterministic compose instead. */
+  const canEnqueueModelRoles = !!(identityIdStr && identityDocExists);
 
   const batchRef = db.collection("rp_product_asset_batches").doc();
   const batchId = batchRef.id;
+  const now = admin.firestore.FieldValue.serverTimestamp();
 
   /** @type {Record<string, object>} */
   const colors = {};
   /** @type {Array<{ blankVariantId: string, primaryVariantId: string }>} */
   const primaries = [];
+
+  let skippedModelSlotsForInitialProgress = 0;
+  let anyNativeModelOnBatch = false;
+  /** @type {Set<string>} */
+  const unionOfficialRolesAcrossColors = new Set();
 
   for (const [blankVariantKey, group] of byColor.entries()) {
     let primaryDoc = group.find((d) => {
@@ -169,11 +199,34 @@ async function startInitialProductAssetBatch(ctx) {
     primaries.push({ blankVariantId: blankVariantKey, primaryVariantId });
 
     const vr = primaryDoc.data() || {};
+    const blankVarRow = (blank.variants || []).find((v) => v.variantId === blankVariantKey) || null;
+    const nativeModelBack = !!(blankVarRow && getVariantModelBackUrl(blank, blankVarRow));
+    const nativeModelFront = !!(blankVarRow && getVariantModelFrontUrl(blank, blankVarRow));
+    if (nativeModelBack || nativeModelFront) anyNativeModelOnBatch = true;
+    if (!canEnqueueModelRoles) {
+      skippedModelSlotsForInitialProgress += (!nativeModelBack ? 1 : 0) + (!nativeModelFront ? 1 : 0);
+    }
+    const officialResolved =
+      blankVarRow && blank ? resolveBlankProductImagePlan(blank, blankVarRow) : null;
+    const rolesOrdered =
+      officialResolved && officialResolved.enabledOfficialRolesOrdered.length
+        ? officialResolved.enabledOfficialRolesOrdered
+        : [...LEGACY_DEFAULT_ASSET_PLAN];
+    for (const r of rolesOrdered) unionOfficialRolesAcrossColors.add(r);
+
     colors[blankVariantKey] = {
       blankVariantId: blankVariantKey,
       colorName: vr.colorName || (vr.optionValues && vr.optionValues.color) || null,
       primaryVariantId,
-      roles: emptyRoleMap(),
+      officialPlan: officialResolved
+        ? {
+            enabledOfficialRolesOrdered: officialResolved.enabledOfficialRolesOrdered,
+            requiredLaunchOfficialRoles: officialResolved.requiredLaunchOfficialRoles,
+            requiredShopifyOfficialRoles: officialResolved.requiredShopifyOfficialRoles,
+            galleryOrderOfficialRoles: officialResolved.galleryOrderOfficialRoles,
+          }
+        : null,
+      roles: emptyRoleMap(canEnqueueModelRoles, now, { back: nativeModelBack, front: nativeModelFront }, rolesOrdered),
     };
 
     const sz = vr.optionValues && vr.optionValues.size ? String(vr.optionValues.size) : "";
@@ -192,8 +245,12 @@ async function startInitialProductAssetBatch(ctx) {
   }
 
   const colorCount = Object.keys(colors).length;
-  const totalRoles = colorCount * DEFAULT_ASSET_PLAN.length;
-  const now = admin.firestore.FieldValue.serverTimestamp();
+  let totalRoles = 0;
+  for (const c of Object.values(colors)) {
+    const n = c && c.roles ? Object.keys(c.roles).length : 0;
+    totalRoles += n;
+  }
+  const initialCompleted = !canEnqueueModelRoles ? skippedModelSlotsForInitialProgress : 0;
 
   await batchRef.set(
     sanitizeForFirestore({
@@ -203,10 +260,12 @@ async function startInitialProductAssetBatch(ctx) {
       teamId,
       status: "running",
       resolvedModelIdentityId: resolvedModelIdentityId || null,
-      launchPipeline: !!(launchOptions && typeof launchOptions === "object"),
-      launchOptions: launchOptions && typeof launchOptions === "object" ? launchOptions : null,
+      officialModelRolesEnabled: canEnqueueModelRoles,
+      launchPipeline: true,
+      launchOptions: resolvedLaunchOptions,
+      readinessPrintSides,
       colors,
-      assetsProgress: { completed: 0, total: totalRoles },
+      assetsProgress: { completed: initialCompleted, total: totalRoles },
       createdAt: now,
       updatedAt: now,
       createdBy: userId,
@@ -214,13 +273,27 @@ async function startInitialProductAssetBatch(ctx) {
     })
   );
 
+  launchBatchLog("PROOF_BATCH_CREATED", {
+    productId,
+    batchId,
+    officialModelRolesEnabled: canEnqueueModelRoles,
+    rolesExpectedToEnqueueUnion: Array.from(unionOfficialRolesAcrossColors),
+    planSource: "resolveBlankProductImagePlan_per_color",
+    modelRolesSkippedNoIdentity: !canEnqueueModelRoles,
+    launchPipeline: true,
+  });
+
   await productRef.update(
     sanitizeForFirestore({
       assetsStatus: "running",
       assetsBatchId: batchId,
-      assetsProgress: { completed: 0, total: totalRoles },
+      assetsProgress: { completed: initialCompleted, total: totalRoles },
       assetsRoles: {},
       assetsUpdatedAt: now,
+      officialAssetsNote:
+        !canEnqueueModelRoles && !anyNativeModelOnBatch
+          ? "Optional model assets skipped — no model identity configured."
+          : admin.firestore.FieldValue.delete(),
     })
   );
 
@@ -229,22 +302,26 @@ async function startInitialProductAssetBatch(ctx) {
     batchId,
     queuedColorCount: colorCount,
     queuedRoleCount: totalRoles,
-    launchPipeline: !!(launchOptions && typeof launchOptions === "object"),
+    launchPipeline: true,
+    launchOptions: resolvedLaunchOptions,
   });
 
+  const officialScenePresetIdResolved = await resolveOfficialScenePresetIdForEnqueue(db, product);
   logOfficialAssetBatchStart({
     productId,
     batchId,
     colors: Object.keys(colors),
-    roles: [...DEFAULT_ASSET_PLAN],
-    pipeline: "official_rp_generation_jobs",
+    roles: Array.from(unionOfficialRolesAcrossColors),
+    pipeline: "official_flat_compose_plus_model_jobs",
     resolvedModelIdentityId: resolvedModelIdentityId || null,
-    officialScenePresetIdResolved: resolveOfficialScenePresetId(product),
+    officialScenePresetIdResolved: officialScenePresetIdResolved || null,
+    officialModelRolesEnabled: canEnqueueModelRoles,
   });
 
   await recomputeAndSyncParent({ db, admin, sanitizeForFirestore, productId, batchId });
 
   const createGenerationJob = createCreateGenerationJob({ db, admin, sanitizeForFirestore });
+  const storage = admin.storage();
 
   for (const { blankVariantId, primaryVariantId } of primaries) {
     const vRef = productRef.collection("variants").doc(primaryVariantId);
@@ -262,11 +339,14 @@ async function startInitialProductAssetBatch(ctx) {
 
   let enqueueErrors = 0;
   let enqueueFailed = false;
+  /** @type {string[]} */
+  let rolesEnqueued = Array.from(unionOfficialRolesAcrossColors);
   try {
-    await enqueueOfficialProductImages({
+    const enqOut = await enqueueOfficialProductImages({
       db,
       admin,
       sanitizeForFirestore,
+      storage,
       createGenerationJob,
       productId,
       userId,
@@ -275,14 +355,31 @@ async function startInitialProductAssetBatch(ctx) {
       product,
       designId,
       resolvedModelIdentityId,
+      canEnqueueModelRoles,
     });
+    if (enqOut && Array.isArray(enqOut.rolesEnqueued)) rolesEnqueued = enqOut.rolesEnqueued;
   } catch (e) {
     enqueueFailed = true;
     enqueueErrors = primaries.length;
     console.error("[startInitialProductAssetBatch] enqueueOfficialProductImages:", e && e.message ? e.message : e);
     const failMsg = e && e.message ? String(e.message).slice(0, 400) : "enqueue_failed";
+    try {
+      console.log(
+        "[OFFICIAL_ENQUEUE:MARK_FAILED]",
+        JSON.stringify({
+          productId,
+          batchId,
+          failedRoles: Array.from(unionOfficialRolesAcrossColors),
+          reason: failMsg,
+        })
+      );
+    } catch (_) {
+      /* ignore */
+    }
     for (const { blankVariantId } of primaries) {
-      for (const role of DEFAULT_ASSET_PLAN) {
+      const rk = Object.keys((colors[blankVariantId] && colors[blankVariantId].roles) || {});
+      const roleList = rk.length ? rk : [...LEGACY_DEFAULT_ASSET_PLAN];
+      for (const role of roleList) {
         launchBatchLog("ROLE_MARK_FAILED", {
           batchId,
           blankVariantId,
@@ -297,7 +394,10 @@ async function startInitialProductAssetBatch(ctx) {
     for (const { blankVariantId } of primaries) {
       const block = { ...(col[blankVariantId] || {}) };
       const roles = { ...(block.roles || {}) };
-      for (const role of DEFAULT_ASSET_PLAN) {
+      const roleList = Object.keys(roles).length ? Object.keys(roles) : [...LEGACY_DEFAULT_ASSET_PLAN];
+      for (const role of roleList) {
+        const prev = roles[role];
+        if (prev && String(prev.status) === "skipped_no_identity") continue;
         roles[role] = {
           status: "failed",
           error: failMsg,
@@ -315,8 +415,8 @@ async function startInitialProductAssetBatch(ctx) {
       productId,
       batchId,
       colorKeys: primaries.map((p) => p.blankVariantId),
-      rolesQueued: [...DEFAULT_ASSET_PLAN],
-      pipeline: "official_rp_generation_jobs",
+      rolesQueued: [...rolesEnqueued],
+      pipeline: "official_flat_compose_plus_model_jobs",
     });
     const snapAfter = await batchRef.get();
     const cdata = snapAfter.data() || {};
@@ -324,7 +424,11 @@ async function startInitialProductAssetBatch(ctx) {
     for (const { blankVariantId } of primaries) {
       const block2 = { ...(col2[blankVariantId] || {}) };
       const roles2 = { ...(block2.roles || {}) };
-      for (const role of DEFAULT_ASSET_PLAN) {
+      for (const role of rolesEnqueued) {
+        const prevSt = roles2[role] && roles2[role].status ? String(roles2[role].status) : "";
+        if (prevSt === "done" || prevSt === "skipped_no_identity") {
+          continue;
+        }
         roles2[role] = {
           status: "running",
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -338,8 +442,9 @@ async function startInitialProductAssetBatch(ctx) {
 
   await recomputeAndSyncParent({ db, admin, sanitizeForFirestore, productId, batchId });
 
-  const run8394Secondary = !(launchOptions && launchOptions.queue8394Secondary === false);
-  if (run8394Secondary && enqueueErrors === 0) {
+  /** Legacy MVP (`rp_mock_jobs` → `generateProductFlatRenders` / `variant_render_source`) — opt-in only; official batch is canonical. */
+  const run8394Secondary = enqueueErrors === 0 && resolvedLaunchOptions && resolvedLaunchOptions.queue8394Secondary === true;
+  if (run8394Secondary) {
     for (const { blankVariantId, primaryVariantId } of primaries) {
       try {
         await queueVariant8394BaseAssets({

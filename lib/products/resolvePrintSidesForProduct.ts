@@ -64,8 +64,18 @@ export function resolvePrintSidesForProduct(
     )} artwork. Adjust the blank’s default print sides, add artwork, or pick another design.`;
   }
 
-  const effectiveFront = intersection.has("front");
-  const effectiveBack = intersection.has("back");
+  let effectiveFront = intersection.has("front");
+  let effectiveBack = intersection.has("back");
+
+  const viewConstrained = applyBlankSupportedRenderViews(blank, {
+    effectiveFront,
+    effectiveBack,
+    conflict,
+    canGenerate,
+    blockMessage,
+  });
+  effectiveFront = viewConstrained.effectiveFront;
+  effectiveBack = viewConstrained.effectiveBack;
 
   let primaryPlacementSide: "front" | "back" = "front";
   if (effectiveBack && !effectiveFront) primaryPlacementSide = "back";
@@ -79,12 +89,64 @@ export function resolvePrintSidesForProduct(
   return {
     blankMode,
     designMode,
-    conflict,
-    canGenerate,
+    conflict: viewConstrained.conflict,
+    canGenerate: viewConstrained.canGenerate,
     effectiveFront,
     effectiveBack,
     primaryPlacementSide,
-    blockMessage,
+    blockMessage: viewConstrained.blockMessage ?? blockMessage,
+  };
+}
+
+/**
+ * Intersect commerce print sides with `rp_blanks.supportedRenderViews` when set (blank render profile / editor).
+ */
+export function applyBlankSupportedRenderViews(
+  blank: RPBlank | null | undefined,
+  partial: {
+    effectiveFront: boolean;
+    effectiveBack: boolean;
+    conflict: "none" | "hard";
+    canGenerate: boolean;
+    blockMessage?: string;
+  }
+): {
+  effectiveFront: boolean;
+  effectiveBack: boolean;
+  conflict: "none" | "hard";
+  canGenerate: boolean;
+  blockMessage?: string;
+} {
+  const raw = blank?.supportedRenderViews;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return { ...partial };
+  }
+  const allowed = new Set(raw.filter((x): x is "front" | "back" => x === "front" || x === "back"));
+  if (allowed.size === 0) {
+    return { ...partial };
+  }
+
+  const effectiveFront = partial.effectiveFront && allowed.has("front");
+  const effectiveBack = partial.effectiveBack && allowed.has("back");
+
+  if (effectiveFront || effectiveBack) {
+    return {
+      effectiveFront,
+      effectiveBack,
+      conflict: partial.conflict,
+      canGenerate: partial.canGenerate,
+      blockMessage: partial.blockMessage,
+    };
+  }
+
+  return {
+    effectiveFront: false,
+    effectiveBack: false,
+    conflict: "hard",
+    canGenerate: false,
+    blockMessage:
+      partial.blockMessage ||
+      "This blank’s supportedRenderViews do not include any side that matches the current design × default print intersection.",
   };
 }
 

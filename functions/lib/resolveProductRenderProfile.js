@@ -170,15 +170,16 @@ function normalizeSimple8394(s) {
   return { realism, inkStrength, sizePreset };
 }
 
+/** Matches `lib/blanks/preview8394` `mapRealismToBlendPreview` (parity with blank editor + Sharp). */
 function mapRealism8394(realism) {
   const r = Math.max(0, Math.min(100, realism));
   let blendMode;
-  if (r < 28) blendMode = "normal";
-  else if (r < 52) blendMode = "soft-light";
-  else if (r < 76) blendMode = "overlay";
+  if (r < 22) blendMode = "normal";
+  else if (r < 46) blendMode = "soft-light";
+  else if (r < 70) blendMode = "overlay";
   else blendMode = "multiply";
   const t = r / 100;
-  const blendOpacity = Math.max(0.62, Math.min(1, 1 - t * 0.26));
+  const blendOpacity = Math.min(0.97, Math.max(0.4, 0.44 + (1 - t) * 0.52));
   return { blendMode, blendOpacity };
 }
 
@@ -573,14 +574,7 @@ function resolveEngineBlendForRenderTarget(product, blank, variant, target, tuni
       typeof tb.fabricFeel === "number" && Number.isFinite(tb.fabricFeel) ? tb.fabricFeel : 0.52;
     const clamped = Math.max(0, Math.min(1, ff));
     const r = Math.round(clamped * 100);
-    let blendMode;
-    if (r < 28) blendMode = "normal";
-    else if (r < 52) blendMode = "soft-light";
-    else if (r < 76) blendMode = "overlay";
-    else blendMode = "multiply";
-    const t = r / 100;
-    const blendOpacity = Math.max(0.74, Math.min(1, 1 - t * 0.16));
-    fromTuning = { blendMode, blendOpacity };
+    fromTuning = mapRealism8394(r);
   } else {
     fromTuning = blendSettingsToEngineBlend(tuningBlend);
   }

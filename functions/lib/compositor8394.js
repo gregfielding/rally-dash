@@ -123,7 +123,7 @@ async function cropDesignToArtworkBounds(designBuffer, sharp) {
   const meta = await sharp(designBuffer).metadata();
   const w = meta.width;
   const h = meta.height;
-  if (!w || !h) return { buffer: designBuffer, width: w || 1, height: h || 1 };
+  if (!w || !h) return { buffer: designBuffer, width: w || 1, height: h || 1, left: 0, top: 0 };
 
   const raw = await sharp(designBuffer).ensureAlpha().raw().toBuffer({ depth: 8, resolveWithObject: false });
 
@@ -147,7 +147,7 @@ async function cropDesignToArtworkBounds(designBuffer, sharp) {
   const boundsW = maxX >= minX ? maxX - minX + 1 : w;
   const boundsH = maxY >= minY ? maxY - minY + 1 : h;
   if (boundsW < 1 || boundsH < 1) {
-    return { buffer: designBuffer, width: w, height: h };
+    return { buffer: designBuffer, width: w, height: h, left: 0, top: 0 };
   }
 
   const cropped = await sharp(designBuffer)
@@ -155,7 +155,7 @@ async function cropDesignToArtworkBounds(designBuffer, sharp) {
     .png()
     .toBuffer();
 
-  return { buffer: cropped, width: boundsW, height: boundsH };
+  return { buffer: cropped, width: boundsW, height: boundsH, left: minX, top: minY };
 }
 
 /**

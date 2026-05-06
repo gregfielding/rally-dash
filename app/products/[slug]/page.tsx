@@ -3,7 +3,20 @@
 import { useState, useEffect, useRef, useMemo, useCallback, FormEvent } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
-import { addDoc, collection, deleteDoc, doc, getDoc, getDocs, query, serverTimestamp, updateDoc, where, writeBatch } from "firebase/firestore";
+import {
+  addDoc,
+  collection,
+  deleteDoc,
+  doc,
+  getDoc,
+  getDocs,
+  onSnapshot,
+  query,
+  serverTimestamp,
+  updateDoc,
+  where,
+  writeBatch,
+} from "firebase/firestore";
 import { db } from "@/lib/firebase/config";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import { useAuth } from "@/lib/providers/AuthProvider";
@@ -21,6 +34,7 @@ import {
   useUpdateSceneAssetApproval,
   useRefreshProductMerchandisingFromSources,
   useRetryVariant8394Assets,
+  useBulkProductOps,
 } from "@/lib/hooks/useRPProductMutations";
 import { useCreateMockJob, useWatchMockJob } from "@/lib/hooks/useMockAssets";
 import { useProductFailedMockJobsByVariant } from "@/lib/hooks/useProductMockJobFailures";
@@ -32,7 +46,13 @@ import { useDesignConcepts } from "@/lib/hooks/useDesignConcepts";
 import { useCreateProductDesign, useCreateDesignFromConcept, useCreateDesignBrief } from "@/lib/hooks/useDesignMutations";
 import { useDesign, useDesigns } from "@/lib/hooks/useDesignAssets";
 import { useBlank, useBlanks } from "@/lib/hooks/useBlanks";
-import { get8394EngineQaMetrics, getVariantById, inferDefaultPrintSides } from "@/lib/blanks";
+import {
+  get8394EngineQaMetrics,
+  get8394PreviewVsOfficialBlendParity,
+  getEffectiveColorFamily,
+  getVariantById,
+  inferDefaultPrintSides,
+} from "@/lib/blanks";
 import { designSupportsGarmentSide, getDesignPreviewUrl } from "@/lib/designs/designHelpers";
 import {
   computeProductFlatRenderFingerprintAsync,
@@ -79,7 +99,9 @@ import {
   type RpScenePreset,
   type RpProductFlatRendersMvp,
   type RpProductAsset,
+  type RpProductAssetBatch,
   type RpProductVariantFulfillmentPackage,
+  type RpRenderTarget,
 } from "@/lib/types/firestore";
 
 function formatFirestoreTimestamp(ts: unknown): string {
@@ -95,13 +117,28 @@ function formatFirestoreTimestamp(ts: unknown): string {
   return "—";
 }
 import {
+  getPlacementFingerprintSliceForRenderTarget,
   hasProductPlacementOverride,
   resolveEffectivePlacement,
   resolveEffectiveRenderTargetSettings,
+  resolveEngineBlendForRenderTarget,
 } from "@/lib/products/resolveProductRenderProfile";
 import { HANGER_CREWNECK_SCENE_TEMPLATE } from "@/lib/scenes/sceneTemplates";
 import { pickFlatBlendedUrlForScene } from "@/lib/scenes/sceneRenderHelpers";
 import { isProductReadyForShopify } from "@/lib/shopify/isProductReadyForShopify";
+import {
+  checkBackOnly8394OfficialFlatInvariants,
+  explainStorefrontPrimarySelection8394,
+  mergeInheritedMediaForReadiness8394,
+  resolvePrimaryVariantImage8394ForShopify,
+  trimMediaUrl,
+  type ProductPrintSidesForCommerce,
+} from "@/lib/shopify/variantShopifyMedia";
+import { build8394StorefrontOfficialDriftProof } from "@/lib/products/proof8394StorefrontOfficial";
+import {
+  filterBackOnly8394StorefrontGalleryUrls,
+  isBackOnlyPrintSides8394,
+} from "@/lib/shopify/backOnly8394Storefront";
 import {
   orderedGalleryAssetUrlsForVariant,
   sortRpProductAssetsForGallery,
@@ -118,7 +155,20 @@ import {
   isProductFullyCatalogReady8394,
   isProductStorefrontReady8394,
   isVariantBaseComplete8394,
+  type ProductPrintSidesLike,
 } from "@/lib/products/variantReadiness";
+import { buildProductReadinessRecipe } from "@/lib/products/productReadinessRecipe";
+import {
+  buildResolvedSavedBlankProfileDebugRow,
+  compareResolvedProfileToRecipeProvenance,
+  applyOfficialComposeGuardsToDebugRow,
+} from "@/lib/products/resolveSavedBlankProfileDebug";
+import {
+  build8394PreviewStillUrlsFromPlan,
+  generationKeyForOfficialRole,
+  resolveBlankProductImagePlan,
+  variantHasGenerationKeyOutput8394,
+} from "@/lib/products/blankProductImagePlan";
 import { Variant8394ReadinessBadge } from "@/components/products/Variant8394ReadinessBadge";
 import {
   resolveProductGeneration,
@@ -126,6 +176,7 @@ import {
 } from "@/lib/generation/resolveProductGeneration";
 import { useDesignTeam } from "@/lib/hooks/useDesignTeam";
 import ResolvedGenerationSummary from "@/components/products/ResolvedGenerationSummary";
+import Official8394EnqueuePresetReadout from "@/components/products/Official8394EnqueuePresetReadout";
 
 /**
  * Parent row for multi-color products. Some docs omit `productKind` but have variantCount / variantSummary.
@@ -1793,6 +1844,7 @@ function ProductDetailContent() {
     mockupUrl?: string | null;
     sku?: string | null;
     status?: string | null;
+    renderSetup?: RpProduct["renderSetup"];
     optionValues?: { color?: string | null; size?: string | null } | null;
     media?: { heroFront?: string | null; heroBack?: string | null } | null;
     flatRenders?: RpProductFlatRendersMvp | null;
@@ -1800,6 +1852,8 @@ function ProductDetailContent() {
     assetPipeline?: import("@/lib/types/firestore").RpVariantAssetPipeline8394 | null;
     variant8394NextRetryAt?: unknown;
     fulfillmentPackage?: RpProductVariantFulfillmentPackage | null;
+    inheritsMediaFromVariantId?: string | null;
+    generatedRenderOutputs?: import("@/lib/types/firestore").RpVariantGeneratedRenderOutput[] | null;
   };
 
   const params = useParams();
@@ -1816,6 +1870,10 @@ function ProductDetailContent() {
   const [imagesTabVariantId, setImagesTabVariantId] = useState<string>("");
   /** Bumps to re-run variant subcollection fetch after mock/flat writes (parent products). */
   const [variantReloadTick, setVariantReloadTick] = useState(0);
+  /** Ops/dev: which render target to show in Saved blank profile debug panel. */
+  const [savedProfileDebugTarget, setSavedProfileDebugTarget] = useState<RpRenderTarget>("flat_back");
+  /** Ops/dev: official render target for persisted recipeProvenance compare (Images tab variant = color). */
+  const [officialRecipeCompareTarget, setOfficialRecipeCompareTarget] = useState<RpRenderTarget>("flat_back");
   // Two-stage pipeline: Product Images (Stage 1) vs Model Images (Stage 2)
   const [generateMode, setGenerateMode] = useState<"product" | "model">("product");
 
@@ -1830,6 +1888,8 @@ function ProductDetailContent() {
   /** Raw `variants` subcollection doc count from `getDocs` (before variantSummary fallback merge). */
   const [variantSubcollectionDocCount, setVariantSubcollectionDocCount] = useState<number | null>(null);
   const [variantSubdocSampleIds, setVariantSubdocSampleIds] = useState<string[]>([]);
+  /** Live `rp_product_asset_batches/{assetsBatchId}` for ops proof (plan vs batch vs variant outputs). */
+  const [assetBatchLive, setAssetBatchLive] = useState<RpProductAssetBatch | null>(null);
 
   const { adminUser } = useAuth();
   const showProductVariantDebugPanel =
@@ -1849,6 +1909,31 @@ function ProductDetailContent() {
       console.error("[ProductDetailContent] Error loading product:", productError);
     }
   }, [productError]);
+
+  useEffect(() => {
+    if (!db || !product?.assetsBatchId) {
+      setAssetBatchLive(null);
+      return;
+    }
+    const batchId = String(product.assetsBatchId).trim();
+    if (!batchId) {
+      setAssetBatchLive(null);
+      return;
+    }
+    const ref = doc(db, "rp_product_asset_batches", batchId);
+    const unsub = onSnapshot(
+      ref,
+      (snap) => {
+        if (!snap.exists()) {
+          setAssetBatchLive(null);
+          return;
+        }
+        setAssetBatchLive({ id: snap.id, ...(snap.data() as RpProductAssetBatch) });
+      },
+      () => setAssetBatchLive(null)
+    );
+    return () => unsub();
+  }, [product?.assetsBatchId]);
 
   useEffect(() => {
     if (!product) return;
@@ -2100,6 +2185,7 @@ function ProductDetailContent() {
   const shopifyActiveVariantsInput = useMemo(() => {
     if (!treatsAsParentProduct) return undefined;
     return productVariants.map((v) => ({
+      id: v.id,
       sku: v.sku,
       status: v.status,
       optionValues: {
@@ -2109,12 +2195,15 @@ function ProductDetailContent() {
       media: v.media,
       mockupUrl: v.mockupUrl,
       flatRenders: v.flatRenders,
+      inheritsMediaFromVariantId: v.inheritsMediaFromVariantId ?? null,
+      generatedRenderOutputs: v.generatedRenderOutputs ?? null,
     }));
   }, [treatsAsParentProduct, productVariants]);
 
   const { assets, loading: assetsLoading, refetch: refetchAssets } = useProductAssets(
     product?.id ? { productId: product.id, productSlug: product.slug } : null
   );
+  const { blank: currentBlank, loading: blankLoading } = useBlank(product?.blankId);
   const sortedGalleryAssets = useMemo(
     () => sortRpProductAssetsForGallery(assets as RpProductAsset[]),
     [assets]
@@ -2123,6 +2212,7 @@ function ProductDetailContent() {
   const shopifyPreviewGalleryUrls = useMemo(() => {
     if (!product) return [] as string[];
     const backFirst = String(product.blankStyleCode || "").trim() === "8394";
+    const printSides = (product.fulfillmentSummary?.printSides ?? undefined) as ProductPrintSidesForCommerce | undefined;
     const out: string[] = [];
     const add = (u?: string | null) => {
       if (u && typeof u === "string" && u.trim() && !out.includes(u.trim())) out.push(u.trim());
@@ -2182,17 +2272,36 @@ function ProductDetailContent() {
       // displayMedia when the selection has no URLs yet (that showed another color’s mock in Shopify preview).
       const row = shopifyPreviewVariantDoc;
       if (row) {
-        for (const u of urlsFromVariant(row)) add(u);
+        const planStills =
+          backFirst && currentBlank && row.blankVariantId
+            ? build8394PreviewStillUrlsFromPlan({
+                backFirst,
+                row,
+                blank: currentBlank,
+                blankVariant: getVariantById(currentBlank, row.blankVariantId) ?? null,
+              })
+            : null;
+        if (planStills && planStills.length) {
+          for (const u of planStills) add(u);
+        } else {
+          for (const u of urlsFromVariant(row)) add(u);
+        }
       }
       appendSceneExtras();
       if (out.length === 0 && !imagesTabVariantId) {
         appendParentFallback();
+      }
+      if (backFirst && isBackOnlyPrintSides8394(printSides)) {
+        return filterBackOnly8394StorefrontGalleryUrls(shopifyPreviewVariantDoc ?? null, printSides, out);
       }
       return out;
     }
 
     appendParentFallback();
     appendSceneExtras();
+    if (backFirst && isBackOnlyPrintSides8394(printSides)) {
+      return filterBackOnly8394StorefrontGalleryUrls(null, printSides, out);
+    }
     return out;
   }, [
     product,
@@ -2201,8 +2310,10 @@ function ProductDetailContent() {
     shopifyPreviewVariantDoc,
     product?.heroVariantId,
     product?.defaultVariantId,
+    product?.fulfillmentSummary,
     assets,
     imagesTabVariantId,
+    currentBlank,
   ]);
 
   const { designs, loading: designsLoading, refetch: refetchDesigns } = useProductDesigns(
@@ -2285,7 +2396,9 @@ function ProductDetailContent() {
     setLastFlatRender8394Payload(null);
   }, [product?.id]);
   const { retryVariant8394Assets } = useRetryVariant8394Assets();
+  const { retryOfficialProductAssets } = useBulkProductOps();
   const [retrying8394Assets, setRetrying8394Assets] = useState(false);
+  const [retryingOfficialAssets, setRetryingOfficialAssets] = useState(false);
   const [queueingNeutralHangerScene, setQueueingNeutralHangerScene] = useState(false);
   const [queueingBackdropNeutralScene, setQueueingBackdropNeutralScene] = useState(false);
   const [queueingFlatlayWoodScene, setQueueingFlatlayWoodScene] = useState(false);
@@ -2310,7 +2423,6 @@ function ProductDetailContent() {
   const { packs } = useModelPacks();
 
   // Render Setup: explicit blank/design/side (part of product definition)
-  const { blank: currentBlank, loading: blankLoading } = useBlank(product?.blankId);
   const designIdForFront = product?.designIdFront ?? product?.designId ?? null;
   /** Same design doc as front when product only has `designId` (e.g. Design + Blank). */
   const designIdForBack = product?.designIdBack ?? product?.designId ?? null;
@@ -2375,25 +2487,290 @@ function ProductDetailContent() {
     treatsAsParentProduct && is8394ProductContext && productVariants.length > 0;
 
   const heroOrDefaultVariantId = product?.heroVariantId || product?.defaultVariantId || null;
+
+  const readinessRecipe = useMemo(() => {
+    if (!is8394ProductContext || !currentBlank || !designForFlatRender) return null;
+    return buildProductReadinessRecipe(currentBlank, designForFlatRender);
+  }, [is8394ProductContext, currentBlank, designForFlatRender]);
+
+  const fulfillmentPrintSides =
+    (readinessRecipe?.printSides as ProductPrintSidesLike | undefined) ??
+    (product?.fulfillmentSummary?.printSides as ProductPrintSidesLike | undefined);
+
+  const resolvedColorLineCountFor8394Ui = useMemo(() => {
+    return (
+      product?.colorVariantCount ??
+      (product?.variantSummary?.length
+        ? new Set(product.variantSummary.map((s) => s.blankVariantId).filter(Boolean)).size
+        : treatsAsParentProduct
+          ? new Set(productVariants.map((v) => v.blankVariantId).filter(Boolean)).size
+          : null)
+    );
+  }, [product?.colorVariantCount, product?.variantSummary, treatsAsParentProduct, productVariants]);
+
   const storefrontReady8394 = useMemo(
-    () => isProductStorefrontReady8394(heroOrDefaultVariantId, productVariants),
-    [heroOrDefaultVariantId, productVariants]
+    () => isProductStorefrontReady8394(heroOrDefaultVariantId, productVariants, fulfillmentPrintSides),
+    [heroOrDefaultVariantId, productVariants, fulfillmentPrintSides]
   );
   const catalogReady8394 = useMemo(
-    () => isProductFullyCatalogReady8394(productVariants),
-    [productVariants]
+    () => isProductFullyCatalogReady8394(productVariants, fulfillmentPrintSides),
+    [productVariants, fulfillmentPrintSides]
   );
 
   const readinessStateForVariant = useCallback(
     (v: ProductVariantRow) => {
+      const matrixOpts = {
+        variantMatrix: productVariants,
+        blankVariantRowForPlan:
+          currentBlank && v.blankVariantId ? getVariantById(currentBlank, v.blankVariantId) ?? null : null,
+      };
       const failedMsg =
-        failedMockByVariant[v.id] && !isVariantBaseComplete8394(v)
+        failedMockByVariant[v.id] && !isVariantBaseComplete8394(v, fulfillmentPrintSides, matrixOpts)
           ? failedMockByVariant[v.id]
           : null;
-      return getVariant8394ReadinessState(v, { failedMessage: failedMsg });
+      return getVariant8394ReadinessState(v, {
+        failedMessage: failedMsg,
+        printSides: fulfillmentPrintSides,
+        variantMatrix: productVariants,
+        blankVariantRowForPlan: matrixOpts.blankVariantRowForPlan,
+      });
     },
-    [failedMockByVariant]
+    [failedMockByVariant, fulfillmentPrintSides, productVariants, currentBlank]
   );
+
+  const savedBlankProfileDebugRow = useMemo(() => {
+    if (!showProductVariantDebugPanel || !is8394ProductContext || !currentBlank || !designForFlatRender || !product) {
+      return null;
+    }
+    const bv =
+      (treatsAsParentProduct && shopifyPreviewVariantDoc?.blankVariantId) || product.blankVariantId || null;
+    if (!bv) return null;
+    return buildResolvedSavedBlankProfileDebugRow({
+      blank: currentBlank,
+      blankVariantId: bv,
+      design: designForFlatRender,
+      product,
+      renderTarget: savedProfileDebugTarget,
+    });
+  }, [
+    showProductVariantDebugPanel,
+    is8394ProductContext,
+    currentBlank,
+    designForFlatRender,
+    product,
+    treatsAsParentProduct,
+    shopifyPreviewVariantDoc?.blankVariantId,
+    product?.blankVariantId,
+    savedProfileDebugTarget,
+  ]);
+
+  /** Variant row for recipe provenance panel: Images tab color for parent products; first variant otherwise. */
+  const recipeDebugVariantRow = useMemo(() => {
+    if (treatsAsParentProduct) return shopifyPreviewVariantDoc ?? null;
+    return productVariants[0] ?? null;
+  }, [treatsAsParentProduct, shopifyPreviewVariantDoc, productVariants]);
+
+  /** Blank row + batch doc: same plan as preview / official enqueue / readiness gates. */
+  const blankDrivenImagePlanOpsProof = useMemo(() => {
+    if (!showProductVariantDebugPanel || !is8394ProductContext || !currentBlank || !recipeDebugVariantRow?.blankVariantId) {
+      return null;
+    }
+    const bvId = String(recipeDebugVariantRow.blankVariantId).trim();
+    if (!bvId) return null;
+    const blankRow = getVariantById(currentBlank, bvId);
+    if (!blankRow) return null;
+    const resolved = resolveBlankProductImagePlan(currentBlank, blankRow);
+    const vRow = recipeDebugVariantRow;
+    const missingLaunch = resolved.requiredLaunchOfficialRoles.filter((r) => {
+      const k = generationKeyForOfficialRole(r);
+      return !!(k && !variantHasGenerationKeyOutput8394(vRow, k));
+    });
+    const missingShopify = (resolved.requiredShopifyOfficialRoles ?? []).filter((r) => {
+      const k = generationKeyForOfficialRole(r);
+      return !!(k && !variantHasGenerationKeyOutput8394(vRow, k));
+    });
+    const batch = assetBatchLive;
+    const colorBlock = batch?.colors?.[bvId];
+    const batchRoleKeys = colorBlock?.roles ? Object.keys(colorBlock.roles).sort() : [];
+    const snap = colorBlock?.officialPlan;
+
+    const eqStrArr = (a: readonly string[], b: readonly string[]) =>
+      a.length === b.length && a.every((x, i) => x === b[i]);
+    const sameRoleKeySet = (keys: string[], ordered: readonly string[]) =>
+      keys.length === ordered.length && [...keys].sort().join("\0") === [...ordered].sort().join("\0");
+    const shopSnapVsResolved = (): boolean => {
+      if (snap?.requiredShopifyOfficialRoles == null && resolved.requiredShopifyOfficialRoles == null) return true;
+      if (snap?.requiredShopifyOfficialRoles == null || resolved.requiredShopifyOfficialRoles == null) return false;
+      return eqStrArr(snap.requiredShopifyOfficialRoles, resolved.requiredShopifyOfficialRoles);
+    };
+
+    let planParityStatus: "match" | "fallback" | "mismatch" = "fallback";
+    if (!batch || !colorBlock || !snap) {
+      planParityStatus = "fallback";
+    } else if (
+      eqStrArr(snap.enabledOfficialRolesOrdered, resolved.enabledOfficialRolesOrdered) &&
+      eqStrArr(snap.requiredLaunchOfficialRoles, resolved.requiredLaunchOfficialRoles) &&
+      eqStrArr(snap.galleryOrderOfficialRoles, resolved.galleryOrderOfficialRoles) &&
+      shopSnapVsResolved() &&
+      sameRoleKeySet(Object.keys(colorBlock.roles || {}), resolved.enabledOfficialRolesOrdered)
+    ) {
+      planParityStatus = "match";
+    } else {
+      planParityStatus = "mismatch";
+    }
+
+    return {
+      blankVariantId: bvId,
+      planParityStatus,
+      resolvedBlankProductImagePlan: resolved,
+      officialAssetBatchPlannedTargets: batchRoleKeys,
+      batchOfficialPlanSnapshot: colorBlock?.officialPlan ?? null,
+      missingRequiredForLaunch: missingLaunch,
+      missingRequiredForShopify: missingShopify,
+      finalGalleryOrder: resolved.galleryOrderOfficialRoles,
+      assetsBatchId: product?.assetsBatchId ?? null,
+      batchStatus: batch?.status ?? null,
+      previewStillUrlsOrder: build8394PreviewStillUrlsFromPlan({
+        backFirst: true,
+        row: vRow,
+        blank: currentBlank,
+        blankVariant: blankRow,
+      }),
+      storefrontPrimaryExplain: explainStorefrontPrimarySelection8394(
+        recipeDebugVariantRow,
+        fulfillmentPrintSides as ProductPrintSidesForCommerce | undefined
+      ),
+      flatBackComposeBytesProof:
+        (
+          vRow.flatRenders?.flat_blended?.back?.recipeProvenance as
+            | { composeBytesProof?: unknown }
+            | null
+            | undefined
+        )?.composeBytesProof ?? null,
+    };
+  }, [
+    showProductVariantDebugPanel,
+    is8394ProductContext,
+    currentBlank,
+    recipeDebugVariantRow,
+    assetBatchLive,
+    product?.assetsBatchId,
+    fulfillmentPrintSides,
+  ]);
+
+  const recipeProvenanceResolvedRow = useMemo(() => {
+    if (!showProductVariantDebugPanel || !is8394ProductContext || !currentBlank || !designForFlatRender || !product) {
+      return null;
+    }
+    const bv =
+      (recipeDebugVariantRow?.blankVariantId && String(recipeDebugVariantRow.blankVariantId).trim()) ||
+      product.blankVariantId ||
+      null;
+    if (!bv) return null;
+    const row = buildResolvedSavedBlankProfileDebugRow({
+      blank: currentBlank,
+      blankVariantId: bv,
+      design: designForFlatRender,
+      product,
+      renderTarget: officialRecipeCompareTarget,
+    });
+    return applyOfficialComposeGuardsToDebugRow(row, officialRecipeCompareTarget);
+  }, [
+    showProductVariantDebugPanel,
+    is8394ProductContext,
+    currentBlank,
+    designForFlatRender,
+    product,
+    recipeDebugVariantRow?.blankVariantId,
+    product?.blankVariantId,
+    officialRecipeCompareTarget,
+  ]);
+
+  const recipeProvenancePersisted = useMemo(() => {
+    const v = recipeDebugVariantRow;
+    if (!v) return { genProvenance: null, flatProvenance: null };
+    const rt = officialRecipeCompareTarget;
+    const role =
+      rt === "flat_front"
+        ? "flat_front"
+        : rt === "flat_back"
+          ? "flat_back"
+          : rt === "model_front"
+            ? "model_front"
+            : "model_back";
+    const genEntry = v.generatedRenderOutputs?.find((o) => o.role === role) ?? null;
+    const flatSlot =
+      rt === "flat_back"
+        ? (v.flatRenders?.flat_blended?.back ?? null)
+        : rt === "flat_front"
+          ? (v.flatRenders?.flat_clean?.front ?? null)
+          : rt === "model_back"
+            ? (v.flatRenders?.model_blended?.back ?? null)
+            : (v.flatRenders?.model_clean?.front ?? null);
+    return {
+      genProvenance: genEntry?.recipeProvenance ?? null,
+      flatProvenance: flatSlot?.recipeProvenance ?? null,
+    };
+  }, [recipeDebugVariantRow, officialRecipeCompareTarget]);
+
+  const recipeProvenanceMatch = useMemo(() => {
+    const resolved = recipeProvenanceResolvedRow;
+    const { genProvenance, flatProvenance } = recipeProvenancePersisted;
+    if (!resolved) return null;
+    const mGen = compareResolvedProfileToRecipeProvenance(resolved, genProvenance);
+    const mFlat = compareResolvedProfileToRecipeProvenance(resolved, flatProvenance);
+    const hasG = !!genProvenance;
+    const hasF = !!flatProvenance;
+    let match = false;
+    if (hasG && hasF) match = mGen.match && mFlat.match;
+    else if (hasG) match = mGen.match;
+    else if (hasF) match = mFlat.match;
+    return { match, mGen, mFlat, hasG, hasF };
+  }, [recipeProvenanceResolvedRow, recipeProvenancePersisted]);
+
+  /** Single-row proof: merged inheritance view + storefront resolver + fulfillment refs vs parent displayMedia. */
+  const canonicalReadinessProof = useMemo(() => {
+    if (!showProductVariantDebugPanel || !is8394ProductContext || !product || !recipeDebugVariantRow?.id) {
+      return null;
+    }
+    const byId = new Map(productVariants.filter((x) => x.id).map((x) => [x.id, x]));
+    const merged = mergeInheritedMediaForReadiness8394(
+      { ...recipeDebugVariantRow, id: recipeDebugVariantRow.id },
+      byId
+    );
+    const printSides = (fulfillmentPrintSides ?? undefined) as ProductPrintSidesForCommerce | undefined;
+    const storefront = resolvePrimaryVariantImage8394ForShopify(merged, printSides);
+    const backOnlyRegression = checkBackOnly8394OfficialFlatInvariants(merged, printSides);
+    const fp = recipeDebugVariantRow.id
+      ? productVariants.find((x) => x.id === recipeDebugVariantRow.id)?.fulfillmentPackage
+      : undefined;
+    return {
+      variantId: recipeDebugVariantRow.id,
+      canonicalFlatBlendedBack: merged.flatRenders?.flat_blended?.back?.url ?? null,
+      canonicalHeroBack: merged.media?.heroBack ?? null,
+      mockupUrl: merged.mockupUrl ?? null,
+      storefrontPrimary: storefront,
+      backOnly8394OfficialRegression: backOnlyRegression,
+      fulfillmentPrintFileRefs: fp?.printFileRefs ?? null,
+      fulfillmentMissing: fp?.fulfillmentMissing ?? null,
+      parentDisplayMedia: product.displayMedia ?? null,
+      baseComplete: isVariantBaseComplete8394(recipeDebugVariantRow, fulfillmentPrintSides, {
+        variantMatrix: productVariants,
+        blankVariantRowForPlan:
+          currentBlank && recipeDebugVariantRow.blankVariantId
+            ? getVariantById(currentBlank, recipeDebugVariantRow.blankVariantId) ?? null
+            : null,
+      }),
+    };
+  }, [
+    showProductVariantDebugPanel,
+    is8394ProductContext,
+    product,
+    recipeDebugVariantRow,
+    productVariants,
+    currentBlank,
+    fulfillmentPrintSides,
+  ]);
 
   /** Canonical back placement + effective blend + inputs the server would use (8394 back MVP). */
   const mvp8394VerifyPanel = useMemo(() => {
@@ -2437,6 +2814,53 @@ function ProductDetailContent() {
     if (typeof ff !== "number" || typeof ps !== "number") return null;
     return get8394EngineQaMetrics(ff, ps);
   }, [is8394ProductContext, currentBlank, product, product?.blankVariantId]);
+
+  /** Ops: preview curve vs engine curve after garment×tone blend (flat_back + model_back). */
+  const mvp8394PreviewOfficialBlendParity = useMemo(() => {
+    if (!is8394ProductContext || !currentBlank || !product?.blankVariantId || !mvp8394VerifyPanel?.designPick?.ref) {
+      return null;
+    }
+    const v = getVariantById(currentBlank, product.blankVariantId);
+    if (!v) return null;
+    const garmentFamily = getEffectiveColorFamily(v.colorFamily, v.colorName);
+    const tone = mvp8394VerifyPanel.designPick.ref;
+    const effFlat = resolveEffectiveRenderTargetSettings(product, currentBlank, v, "flat_back");
+    const effModel = resolveEffectiveRenderTargetSettings(product, currentBlank, v, "model_back");
+    const ffF = effFlat.settings.blend.fabricFeel;
+    const psF = effFlat.settings.blend.printStrength;
+    const ffM = effModel.settings.blend.fabricFeel;
+    const psM = effModel.settings.blend.printStrength;
+    if (typeof ffF !== "number" || typeof psF !== "number" || typeof ffM !== "number" || typeof psM !== "number") {
+      return null;
+    }
+    return {
+      flat_back: get8394PreviewVsOfficialBlendParity(ffF, psF, garmentFamily, tone),
+      model_back: get8394PreviewVsOfficialBlendParity(ffM, psM, garmentFamily, tone),
+    };
+  }, [is8394ProductContext, currentBlank, product, product?.blankVariantId, mvp8394VerifyPanel?.designPick?.ref]);
+
+  /** Ops: storefront gallery vs newest official PNG URLs (read-only; does not change render math). */
+  const mvp8394StorefrontOfficialDriftProof = useMemo(() => {
+    if (!is8394ProductContext || !shopifyPreviewVariantDoc) return null;
+    return build8394StorefrontOfficialDriftProof({
+      variant: shopifyPreviewVariantDoc,
+      printSides: fulfillmentPrintSides as ProductPrintSidesForCommerce | undefined,
+      storefrontGalleryUrlsOrdered: shopifyPreviewGalleryUrls,
+      blendParityByTarget: mvp8394PreviewOfficialBlendParity,
+    });
+  }, [
+    is8394ProductContext,
+    shopifyPreviewVariantDoc,
+    fulfillmentPrintSides,
+    shopifyPreviewGalleryUrls,
+    mvp8394PreviewOfficialBlendParity,
+  ]);
+
+  useEffect(() => {
+    if (!showProductVariantDebugPanel || !mvp8394StorefrontOfficialDriftProof) return;
+    console.log("[8394 drift proof — Images tab variant] object", mvp8394StorefrontOfficialDriftProof);
+    console.log(mvp8394StorefrontOfficialDriftProof.opsPrintBlock);
+  }, [showProductVariantDebugPanel, mvp8394StorefrontOfficialDriftProof]);
 
   /** Same blank → quick jump while tuning 8394 across colorways. */
   const [linked8394Nav, setLinked8394Nav] = useState<{ id: string; slug: string; name: string }[]>([]);
@@ -2860,6 +3284,64 @@ function ProductDetailContent() {
   const designFrontUrl = effectiveFrontConfig.designAssetUrl ?? designFrontUrlResolved;
   const designBackUrl = effectiveBackConfig.designAssetUrl ?? designBackUrlResolved;
 
+  /**
+   * Compare blank-editor / fingerprint tuning (preview) vs official compose inputs for flat_back.
+   * Server logs `OFFICIAL_FLAT_COMPOSE_TELEMETRY` when running official flat; set `OFFICIAL_FLAT_DEBUG_ARTIFACTS=1` for PNG artifacts.
+   */
+  const flatBackOfficialVsPreviewDiffReport = useMemo(() => {
+    if (!showProductVariantDebugPanel || !is8394ProductContext || !currentBlank || !product || !recipeDebugVariantRow) {
+      return null;
+    }
+    if (officialRecipeCompareTarget !== "flat_back") return null;
+    const bvId = recipeDebugVariantRow.blankVariantId && String(recipeDebugVariantRow.blankVariantId).trim();
+    if (!bvId) return null;
+    const blankV = getVariantById(currentBlank, bvId);
+    if (!blankV) return null;
+    const resolved = recipeProvenanceResolvedRow;
+    const tuning = resolveEffectiveRenderTargetSettings(product, currentBlank, blankV, "flat_back");
+    const engineBlend = resolveEngineBlendForRenderTarget(product, currentBlank, blankV, "flat_back", tuning.settings.blend);
+    const fp = getPlacementFingerprintSliceForRenderTarget(currentBlank, product, "flat_back", blankV);
+    const byId = new Map(productVariants.filter((x) => x.id).map((x) => [x.id, x]));
+    const merged = mergeInheritedMediaForReadiness8394(
+      { ...recipeDebugVariantRow, id: recipeDebugVariantRow.id },
+      byId
+    );
+    const printSides = fulfillmentPrintSides as ProductPrintSidesForCommerce | undefined;
+    const storefront = resolvePrimaryVariantImage8394ForShopify(merged, printSides);
+    const flatBackUrl = trimMediaUrl(merged.flatRenders?.flat_blended?.back?.url);
+    const prov = merged.flatRenders?.flat_blended?.back?.recipeProvenance;
+    const staleRs = trimMediaUrl(recipeDebugVariantRow.renderSetup?.back?.designAssetUrl);
+    const resolvedRaster = trimMediaUrl(resolved?.resolvedDesignUrl);
+    return {
+      blankVariantId: bvId,
+      selectedTone: resolved?.resolvedTone ?? null,
+      selectedRasterUrl: resolvedRaster || null,
+      sourcePathUsed: resolved?.sourcePathUsed ?? null,
+      renderSetupBackDesignAssetUrl: staleRs || null,
+      renderSetupMatchesResolvedRaster: !!resolvedRaster && staleRs === resolvedRaster,
+      previewPlacementFingerprint8394: fp,
+      previewEngineBlend8394: engineBlend,
+      previewTargetTuningQa: tuning.qa,
+      shopifyPrimaryResolution: storefront,
+      flatBlendedBackUrl: flatBackUrl || null,
+      flatBlendedBackHasOfficialRecipeProvenance: !!(prov && typeof prov === "object"),
+      primaryUrlMatchesFlatBlendedBack:
+        !!(storefront.url && flatBackUrl) && storefront.url === flatBackUrl,
+      note:
+        "Compare to Cloud Function logs OFFICIAL_FLAT_COMPOSE_TELEMETRY (treatment) and OFFICIAL_FLAT_DESIGN_SOURCE_PROOF. Artifacts: OFFICIAL_FLAT_DEBUG_ARTIFACTS=1.",
+    };
+  }, [
+    showProductVariantDebugPanel,
+    is8394ProductContext,
+    currentBlank,
+    product,
+    recipeDebugVariantRow,
+    recipeProvenanceResolvedRow,
+    productVariants,
+    fulfillmentPrintSides,
+    officialRecipeCompareTarget,
+  ]);
+
   /** Back-only blanks: default Generate mockup to Back when no front artwork is configured. */
   useEffect(() => {
     if (!resolved) return;
@@ -3046,6 +3528,54 @@ function ProductDetailContent() {
       showToast(msg, "error");
     } finally {
       setRetrying8394Assets(false);
+    }
+  };
+
+  const handleRetryOfficialAssets = async () => {
+    if (!product?.id) return;
+    if (
+      !window.confirm(
+        "Re-run the initial official asset batch for this product? This forces a new batch (same as bulk retry) and clears the last pipeline error fields."
+      )
+    ) {
+      return;
+    }
+    setRetryingOfficialAssets(true);
+    try {
+      const data = await retryOfficialProductAssets({ productId: product.id });
+      const row = data.results?.find((r) => r.productId === product.id);
+      const detail = row?.detail as {
+        assetsBatchId?: string;
+        enqueueErrors?: number;
+        skipped?: boolean;
+        reason?: string;
+      } | undefined;
+      if (row?.ok && detail?.skipped && detail.reason === "not_8394") {
+        showToast("Skipped — product is not 8394.", "error");
+      } else if (row?.ok && detail?.assetsBatchId) {
+        const n = detail.enqueueErrors ?? 0;
+        if (n > 0) {
+          showToast(
+            `Batch ${detail.assetsBatchId} created but official enqueue reported ${n} error(s). Check Last pipeline error.`,
+            "error"
+          );
+        } else {
+          showToast(`Official batch started — assetsBatchId ${detail.assetsBatchId}`, "success");
+        }
+      } else if (row?.ok) {
+        showToast("Official asset retry completed — check Ops summary for batch id.", "success");
+      } else {
+        showToast(row?.error ?? "Official asset retry failed", "error");
+      }
+      await refetchProduct();
+    } catch (err: unknown) {
+      const msg =
+        err && typeof err === "object" && "message" in err
+          ? String((err as { message?: string }).message)
+          : "Retry failed";
+      showToast(msg, "error");
+    } finally {
+      setRetryingOfficialAssets(false);
     }
   };
 
@@ -3626,6 +4156,34 @@ function ProductDetailContent() {
                 <dt className="text-slate-500 shrink-0">Assets status</dt>
                 <dd className="font-mono text-slate-900 text-right">{product.assetsStatus ?? "—"}</dd>
               </div>
+              <div className="flex justify-between gap-4 items-start">
+                <dt className="text-slate-500 shrink-0 pt-0.5">Optional model assets</dt>
+                <dd className="text-slate-800 text-right text-xs max-w-[min(100%,14rem)]">
+                  {product.officialAssetsNote?.trim() ? product.officialAssetsNote : "—"}
+                </dd>
+              </div>
+              <div className="flex justify-between gap-4 items-start">
+                <dt className="text-slate-500 shrink-0 pt-0.5">Assets batch</dt>
+                <dd className="font-mono text-slate-900 text-right text-xs break-all max-w-[min(100%,14rem)]">
+                  {product.assetsBatchId ?? "—"}
+                </dd>
+              </div>
+              {treatsAsParentProduct && is8394ProductContext ? (
+                <div className="pt-1">
+                  <button
+                    type="button"
+                    onClick={() => void handleRetryOfficialAssets()}
+                    disabled={retryingOfficialAssets || !product.id}
+                    className="w-full sm:w-auto px-3 py-1.5 rounded-md bg-slate-800 text-white text-xs font-medium hover:bg-slate-900 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {retryingOfficialAssets ? "Starting official batch…" : "Retry official assets"}
+                  </button>
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    Same as Products list → bulk retry: new initial batch with <code className="text-[10px]">force</code>,
+                    clears pipeline error fields.
+                  </p>
+                </div>
+              ) : null}
               <div className="flex justify-between gap-4">
                 <dt className="text-slate-500 shrink-0">Shopify ready</dt>
                 <dd className="text-slate-900 text-right">{product.shopifyReady === true ? "Yes" : product.shopifyReady === false ? "No" : "—"}</dd>
@@ -3685,6 +4243,8 @@ function ProductDetailContent() {
             </dl>
           </section>
 
+          {/* FULFILLMENT PACKAGE (QA) PANEL HIDDEN — flip `false` to `true` below to re-enable. */}
+          {false && (
           <section
             className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm"
             aria-labelledby="fulfillment-qa-heading"
@@ -3696,7 +4256,7 @@ function ProductDetailContent() {
               <div className="mt-3 space-y-3 text-sm">
                 <div>
                   <span className="text-slate-500">Print sides</span>
-                  <pre className="mt-1 text-xs font-mono bg-slate-50 border border-slate-100 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">
+                  <pre className="mt-1 text-xs font-mono text-slate-900 bg-slate-50 border border-slate-100 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">
                     {JSON.stringify(product.fulfillmentSummary.printSides ?? {}, null, 2)}
                   </pre>
                 </div>
@@ -3759,7 +4319,7 @@ function ProductDetailContent() {
                         {rows.map((v) => (
                           <li key={v.id} className="text-xs">
                             <span className="font-medium text-slate-800">{v.colorName || v.id}</span>
-                            <pre className="mt-1 font-mono bg-slate-50 border border-slate-100 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">
+                            <pre className="mt-1 font-mono text-slate-900 bg-slate-50 border border-slate-100 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">
                               {JSON.stringify(v.fulfillmentPackage?.printFileRefs ?? {}, null, 2)}
                             </pre>
                           </li>
@@ -3775,25 +4335,288 @@ function ProductDetailContent() {
               </p>
             )}
           </section>
+          )}
         </div>
 
-        {showProductVariantDebugPanel && product?.id && (
-          <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-mono text-amber-950 space-y-1">
+        {/* DEBUG PANEL HIDDEN — flip `false` to `true` below to re-enable. */}
+        {false && showProductVariantDebugPanel && product?.id && (
+          <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-mono text-amber-950 space-y-3">
             <div className="font-semibold text-amber-900">Variant load debug (ops / dev)</div>
             <div>productId: {product.id}</div>
+            <div className="pt-1 border-t border-amber-200/70 space-y-1">
+              <div className="font-medium text-amber-900">Shopify variant mode (inheritance)</div>
+              <div>
+                <span className="text-amber-950">product.shopifyVariantMode:</span>{" "}
+                {product.shopifyVariantMode != null && String(product.shopifyVariantMode).trim() !== "" ? (
+                  <code className="bg-white/80 px-1 rounded text-amber-950">{String(product.shopifyVariantMode)}</code>
+                ) : (
+                  <span className="text-slate-600">
+                    — unset{" "}
+                    <span className="text-slate-500">
+                      (older docs: sync uses legacy Color×Size; new products from blank usually{" "}
+                      <code className="font-mono bg-white/80 px-0.5 rounded">color</code>)
+                    </span>
+                  </span>
+                )}
+              </div>
+              {currentBlank && product.blankId ? (
+                <div>
+                  <span className="text-amber-950">blank.shopifyVariantMode (linked {product.blankId}):</span>{" "}
+                  {currentBlank.shopifyVariantMode != null && String(currentBlank.shopifyVariantMode).trim() !== "" ? (
+                    <code className="bg-white/80 px-1 rounded text-amber-950">{String(currentBlank.shopifyVariantMode)}</code>
+                  ) : (
+                    <span className="text-slate-600">— unset (effective default: color)</span>
+                  )}
+                </div>
+              ) : null}
+            </div>
             <div>isParentProductRow: {String(treatsAsParentProduct)}</div>
             <div>variantSummary.length: {product.variantSummary?.length ?? 0}</div>
             <div>colorVariantCount: {product.colorVariantCount ?? "—"}</div>
             <div>queried variant subdoc count: {variantSubcollectionDocCount ?? "—"}</div>
             <div>first 5 variant subdoc IDs: {variantSubdocSampleIds.length ? variantSubdocSampleIds.join(", ") : "—"}</div>
+
+            {is8394ProductContext && currentBlank && designForFlatRender ? (
+              <div className="pt-2 border-t border-amber-200/80 space-y-2">
+                <div className="font-semibold text-amber-950">Readiness recipe (client = buildProductReadinessRecipe(blank, design))</div>
+                <pre className="whitespace-pre-wrap break-all text-[11px] leading-snug bg-white/70 rounded p-2 border border-amber-200/90 max-h-40 overflow-auto">
+                  {JSON.stringify(readinessRecipe ?? null, null, 2)}
+                </pre>
+                <div className="text-[11px] text-amber-950">
+                  Storefront/catalog/Shopify checks use <code className="bg-white/80 px-0.5 rounded">fulfillmentPrintSides</code>{" "}
+                  = recipe above when blank+design load, else <code className="bg-white/80 px-0.5 rounded">fulfillmentSummary.printSides</code>.
+                </div>
+              </div>
+            ) : null}
+
+            {blankDrivenImagePlanOpsProof ? (
+              <div className="pt-2 border-t border-amber-200/80 space-y-2">
+                <div className="font-semibold text-amber-950">Blank-driven image plan proof (preview = launch batch = readiness)</div>
+                <p className="text-[11px] font-mono text-amber-950">
+                  planParityStatus:{" "}
+                  <span
+                    className={
+                      blankDrivenImagePlanOpsProof.planParityStatus === "match"
+                        ? "text-emerald-800 font-semibold"
+                        : blankDrivenImagePlanOpsProof.planParityStatus === "mismatch"
+                          ? "text-rose-800 font-semibold"
+                          : "text-amber-950"
+                    }
+                  >
+                    {blankDrivenImagePlanOpsProof.planParityStatus}
+                  </span>{" "}
+                  (preview resolve vs batch <code className="bg-white/80 px-0.5 rounded">officialPlan</code> vs
+                  launch-required roles)
+                </p>
+                <p className="text-[11px] text-amber-950">
+                  Color = Images tab selection (parent) or first variant. Compare{" "}
+                  <code className="bg-white/80 px-0.5 rounded">resolveBlankProductImagePlan(blank, blankVariantRow)</code> to{" "}
+                  <code className="bg-white/80 px-0.5 rounded">rp_product_asset_batches · colors[blankVariantId]</code> and
+                  variant outputs (missing lists).
+                </p>
+                <div className="grid gap-2 sm:grid-cols-2 text-[11px]">
+                  <div>
+                    <div className="font-medium text-amber-950 mb-0.5">assetsBatchId / batch status</div>
+                    <div className="font-mono text-amber-950 break-all">
+                      {blankDrivenImagePlanOpsProof.assetsBatchId ?? "—"} · {blankDrivenImagePlanOpsProof.batchStatus ?? "—"}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="font-medium text-amber-950 mb-0.5">Official batch planned targets (role keys)</div>
+                    <div className="font-mono text-amber-950 break-all">
+                      {blankDrivenImagePlanOpsProof.officialAssetBatchPlannedTargets.length
+                        ? blankDrivenImagePlanOpsProof.officialAssetBatchPlannedTargets.join(", ")
+                        : "— (no batch doc or no color block)"}
+                    </div>
+                  </div>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2 text-[11px]">
+                  <div>
+                    <div className="font-medium text-amber-950 mb-0.5">Missing required-for-launch (official roles)</div>
+                    <div className="font-mono text-amber-950 break-all">
+                      {blankDrivenImagePlanOpsProof.missingRequiredForLaunch.length
+                        ? blankDrivenImagePlanOpsProof.missingRequiredForLaunch.join(", ")
+                        : "—"}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="font-medium text-amber-950 mb-0.5">Missing required-for-Shopify (official roles)</div>
+                    <div className="font-mono text-amber-950 break-all">
+                      {blankDrivenImagePlanOpsProof.missingRequiredForShopify.length
+                        ? blankDrivenImagePlanOpsProof.missingRequiredForShopify.join(", ")
+                        : "— (no explicit Shopify flags on blank row)"}
+                    </div>
+                  </div>
+                </div>
+                <div>
+                  <div className="font-medium text-amber-950 mb-0.5 text-[11px]">Final gallery order (blank plan, official role ids)</div>
+                  <div className="font-mono text-[11px] text-amber-950 break-all">
+                    {blankDrivenImagePlanOpsProof.finalGalleryOrder.join(", ")}
+                  </div>
+                </div>
+                <div>
+                  <div className="font-medium text-amber-950 mb-0.5 text-[11px]">Preview still URL order (heroes + plan slots)</div>
+                  <pre className="whitespace-pre-wrap break-all text-[10px] leading-snug bg-white/70 rounded p-2 border border-amber-200/90 max-h-32 overflow-auto">
+                    {JSON.stringify(blankDrivenImagePlanOpsProof.previewStillUrlsOrder ?? [], null, 0)}
+                  </pre>
+                </div>
+                <div>
+                  <div className="font-medium text-amber-950 mb-0.5 text-[11px]">Batch snapshot: officialPlan (if present)</div>
+                  <pre className="whitespace-pre-wrap break-all text-[10px] leading-snug bg-white/70 rounded p-2 border border-amber-200/90 max-h-36 overflow-auto">
+                    {JSON.stringify(blankDrivenImagePlanOpsProof.batchOfficialPlanSnapshot ?? null, null, 2)}
+                  </pre>
+                </div>
+                <div>
+                  <div className="font-medium text-amber-950 mb-0.5 text-[11px]">Resolved blank product image plan (full)</div>
+                  <pre className="whitespace-pre-wrap break-all text-[10px] leading-snug bg-white/70 rounded p-2 border border-amber-200/90 max-h-64 overflow-auto">
+                    {JSON.stringify(blankDrivenImagePlanOpsProof.resolvedBlankProductImagePlan ?? null, null, 2)}
+                  </pre>
+                </div>
+              </div>
+            ) : null}
+
+            {is8394ProductContext && currentBlank && designForFlatRender ? (
+              <div className="pt-2 border-t border-amber-200/80 space-y-2">
+                <div className="font-semibold text-amber-950">Saved blank render profile (selected color + target)</div>
+                <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                  <label className="text-amber-900">renderTarget</label>
+                  <select
+                    className="border border-amber-300 rounded px-1 py-0.5 bg-white text-amber-950"
+                    value={savedProfileDebugTarget}
+                    onChange={(e) => setSavedProfileDebugTarget(e.target.value as RpRenderTarget)}
+                  >
+                    <option value="flat_front">flat_front</option>
+                    <option value="flat_back">flat_back</option>
+                    <option value="model_front">model_front</option>
+                    <option value="model_back">model_back</option>
+                  </select>
+                </div>
+                <pre className="whitespace-pre-wrap break-all text-[11px] leading-snug bg-white/70 rounded p-2 border border-amber-200/90 max-h-64 overflow-auto">
+                  {JSON.stringify(savedBlankProfileDebugRow ?? { error: "missing blankVariantId or variant row" }, null, 2)}
+                </pre>
+                <p className="text-[10px] text-amber-950">
+                  Doc: <code className="bg-white/80 px-0.5 rounded">{savedBlankProfileDebugRow?.blankDocPath ?? "—"}</code> · row{" "}
+                  <code className="bg-white/80 px-0.5 rounded">variants[]</code> where{" "}
+                  <code className="bg-white/80 px-0.5 rounded">variantId</code> = blank color key. Tuning from{" "}
+                  <code className="bg-white/80 px-0.5 rounded">renderProfile.renderTargets</code> +{" "}
+                  <code className="bg-white/80 px-0.5 rounded">renderTargetsByColor</code>.
+                </p>
+              </div>
+            ) : null}
+
+            {is8394ProductContext && currentBlank && designForFlatRender && recipeDebugVariantRow ? (
+              <div className="pt-2 border-t border-amber-200/80 space-y-2">
+                <div className="font-semibold text-amber-950">Persisted recipe provenance (official deterministic)</div>
+                <p className="text-[11px] text-amber-950">
+                  Color = Images tab selection (parent) or primary variant (
+                  <code className="bg-white/80 px-0.5 rounded">{recipeDebugVariantRow.id ?? "—"}</code>
+                  {recipeDebugVariantRow.colorName ? ` · ${recipeDebugVariantRow.colorName}` : ""}). Compare to{" "}
+                  <code className="bg-white/80 px-0.5 rounded">recipeProvenance</code> on{" "}
+                  <code className="bg-white/80 px-0.5 rounded">generatedRenderOutputs</code> and{" "}
+                  <code className="bg-white/80 px-0.5 rounded">flatRenders</code>. Official{" "}
+                  <code className="bg-white/80 px-0.5 rounded">flat_front_clean</code> is garment-only: expect{" "}
+                  <code className="bg-white/80 px-0.5 rounded">garmentOnly: true</code> /{" "}
+                  <code className="bg-white/80 px-0.5 rounded">garmentOnlyCleanFront: true</code>,{" "}
+                  <code className="bg-white/80 px-0.5 rounded">resolvedDesignUrl: null</code> (not the designed PDP face
+                  for back-only blanks).
+                </p>
+                <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                  <label className="text-amber-900">Official render target</label>
+                  <select
+                    className="border border-amber-300 rounded px-1 py-0.5 bg-white text-amber-950"
+                    value={officialRecipeCompareTarget}
+                    onChange={(e) => setOfficialRecipeCompareTarget(e.target.value as RpRenderTarget)}
+                  >
+                    <option value="flat_back">flat_back (flat_blended.back)</option>
+                    <option value="flat_front">flat_front (flat_clean.front)</option>
+                    <option value="model_back">model_back (model_blended.back)</option>
+                    <option value="model_front">model_front (model_clean.front)</option>
+                  </select>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                  <span className="text-amber-900">Resolved profile (same resolver as compose)</span>
+                  <pre className="flex-1 min-w-[12rem] whitespace-pre-wrap break-all text-[11px] leading-snug bg-white/70 rounded p-2 border border-amber-200/90 max-h-40 overflow-auto">
+                    {JSON.stringify(recipeProvenanceResolvedRow ?? { error: "missing blankVariantId or variant row" }, null, 2)}
+                  </pre>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[11px] font-semibold text-amber-950">Recipe match</span>
+                  {recipeProvenanceMatch == null ? (
+                    <span className="text-[11px] text-amber-800">—</span>
+                  ) : !recipeProvenanceMatch.hasG && !recipeProvenanceMatch.hasF ? (
+                    <span className="text-[11px] font-medium text-slate-600">No persisted provenance (run official flat)</span>
+                  ) : recipeProvenanceMatch.match ? (
+                    <span className="text-[11px] font-semibold text-emerald-800">Match</span>
+                  ) : (
+                    <span className="text-[11px] font-semibold text-rose-800">Mismatch</span>
+                  )}
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <div>
+                    <div className="text-[10px] font-medium text-amber-950 mb-0.5">generatedRenderOutputs[].recipeProvenance</div>
+                    <pre className="whitespace-pre-wrap break-all text-[10px] leading-snug bg-white/70 rounded p-2 border border-amber-200/90 max-h-36 overflow-auto">
+                      {JSON.stringify(recipeProvenancePersisted.genProvenance ?? null, null, 2)}
+                    </pre>
+                  </div>
+                  <div>
+                    <div className="text-[10px] font-medium text-amber-950 mb-0.5">flatRenders slot recipeProvenance</div>
+                    <pre className="whitespace-pre-wrap break-all text-[10px] leading-snug bg-white/70 rounded p-2 border border-amber-200/90 max-h-36 overflow-auto">
+                      {JSON.stringify(recipeProvenancePersisted.flatProvenance ?? null, null, 2)}
+                    </pre>
+                  </div>
+                </div>
+                {recipeProvenanceMatch && (recipeProvenanceMatch.hasG || recipeProvenanceMatch.hasF) && !recipeProvenanceMatch.match ? (
+                  <pre className="whitespace-pre-wrap break-all text-[10px] leading-snug bg-rose-50/80 rounded p-2 border border-rose-200/90 max-h-32 overflow-auto text-rose-950">
+                    {JSON.stringify(
+                      {
+                        vs_generatedRenderOutputs: recipeProvenanceMatch.hasG ? recipeProvenanceMatch.mGen.fields : null,
+                        vs_flatRenders: recipeProvenanceMatch.hasF ? recipeProvenanceMatch.mFlat.fields : null,
+                      },
+                      null,
+                      2
+                    )}
+                  </pre>
+                ) : null}
+                {officialRecipeCompareTarget === "flat_back" && flatBackOfficialVsPreviewDiffReport ? (
+                  <div className="pt-2 border-t border-amber-200/80 space-y-1">
+                    <div className="font-semibold text-amber-950">flat_back: preview tuning vs official compose (investigation)</div>
+                    <p className="text-[10px] text-amber-950">
+                      Client uses <code className="bg-white/80 px-0.5 rounded">getPlacementFingerprintSliceForRenderTarget</code> +{" "}
+                      <code className="bg-white/80 px-0.5 rounded">resolveEngineBlendForRenderTarget</code> (same family as blank editor).
+                      Official compose logs <code className="bg-white/80 px-0.5 rounded">OFFICIAL_FLAT_COMPOSE_TELEMETRY</code> in Cloud Functions;
+                      set <code className="bg-white/80 px-0.5 rounded">OFFICIAL_FLAT_DEBUG_ARTIFACTS=1</code> for three PNG artifacts per run.
+                    </p>
+                    <pre className="whitespace-pre-wrap break-all text-[10px] leading-snug bg-white/70 rounded p-2 border border-amber-200/90 max-h-56 overflow-auto">
+                      {JSON.stringify(flatBackOfficialVsPreviewDiffReport, null, 2)}
+                    </pre>
+                  </div>
+                ) : null}
+                {canonicalReadinessProof ? (
+                  <div className="pt-2 border-t border-amber-200/80 space-y-1">
+                    <div className="font-semibold text-amber-950">Canonical readiness / fulfillment alignment</div>
+                    <p className="text-[10px] text-amber-950">
+                      Merged primary→sibling view, storefront resolver, variant fulfillmentPackage, parent displayMedia,
+                      and isVariantBaseComplete8394 (matrix-aware).
+                    </p>
+                    <pre className="whitespace-pre-wrap break-all text-[10px] leading-snug bg-white/70 rounded p-2 border border-amber-200/90 max-h-48 overflow-auto">
+                      {JSON.stringify(canonicalReadinessProof, null, 2)}
+                    </pre>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         )}
-        {show8394VariantReadinessUi && (
+        {/* 8394 VARIANT ASSETS PANEL HIDDEN — flip `false` to `true` below to re-enable. */}
+        {false && show8394VariantReadinessUi && (
           <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50/90 px-4 py-3 text-sm text-slate-800">
             <p className="font-semibold text-slate-900">8394 variant assets</p>
             <p className="mt-1 text-xs text-slate-600">
-              Base complete = back mock/hero, back fabric blend, front clean/hero. Storefront uses the hero or default color;
-              catalog needs every color.
+              {fulfillmentPrintSides?.effectiveBack === true && fulfillmentPrintSides?.effectiveFront === false
+                ? `Base complete = back fabric blend + back display (hero or mockup). flat_front_clean policy: ${
+                    readinessRecipe?.flatFrontCleanPolicy ?? "optional"
+                  } (not required for readiness). Catalog needs every color line.`
+                : "Base complete = back mock/hero, back fabric blend, front clean/hero. Storefront uses the hero or default color; catalog needs every color."}
             </p>
             <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-sm">
               <span>
@@ -3816,7 +4639,11 @@ function ProductDetailContent() {
                   {catalogReady8394 ? "Yes" : "No"}
                 </span>
                 <span className="text-slate-500 text-xs ml-1">
-                  ({productVariants.length} color{productVariants.length === 1 ? "" : "s"})
+                  (
+                  {resolvedColorLineCountFor8394Ui != null
+                    ? `${resolvedColorLineCountFor8394Ui} color${resolvedColorLineCountFor8394Ui === 1 ? "" : "s"}`
+                    : `${productVariants.length} variant row${productVariants.length === 1 ? "" : "s"}`}
+                  )
                 </span>
               </span>
             </div>
@@ -4403,7 +5230,15 @@ function ProductDetailContent() {
                         </ul>
                       </div>
                     )}
-                    {is8394ProductContext && shopifyPreviewVariantDoc && !isVariantBaseComplete8394(shopifyPreviewVariantDoc) ? (
+                    {is8394ProductContext &&
+                    shopifyPreviewVariantDoc &&
+                    !isVariantBaseComplete8394(shopifyPreviewVariantDoc, fulfillmentPrintSides, {
+                      variantMatrix: productVariants,
+                      blankVariantRowForPlan:
+                        currentBlank && shopifyPreviewVariantDoc.blankVariantId
+                          ? getVariantById(currentBlank, shopifyPreviewVariantDoc.blankVariantId) ?? null
+                          : null,
+                    }) ? (
                       <div className="rounded-md border border-amber-200 bg-amber-50/60 px-3 py-2 text-xs text-amber-950">
                         <p className="font-medium text-amber-900 mb-1">Asset pipeline</p>
                         <p className="text-amber-800/90 mb-2">
@@ -4924,6 +5759,154 @@ function ProductDetailContent() {
                         </p>
                       </div>
                     ) : null}
+                    {mvp8394PreviewOfficialBlendParity ? (
+                      <div className="pt-2 border-t border-amber-200/80 bg-amber-50/40 rounded px-2 py-1.5">
+                        <span className="font-semibold text-amber-900 uppercase tracking-wide text-[10px]">
+                          Preview vs official effective blend parity
+                        </span>
+                        <p className="text-[9px] text-amber-900/80 mt-0.5 mb-1.5 font-sans leading-snug">
+                          Base zone: <code className="bg-white/80 px-0.5 rounded">mapRealismToBlendPreview</code> vs{" "}
+                          <code className="bg-white/80 px-0.5 rounded">mapRealismToBlend</code>, then{" "}
+                          <code className="bg-white/80 px-0.5 rounded">resolveBlendedPreviewBlend8394</code> (same as Sharp
+                          when blended).
+                        </p>
+                        {(["flat_back", "model_back"] as const).map((target) => {
+                          const row = mvp8394PreviewOfficialBlendParity[target];
+                          return (
+                            <div key={target} className="mb-2 last:mb-0">
+                              <div className="text-[10px] font-medium text-gray-700 font-mono">{target}</div>
+                              <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-3 gap-y-0.5 font-mono text-[9px] text-gray-900 mt-0.5">
+                                <div>
+                                  <dt className="text-gray-600 font-sans inline mr-1">previewBlendResolved</dt>
+                                  <dd className="inline">
+                                    {row.previewBlendResolved.blendMode} · {row.previewBlendResolved.blendOpacity.toFixed(3)}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt className="text-gray-600 font-sans inline mr-1">officialBlendResolved</dt>
+                                  <dd className="inline">
+                                    {row.officialBlendResolved.blendMode} · {row.officialBlendResolved.blendOpacity.toFixed(3)}
+                                  </dd>
+                                </div>
+                                <div className="sm:col-span-2">
+                                  <dt className="text-gray-600 font-sans inline mr-1">parityStatus</dt>
+                                  <dd
+                                    className={`inline font-semibold ${
+                                      row.parityStatus === "match" ? "text-emerald-700" : "text-red-700"
+                                    }`}
+                                  >
+                                    {row.parityStatus}
+                                  </dd>
+                                  {row.fieldDiffs.length > 0 ? (
+                                    <span className="block text-red-700 mt-0.5">fieldDiffs: {row.fieldDiffs.join("; ")}</span>
+                                  ) : null}
+                                </div>
+                              </dl>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : null}
+                    {mvp8394StorefrontOfficialDriftProof ? (
+                      <div className="pt-2 border-t border-slate-200 bg-slate-50/80 rounded px-2 py-1.5 space-y-2">
+                        <span className="font-semibold text-slate-800 uppercase tracking-wide text-[10px]">
+                          Storefront URL vs newest official (Giants 8394 black: pick that color on Images tab)
+                        </span>
+                        <p className="text-[9px] text-slate-600 font-sans leading-snug">
+                          Open browser DevTools → Console for a full{" "}
+                          <code className="bg-white/90 px-0.5 rounded">[8394 drift proof]</code> object when variant debug
+                          is on. Compares <code className="bg-white/90 px-0.5 rounded">flatRenders</code> slots to newest
+                          official <code className="bg-white/90 px-0.5 rounded">generatedRenderOutputs</code> rows.
+                        </p>
+                        {(["flat_back", "model_back"] as const).map((target) => {
+                          const bp = mvp8394StorefrontOfficialDriftProof.blendParity[target];
+                          return (
+                            <div key={`bp-${target}`} className="text-[9px] font-mono text-slate-900 border border-slate-200/80 rounded p-1.5 bg-white/90">
+                              <div className="font-sans font-semibold text-slate-600 mb-0.5">{target} blend parity</div>
+                              {bp ? (
+                                <>
+                                  <div>previewBlendResolved: {bp.previewBlendResolved.blendMode} · {bp.previewBlendResolved.blendOpacity.toFixed(3)}</div>
+                                  <div>officialBlendResolved: {bp.officialBlendResolved.blendMode} · {bp.officialBlendResolved.blendOpacity.toFixed(3)}</div>
+                                  <div>parityStatus: {bp.parityStatus}</div>
+                                  <div>fieldDiffs: {bp.fieldDiffs.length ? bp.fieldDiffs.join("; ") : "[]"}</div>
+                                </>
+                              ) : (
+                                <div className="text-slate-500">— (need design tone pick)</div>
+                              )}
+                            </div>
+                          );
+                        })}
+                        <div className="text-[9px] font-mono text-slate-900 space-y-0.5 break-all">
+                          <div>
+                            displayed storefront gallery[0]:{" "}
+                            <span className="text-indigo-800">
+                              {mvp8394StorefrontOfficialDriftProof.displayed.storefrontGalleryFirstUrl || "—"}
+                            </span>
+                          </div>
+                          <div>
+                            primary resolver (commerce): {mvp8394StorefrontOfficialDriftProof.displayed.primaryResolvedSource} →{" "}
+                            <span className="text-indigo-800">{mvp8394StorefrontOfficialDriftProof.displayed.primaryResolvedUrl || "—"}</span>
+                          </div>
+                          <div>
+                            displayed flat_blended.back:{" "}
+                            <span className="text-indigo-800">
+                              {mvp8394StorefrontOfficialDriftProof.displayed.flatBlendedBackUrl || "—"}
+                            </span>
+                          </div>
+                          <div>
+                            newest official flat_back:{" "}
+                            <span className="text-indigo-800">
+                              {mvp8394StorefrontOfficialDriftProof.newestOfficial.flat_back.url || "—"}
+                            </span>
+                          </div>
+                          <div>
+                            flat URL identical:{" "}
+                            <span
+                              className={
+                                mvp8394StorefrontOfficialDriftProof.identity.flatBlendedBackUrl_equals_newestOfficialFlatBack
+                                  ? "text-emerald-700"
+                                  : "text-red-700"
+                              }
+                            >
+                              {String(mvp8394StorefrontOfficialDriftProof.identity.flatBlendedBackUrl_equals_newestOfficialFlatBack)}
+                            </span>
+                          </div>
+                          <div>
+                            displayed model_blended.back:{" "}
+                            <span className="text-indigo-800">
+                              {mvp8394StorefrontOfficialDriftProof.displayed.modelBlendedBackUrl || "—"}
+                            </span>
+                          </div>
+                          <div>
+                            newest official model_back:{" "}
+                            <span className="text-indigo-800">
+                              {mvp8394StorefrontOfficialDriftProof.newestOfficial.model_back.url || "—"}
+                            </span>
+                          </div>
+                          <div>
+                            model URL identical:{" "}
+                            <span
+                              className={
+                                mvp8394StorefrontOfficialDriftProof.identity.modelBlendedBackUrl_equals_newestOfficialModelBack
+                                  ? "text-emerald-700"
+                                  : "text-red-700"
+                              }
+                            >
+                              {String(mvp8394StorefrontOfficialDriftProof.identity.modelBlendedBackUrl_equals_newestOfficialModelBack)}
+                            </span>
+                          </div>
+                          <div className="text-[8px] text-slate-600 font-sans pt-1 border-t border-slate-200 mt-1">
+                            media.heroBack: {mvp8394StorefrontOfficialDriftProof.displayed.mediaHeroBackUrl || "—"} (last official
+                            job wins)
+                          </div>
+                          {mvp8394StorefrontOfficialDriftProof.firstDriftHintIfUrlsAligned ? (
+                            <div className="text-[9px] text-slate-700 font-sans pt-1 leading-snug">
+                              {mvp8394StorefrontOfficialDriftProof.firstDriftHintIfUrlsAligned}
+                            </div>
+                          ) : null}
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
                 )}
 
@@ -5282,6 +6265,7 @@ function ProductDetailContent() {
               const { ready, missing, warnings } = isProductReadyForShopify(product, {
                 mediaFallback: shopifyReadinessMediaFallback,
                 activeVariants: shopifyActiveVariantsInput,
+                printSides: (fulfillmentPrintSides ?? undefined) as ProductPrintSidesForCommerce | undefined,
               });
               return (
                 <div className={`border rounded-lg p-4 ${ready ? "border-green-300 bg-green-50/50" : "border-amber-200 bg-amber-50/50"}`}>
@@ -5310,6 +6294,7 @@ function ProductDetailContent() {
               const shopifyReady = isProductReadyForShopify(product, {
                 mediaFallback: shopifyReadinessMediaFallback,
                 activeVariants: shopifyActiveVariantsInput,
+                printSides: (fulfillmentPrintSides ?? undefined) as ProductPrintSidesForCommerce | undefined,
               });
               const shopifyTags =
                 product.tags && product.tags.length > 0 ? product.tags : buildShopifyTags(product);
@@ -6046,6 +7031,7 @@ function ProductDetailContent() {
                   loading={blankLoading || designTeamLoading}
                   defaultGenerateMode={generateMode}
                 />
+                {is8394ProductContext ? <Official8394EnqueuePresetReadout product={product} /> : null}
                 <div className="flex flex-wrap items-center gap-3">
                   <button
                     type="button"

@@ -292,76 +292,14 @@ export function variantRenderTargetSliceIsMeaningful(
   );
 }
 
-const POS_EPS = 1e-4;
-const BLEND_EPS = 1e-3;
-
-function neqNum(a: number, b: number, eps: number): boolean {
-  return Math.abs(a - b) > eps;
-}
-
 /**
- * Variant-only slice: differences between operator UI and **blank baseline** (no variant merge).
- * Null means this render target inherits blank defaults for this color.
+ * NOTE: write helpers `diffSettingsToVariantRenderTargetOverride` and
+ * `mergeVariantRenderTargetOverrides` were removed when the blank render
+ * profile editor's save flow was unified onto
+ * `renderProfile.renderTargetsByColor[variantId][target]` for all master
+ * blanks. The legacy diff path only emitted `simpleRenderControls8394` for
+ * 8394-back, so it silently dropped `fabricFeel` / `printStrength` changes
+ * for every other styleCode/side. The read-side helpers above
+ * (`variantSliceToRenderTargetSettingsPatch`, `variantRenderTargetSliceIsMeaningful`)
+ * remain so existing `variant.renderTargetOverrides` data still resolves.
  */
-export function diffSettingsToVariantRenderTargetOverride(
-  ui: RpRenderTargetSettings,
-  blankBase: RpRenderTargetSettings,
-  row: PlacementRowLike,
-  styleCode: string
-): RPBlankVariantRenderProfileSideOverride | null {
-  const out: RPBlankVariantRenderProfileSideOverride = {};
-  let any = false;
-
-  if (neqNum(ui.placement.x, blankBase.placement.x, POS_EPS)) {
-    out.defaultX = ui.placement.x;
-    any = true;
-  }
-  if (neqNum(ui.placement.y, blankBase.placement.y, POS_EPS)) {
-    out.defaultY = ui.placement.y;
-    any = true;
-  }
-  if (neqNum(ui.placement.scale, blankBase.placement.scale, POS_EPS)) {
-    out.defaultScale = ui.placement.scale;
-    any = true;
-  }
-
-  const sc = String(styleCode || "").trim();
-  if (sc === "8394" && row.view === "back") {
-    if (
-      neqNum(ui.blend.fabricFeel, blankBase.blend.fabricFeel, BLEND_EPS) ||
-      neqNum(ui.blend.printStrength, blankBase.blend.printStrength, BLEND_EPS)
-    ) {
-      out.simpleRenderControls8394 = {
-        realism: Math.round(clamp(ui.blend.fabricFeel, 0, 1) * 100),
-        inkStrength: Math.round(clamp(ui.blend.printStrength, 0, 1) * 100),
-      };
-      any = true;
-    }
-  }
-
-  return any ? out : null;
-}
-
-/** Merge variant list: set `renderTargetOverrides` for one variant id from a per-target patch (null removes a target key). */
-export function mergeVariantRenderTargetOverrides(
-  variants: RPBlankVariant[],
-  variantId: string,
-  patch: Partial<Record<RpRenderTarget, RPBlankVariantRenderProfileSideOverride | null>>
-): RPBlankVariant[] {
-  return variants.map((v) => {
-    if (v.variantId !== variantId) return v;
-    const prev = { ...(v.renderTargetOverrides ?? {}) } as Record<string, RPBlankVariantRenderProfileSideOverride | null>;
-    for (const t of RENDER_TARGETS) {
-      const key = t as string;
-      if (!(key in patch)) continue;
-      const val = patch[t];
-      if (val == null) delete prev[key];
-      else prev[key] = val;
-    }
-    const keys = Object.keys(prev).filter((k) => prev[k as RpRenderTarget] != null);
-    return {
-      ...v,
-      renderTargetOverrides: keys.length ? (prev as RPBlankVariant["renderTargetOverrides"]) : null,
-    };
-  });
-}

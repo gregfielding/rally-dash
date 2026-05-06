@@ -36,7 +36,7 @@ export {
   normalizeSimpleControls8394,
   sizePresetToDefaultScale,
 } from "./simpleRenderControls8394";
-export { get8394EngineQaMetrics } from "./8394EngineQaMetrics";
+export { get8394EngineQaMetrics, get8394PreviewVsOfficialBlendParity } from "./8394EngineQaMetrics";
 export {
   resolveBlankTemplates,
   stripUnresolvedTemplateArtifacts,

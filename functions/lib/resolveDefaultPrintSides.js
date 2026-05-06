@@ -98,8 +98,8 @@ function resolvePrintSidesForProductBuild(blank, design) {
   for (const s of ds) {
     if (bs.has(s)) intersection.add(s);
   }
-  const conflict = intersection.size === 0 ? "hard" : "none";
-  const canGenerate = intersection.size > 0;
+  let conflict = intersection.size === 0 ? "hard" : "none";
+  let canGenerate = intersection.size > 0;
   let blockMessage;
   if (conflict === "hard") {
     blockMessage =
@@ -107,10 +107,24 @@ function resolvePrintSidesForProductBuild(blank, design) {
       `but the design only has ${designMode === "front_only" ? "front-only" : designMode === "back_only" ? "back-only" : "front and back"} artwork. ` +
       "Adjust the blank, add artwork, or pick another design.";
   }
-  const effectiveFront = intersection.has("front");
-  const effectiveBack = intersection.has("back");
+  let effectiveFront = intersection.has("front");
+  let effectiveBack = intersection.has("back");
+  const viewConstrained = applyBlankSupportedRenderViews(blank, {
+    effectiveFront,
+    effectiveBack,
+    conflict,
+    canGenerate,
+    blockMessage,
+  });
+  effectiveFront = viewConstrained.effectiveFront;
+  effectiveBack = viewConstrained.effectiveBack;
+  conflict = viewConstrained.conflict;
+  canGenerate = viewConstrained.canGenerate;
+  blockMessage = viewConstrained.blockMessage != null ? viewConstrained.blockMessage : blockMessage;
+
   let primaryPlacementSide = "front";
   if (effectiveBack && !effectiveFront) primaryPlacementSide = "back";
+  else if (effectiveFront && !effectiveBack) primaryPlacementSide = "front";
   else if (effectiveFront && effectiveBack) {
     const gv = blank.generationDefaults && blank.generationDefaults.primaryView;
     if (gv === "back") primaryPlacementSide = "back";
@@ -124,6 +138,37 @@ function resolvePrintSidesForProductBuild(blank, design) {
     effectiveBack,
     primaryPlacementSide,
     blockMessage,
+  };
+}
+
+function applyBlankSupportedRenderViews(blank, partial) {
+  const raw = blank && blank.supportedRenderViews;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return { ...partial };
+  }
+  const allowed = new Set(raw.filter((x) => x === "front" || x === "back"));
+  if (allowed.size === 0) {
+    return { ...partial };
+  }
+  const effectiveFront = partial.effectiveFront && allowed.has("front");
+  const effectiveBack = partial.effectiveBack && allowed.has("back");
+  if (effectiveFront || effectiveBack) {
+    return {
+      effectiveFront,
+      effectiveBack,
+      conflict: partial.conflict,
+      canGenerate: partial.canGenerate,
+      blockMessage: partial.blockMessage,
+    };
+  }
+  return {
+    effectiveFront: false,
+    effectiveBack: false,
+    conflict: "hard",
+    canGenerate: false,
+    blockMessage:
+      partial.blockMessage ||
+      "This blank’s supportedRenderViews do not include any side that matches the current design × default print intersection.",
   };
 }
 

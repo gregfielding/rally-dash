@@ -1,40 +1,100 @@
 "use strict";
 
-const { DEFAULT_ASSET_PLAN } = require("./defaultAssetPlan");
+const {
+  DEFAULT_ASSET_PLAN,
+  OFFICIAL_MODEL_ROLES,
+  OFFICIAL_REQUIRED_LAUNCH_ROLES,
+} = require("./defaultAssetPlan");
+const { isOfficialModelRoleName } = require("./blankProductImagePlan");
 const { logOfficialAssetBatchRollup } = require("./officialAssetPipelineLog");
 const { DEFAULT_8394_ASSET_PLAN } = require("./default8394AssetPlan");
+const { getVariantModelBackUrl, getVariantModelFrontUrl } = require("./variantRenderSources");
 
-function emptyRoleMap() {
-  /** @type {Record<string, { status: string }>} */
+/**
+ * @param {boolean} canEnqueueModelRoles — identity id present + rp_identities doc exists (AI on-model path)
+ * @param {import("firebase-admin").firestore.FieldValue} now
+ * @param {{ back?: boolean; front?: boolean }} [nativeModel] — saved blank master has on-model URLs for this color
+ */
+/**
+ * @param {string[]} officialRolesOrdered — from `resolveBlankProductImagePlan` for this color (enabled slots).
+ */
+function emptyRoleMap(canEnqueueModelRoles, now, nativeModel, officialRolesOrdered) {
+  /* Legacy fallback only when caller did not pass plan-derived roles (older code paths / defensive). */
+  const roleList =
+    Array.isArray(officialRolesOrdered) && officialRolesOrdered.length ? officialRolesOrdered : [...DEFAULT_ASSET_PLAN];
+  const nm =
+    nativeModel && typeof nativeModel === "object"
+      ? { back: !!nativeModel.back, front: !!nativeModel.front }
+      : { back: false, front: false };
+  /** @type {Record<string, { status: string; reason?: string; updatedAt?: unknown }>} */
   const m = {};
-  for (const r of DEFAULT_ASSET_PLAN) {
-    m[r] = { status: "queued" };
+  for (const r of roleList) {
+    if (!canEnqueueModelRoles && isOfficialModelRoleName(r)) {
+      if (r === "model_back_designed" && nm.back) {
+        m[r] = { status: "queued" };
+      } else if (r === "model_front_clean" && nm.front) {
+        m[r] = { status: "queued" };
+      } else {
+        m[r] = {
+          status: "skipped_no_identity",
+          reason: "Optional model assets skipped — no model identity configured.",
+          updatedAt: now,
+        };
+      }
+    } else {
+      m[r] = { status: "queued" };
+    }
   }
   return m;
+}
+
+/**
+ * Batch fails only when a **required** (flat) role fails. Model roles can be skipped_no_identity or optional_failed.
+ */
+function requiredLaunchRolesForColor(colorBlock) {
+  const op = colorBlock && colorBlock.officialPlan && typeof colorBlock.officialPlan === "object" ? colorBlock.officialPlan : null;
+  const req = op && Array.isArray(op.requiredLaunchOfficialRoles) ? op.requiredLaunchOfficialRoles : null;
+  /* Legacy fallback: both flat roles — used when batch has no officialPlan snapshot (pre-migration docs). */
+  return req && req.length ? req : [...OFFICIAL_REQUIRED_LAUNCH_ROLES];
+}
+
+function allTrackedRolesForColor(colorBlock) {
+  const roles = (colorBlock && colorBlock.roles) || {};
+  return Object.keys(roles);
 }
 
 function deriveBatchStatus(colors) {
   const keys = Object.keys(colors || {});
   if (keys.length === 0) return "complete";
-  const totalSlots = keys.length * DEFAULT_ASSET_PLAN.length;
-  let doneC = 0;
-  let failC = 0;
-  let runC = 0;
-  let qC = 0;
+
   for (const k of keys) {
-    const roles = colors[k].roles || {};
-    for (const r of DEFAULT_ASSET_PLAN) {
+    const block = colors[k] || {};
+    const roles = block.roles || {};
+    for (const r of requiredLaunchRolesForColor(block)) {
       const st = roles[r] && roles[r].status ? String(roles[r].status) : "queued";
-      if (st === "done") doneC += 1;
-      else if (st === "failed") failC += 1;
-      else if (st === "running") runC += 1;
-      else qC += 1;
+      if (st === "failed") return "failed";
     }
   }
-  if (doneC === totalSlots) return "complete";
-  if (failC > 0 && runC === 0 && qC === 0) return failC === totalSlots ? "failed" : "partial";
-  if (runC > 0) return "running";
-  return "queued";
+
+  for (const k of keys) {
+    const block = colors[k] || {};
+    const roles = block.roles || {};
+    for (const r of allTrackedRolesForColor(block)) {
+      const st = roles[r] && roles[r].status ? String(roles[r].status) : "queued";
+      if (st === "running") return "running";
+    }
+  }
+
+  for (const k of keys) {
+    const block = colors[k] || {};
+    const roles = block.roles || {};
+    for (const r of allTrackedRolesForColor(block)) {
+      const st = roles[r] && roles[r].status ? String(roles[r].status) : "queued";
+      if (st === "queued") return "queued";
+    }
+  }
+
+  return "complete";
 }
 
 function aggregateRoleAcrossColors(colors, roleKey) {
@@ -48,6 +108,10 @@ function aggregateRoleAcrossColors(colors, roleKey) {
   if (states.some((s) => s === "failed")) return "failed";
   if (states.some((s) => s === "running")) return "running";
   if (states.some((s) => s === "queued")) return "queued";
+  if (states.some((s) => s === "optional_failed")) return "optional_failed";
+  if (states.every((s) => s === "skipped_no_identity")) return "skipped_no_identity";
+  if (states.some((s) => s === "skipped_no_identity") && states.some((s) => s === "done")) return "done";
+  if (states.some((s) => s === "skipped_no_identity")) return "skipped_no_identity";
   if (states.every((s) => s === "done")) return "done";
   return "idle";
 }
@@ -55,7 +119,15 @@ function aggregateRoleAcrossColors(colors, roleKey) {
 function summarizeParentAssets(colors) {
   /** @type {Record<string, string>} */
   const assets = {};
-  for (const r of DEFAULT_ASSET_PLAN) {
+  const roleSet = new Set();
+  for (const c of Object.values(colors || {})) {
+    for (const r of allTrackedRolesForColor(c)) roleSet.add(r);
+  }
+  if (roleSet.size === 0) {
+    /* Legacy fallback: empty `colors[].roles` (unexpected) — parent rollup still needs a stable role key list. */
+    for (const r of DEFAULT_ASSET_PLAN) roleSet.add(r);
+  }
+  for (const r of roleSet) {
     assets[r] = aggregateRoleAcrossColors(colors, r);
   }
   return assets;
@@ -63,12 +135,21 @@ function summarizeParentAssets(colors) {
 
 function assetsProgressFromColors(colors) {
   let done = 0;
-  const total = Object.keys(colors || {}).length * DEFAULT_ASSET_PLAN.length;
+  let total = 0;
   for (const c of Object.values(colors || {})) {
     const roles = c && c.roles ? c.roles : {};
-    for (const r of DEFAULT_ASSET_PLAN) {
+    const keys = Object.keys(roles);
+    total += keys.length;
+    for (const r of keys) {
       const st = roles[r] && roles[r].status ? String(roles[r].status) : "queued";
-      if (st === "done") done += 1;
+      if (
+        st === "done" ||
+        st === "skipped_no_identity" ||
+        st === "optional_failed" ||
+        (isOfficialModelRoleName(r) && st === "failed")
+      ) {
+        done += 1;
+      }
     }
   }
   return { completed: done, total };
@@ -78,19 +159,23 @@ function assetsProgressFromColors(colors) {
 function collectBatchFailureDetails(colors) {
   const failedRoles = [];
   let firstError = null;
+  let firstRoleErrorMessage = null;
   const colorKeys = Object.keys(colors || {}).sort();
   for (const k of colorKeys) {
-    const roles = (colors[k] && colors[k].roles) || {};
-    for (const r of DEFAULT_ASSET_PLAN) {
+    const block = colors[k] || {};
+    const roles = block.roles || {};
+    const reqList = requiredLaunchRolesForColor(block);
+    for (const r of reqList) {
       const o = roles[r];
       if (o && String(o.status) === "failed") {
         const err = o.error != null ? String(o.error) : "";
         failedRoles.push({ blankVariantId: k, role: r, error: err || null });
         if (!firstError && err) firstError = `${k}/${r}: ${err}`;
+        if (!firstRoleErrorMessage && err) firstRoleErrorMessage = err;
       }
     }
   }
-  return { failedRoles, firstError };
+  return { failedRoles, firstError, firstRoleErrorMessage };
 }
 
 /**
@@ -116,6 +201,7 @@ async function applyPrimaryVariantMediaInheritance({ db, admin, parentId, primar
       mockupUrl: pv.mockupUrl ?? null,
       media: pv.media ?? {},
       flatRenders: pv.flatRenders ?? null,
+      generatedRenderOutputs: pv.generatedRenderOutputs ?? null,
       sceneRenders: pv.sceneRenders ?? null,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedBy: pv.updatedBy || "system",
@@ -131,6 +217,35 @@ function launchBatchLog(tag, payload) {
     console.log(`[LAUNCH_BATCH:${tag}]\n${JSON.stringify(payload, null, 2)}`);
   } catch {
     console.log(`[LAUNCH_BATCH:${tag}]`, payload);
+  }
+}
+
+/**
+ * Back-only commerce: `flat_front_clean` is not required for batch/launch terminal — failures become `optional_failed`.
+ * Uses `readinessPrintSides` on the batch when present; otherwise resolves from product blank+design (legacy batches).
+ */
+async function resolveBackOnlyFlatFrontCleanOptional({ db, batchData, productId }) {
+  const rp = batchData && batchData.readinessPrintSides;
+  if (rp && typeof rp === "object" && "effectiveBack" in rp && "effectiveFront" in rp) {
+    return rp.effectiveBack === true && rp.effectiveFront === false;
+  }
+  try {
+    const { resolvePrintSidesForProductBuild } = require("./resolveDefaultPrintSides");
+    const pSnap = await db.collection("rp_products").doc(productId).get();
+    if (!pSnap.exists) return false;
+    const p = pSnap.data() || {};
+    const bid = p.blankId && String(p.blankId).trim();
+    const designId = p.designId && String(p.designId).trim();
+    if (!bid || !designId) return false;
+    const [bSnap, dSnap] = await Promise.all([
+      db.collection("rp_blanks").doc(bid).get(),
+      db.collection("designs").doc(designId).get(),
+    ]);
+    if (!bSnap.exists || !dSnap.exists) return false;
+    const sides = resolvePrintSidesForProductBuild(bSnap.data() || {}, dSnap.data() || {});
+    return sides.effectiveBack === true && sides.effectiveFront === false;
+  } catch {
+    return false;
   }
 }
 
@@ -195,8 +310,10 @@ async function recomputeAndSyncParent({ db, admin, sanitizeForFirestore, product
     })
   );
 
+  let firstRoleErrorMessage = null;
   if (status === "failed") {
-    const { failedRoles, firstError } = collectBatchFailureDetails(colors);
+    const { failedRoles, firstError, firstRoleErrorMessage: frErr } = collectBatchFailureDetails(colors);
+    firstRoleErrorMessage = frErr || null;
     launchBatchLog("FINAL_FAIL_REASON", {
       batchId,
       productId,
@@ -204,6 +321,7 @@ async function recomputeAndSyncParent({ db, admin, sanitizeForFirestore, product
       total: assetsProgress.total,
       failedRoles,
       firstError: firstError || null,
+      firstRoleErrorMessage: firstRoleErrorMessage || null,
     });
   }
 
@@ -216,6 +334,38 @@ async function recomputeAndSyncParent({ db, admin, sanitizeForFirestore, product
     assetsRoles: assets,
     launchPipeline: b.launchPipeline === true,
   });
+
+  /** One-line proof for blank+design-only runs: required flats vs model skips, terminal batch status. */
+  try {
+    const roleSnapshotByColor = {};
+    const colorKeys = Object.keys(colors || {}).sort();
+    for (const k of colorKeys) {
+      const block = colors[k] || {};
+      const roles = block.roles || {};
+      const req = {};
+      for (const r of requiredLaunchRolesForColor(block)) {
+        req[r] = roles[r] && roles[r].status ? String(roles[r].status) : null;
+      }
+      const model = {};
+      for (const r of OFFICIAL_MODEL_ROLES) {
+        model[r] = roles[r] && roles[r].status ? String(roles[r].status) : null;
+      }
+      roleSnapshotByColor[k] = { required: req, model };
+    }
+    launchBatchLog("PROOF_BATCH_TERMINAL", {
+      productId,
+      batchId,
+      batchStatus: status,
+      officialModelRolesEnabled: b.officialModelRolesEnabled === true,
+      requiredLaunchRolesNote: "per-color officialPlan.requiredLaunchOfficialRoles when present",
+      roleSnapshotByColor,
+      assetsProgress,
+      blankDesignOnlyPath:
+        b.officialModelRolesEnabled === false && b.launchPipeline === true,
+    });
+  } catch (pe) {
+    console.warn("[recomputeAndSyncParent] PROOF_BATCH_TERMINAL log:", pe && pe.message ? pe.message : pe);
+  }
 
   try {
     const {
@@ -244,6 +394,7 @@ async function recomputeAndSyncParent({ db, admin, sanitizeForFirestore, product
         productId,
         batchStatus: "failed",
         userId: createdBy,
+        firstRoleErrorMessage,
       });
     } else if (status === "partial") {
       await advanceLaunchAfterAssetBatchTerminal({
@@ -306,6 +457,11 @@ async function markOfficialAssetRoleTerminal({
   const colorBlock = { ...(colors[colorKey] || {}) };
   const roles = { ...(colorBlock.roles || {}) };
 
+  let backOnlyFlatFrontOptional = false;
+  if (!ok && role === "flat_front_clean") {
+    backOnlyFlatFrontOptional = await resolveBackOnlyFlatFrontCleanOptional({ db, batchData: b, productId });
+  }
+
   if (ok) {
     roles[role] = {
       status: "done",
@@ -314,17 +470,21 @@ async function markOfficialAssetRoleTerminal({
     };
   } else {
     const err = errorMessage ? String(errorMessage).slice(0, 500) : "failed";
+    const optionalModel = isOfficialModelRoleName(role);
+    const optionalFlatFront = role === "flat_front_clean" && backOnlyFlatFrontOptional === true;
+    const optionalTerminal = optionalModel || optionalFlatFront;
     roles[role] = {
-      status: "failed",
+      status: optionalTerminal ? "optional_failed" : "failed",
       error: err,
       generationJobId: jobId || null,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
-    launchBatchLog("ROLE_MARK_FAILED", {
+    launchBatchLog(optionalTerminal ? "ROLE_OPTIONAL_FAILED" : "ROLE_MARK_FAILED", {
       batchId,
       blankVariantId: colorKey,
       role,
       reason: err,
+      backOnlyFlatFrontOptional: optionalFlatFront || undefined,
     });
   }
 
@@ -343,8 +503,62 @@ async function markOfficialAssetRoleTerminal({
     batchId,
     blankVariantId: colorKey,
     role,
-    status: ok ? "done" : "failed",
+    status: ok
+      ? "done"
+      : isOfficialModelRoleName(role) || (!ok && role === "flat_front_clean" && backOnlyFlatFrontOptional)
+        ? "optional_failed"
+        : "failed",
     generationJobId: jobId || null,
+  });
+
+  await recomputeAndSyncParent({ db, admin, sanitizeForFirestore, productId, batchId });
+}
+
+/**
+ * Model role skipped in official enqueue (no AI path) — must not leave batch role stuck `queued`.
+ */
+async function markOfficialAssetRoleSkippedNoIdentity({
+  db,
+  admin,
+  sanitizeForFirestore,
+  productId,
+  batchId,
+  colorKey,
+  role,
+  reason,
+}) {
+  const batchRef = db.collection("rp_product_asset_batches").doc(batchId);
+  const batchSnap = await batchRef.get();
+  if (!batchSnap.exists) return;
+
+  const b = batchSnap.data() || {};
+  const colors = { ...(b.colors || {}) };
+  const colorBlock = { ...(colors[colorKey] || {}) };
+  const roles = { ...(colorBlock.roles || {}) };
+
+  roles[role] = {
+    status: "skipped_no_identity",
+    reason: reason ? String(reason).slice(0, 400) : "Optional model assets skipped — no model identity configured.",
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  colorBlock.roles = roles;
+  colors[colorKey] = colorBlock;
+
+  await batchRef.update(
+    sanitizeForFirestore({
+      colors,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    })
+  );
+
+  launchBatchLog("ROLE_FINISH", {
+    productId,
+    batchId,
+    blankVariantId: colorKey,
+    role,
+    status: "skipped_no_identity",
+    generationJobId: null,
   });
 
   await recomputeAndSyncParent({ db, admin, sanitizeForFirestore, productId, batchId });
@@ -380,6 +594,8 @@ async function supersedeOpenBatchesForProduct({ db, admin, sanitizeForFirestore,
 
 module.exports = {
   DEFAULT_ASSET_PLAN,
+  OFFICIAL_MODEL_ROLES,
+  OFFICIAL_REQUIRED_LAUNCH_ROLES,
   DEFAULT_8394_ASSET_PLAN,
   emptyRoleMap,
   deriveBatchStatus,
@@ -388,6 +604,7 @@ module.exports = {
   applyPrimaryVariantMediaInheritance,
   recomputeAndSyncParent,
   markOfficialAssetRoleTerminal,
+  markOfficialAssetRoleSkippedNoIdentity,
   on8394SecondaryPipelineMediaInheritance,
   supersedeOpenBatchesForProduct,
   launchBatchLog,

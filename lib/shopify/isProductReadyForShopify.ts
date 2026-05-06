@@ -1,5 +1,9 @@
-import type { RpProduct } from "@/lib/types/firestore";
-import { primaryVariantImageUrlForShopify } from "@/lib/shopify/variantShopifyMedia";
+import type { RpProduct, RpVariantGeneratedRenderOutput } from "@/lib/types/firestore";
+import {
+  mergeInheritedMediaForReadiness8394,
+  primaryVariantImageUrlForShopify,
+  type ProductPrintSidesForCommerce,
+} from "@/lib/shopify/variantShopifyMedia";
 
 /** Human-readable labels for required fields (used in missing[] and UI). */
 const REQUIRED_LABELS: Record<string, string> = {
@@ -35,12 +39,15 @@ export type ShopifyReadinessMediaFallback = {
 
 /** Subset of variant fields used for parent Color × Size Shopify readiness (pass loaded `variants/*` rows). */
 export type ShopifyReadinessVariantInput = {
+  id?: string | null;
   sku?: string | null;
   status?: string | null;
   optionValues?: { color?: string | null; size?: string | null };
   media?: { heroFront?: string | null; heroBack?: string | null } | null;
   mockupUrl?: string | null;
   flatRenders?: RpProduct["flatRenders"] | null;
+  inheritsMediaFromVariantId?: string | null;
+  generatedRenderOutputs?: RpVariantGeneratedRenderOutput[] | null;
 };
 
 /**
@@ -59,6 +66,8 @@ export function isProductReadyForShopify(
   options?: {
     mediaFallback?: ShopifyReadinessMediaFallback | null;
     activeVariants?: ShopifyReadinessVariantInput[] | null;
+    /** When set (e.g. from `buildProductReadinessRecipe(blank, design)`), wins over `fulfillmentSummary.printSides`. */
+    printSides?: ProductPrintSidesForCommerce | null;
   }
 ): ShopifyReadinessResult {
   const missing: string[] = [];
@@ -88,6 +97,30 @@ export function isProductReadyForShopify(
   const is8394BackPrimary = blankStyle === "8394";
   const isParent = product.productKind === "parent";
   const activeVariants = options?.activeVariants;
+  const printSides =
+    (options?.printSides as ProductPrintSidesForCommerce | undefined) ??
+    (product.fulfillmentSummary?.printSides as ProductPrintSidesForCommerce | undefined) ??
+    null;
+
+  if (isParent && product.shopifyVariantMode === "color_size") {
+    const colorCount = product.colorVariantCount;
+    const sizeCount = Array.isArray(product.availableSizes) ? product.availableSizes.length : 0;
+    const vc = product.variantCount;
+    if (sizeCount === 0) {
+      warnings.push("shopifyVariantMode color_size: product.availableSizes is empty — set sizes on the blank");
+    }
+    if (
+      typeof colorCount === "number" &&
+      colorCount > 0 &&
+      sizeCount > 0 &&
+      typeof vc === "number" &&
+      vc !== colorCount * sizeCount
+    ) {
+      warnings.push(
+        `shopifyVariantMode color_size: variantCount (${vc}) may not match matrix (colorVariantCount ${colorCount} × ${sizeCount} sizes = ${colorCount * sizeCount})`
+      );
+    }
+  }
 
   if (isParent && Array.isArray(activeVariants)) {
     const active = activeVariants.filter((v) => v.status !== "archived");
@@ -97,12 +130,19 @@ export function isProductReadyForShopify(
       let needSku = false;
       let needOpts = false;
       let needImg = false;
+      const byId = new Map(
+        active
+          .filter((v) => v.id != null && String(v.id).trim())
+          .map((v) => [String(v.id), v as ShopifyReadinessVariantInput])
+      );
       for (const v of active) {
         if (!String(v.sku ?? "").trim()) needSku = true;
         const c = String(v.optionValues?.color ?? "").trim();
         const sz = String(v.optionValues?.size ?? "").trim();
         if (!c || !sz) needOpts = true;
-        if (!primaryVariantImageUrlForShopify(v, product.blankStyleCode)) needImg = true;
+        const vid = v.id != null ? String(v.id) : "";
+        const merged = mergeInheritedMediaForReadiness8394({ ...v, id: vid || undefined }, byId);
+        if (!primaryVariantImageUrlForShopify(merged, product.blankStyleCode, printSides)) needImg = true;
       }
       if (needSku) missing.push("SKU on every active variant");
       if (needOpts) missing.push("Color × Size on every active variant");
@@ -111,7 +151,12 @@ export function isProductReadyForShopify(
   } else if (is8394BackPrimary) {
     const hasHeroBack = !!effHeroBack || !!effMockup;
     const hasHeroFront = !!effHeroFront;
-    if (!hasHeroBack && !hasHeroFront) {
+    const backOnly = printSides?.effectiveBack === true && printSides?.effectiveFront === false;
+    if (backOnly) {
+      if (!hasHeroBack) {
+        missing.push("Hero back or mockup (8394 back-only)");
+      }
+    } else if (!hasHeroBack && !hasHeroFront) {
       missing.push("Hero back or hero front (8394 is back-print; use back blended or blank front)");
     }
   } else if (!effHeroFront) {

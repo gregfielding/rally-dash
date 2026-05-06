@@ -4,6 +4,9 @@
  * Shared implementation: parent rp_products doc + Color × Size variant subdocs (sizes from blank or XS–XL).
  * Used by createProductFromDesignBlank callable and bulk find-or-create.
  *
+ * Product materialization depends only on **blank** (matrix, render, placement) + **design** (artwork, metadata);
+ * model identity / LoRA are not required here.
+ *
  * @param {object} ctx
  * @param {FirebaseFirestore.Firestore} ctx.db
  * @param {typeof import("firebase-admin")} ctx.admin
@@ -330,6 +333,7 @@ async function runCreateProductFromDesignBlankCore(ctx) {
       blankVersionUsed,
       designVersionUsed,
       blankId,
+      shopifyVariantMode: blank.shopifyVariantMode != null && blank.shopifyVariantMode !== "" ? blank.shopifyVariantMode : "color",
       blankVariantId: null,
       designId,
       designSeries: design.designSeries ?? null,

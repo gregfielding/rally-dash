@@ -3,11 +3,15 @@
  * Kept separate from `simpleRenderControls8394` for a stable barrel export.
  */
 
+import type { RPBlankColorFamily } from "@/lib/types/firestore";
+import type { ArtworkToneSlot } from "@/lib/designs/artworkToneResolution";
+import { resolveBlendedPreviewBlend8394 } from "@/lib/designs/artworkToneResolution";
 import {
   mapInkStrengthToFactors,
   mapRealismToBlend,
   normalizeSimpleControls8394,
 } from "./simpleRenderControls8394";
+import { mapRealismToBlendPreview } from "./preview8394";
 
 function clamp(n: number, lo: number, hi: number) {
   return Math.min(hi, Math.max(lo, n));
@@ -32,5 +36,42 @@ export function get8394EngineQaMetrics(fabricFeel01: number, printStrength01: nu
     effectiveBlendOpacity: blendOpacity,
     effectiveInkMultiplier: designOpacityMultiplier,
     blendMode,
+  };
+}
+
+/**
+ * Dev/ops: after `mapRealismToBlend` ↔ `mapRealismToBlendPreview` parity, `resolveBlendedPreviewBlend8394` should
+ * receive identical base zones — preview vs official effective blend should match.
+ */
+export function get8394PreviewVsOfficialBlendParity(
+  fabricFeel01: number,
+  printStrength01: number,
+  garmentFamily: RPBlankColorFamily,
+  resolvedTone: ArtworkToneSlot | null | undefined
+): {
+  previewBlendResolved: { blendMode: string; blendOpacity: number };
+  officialBlendResolved: { blendMode: string; blendOpacity: number };
+  parityStatus: "match" | "mismatch";
+  fieldDiffs: string[];
+} {
+  const simple = normalizeSimpleControls8394({
+    realism: Math.round(clamp(fabricFeel01, 0, 1) * 100),
+    inkStrength: Math.round(clamp(printStrength01, 0, 1) * 100),
+  });
+  const tone: ArtworkToneSlot = resolvedTone ?? "dark";
+  const basePreview = mapRealismToBlendPreview(simple.realism);
+  const baseOfficial = mapRealismToBlend(simple.realism);
+  const pv = resolveBlendedPreviewBlend8394(garmentFamily, tone, basePreview);
+  const ov = resolveBlendedPreviewBlend8394(garmentFamily, tone, baseOfficial);
+  const fieldDiffs: string[] = [];
+  if (pv.blendMode !== ov.blendMode) fieldDiffs.push(`blendMode: preview=${pv.blendMode} official=${ov.blendMode}`);
+  if (Math.abs(pv.blendOpacity - ov.blendOpacity) > 1e-9) {
+    fieldDiffs.push(`blendOpacity: preview=${pv.blendOpacity} official=${ov.blendOpacity}`);
+  }
+  return {
+    previewBlendResolved: { blendMode: pv.blendMode, blendOpacity: pv.blendOpacity },
+    officialBlendResolved: { blendMode: ov.blendMode, blendOpacity: ov.blendOpacity },
+    parityStatus: fieldDiffs.length === 0 ? "match" : "mismatch",
+    fieldDiffs,
   };
 }

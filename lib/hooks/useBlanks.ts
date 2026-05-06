@@ -33,6 +33,7 @@ import {
   RPBlankEligibility,
   RPBlankDefaultPrintSides,
   RPBlankRenderProfile,
+  ShopifyVariantMode,
 } from "@/lib/types/firestore";
 import { mapRpBlankFromFirestore } from "@/lib/blanks/blankFirestore";
 
@@ -262,6 +263,8 @@ export interface UpdateBlankInput {
   garmentSizes?: RPBlankGarmentSizeCode[] | null;
   /** Garment-level default for which sides receive print; omit to leave unchanged. */
   defaultPrintSides?: RPBlankDefaultPrintSides | null;
+  /** Shopify variant matrix for products created from this blank. */
+  shopifyVariantMode?: ShopifyVariantMode | null;
 }
 
 /**

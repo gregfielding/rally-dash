@@ -1864,7 +1864,7 @@ exports.launchProductsFromDesign = functions.https.onCall(async (data, context) 
     throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
   }
 
-  const { designId, blankId, blankVariantIds, forceAssetBatch, autoSyncShopify } = data || {};
+  const { designId, blankId, blankVariantIds, forceAssetBatch, autoSyncShopify, queue8394Secondary } = data || {};
   if (!designId || typeof designId !== "string") {
     throw new functions.https.HttpsError("invalid-argument", "designId is required");
   }
@@ -1898,6 +1898,7 @@ exports.launchProductsFromDesign = functions.https.onCall(async (data, context) 
       blankId,
       selectedBlankVariantIds: uniqueIds,
       autoSyncShopify: autoSyncShopify === true,
+      queue8394Secondary: queue8394Secondary === true,
       userId: uid,
       timestamp: new Date().toISOString(),
     })
@@ -1926,6 +1927,7 @@ exports.launchProductsFromDesign = functions.https.onCall(async (data, context) 
     uid,
     forceAssetBatch: forceAssetBatch === true,
     autoSyncShopify: autoSyncShopify === true,
+    queue8394Secondary: queue8394Secondary === true,
   });
 });
 
@@ -3458,9 +3460,9 @@ exports.onRpGenerationJobCreated = functions.firestore
         updatedAt: now,
       });
 
-      // PRODUCT_ONLY: Exact composite path — use mockup as-is (deterministic), no generative model
-      // Phase 1: Rally must output the real blank + design + placement, matching Photoshop benchmark.
-      if (generationType === "product_only") {
+      // PRODUCT_ONLY: Exact composite path — use mockup as-is (deterministic), no generative model.
+      // Official catalog flat roles (initialAssetRole) use product_only + Fal packshot prompts instead.
+      if (generationType === "product_only" && !job.initialAssetRole) {
         const mockupUrl = job.inputImageUrl || product?.mockupUrl || null;
         if (!mockupUrl) {
           throw new Error("product_only job requires inputImageUrl (product mockup). Generate mockup first.");
@@ -5723,6 +5725,7 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
     preferredFlatLook8394: preferredFlatLook8394Input,
     garmentSizes: garmentSizesInput,
     defaultPrintSides: defaultPrintSidesInput,
+    shopifyVariantMode: shopifyVariantModeInput,
     renderProfile: renderProfileInput,
   } = data;
 
@@ -5989,6 +5992,14 @@ exports.updateBlank = functions.https.onCall(async (data, context) => {
       updateData.defaultPrintSides = admin.firestore.FieldValue.delete();
     } else if (["front_only", "back_only", "both"].includes(defaultPrintSidesInput)) {
       updateData.defaultPrintSides = defaultPrintSidesInput;
+    }
+  }
+
+  if (shopifyVariantModeInput !== undefined) {
+    if (shopifyVariantModeInput === null || shopifyVariantModeInput === "") {
+      updateData.shopifyVariantMode = admin.firestore.FieldValue.delete();
+    } else if (shopifyVariantModeInput === "color" || shopifyVariantModeInput === "color_size") {
+      updateData.shopifyVariantMode = shopifyVariantModeInput;
     }
   }
 
@@ -8390,8 +8401,15 @@ exports.onShopifySyncJobCreated = functions
 
     const product = productSnap.data();
     const variantSnap = await productRef.collection("variants").get();
-    const variantDocs = variantSnap.docs.map((d) => ({ firestoreDocId: d.id, ...d.data() }));
-    const readiness = shopifySync.readinessCheck(product, { variantDocs });
+    const variantDocs = variantSnap.docs.map((d) => ({
+      id: d.id,
+      firestoreDocId: d.id,
+      ...d.data(),
+    }));
+    const readiness = shopifySync.readinessCheck(product, {
+      variantDocs,
+      printSides: product.fulfillmentSummary?.printSides || null,
+    });
 
     if (!readiness.ready) {
       const errorMsg = `Product not ready for sync: ${readiness.missing.join(", ")}`;

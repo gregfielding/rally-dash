@@ -199,6 +199,8 @@ export function useLaunchProductsFromDesign() {
       blankVariantIds: string[];
       forceAssetBatch?: boolean;
       autoSyncShopify?: boolean;
+      /** `false` = official generation jobs only; do not enqueue 8394 mock jobs. Default: true. */
+      queue8394Secondary?: boolean;
     }) => {
       if (!functions) {
         throw new Error("Cloud Functions not initialized");
@@ -312,7 +314,15 @@ export function useBulkProductOps() {
     [invalidateProducts]
   );
 
-  return { bulkMarkProductsReviewed, bulkSyncProductsToShopify, bulkRetryProductAssets };
+  /** Same server path as bulk retry: `startInitialProductAssetBatch({ force: true })` for one parent product. */
+  const retryOfficialProductAssets = useCallback(
+    async (input: { productId: string }) => {
+      return bulkRetryProductAssets({ productIds: [input.productId] });
+    },
+    [bulkRetryProductAssets]
+  );
+
+  return { bulkMarkProductsReviewed, bulkSyncProductsToShopify, bulkRetryProductAssets, retryOfficialProductAssets };
 }
 
 /** Re-run server-side merchandising resolution (same as create) for an existing product. */

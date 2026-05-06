@@ -9,7 +9,7 @@ const { resolveMockPlacementForProduct } = require("./resolveProductRenderProfil
 const { executeProductFlatRender8394Mvp, pickDesignPngForVariant } = require("./productFlatRenderMvp");
 const { getVariantFlatBackUrl } = require("./variantRenderSources");
 const { launchBatchLog } = require("./productAssetBatchHelpers");
-const { DEFAULT_ASSET_PLAN } = require("./defaultAssetPlan");
+const { LEGACY_DEFAULT_ASSET_PLAN, resolveBlankProductImagePlan } = require("./defaultAssetPlan");
 
 const RETRY_DELAY_MS = 10 * 60 * 1000;
 
@@ -42,11 +42,18 @@ function nextRetryAt(admin) {
   return admin.firestore.Timestamp.fromMillis(Date.now() + RETRY_DELAY_MS);
 }
 
-function logQueueResultPerRole(ctx, { queued, jobId, reasonIfNotQueued }) {
+function logQueueResultPerRole(ctx, { queued, jobId, reasonIfNotQueued, blank, variantRow }) {
   const { productAssetBatchId, productAssetColorKey } = ctx;
   const bid = productAssetBatchId || null;
   const bvar = productAssetColorKey || null;
-  for (const role of DEFAULT_ASSET_PLAN) {
+  const rolesForLog =
+    blank && variantRow
+      ? (() => {
+          const p = resolveBlankProductImagePlan(blank, variantRow);
+          return p.enabledOfficialRolesOrdered.length ? p.enabledOfficialRolesOrdered : [...LEGACY_DEFAULT_ASSET_PLAN];
+        })()
+      : [...LEGACY_DEFAULT_ASSET_PLAN];
+  for (const role of rolesForLog) {
     launchBatchLog("QUEUE_RESULT", {
       batchId: bid,
       blankVariantId: bvar,
@@ -111,7 +118,7 @@ async function queueVariant8394BaseAssets(ctx) {
     getVariantFlatBackUrl(blank, variantRow);
   if (!variantBackUrl) {
     console.warn("[queueVariant8394BaseAssets] no back image URL");
-    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "no_back_image_url" });
+    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "no_back_image_url", blank, variantRow });
     await variantRef.update({
       assetPipeline: {
         mock_back: { status: "failed", error: "no_back_image_url", failedAt: admin.firestore.FieldValue.serverTimestamp() },
@@ -130,20 +137,20 @@ async function queueVariant8394BaseAssets(ctx) {
     variantDoc.designId ||
     parent.designId;
   if (!designId) {
-    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "no_design_id" });
+    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "no_design_id", blank, variantRow });
     return;
   }
 
   const designSnap = await db.collection("designs").doc(designId).get();
   if (!designSnap.exists) {
-    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "design_doc_missing" });
+    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "design_doc_missing", blank, variantRow });
     return;
   }
   const design = designSnap.data();
   const { url: designPngUrl } = pickDesignPngForVariant(design, variantRow, variantDoc);
   if (!designPngUrl) {
     console.warn("[queueVariant8394BaseAssets] no design PNG for variant");
-    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "no_design_png" });
+    logQueueResultPerRole(ctx, { queued: false, jobId: null, reasonIfNotQueued: "no_design_png", blank, variantRow });
     await variantRef.update({
       assetPipeline: {
         mock_back: { status: "failed", error: "no_design_png", failedAt: admin.firestore.FieldValue.serverTimestamp() },
@@ -184,7 +191,7 @@ async function queueVariant8394BaseAssets(ctx) {
 
   const jobRef = await db.collection("rp_mock_jobs").add(sanitizeForFirestore(jobData));
 
-  logQueueResultPerRole(ctx, { queued: true, jobId: jobRef.id, reasonIfNotQueued: null });
+  logQueueResultPerRole(ctx, { queued: true, jobId: jobRef.id, reasonIfNotQueued: null, blank, variantRow });
 
   launchBatchLog("MOCK_JOB_CREATED", {
     productId: parentId,
