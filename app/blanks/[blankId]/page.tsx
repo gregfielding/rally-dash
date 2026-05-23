@@ -1897,6 +1897,16 @@ function BlankDetailContent() {
                               {masks[maskView]!.mask.bytes && ` • ${Math.round(masks[maskView]!.mask.bytes! / 1024)}KB`}
                             </div>
                             <div className="flex flex-col gap-2">
+                              <label className="text-[11px] text-gray-700 font-medium">
+                                Prompt for SAM
+                                <input
+                                  type="text"
+                                  value={aiPromptInput}
+                                  onChange={(e) => setAiPromptInput(e.target.value)}
+                                  placeholder={maskView === "front" ? "chest" : "upper back"}
+                                  className="mt-1 w-full px-2 py-1 text-sm border border-gray-300 rounded bg-white font-normal"
+                                />
+                              </label>
                               <button
                                 onClick={() => handleAiGenerate(maskView)}
                                 disabled={aiGenerating !== null || aiCommitting !== null || maskUploadingView === maskView || autoGenerating === maskView}
@@ -1906,7 +1916,7 @@ function BlankDetailContent() {
                                 {aiGenerating === maskView ? "Asking SAM…" : "🪄 Generate with AI"}
                               </button>
                               <p className="text-[11px] text-gray-500 -mt-1">
-                                Uses the blank&apos;s reference photo above. <strong>No design needed</strong> — the mask defines where any design can land on this garment.
+                                Uses the blank&apos;s reference photo above. <strong>No design needed</strong>. Use simple nouns SAM understands (e.g. <code>chest</code>, <code>torso</code>, <code>sweatshirt body</code>).
                               </p>
                               <div className="flex gap-2">
                                 <button
@@ -1939,6 +1949,16 @@ function BlankDetailContent() {
                               PNG only. White = print area, Black = protected.
                             </p>
                             <div className="flex flex-col gap-2">
+                              <label className="text-[11px] text-gray-700 font-medium text-left">
+                                Prompt for SAM
+                                <input
+                                  type="text"
+                                  value={aiPromptInput}
+                                  onChange={(e) => setAiPromptInput(e.target.value)}
+                                  placeholder={maskView === "front" ? "chest" : "upper back"}
+                                  className="mt-1 w-full px-2 py-1 text-sm border border-gray-300 rounded bg-white font-normal"
+                                />
+                              </label>
                               <button
                                 onClick={() => handleAiGenerate(maskView)}
                                 disabled={aiGenerating !== null || aiCommitting !== null || maskUploadingView === maskView || autoGenerating === maskView}
@@ -1947,8 +1967,8 @@ function BlankDetailContent() {
                               >
                                 {aiGenerating === maskView ? "Asking SAM…" : "🪄 Generate with AI"}
                               </button>
-                              <p className="text-[11px] text-gray-500 -mt-1 px-1">
-                                Uses the blank&apos;s reference photo. <strong>No design needed</strong> — the mask defines where any design can land on this garment.
+                              <p className="text-[11px] text-gray-500 -mt-1 px-1 text-left">
+                                Uses the blank&apos;s reference photo. <strong>No design needed</strong>. Use simple nouns SAM understands (e.g. <code>chest</code>, <code>torso</code>, <code>sweatshirt body</code>).
                               </p>
                               <button
                                 onClick={() => handleMaskFileSelect(maskView)}

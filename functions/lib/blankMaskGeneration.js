@@ -20,8 +20,13 @@
  */
 
 const DEFAULT_SAM_ENDPOINT = "fal-ai/evf-sam";
-const DEFAULT_PROMPT_FRONT = "chest panel inside seams";
-const DEFAULT_PROMPT_BACK = "back torso panel inside seams";
+/**
+ * SAM-family models segment by concrete nouns, not anatomical region descriptions.
+ * "chest panel inside seams" returned empty masks; "chest" / "upper back" land on
+ * the garment torso reliably for EVF-SAM. Operators can override per-call.
+ */
+const DEFAULT_PROMPT_FRONT = "chest";
+const DEFAULT_PROMPT_BACK = "upper back";
 const FAL_QUEUE_BASE = "https://queue.fal.run";
 const MAX_POLL_ATTEMPTS = 30;
 const POLL_INTERVAL_MS = 2000;
