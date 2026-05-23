@@ -3534,20 +3534,42 @@ export const DEFAULT_MOCK_PLACEMENT: RpMockPlacement = {
 // Mask mode (extensible for future use)
 export type RPBlankMaskMode = "inpaint" | "control";
 
+/**
+ * How a mask was produced. Existing docs without this field are treated as `manual_upload`.
+ * See RALLY_BLANK_MASK_AI_AUTOGEN.md for the source state machine.
+ */
+export type RPBlankMaskSource = "manual_upload" | "ai_sam" | "auto_safearea";
+
 // Blank mask document (rp_blank_masks/{blankId}_{view})
 // One document per blank + view combination
 export interface RPBlankMask {
   id: string;                     // e.g. "abc123_front"
-  
+
   blankId: string;                // FK to rp_blanks
   view: "front" | "back";
-  
+
   mask: RPImageRef;               // PNG mask file (white = editable, black = protected)
-  
+
   mode: RPBlankMaskMode;          // "inpaint" (default)
-  
+
   notes?: string;                 // Optional operator notes
-  
+
+  /** How the mask was produced. Omitted in legacy docs → treat as `manual_upload`. */
+  source?: RPBlankMaskSource;
+
+  /** SAM text prompt used to generate this mask. Only when `source === "ai_sam"`. */
+  aiPrompt?: string;
+
+  /** Random seed used to generate this mask. Only when `source === "ai_sam"`. */
+  aiSeed?: number;
+
+  /**
+   * Set when the operator clicks **Save** on an AI-generated preview (or otherwise
+   * explicitly commits a mask they intend to ship). Production-render enforcement is
+   * not implemented yet — this field exists so a follow-up can read it without a migration.
+   */
+  lockedAt?: Timestamp | null;
+
   // Timestamps
   createdAt: Timestamp;
   createdByUid: string;

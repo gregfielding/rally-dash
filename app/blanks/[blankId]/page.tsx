@@ -6,8 +6,9 @@ import Link from "next/link";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import { useBlank, useUpdateBlank, useDeleteBlank, COLOR_REGISTRY, type UpdateBlankInput } from "@/lib/hooks/useBlanks";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
-import { storage, db } from "@/lib/firebase/config";
+import { storage, db, functions as firebaseFunctions } from "@/lib/firebase/config";
 import { collection, doc, getDoc, getDocs, query, setDoc, serverTimestamp, where } from "firebase/firestore";
+import { httpsCallable } from "firebase/functions";
 import {
   RPBlank,
   RPImageRef,
@@ -693,6 +694,24 @@ function BlankDetailContent() {
   const maskFileInputRef = useRef<HTMLInputElement>(null);
   const [currentMaskUploadView, setCurrentMaskUploadView] = useState<"front" | "back">("front");
   const [autoGenerating, setAutoGenerating] = useState<"front" | "back" | null>(null);
+  // AI mask generation state — preview-only until the user clicks Save (see RALLY_BLANK_MASK_AI_AUTOGEN.md §3)
+  type AiMaskPreview = {
+    view: "front" | "back";
+    previewMaskUrl: string;
+    previewMaskStoragePath: string;
+    width: number;
+    height: number;
+    bytes: number;
+    prompt: string;
+    seed: number;
+    meanGrayscale: number;
+    endpoint: string;
+  };
+  const [aiGenerating, setAiGenerating] = useState<"front" | "back" | null>(null);
+  const [aiCommitting, setAiCommitting] = useState<"front" | "back" | null>(null);
+  const [aiPreview, setAiPreview] = useState<AiMaskPreview | null>(null);
+  const [aiError, setAiError] = useState<string | null>(null);
+  const [aiPromptInput, setAiPromptInput] = useState<string>("");
 
   // Fetch linked products count
   useEffect(() => {
@@ -777,6 +796,7 @@ function BlankDetailContent() {
           bytes: file.size,
         },
         mode: "inpaint",
+        source: "manual_upload",
         updatedAt: serverTimestamp() as any,
         updatedByUid: user.uid,
       };
@@ -894,6 +914,7 @@ function BlankDetailContent() {
           bytes: blob.size,
         },
         mode: "inpaint",
+        source: "auto_safearea",
         updatedAt: serverTimestamp() as any,
         updatedByUid: user.uid,
       };
@@ -920,6 +941,79 @@ function BlankDetailContent() {
     } finally {
       setAutoGenerating(null);
     }
+  };
+
+  /**
+   * Run SAM (fal.ai) to propose a print-zone mask for {blankId, view}. Does not commit;
+   * stores into `aiPreview` so the user can Refresh or Save. See RALLY_BLANK_MASK_AI_AUTOGEN.md.
+   */
+  const handleAiGenerate = async (view: "front" | "back", opts?: { reroll?: boolean }) => {
+    if (!blankId || !firebaseFunctions) {
+      showToast("Firebase functions not available", "error");
+      return;
+    }
+    setAiError(null);
+    setAiGenerating(view);
+    try {
+      const fn = httpsCallable<
+        { blankId: string; view: "front" | "back"; prompt?: string; seed?: number },
+        AiMaskPreview & { previewMaskUrl: string; previewMaskStoragePath: string }
+      >(firebaseFunctions, "generateBlankMaskViaSam");
+      const prompt = aiPromptInput.trim();
+      /** Reroll = new random seed; non-reroll respects user-supplied seed if we ever add a seed input. */
+      const seed = opts?.reroll ? Math.floor(Math.random() * 1e9) : undefined;
+      const result = await fn({
+        blankId,
+        view,
+        prompt: prompt.length > 0 ? prompt : undefined,
+        seed,
+      });
+      setAiPreview({ ...result.data, view });
+    } catch (err: any) {
+      console.error("[BlankDetail] AI mask generate failed:", err);
+      setAiError(err?.message || "AI mask generation failed");
+    } finally {
+      setAiGenerating(null);
+    }
+  };
+
+  /** Commit the active preview to `rp_blank_masks/{blankId}_{view}` via the server callable. */
+  const handleAiSave = async () => {
+    if (!aiPreview || !blankId || !firebaseFunctions) return;
+    setAiError(null);
+    setAiCommitting(aiPreview.view);
+    try {
+      const fn = httpsCallable<
+        { blankId: string; view: "front" | "back"; previewMaskStoragePath: string; prompt: string; seed: number },
+        { ok: boolean; maskDocId: string }
+      >(firebaseFunctions, "commitBlankMaskFromPreview");
+      await fn({
+        blankId,
+        view: aiPreview.view,
+        previewMaskStoragePath: aiPreview.previewMaskStoragePath,
+        prompt: aiPreview.prompt,
+        seed: aiPreview.seed,
+      });
+      /** Re-fetch the canonical mask doc so status pills, overlays, and the dropdown re-read source/prompt/seed. */
+      const refreshed = await getDoc(doc(db!, "rp_blank_masks", `${blankId}_${aiPreview.view}`));
+      setMasks((prev) => ({
+        ...prev,
+        [aiPreview.view]: refreshed.exists() ? (refreshed.data() as RPBlankMask) : prev[aiPreview.view],
+      }));
+      setAiPreview(null);
+      setAiPromptInput("");
+      showToast(`${aiPreview.view} mask saved (AI)`, "success");
+    } catch (err: any) {
+      console.error("[BlankDetail] AI mask commit failed:", err);
+      setAiError(err?.message || "Saving AI mask failed");
+    } finally {
+      setAiCommitting(null);
+    }
+  };
+
+  const handleAiCancel = () => {
+    setAiPreview(null);
+    setAiError(null);
   };
 
   const handleStatusChange = async (newStatus: "draft" | "active" | "archived") => {
@@ -1624,6 +1718,82 @@ function BlankDetailContent() {
                   </button>
                 </div>
 
+                {aiError ? (
+                  <div className="mb-4 p-3 border border-red-200 bg-red-50 rounded-lg text-sm text-red-800">
+                    <strong>AI mask error:</strong> {aiError}
+                    <button
+                      onClick={() => setAiError(null)}
+                      className="ml-3 text-red-700 underline text-xs hover:no-underline"
+                    >
+                      dismiss
+                    </button>
+                  </div>
+                ) : null}
+
+                {aiPreview && aiPreview.view === maskView ? (
+                  <div className="mb-4 border border-pink-300 bg-pink-50 rounded-lg overflow-hidden">
+                    <div className="px-4 py-2 border-b border-pink-200 bg-pink-100 flex items-center justify-between">
+                      <h4 className="text-sm font-semibold text-pink-900">
+                        🪄 AI preview — not saved yet
+                      </h4>
+                      <span className="text-xs text-pink-800 font-mono">
+                        prompt: &quot;{aiPreview.prompt}&quot; · seed: {aiPreview.seed} · mean: {aiPreview.meanGrayscale}
+                      </span>
+                    </div>
+                    <div className="p-4 grid grid-cols-2 gap-4 items-start">
+                      <img
+                        src={aiPreview.previewMaskUrl}
+                        alt="AI mask preview"
+                        className="w-full h-64 object-contain bg-gray-800 rounded border"
+                      />
+                      <div className="flex flex-col gap-3">
+                        <div className="text-xs text-gray-600 space-y-1">
+                          <div>{aiPreview.width} × {aiPreview.height}px · {Math.round(aiPreview.bytes / 1024)}KB</div>
+                          <div className="text-gray-500 font-mono text-[10px]">{aiPreview.endpoint}</div>
+                          <div className="pt-1">
+                            Saving will overwrite the existing {aiPreview.view} mask and lock it (production
+                            renders read this version going forward).
+                          </div>
+                        </div>
+                        <label className="text-xs text-gray-700 font-medium">
+                          Prompt (optional override for refresh)
+                          <input
+                            type="text"
+                            value={aiPromptInput}
+                            onChange={(e) => setAiPromptInput(e.target.value)}
+                            placeholder={aiPreview.prompt}
+                            className="mt-1 w-full px-2 py-1 text-sm border border-gray-300 rounded bg-white"
+                          />
+                        </label>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={handleAiSave}
+                            disabled={aiCommitting !== null || aiGenerating !== null}
+                            className="flex-1 px-4 py-2 bg-pink-600 text-white text-sm font-semibold rounded-lg hover:bg-pink-700 disabled:opacity-50"
+                          >
+                            {aiCommitting === aiPreview.view ? "Saving…" : "Save"}
+                          </button>
+                          <button
+                            onClick={() => handleAiGenerate(aiPreview.view, { reroll: true })}
+                            disabled={aiCommitting !== null || aiGenerating !== null}
+                            className="px-4 py-2 border border-pink-300 text-pink-700 text-sm font-medium rounded-lg hover:bg-pink-100 disabled:opacity-50"
+                            title="Re-run with a new seed (or the prompt above)"
+                          >
+                            {aiGenerating === aiPreview.view ? "Refreshing…" : "Refresh ↻"}
+                          </button>
+                          <button
+                            onClick={handleAiCancel}
+                            disabled={aiCommitting !== null || aiGenerating !== null}
+                            className="px-3 py-2 border border-gray-300 text-gray-700 text-sm rounded-lg hover:bg-gray-50 disabled:opacity-50"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+
                 {masksLoading ? (
                   <div className="flex items-center justify-center py-12">
                     <p className="text-gray-500">Loading masks...</p>
@@ -1679,22 +1849,32 @@ function BlankDetailContent() {
                               {masks[maskView]!.mask.width} × {masks[maskView]!.mask.height}px
                               {masks[maskView]!.mask.bytes && ` • ${Math.round(masks[maskView]!.mask.bytes! / 1024)}KB`}
                             </div>
-                            <div className="flex gap-2">
+                            <div className="flex flex-col gap-2">
                               <button
-                                onClick={() => handleMaskFileSelect(maskView)}
-                                disabled={maskUploadingView === maskView || autoGenerating === maskView}
-                                className="flex-1 px-3 py-1.5 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50"
+                                onClick={() => handleAiGenerate(maskView)}
+                                disabled={aiGenerating !== null || aiCommitting !== null || maskUploadingView === maskView || autoGenerating === maskView}
+                                className="px-3 py-1.5 text-sm bg-pink-600 text-white rounded hover:bg-pink-700 disabled:opacity-50 font-semibold"
+                                title="Ask SAM to find the print zone (preview before saving)"
                               >
-                                {maskUploadingView === maskView ? "Uploading..." : "Replace Mask"}
+                                {aiGenerating === maskView ? "Asking SAM…" : "🪄 Generate with AI"}
                               </button>
-                              <button
-                                onClick={() => handleAutoGenerateMask(maskView)}
-                                disabled={autoGenerating === maskView || maskUploadingView === maskView}
-                                className="px-3 py-1.5 text-sm border border-purple-300 text-purple-700 rounded hover:bg-purple-50 disabled:opacity-50"
-                                title="Regenerate mask from safeArea placement"
-                              >
-                                {autoGenerating === maskView ? "Generating..." : "Regen from SafeArea"}
-                              </button>
+                              <div className="flex gap-2">
+                                <button
+                                  onClick={() => handleMaskFileSelect(maskView)}
+                                  disabled={maskUploadingView === maskView || autoGenerating === maskView || aiGenerating !== null}
+                                  className="flex-1 px-3 py-1.5 text-sm border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50"
+                                >
+                                  {maskUploadingView === maskView ? "Uploading..." : "Replace Mask"}
+                                </button>
+                                <button
+                                  onClick={() => handleAutoGenerateMask(maskView)}
+                                  disabled={autoGenerating === maskView || maskUploadingView === maskView || aiGenerating !== null}
+                                  className="px-3 py-1.5 text-sm border border-purple-300 text-purple-700 rounded hover:bg-purple-50 disabled:opacity-50"
+                                  title="Regenerate rectangular mask from safeArea placement (fallback)"
+                                >
+                                  {autoGenerating === maskView ? "Generating..." : "From SafeArea (fallback)"}
+                                </button>
+                              </div>
                             </div>
                           </div>
                         ) : (
@@ -1710,18 +1890,26 @@ function BlankDetailContent() {
                             </p>
                             <div className="flex flex-col gap-2">
                               <button
+                                onClick={() => handleAiGenerate(maskView)}
+                                disabled={aiGenerating !== null || aiCommitting !== null || maskUploadingView === maskView || autoGenerating === maskView}
+                                className="px-4 py-2 bg-pink-600 text-white text-sm font-semibold rounded-lg hover:bg-pink-700 disabled:opacity-50"
+                                title="Ask SAM to find the print zone (preview before saving)"
+                              >
+                                {aiGenerating === maskView ? "Asking SAM…" : "🪄 Generate with AI"}
+                              </button>
+                              <button
                                 onClick={() => handleMaskFileSelect(maskView)}
-                                disabled={maskUploadingView === maskView || autoGenerating === maskView}
+                                disabled={maskUploadingView === maskView || autoGenerating === maskView || aiGenerating !== null}
                                 className="px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 disabled:opacity-50"
                               >
-                                {maskUploadingView === maskView ? "Uploading..." : "Upload Mask"}
+                                {maskUploadingView === maskView ? "Uploading..." : "Upload Mask (manual)"}
                               </button>
                               <button
                                 onClick={() => handleAutoGenerateMask(maskView)}
-                                disabled={autoGenerating === maskView || maskUploadingView === maskView}
-                                className="px-4 py-2 bg-purple-600 text-white text-sm rounded-lg hover:bg-purple-700 disabled:opacity-50"
+                                disabled={autoGenerating === maskView || maskUploadingView === maskView || aiGenerating !== null}
+                                className="px-4 py-2 border border-purple-300 text-purple-700 text-sm rounded-lg hover:bg-purple-50 disabled:opacity-50"
                               >
-                                {autoGenerating === maskView ? "Generating..." : "Auto-generate from SafeArea"}
+                                {autoGenerating === maskView ? "Generating..." : "From SafeArea (fallback)"}
                               </button>
                             </div>
                           </div>

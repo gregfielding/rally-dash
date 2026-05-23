@@ -2150,9 +2150,17 @@ export function BlankRenderProfileEditor({
               type="button"
               onClick={() => onManageMasks?.(previewSide)}
               className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-900 hover:bg-emerald-200"
-              title="Mask uploaded — click to manage on the Rendering tab"
+              title={
+                currentBlankMaskDoc.source === "ai_sam"
+                  ? `AI-generated mask · prompt: "${currentBlankMaskDoc.aiPrompt ?? "(default)"}" · seed: ${currentBlankMaskDoc.aiSeed ?? "?"}`
+                  : currentBlankMaskDoc.source === "auto_safearea"
+                    ? "Rectangular mask generated from the placement safeArea"
+                    : "Mask uploaded — click to manage on the Rendering tab"
+              }
             >
               <span aria-hidden>✅</span>
+              {currentBlankMaskDoc.source === "ai_sam" ? <span aria-hidden>🪄</span> : null}
+              {currentBlankMaskDoc.source === "auto_safearea" ? <span aria-hidden>▭</span> : null}
               <span>
                 Mask ({previewSide}): Uploaded
                 {currentBlankMaskDoc.mask?.width && currentBlankMaskDoc.mask?.height

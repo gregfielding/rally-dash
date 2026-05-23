@@ -102,6 +102,10 @@ const {
   BASELINE_NEGATIVE_PROMPT,
 } = require("./lib/createGenerationJobCore");
 const createGenerationJob = createCreateGenerationJob({ db, admin, sanitizeForFirestore });
+const {
+  buildGenerateBlankMaskViaSam,
+  buildCommitBlankMaskFromPreview,
+} = require("./lib/blankMaskGeneration");
 
 // Check if placeholder worker mode is enabled (default: true for safety)
 function usePlaceholderWorker() {
@@ -7350,6 +7354,21 @@ async function cropDesignToArtworkBounds(designBuffer, alphaThreshold = ARTWORK_
 
   return { buffer: cropped, width: boundsW, height: boundsH };
 }
+
+/**
+ * Auto-generate a blank print-zone mask via SAM (fal.ai). Spec: RALLY_BLANK_MASK_AI_AUTOGEN.md.
+ * Returns a preview URL; commit with `commitBlankMaskFromPreview`.
+ */
+exports.generateBlankMaskViaSam = functions
+  .runWith({ memory: "1GB", timeoutSeconds: 120 })
+  .https.onCall(buildGenerateBlankMaskViaSam({ db, storage, functions, sharp: require("sharp") }));
+
+/**
+ * Promote an AI-generated preview to the canonical mask and write `rp_blank_masks/{blankId}_{view}`.
+ */
+exports.commitBlankMaskFromPreview = functions
+  .runWith({ memory: "512MB", timeoutSeconds: 60 })
+  .https.onCall(buildCommitBlankMaskFromPreview({ db, admin, storage, functions, sharp: require("sharp") }));
 
 /**
  * Create a mock generation job
