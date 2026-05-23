@@ -1682,6 +1682,10 @@ export function BlankRenderProfileEditor({
             x: number;
             y: number;
             scale: number;
+            /** safeArea.w as the print-zone width (fraction of blank). See RALLY_BLANK_PREVIEW_RENDER.md "Option A". */
+            width?: number;
+            /** safeArea.h as the print-zone height (fraction of blank). */
+            height?: number;
             blendMode?: string;
             blendOpacity?: number;
             maskConfig?: { mode?: string | null } | null;
@@ -1700,6 +1704,13 @@ export function BlankRenderProfileEditor({
       const maskConfigForPreview = selected && selected.maskConfig
         ? { mode: selected.maskConfig.mode ?? null }
         : null;
+      /**
+       * Option A safeArea sizing (RALLY_BLANK_PREVIEW_RENDER.md follow-up): pass the zone's
+       * safeArea.w/h as the print-zone width/height so the compositor sizes the design
+       * relative to the printable region (matches the Render profile CSS canvas instead
+       * of the legacy "0.5 × blank × scale" default).
+       */
+      const safeAreaForPreview = selected?.safeArea;
       const result = await fn({
         blankId: blank.blankId,
         variantId: previewVariant?.variantId ?? null,
@@ -1710,6 +1721,8 @@ export function BlankRenderProfileEditor({
           x: tuning.placement.x,
           y: tuning.placement.y,
           scale: tuning.placement.scale,
+          width: safeAreaForPreview?.w,
+          height: safeAreaForPreview?.h,
           blendMode: effectiveBlend.blendMode,
           blendOpacity: effectiveBlend.blendOpacity,
           maskConfig: maskConfigForPreview,

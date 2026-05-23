@@ -7476,11 +7476,19 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
   const blankPlacement = blank.placements?.find(p => p.placementId === placementId);
   if (blankPlacement) {
     const printArea = blankPlacement.printArea || {};
+    const safeArea = blankPlacement.safeArea || {};
+    /**
+     * Option A safeArea sizing (RALLY_BLANK_PREVIEW_RENDER.md follow-up): if `printArea`
+     * doesn't set width/height, use the zone's `safeArea.w/h` as the print-zone size so
+     * the design is sized relative to the printable region. The legacy fallback
+     * (`0.5 × blank × scale` in onMockJobCreated) only triggers when neither is set —
+     * effectively unreachable now for blanks with a safeArea.
+     */
     placement = {
       x: printArea.x ?? blankPlacement.defaultX ?? placement.x,
       y: printArea.y ?? blankPlacement.defaultY ?? placement.y,
-      width: printArea.width,
-      height: printArea.height,
+      width: printArea.width ?? safeArea.w,
+      height: printArea.height ?? safeArea.h,
       scale: blankPlacement.defaultScale ?? placement.scale,
       safeArea: blankPlacement.safeArea ?? placement.safeArea,
       rotationDeg: 0,
