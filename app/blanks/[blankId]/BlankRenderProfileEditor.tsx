@@ -11,6 +11,7 @@ import {
 } from "react";
 import type {
   RPBlank,
+  RPBlankMask,
   RPPlacement,
   RpRenderTarget,
   RpRenderTargetSettings,
@@ -212,6 +213,25 @@ type GarmentPreviewCanvasProps = {
   maskEnabled8394?: boolean;
   /** Fires when natural canvas telemetry updates (resize or recompose). */
   on8394ParityTelemetry?: (t: Preview8394ParityTelemetry | null) => void;
+  /**
+   * `rp_blank_masks/{blankId}_{view}` PNG (white = print area). Drawn semi-transparent
+   * on top of the garment so designers can see when the design overlay crosses
+   * the editable region. Same mask PNG the compositor multiplies onto the design
+   * RGBA in `onMockJobCreated`.
+   */
+  blankMaskUrl?: string | null;
+  /** "off" hides overlay (default). "filled" tints the editable region. "outline" only highlights its edge. */
+  blankMaskOverlayMode?: "off" | "filled" | "outline";
+  /** 0–1; default 0.35. Only used in "filled" mode. */
+  blankMaskOverlayOpacity?: number;
+  /** Tints the grayscale mask so it pops against any garment color. Default 'magenta'. */
+  blankMaskOverlayTint?: "magenta" | "cyan" | "lime";
+};
+
+const BLANK_MASK_TINT_TO_HEX: Record<NonNullable<GarmentPreviewCanvasProps["blankMaskOverlayTint"]>, string> = {
+  magenta: "#ec4899",
+  cyan: "#06b6d4",
+  lime: "#84cc16",
 };
 
 function GarmentPreviewCanvas({
@@ -248,6 +268,10 @@ function GarmentPreviewCanvas({
   warpEnabled8394 = false,
   maskEnabled8394 = false,
   on8394ParityTelemetry,
+  blankMaskUrl,
+  blankMaskOverlayMode = "off",
+  blankMaskOverlayOpacity = 0.35,
+  blankMaskOverlayTint = "magenta",
 }: GarmentPreviewCanvasProps) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -449,6 +473,68 @@ function GarmentPreviewCanvas({
           </div>
         )}
         {emptyOverlay}
+        {blankMaskUrl && blankMaskOverlayMode !== "off" ? (
+          <div
+            aria-hidden
+            data-blank-mask-overlay
+            data-blank-mask-mode={blankMaskOverlayMode}
+            className="absolute inset-0 flex items-center justify-center pointer-events-none"
+          >
+            {/* Invisible <img> reuses the same w-auto/max-w-full/maxHeightClass rules
+                as the garment img, so the tinted div sizes match the garment exactly
+                even when natural aspect ratios diverge between mask and garment PNGs. */}
+            <div className="relative">
+              <img
+                src={blankMaskUrl}
+                alt=""
+                aria-hidden
+                draggable={false}
+                className={`block ${maxHeightClass} w-auto max-w-full select-none`}
+                style={{ visibility: "hidden" }}
+              />
+              {blankMaskOverlayMode === "filled" ? (
+                <div
+                  className="absolute inset-0"
+                  style={{
+                    backgroundColor: BLANK_MASK_TINT_TO_HEX[blankMaskOverlayTint],
+                    WebkitMaskImage: `url(${blankMaskUrl})`,
+                    maskImage: `url(${blankMaskUrl})`,
+                    WebkitMaskSize: "100% 100%",
+                    maskSize: "100% 100%",
+                    WebkitMaskRepeat: "no-repeat",
+                    maskRepeat: "no-repeat",
+                    WebkitMaskPosition: "center",
+                    maskPosition: "center",
+                    opacity: blankMaskOverlayOpacity,
+                    mixBlendMode: "screen",
+                  }}
+                />
+              ) : (
+                /* Outline: two stacked mask layers (full + slightly inset) with mask-composite
+                   exclude/xor leaves only a thin ring around the shape edge. */
+                <div
+                  className="absolute inset-0"
+                  style={
+                    {
+                      backgroundColor: BLANK_MASK_TINT_TO_HEX[blankMaskOverlayTint],
+                      WebkitMaskImage: `url(${blankMaskUrl}), url(${blankMaskUrl})`,
+                      maskImage: `url(${blankMaskUrl}), url(${blankMaskUrl})`,
+                      WebkitMaskSize: "100% 100%, calc(100% - 6px) calc(100% - 6px)",
+                      maskSize: "100% 100%, calc(100% - 6px) calc(100% - 6px)",
+                      WebkitMaskRepeat: "no-repeat, no-repeat",
+                      maskRepeat: "no-repeat, no-repeat",
+                      WebkitMaskPosition: "center, center",
+                      maskPosition: "center, center",
+                      WebkitMaskComposite: "xor",
+                      maskComposite: "exclude",
+                      opacity: 0.9,
+                    } as CSSProperties
+                  }
+                />
+              )}
+            </div>
+          </div>
+        ) : null}
         {!useNatural8394Canvas && showArt ? (
           <div
             className="absolute pointer-events-auto touch-none cursor-grab active:cursor-grabbing will-change-transform [transform-style:preserve-3d]"
@@ -717,11 +803,17 @@ export function BlankRenderProfileEditor({
   updateBlank,
   refetchBlank,
   showToast,
+  masks,
+  onManageMasks,
 }: {
   blank: RPBlank;
   updateBlank: (i: UpdateBlankInput) => Promise<unknown>;
   refetchBlank: () => void;
   showToast: (m: string, t: "success" | "error") => void;
+  /** `rp_blank_masks/{blankId}_{view}` docs supplied by the parent page (already fetched there). */
+  masks?: { front: RPBlankMask | null; back: RPBlankMask | null };
+  /** Switch the parent tab to the Rendering tab and pre-select `view` so users can upload / replace. */
+  onManageMasks?: (view: "front" | "back") => void;
 }) {
   const { isAdmin } = useAuth();
   const { designs, isLoading: designsLoading } = useDesigns({ hasPng: true });
@@ -758,6 +850,12 @@ export function BlankRenderProfileEditor({
   /** clean = no blend on canvas; blended = current profile; compare = side-by-side */
   const [previewMode, setPreviewMode] = useState<"clean" | "blended" | "compare">("blended");
   const [previewLightbox, setPreviewLightbox] = useState(false);
+  /**
+   * Visualizes `rp_blank_masks/{blankId}_{view}` on top of the garment so designers
+   * can see when the design overlay crosses the editable region. Local UI preference,
+   * not persisted. Default `off` so the canvas isn't decorated until requested.
+   */
+  const [blankMaskOverlayMode, setBlankMaskOverlayMode] = useState<"off" | "outline" | "filled">("off");
   const [lastExplicitRenderStyle, setLastExplicitRenderStyle] = useState<RenderStylePresetId>("soft_print");
   const [explicitCustomStyle, setExplicitCustomStyle] = useState(false);
   const [renderProfileStatus, setRenderProfileStatus] = useState<"draft" | "approved">(
@@ -1031,6 +1129,20 @@ export function BlankRenderProfileEditor({
    */
   const previewSideAllowsPrinting =
     previewSide === "front" ? supportedFront : supportedBack;
+
+  /** Mask doc for the side currently being previewed (used for overlay + status pill + select default). */
+  const currentBlankMaskDoc: RPBlankMask | null =
+    (previewSide === "front" ? masks?.front : masks?.back) ?? null;
+  const currentBlankMaskUrl = currentBlankMaskDoc?.mask?.downloadUrl ?? null;
+  /**
+   * If the operator has not yet picked a clip strategy for this zone, default to
+   * `blank_mask_doc` when an `rp_blank_masks/{blankId}_{view}` doc exists, otherwise
+   * `none`. The compositor has been consuming `blank_mask_doc` for all real renders
+   * for some time; the `(future)` label was stale.
+   */
+  const defaultMaskModeForCurrentView: "none" | "blank_mask_doc" = currentBlankMaskUrl
+    ? "blank_mask_doc"
+    : "none";
   const tuning: RpRenderTargetSettings | null = selected
     ? targetSettingsMap[selectedRenderTarget] ??
       getDefaultRenderTargetSettings(selectedRenderTarget, selected, blank.styleCode)
@@ -2031,6 +2143,37 @@ export function BlankRenderProfileEditor({
           >
             Preview: {previewAssetsReady ? "Ready" : "Missing assets"}
           </span>
+          {/* Per-view mask status. Reads `rp_blank_masks/{blankId}_{previewSide}` from
+              parent-supplied props; click to jump to the Rendering tab pre-set to that view. */}
+          {currentBlankMaskDoc && currentBlankMaskUrl ? (
+            <button
+              type="button"
+              onClick={() => onManageMasks?.(previewSide)}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-900 hover:bg-emerald-200"
+              title="Mask uploaded — click to manage on the Rendering tab"
+            >
+              <span aria-hidden>✅</span>
+              <span>
+                Mask ({previewSide}): Uploaded
+                {currentBlankMaskDoc.mask?.width && currentBlankMaskDoc.mask?.height
+                  ? ` · ${currentBlankMaskDoc.mask.width}×${currentBlankMaskDoc.mask.height}`
+                  : ""}
+                {currentBlankMaskDoc.mask?.bytes
+                  ? ` · ${Math.round(currentBlankMaskDoc.mask.bytes / 1024)}KB`
+                  : ""}
+              </span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => onManageMasks?.(previewSide)}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-amber-100 text-amber-900 hover:bg-amber-200"
+              title="No mask uploaded for this side — click to upload on the Rendering tab"
+            >
+              <span aria-hidden>⚠️</span>
+              <span>Mask ({previewSide}): Missing — Upload on Rendering tab →</span>
+            </button>
+          )}
         </div>
         {is8394 && selectedRenderTarget === "flat_back" && !previewGarmentUrl && previewVariant ? (
           <p className="text-xs text-red-700 mt-2 bg-red-50 border border-red-100 rounded-lg px-3 py-2 inline-block">
@@ -2621,7 +2764,11 @@ export function BlankRenderProfileEditor({
                       />
                     </label>
                   </div>
-                  <p className="text-[10px] text-neutral-500 mt-1">Mask is not drawn on this canvas yet.</p>
+                  <p className="text-[10px] text-neutral-500 mt-1">
+                    These knobs ({"feather"} / {"edge fade"}) tune the soft-edge look applied at compositor time.
+                    Use the <strong>MASK</strong> toggle in the preview header to overlay the uploaded
+                    {" "}<code className="text-[9px]">rp_blank_masks</code> PNG on the canvas.
+                  </p>
                 </div>
               </div>
             ) : null}
@@ -3207,14 +3354,40 @@ export function BlankRenderProfileEditor({
                 <label className="flex flex-col gap-1">
                   <span className="text-xs text-neutral-600">Mask / clip strategy</span>
                   <select
-                    value={selected?.maskConfig?.mode ?? "none"}
+                    value={selected?.maskConfig?.mode ?? defaultMaskModeForCurrentView}
                     onChange={(e) => updateSelected({ maskConfig: { mode: e.target.value } })}
                     className="border border-neutral-300 rounded px-2 py-1 text-sm bg-white text-neutral-900"
                   >
-                    <option value="none">None (MVP)</option>
-                    <option value="blank_mask_doc">Use rp_blank_masks doc (future)</option>
-                    <option value="safe_area_clip">Clip to safe area (future)</option>
+                    <option value="none">None — no clipping</option>
+                    <option value="blank_mask_doc">Use uploaded mask (rp_blank_masks)</option>
+                    <option value="safe_area_clip" disabled>
+                      Clip to safe area (not implemented)
+                    </option>
                   </select>
+                  {/* Status + Manage masks link for the side this zone affects. */}
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] mt-0.5">
+                    {currentBlankMaskDoc && currentBlankMaskUrl ? (
+                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-900 font-medium">
+                        Mask uploaded
+                        {currentBlankMaskDoc.mask?.width && currentBlankMaskDoc.mask?.height
+                          ? ` · ${currentBlankMaskDoc.mask.width}×${currentBlankMaskDoc.mask.height}`
+                          : ""}
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-neutral-100 border border-neutral-200 text-neutral-700">
+                        No mask uploaded for {previewSide}
+                      </span>
+                    )}
+                    {onManageMasks ? (
+                      <button
+                        type="button"
+                        onClick={() => onManageMasks(previewSide)}
+                        className="text-indigo-700 hover:underline font-medium"
+                      >
+                        Manage masks →
+                      </button>
+                    ) : null}
+                  </div>
                 </label>
               )}
             </div>
@@ -3277,6 +3450,37 @@ export function BlankRenderProfileEditor({
                   Enlarge garment
                 </button>
               ) : null}
+              {/* MASK toggle: visualizes rp_blank_masks/{blankId}_{previewSide}. Disabled when no mask exists. */}
+              <span
+                className="ml-2 text-xs font-semibold text-neutral-500 uppercase tracking-wide"
+                title={
+                  currentBlankMaskUrl
+                    ? `Overlay mask for ${previewSide} on the preview`
+                    : `No mask uploaded for ${previewSide} — upload on the Rendering tab`
+                }
+              >
+                Mask
+              </span>
+              {(["off", "outline", "filled"] as const).map((m) => {
+                const disabled = !currentBlankMaskUrl && m !== "off";
+                return (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => setBlankMaskOverlayMode(m)}
+                    disabled={disabled}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors ${
+                      blankMaskOverlayMode === m
+                        ? "bg-pink-600 text-white border-pink-600"
+                        : disabled
+                          ? "bg-neutral-50 text-neutral-300 border-neutral-200 cursor-not-allowed"
+                          : "bg-white text-neutral-700 border-neutral-200 hover:border-pink-300"
+                    }`}
+                  >
+                    {m === "off" ? "Off" : m === "outline" ? "Outline" : "Filled"}
+                  </button>
+                );
+              })}
             </div>
             {is8394SimpleBackUi && previewSideAllowsPrinting ? (
               <p className="text-[10px] text-neutral-400 mt-1 max-w-lg">
@@ -3579,6 +3783,8 @@ export function BlankRenderProfileEditor({
                 onPointerDownOverlay={handlePointerDownOverlay}
                 maxHeightClass="max-h-[min(72vh,720px)]"
                 pixelFaithful8394={is8394 && pixelAccurate8394Preview}
+                blankMaskUrl={currentBlankMaskUrl}
+                blankMaskOverlayMode={blankMaskOverlayMode}
                 {...(is8394 && tuning
                   ? {
                       renderTarget8394: selectedRenderTarget,
@@ -3644,6 +3850,8 @@ export function BlankRenderProfileEditor({
                     onPointerDownOverlay={handlePointerDownOverlay}
                     maxHeightClass="max-h-[min(48vh,440px)]"
                     pixelFaithful8394={is8394 && pixelAccurate8394Preview}
+                    blankMaskUrl={currentBlankMaskUrl}
+                    blankMaskOverlayMode={blankMaskOverlayMode}
                     {...(is8394 && tuning
                       ? {
                           renderTarget8394: selectedRenderTarget,
@@ -3688,6 +3896,8 @@ export function BlankRenderProfileEditor({
               onPointerDownOverlay={handlePointerDownOverlay}
               maxHeightClass="max-h-[min(72vh,720px)]"
               pixelFaithful8394={is8394 && pixelAccurate8394Preview}
+              blankMaskUrl={currentBlankMaskUrl}
+              blankMaskOverlayMode={blankMaskOverlayMode}
               {...(is8394 && tuning
                 ? {
                     renderTarget8394: selectedRenderTarget,

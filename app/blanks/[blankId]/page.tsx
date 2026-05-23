@@ -511,7 +511,21 @@ function SourcingCostSection({ blank, updateBlank, refetchBlank, showToast }: { 
   );
 }
 
-function PlacementEditorSection({ blank, updateBlank, refetchBlank, showToast }: { blank: RPBlank; updateBlank: (i: UpdateBlankInput) => Promise<unknown>; refetchBlank: () => void; showToast: (m: string, t: "success" | "error") => void }) {
+function PlacementEditorSection({
+  blank,
+  updateBlank,
+  refetchBlank,
+  showToast,
+  masks,
+  onManageMasks,
+}: {
+  blank: RPBlank;
+  updateBlank: (i: UpdateBlankInput) => Promise<unknown>;
+  refetchBlank: () => void;
+  showToast: (m: string, t: "success" | "error") => void;
+  masks?: { front: RPBlankMask | null; back: RPBlankMask | null };
+  onManageMasks?: (view: "front" | "back") => void;
+}) {
   const is8394 = String(blank.styleCode || "").trim() === "8394";
   return (
     <div>
@@ -534,6 +548,8 @@ function PlacementEditorSection({ blank, updateBlank, refetchBlank, showToast }:
         updateBlank={updateBlank}
         refetchBlank={refetchBlank}
         showToast={showToast}
+        masks={masks}
+        onManageMasks={onManageMasks}
       />
     </div>
   );
@@ -1542,6 +1558,11 @@ function BlankDetailContent() {
                 updateBlank={updateBlank}
                 refetchBlank={refetchBlank}
                 showToast={showToast}
+                masks={masks}
+                onManageMasks={(view) => {
+                  setMaskView(view);
+                  setActiveTab("rendering");
+                }}
               />
             )}
 
