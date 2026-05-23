@@ -7486,6 +7486,8 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
       rotationDeg: 0,
       blendMode: blankPlacement.blendMode ?? "multiply",
       blendOpacity: blankPlacement.blendOpacity ?? 0.87,
+      // Operator's chosen clip strategy — read by onMockJobCreated to gate mask application.
+      maskConfig: blankPlacement.maskConfig ?? null,
     };
   }
 
@@ -7699,10 +7701,23 @@ exports.onMockJobCreated = functions
       const blendMode = placement.blendMode || "soft-light";
       const effectiveOpacity = placement.blendOpacity ?? 0.9;
 
-      // Fabric mask: design × mask for fabric integration. Skip if mask appears inverted (would zero design on garment).
+      /**
+       * Fabric mask: design × mask for fabric integration. Three gates:
+       *   1. `placement.maskConfig.mode === "none"` → skip (operator opted out via Render profile dropdown).
+       *      Null/undefined or "blank_mask_doc" → apply if a mask doc exists.
+       *   2. Mask doc must exist with a downloadUrl.
+       *   3. Mask must not look inverted (mean > 80).
+       */
+      const maskMode =
+        placement && placement.maskConfig && typeof placement.maskConfig.mode === "string"
+          ? placement.maskConfig.mode
+          : null;
       const maskDocId = `${blankId}_${view}`;
-      const maskDoc = await db.collection("rp_blank_masks").doc(maskDocId).get();
-      const maskData = maskDoc.exists ? maskDoc.data() : null;
+      const maskDoc = maskMode === "none" ? null : await db.collection("rp_blank_masks").doc(maskDocId).get();
+      const maskData = maskDoc && maskDoc.exists ? maskDoc.data() : null;
+      if (maskMode === "none") {
+        console.log("[onMockJobCreated] Skipping fabric mask (maskConfig.mode='none')");
+      }
       if (maskData?.mask?.downloadUrl) {
         try {
           const maskResp = await fetch(maskData.mask.downloadUrl);

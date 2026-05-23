@@ -1682,6 +1682,7 @@ export function BlankRenderProfileEditor({
             scale: number;
             blendMode?: string;
             blendOpacity?: number;
+            maskConfig?: { mode?: string | null } | null;
           };
         },
         RealPreviewResult
@@ -1689,6 +1690,14 @@ export function BlankRenderProfileEditor({
       const effectiveBlend = is8394SimpleBackUi
         ? { blendMode: zoneBlendFor8394BlendedPreview.blendMode, blendOpacity: zoneBlendFor8394BlendedPreview.blendOpacity }
         : { blendMode: zoneBlend.blendMode, blendOpacity: zoneBlend.blendOpacity };
+      /**
+       * Pass the operator's unsaved mask-config choice so the preview honors the
+       * Render profile dropdown (none vs use uploaded mask) the same way production
+       * onMockJobCreated will after this PR.
+       */
+      const maskConfigForPreview = selected && selected.maskConfig
+        ? { mode: selected.maskConfig.mode ?? null }
+        : null;
       const result = await fn({
         blankId: blank.blankId,
         variantId: previewVariant?.variantId ?? null,
@@ -1700,6 +1709,7 @@ export function BlankRenderProfileEditor({
           scale: tuning.placement.scale,
           blendMode: effectiveBlend.blendMode,
           blendOpacity: effectiveBlend.blendOpacity,
+          maskConfig: maskConfigForPreview,
         },
       });
       setRealPreview(result.data);

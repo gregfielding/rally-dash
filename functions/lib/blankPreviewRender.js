@@ -232,16 +232,24 @@ function buildPreviewBlankRender({ db, storage, functions, sharp }) {
     const effectiveOpacity = Number.isFinite(Number(pl.blendOpacity)) ? Number(pl.blendOpacity) : 0.9;
 
     /**
-     * Multiply rp_blank_masks/{blankId}_{view} onto the design RGBA. Same inversion sanity
-     * check `onMockJobCreated` uses (skip if mean < 80). Preview NEVER renders without
-     * the mask if one exists — that's the entire point of this surface.
+     * Multiply rp_blank_masks/{blankId}_{view} onto the design RGBA. Three gates, same as
+     * onMockJobCreated:
+     *   1. `placement.maskConfig.mode === "none"` → skip (operator opted out).
+     *      Null/undefined or "blank_mask_doc" → apply if a mask doc exists.
+     *   2. Mask doc must exist with a downloadUrl.
+     *   3. Mask must not look inverted (mean > 80).
      */
     let maskApplied = false;
     let maskMean = null;
+    const maskMode =
+      pl.maskConfig && typeof pl.maskConfig.mode === "string" ? pl.maskConfig.mode : null;
     try {
+      if (maskMode === "none") {
+        console.log("[previewBlankRender] Skipping fabric mask (maskConfig.mode='none')");
+      }
       const maskDocId = `${blankId}_${view}`;
-      const maskDoc = await db.collection("rp_blank_masks").doc(maskDocId).get();
-      const maskData = maskDoc.exists ? maskDoc.data() : null;
+      const maskDoc = maskMode === "none" ? null : await db.collection("rp_blank_masks").doc(maskDocId).get();
+      const maskData = maskDoc && maskDoc.exists ? maskDoc.data() : null;
       if (maskData && maskData.mask && maskData.mask.downloadUrl) {
         const maskResp = await fetch(maskData.mask.downloadUrl);
         if (maskResp.ok) {
@@ -318,6 +326,7 @@ function buildPreviewBlankRender({ db, storage, functions, sharp }) {
       bytes: previewBuffer.length,
       maskApplied,
       maskMean: maskMean != null ? Math.round(maskMean) : null,
+      maskMode,
       designOriginalPx: { w: originalDesignW, h: originalDesignH },
       designCroppedPx: { w: designWidth, h: designHeight },
       designResizedPx: { w: actualW, h: actualH },
