@@ -805,6 +805,8 @@ export function BlankRenderProfileEditor({
   showToast,
   masks,
   onManageMasks,
+  onGenerateAiMask,
+  aiMaskGeneratingForView,
 }: {
   blank: RPBlank;
   updateBlank: (i: UpdateBlankInput) => Promise<unknown>;
@@ -814,6 +816,14 @@ export function BlankRenderProfileEditor({
   masks?: { front: RPBlankMask | null; back: RPBlankMask | null };
   /** Switch the parent tab to the Rendering tab and pre-select `view` so users can upload / replace. */
   onManageMasks?: (view: "front" | "back") => void;
+  /**
+   * Kick off an AI mask generation for `view` from inside the Render profile tab.
+   * Parent shows the preview / Save / Refresh UI on the Rendering tab (and switches tabs to it),
+   * so designers can keep tuning placement here and only briefly hop over to confirm + save.
+   */
+  onGenerateAiMask?: (view: "front" | "back") => void;
+  /** True while the AI mask callable is in flight for the current view — disables the button. */
+  aiMaskGeneratingForView?: "front" | "back" | null;
 }) {
   const { isAdmin } = useAuth();
   const { designs, isLoading: designsLoading } = useDesigns({ hasPng: true });
@@ -3494,6 +3504,19 @@ export function BlankRenderProfileEditor({
                   </button>
                 );
               })}
+              {/* Shortcut: kick off AI mask generation for the currently-previewed side. Parent
+                  switches to Rendering tab where the preview / Save / Refresh card lives. */}
+              {onGenerateAiMask ? (
+                <button
+                  type="button"
+                  onClick={() => onGenerateAiMask(previewSide)}
+                  disabled={aiMaskGeneratingForView !== null && aiMaskGeneratingForView !== undefined}
+                  className="ml-2 px-3 py-1.5 rounded-lg text-xs font-semibold bg-pink-600 text-white hover:bg-pink-700 disabled:opacity-50"
+                  title="Ask SAM to find the printable region of this garment (no design needed)"
+                >
+                  {aiMaskGeneratingForView === previewSide ? "Asking SAM…" : "🪄 Generate AI mask"}
+                </button>
+              ) : null}
             </div>
             {is8394SimpleBackUi && previewSideAllowsPrinting ? (
               <p className="text-[10px] text-neutral-400 mt-1 max-w-lg">

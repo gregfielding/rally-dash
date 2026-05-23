@@ -519,6 +519,8 @@ function PlacementEditorSection({
   showToast,
   masks,
   onManageMasks,
+  onGenerateAiMask,
+  aiMaskGeneratingForView,
 }: {
   blank: RPBlank;
   updateBlank: (i: UpdateBlankInput) => Promise<unknown>;
@@ -526,6 +528,8 @@ function PlacementEditorSection({
   showToast: (m: string, t: "success" | "error") => void;
   masks?: { front: RPBlankMask | null; back: RPBlankMask | null };
   onManageMasks?: (view: "front" | "back") => void;
+  onGenerateAiMask?: (view: "front" | "back") => void;
+  aiMaskGeneratingForView?: "front" | "back" | null;
 }) {
   const is8394 = String(blank.styleCode || "").trim() === "8394";
   return (
@@ -551,6 +555,8 @@ function PlacementEditorSection({
         showToast={showToast}
         masks={masks}
         onManageMasks={onManageMasks}
+        onGenerateAiMask={onGenerateAiMask}
+        aiMaskGeneratingForView={aiMaskGeneratingForView}
       />
     </div>
   );
@@ -1657,6 +1663,15 @@ function BlankDetailContent() {
                   setMaskView(view);
                   setActiveTab("rendering");
                 }}
+                onGenerateAiMask={(view) => {
+                  /** Hop to the Rendering tab so the AI preview / Save / Refresh card is visible,
+                      then kick off the same handler the in-tab button uses. handleAiGenerate
+                      sets aiGenerating + populates aiPreview on success. */
+                  setMaskView(view);
+                  setActiveTab("rendering");
+                  void handleAiGenerate(view);
+                }}
+                aiMaskGeneratingForView={aiGenerating}
               />
             )}
 
@@ -1808,17 +1823,49 @@ function BlankDetailContent() {
                         </h4>
                       </div>
                       <div className="p-4">
-                        {blank.images?.[maskView]?.downloadUrl ? (
-                          <img
-                            src={blank.images[maskView]!.downloadUrl}
-                            alt={`${maskView} view`}
-                            className="w-full h-64 object-contain bg-white rounded border"
-                          />
-                        ) : (
-                          <div className="w-full h-64 bg-gray-100 rounded border flex items-center justify-center">
-                            <p className="text-sm text-gray-500">No {maskView} image</p>
-                          </div>
-                        )}
+                        {(() => {
+                          /**
+                           * Mirror the backend's `pickRefImageUrl` (functions/lib/blankMaskGeneration.js):
+                           * top-level blank image first, then first variant's flat photo for the view.
+                           * This is what SAM will see when "Generate with AI" runs — show it here so
+                           * "No front image" doesn't mislead when variants are present.
+                           */
+                          const direct = blank.images?.[maskView]?.downloadUrl;
+                          if (direct) {
+                            return (
+                              <img
+                                src={direct}
+                                alt={`${maskView} view`}
+                                className="w-full h-64 object-contain bg-white rounded border"
+                              />
+                            );
+                          }
+                          const variantFallback = (blank.variants ?? []).find((v: any) => {
+                            const im = v?.images;
+                            return im && (maskView === "front" ? im.flatFront?.downloadUrl || im.front?.downloadUrl : im.flatBack?.downloadUrl || im.back?.downloadUrl);
+                          });
+                          if (variantFallback) {
+                            const im = (variantFallback as any).images;
+                            const ref = maskView === "front" ? im.flatFront || im.front : im.flatBack || im.back;
+                            return (
+                              <>
+                                <img
+                                  src={ref.downloadUrl}
+                                  alt={`${maskView} view (variant fallback)`}
+                                  className="w-full h-64 object-contain bg-white rounded border"
+                                />
+                                <p className="mt-2 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                                  Using <strong>{(variantFallback as any).colorName || "first variant"}</strong> flat as reference. SAM will use this image. Upload a master {maskView} image on the Identity tab to override.
+                                </p>
+                              </>
+                            );
+                          }
+                          return (
+                            <div className="w-full h-64 bg-gray-100 rounded border flex items-center justify-center">
+                              <p className="text-sm text-gray-500">No {maskView} image — upload one on the Identity tab or add a variant photo</p>
+                            </div>
+                          );
+                        })()}
                       </div>
                     </div>
 
@@ -1858,6 +1905,9 @@ function BlankDetailContent() {
                               >
                                 {aiGenerating === maskView ? "Asking SAM…" : "🪄 Generate with AI"}
                               </button>
+                              <p className="text-[11px] text-gray-500 -mt-1">
+                                Uses the blank&apos;s reference photo above. <strong>No design needed</strong> — the mask defines where any design can land on this garment.
+                              </p>
                               <div className="flex gap-2">
                                 <button
                                   onClick={() => handleMaskFileSelect(maskView)}
@@ -1897,6 +1947,9 @@ function BlankDetailContent() {
                               >
                                 {aiGenerating === maskView ? "Asking SAM…" : "🪄 Generate with AI"}
                               </button>
+                              <p className="text-[11px] text-gray-500 -mt-1 px-1">
+                                Uses the blank&apos;s reference photo. <strong>No design needed</strong> — the mask defines where any design can land on this garment.
+                              </p>
                               <button
                                 onClick={() => handleMaskFileSelect(maskView)}
                                 disabled={maskUploadingView === maskView || autoGenerating === maskView || aiGenerating !== null}
