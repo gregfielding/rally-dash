@@ -11,6 +11,8 @@
  * Spec: RALLY_BLANK_PREVIEW_RENDER.md
  */
 
+const { resolveDesignAssetUrls } = require("./designFileMergeCore");
+
 const VARIANT_FLAT_FRONT_KEYS = ["flatFront", "front"];
 const VARIANT_FLAT_BACK_KEYS = ["flatBack", "back"];
 
@@ -28,19 +30,15 @@ function pickRefImage(blank, variant, view) {
   return null;
 }
 
-/** Mirror `designPngUrlForProcessing` in index.js: lightPng → darkPng → null. */
+/**
+ * Mirror `designPngUrlForProcessing` in index.js: delegates to the shared resolver in
+ * designFileMergeCore (which handles `files.{side}.lightPng.downloadUrl` etc.) so this
+ * preview matches what the production pipeline picks for the same design.
+ */
 function pickDesignPngUrl(design) {
   if (!design) return null;
-  const candidates = [
-    design.lightPng && design.lightPng.downloadUrl,
-    design.darkPng && design.darkPng.downloadUrl,
-    design.files && design.files.front && design.files.front.png && design.files.front.png.downloadUrl,
-    design.files && design.files.back && design.files.back.png && design.files.back.png.downloadUrl,
-  ];
-  for (const c of candidates) {
-    if (typeof c === "string" && c.length > 0) return c;
-  }
-  return null;
+  const u = resolveDesignAssetUrls(design);
+  return u.lightPng || u.darkPng || u.whitePng || null;
 }
 
 /**
