@@ -473,7 +473,14 @@ function GarmentPreviewCanvas({
           </div>
         )}
         {emptyOverlay}
-        {blankMaskUrl && blankMaskOverlayMode !== "off" ? (
+        {blankMaskUrl && blankMaskOverlayMode !== "off" ? (() => {
+          /**
+           * CSS `mask-image: url(...)` is subject to CORS even when an `<img>` from the same
+           * source loads fine. Firebase Storage omits ACAO by default, so route the mask
+           * through the same-origin `/api/storage-proxy` (helper handles the allowlist).
+           */
+          const proxiedMaskUrl = proxiedImageUrlForCanvas(blankMaskUrl);
+          return (
           <div
             aria-hidden
             data-blank-mask-overlay
@@ -485,7 +492,7 @@ function GarmentPreviewCanvas({
                 even when natural aspect ratios diverge between mask and garment PNGs. */}
             <div className="relative">
               <img
-                src={blankMaskUrl}
+                src={proxiedMaskUrl}
                 alt=""
                 aria-hidden
                 draggable={false}
@@ -497,8 +504,8 @@ function GarmentPreviewCanvas({
                   className="absolute inset-0"
                   style={{
                     backgroundColor: BLANK_MASK_TINT_TO_HEX[blankMaskOverlayTint],
-                    WebkitMaskImage: `url(${blankMaskUrl})`,
-                    maskImage: `url(${blankMaskUrl})`,
+                    WebkitMaskImage: `url(${proxiedMaskUrl})`,
+                    maskImage: `url(${proxiedMaskUrl})`,
                     WebkitMaskSize: "100% 100%",
                     maskSize: "100% 100%",
                     WebkitMaskRepeat: "no-repeat",
@@ -517,8 +524,8 @@ function GarmentPreviewCanvas({
                   style={
                     {
                       backgroundColor: BLANK_MASK_TINT_TO_HEX[blankMaskOverlayTint],
-                      WebkitMaskImage: `url(${blankMaskUrl}), url(${blankMaskUrl})`,
-                      maskImage: `url(${blankMaskUrl}), url(${blankMaskUrl})`,
+                      WebkitMaskImage: `url(${proxiedMaskUrl}), url(${proxiedMaskUrl})`,
+                      maskImage: `url(${proxiedMaskUrl}), url(${proxiedMaskUrl})`,
                       WebkitMaskSize: "100% 100%, calc(100% - 6px) calc(100% - 6px)",
                       maskSize: "100% 100%, calc(100% - 6px) calc(100% - 6px)",
                       WebkitMaskRepeat: "no-repeat, no-repeat",
@@ -534,7 +541,8 @@ function GarmentPreviewCanvas({
               )}
             </div>
           </div>
-        ) : null}
+          );
+        })() : null}
         {!useNatural8394Canvas && showArt ? (
           <div
             className="absolute pointer-events-auto touch-none cursor-grab active:cursor-grabbing will-change-transform [transform-style:preserve-3d]"
