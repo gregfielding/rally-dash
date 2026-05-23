@@ -1993,6 +1993,30 @@ export function BlankRenderProfileEditor({
     tuning?.warp?.enabled,
   ]);
 
+  /**
+   * Hooks must run on every render, so the strict-parity useMemos live above the
+   * `if (!rows.length)` early return below. They depend on state that exists from
+   * the start of the component, so hoisting is safe.
+   */
+  const official8394Parsed = useMemo(
+    () => parseOfficial8394StrictParityJson(official8394StrictPaste.trim()),
+    [official8394StrictPaste]
+  );
+
+  const preview8394StrictSnapshot = useMemo(() => {
+    if (!preview8394Parity) return null;
+    return buildPreview8394StrictSnapshotFromTelemetry(preview8394Parity, {
+      contrastPercent: designTreatment8394.contrastPercent,
+      saturatePercent: designTreatment8394.saturatePercent,
+      note: "Canvas filter mirrors ink/contrast; Sharp uses apply8394DesignTreatmentPng.",
+    });
+  }, [preview8394Parity, designTreatment8394]);
+
+  const strict8394ParityCompare: StrictParityComparison | null = useMemo(() => {
+    if (!preview8394StrictSnapshot || !official8394Parsed) return null;
+    return compare8394StrictParity(preview8394StrictSnapshot, official8394Parsed);
+  }, [preview8394StrictSnapshot, official8394Parsed]);
+
   if (!rows.length) {
     return (
       <div>
@@ -2081,25 +2105,6 @@ export function BlankRenderProfileEditor({
   const zonesFront = rows.some((r) => r.view === "front" || placementSide(r.placementId) === "front");
   const zonesBack = rows.some((r) => r.view === "back" || placementSide(r.placementId) === "back");
   const zonesLabel = [zonesFront ? "Front" : null, zonesBack ? "Back" : null].filter(Boolean).join(" · ") || "—";
-
-  const official8394Parsed = useMemo(
-    () => parseOfficial8394StrictParityJson(official8394StrictPaste.trim()),
-    [official8394StrictPaste]
-  );
-
-  const preview8394StrictSnapshot = useMemo(() => {
-    if (!preview8394Parity) return null;
-    return buildPreview8394StrictSnapshotFromTelemetry(preview8394Parity, {
-      contrastPercent: designTreatment8394.contrastPercent,
-      saturatePercent: designTreatment8394.saturatePercent,
-      note: "Canvas filter mirrors ink/contrast; Sharp uses apply8394DesignTreatmentPng.",
-    });
-  }, [preview8394Parity, designTreatment8394]);
-
-  const strict8394ParityCompare: StrictParityComparison | null = useMemo(() => {
-    if (!preview8394StrictSnapshot || !official8394Parsed) return null;
-    return compare8394StrictParity(preview8394StrictSnapshot, official8394Parsed);
-  }, [preview8394StrictSnapshot, official8394Parsed]);
 
   const strictTargetMismatch =
     official8394Parsed &&
