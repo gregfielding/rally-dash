@@ -19,7 +19,7 @@
  * Spec: RALLY_BLANK_MASK_AI_AUTOGEN.md
  */
 
-const DEFAULT_SAM_ENDPOINT = "fal-ai/grounded-sam";
+const DEFAULT_SAM_ENDPOINT = "fal-ai/evf-sam";
 const DEFAULT_PROMPT_FRONT = "chest panel inside seams";
 const DEFAULT_PROMPT_BACK = "back torso panel inside seams";
 const FAL_QUEUE_BASE = "https://queue.fal.run";
@@ -79,11 +79,16 @@ function pickRefImageUrl(blank, view) {
 async function runSam(falApiKey, endpoint, imageUrl, prompt, seed) {
   const url = `${FAL_QUEUE_BASE}/${endpoint}`;
 
+  /**
+   * Default endpoint is `fal-ai/evf-sam` which takes `prompt` + `image_url`.
+   * `text_prompt` is included for compatibility with grounded-sam-family endpoints if
+   * an operator points `RP_SAM_ENDPOINT` at one. Extra unrecognized fields are usually
+   * ignored — keep `seed` for deterministic re-rolls.
+   */
   const body = {
     image_url: imageUrl,
+    prompt: prompt,
     text_prompt: prompt,
-    box_threshold: 0.3,
-    text_threshold: 0.25,
     seed: seed,
   };
 
