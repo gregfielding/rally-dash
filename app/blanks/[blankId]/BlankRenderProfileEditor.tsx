@@ -3527,8 +3527,11 @@ export function BlankRenderProfileEditor({
             </div>
           ) : null}
 
-          {/* NATURAL PREVIEW — STRICT TELEMETRY PANEL HIDDEN — flip `false` to `true` below to re-enable. */}
-          {false && is8394 && preview8394Parity ? (
+          {/* NATURAL PREVIEW — STRICT TELEMETRY PANEL HIDDEN — flip `STRICT_TELEMETRY_ENABLED` to `true` below to re-enable. */}
+          {(() => {
+            const STRICT_TELEMETRY_ENABLED = false;
+            if (!STRICT_TELEMETRY_ENABLED || !is8394 || !preview8394Parity) return null;
+            return (
             <div
               className="rounded-lg border border-emerald-200 bg-emerald-50/95 px-3 py-2 text-[11px] text-emerald-950 space-y-2"
               role="region"
@@ -3664,7 +3667,8 @@ export function BlankRenderProfileEditor({
                 ) : null}
               </div>
             </div>
-          ) : null}
+            );
+          })()}
 
           {is8394 ? (
             <div
