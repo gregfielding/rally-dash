@@ -16,6 +16,22 @@ const { resolveDesignAssetUrls } = require("./designFileMergeCore");
 const VARIANT_FLAT_FRONT_KEYS = ["flatFront", "front"];
 const VARIANT_FLAT_BACK_KEYS = ["flatBack", "back"];
 
+/**
+ * Sharp's composite() uses `"over"` for the standard normal/source-over operation; it
+ * rejects `"normal"` with `Expected valid blend name for blend but received normal`.
+ * The editor (and CSS mix-blend-mode) speaks "normal," so normalize at the boundary.
+ */
+const CSS_TO_SHARP_BLEND = {
+  normal: "over",
+  source: "over",
+  "source-over": "over",
+};
+
+function normalizeBlendModeForSharp(mode) {
+  if (typeof mode !== "string" || mode.length === 0) return "soft-light";
+  return CSS_TO_SHARP_BLEND[mode] || mode;
+}
+
 function pickRefImage(blank, variant, view) {
   const variantImages = (variant && variant.images) || null;
   const keys = view === "front" ? VARIANT_FLAT_FRONT_KEYS : VARIANT_FLAT_BACK_KEYS;
@@ -228,7 +244,8 @@ function buildPreviewBlankRender({ db, storage, functions, sharp }) {
     const actualW = resizedResult.info.width;
     const actualH = resizedResult.info.height;
 
-    const blendMode = typeof pl.blendMode === "string" && pl.blendMode.length > 0 ? pl.blendMode : "soft-light";
+    const blendModeRequested = typeof pl.blendMode === "string" && pl.blendMode.length > 0 ? pl.blendMode : "soft-light";
+    const blendMode = normalizeBlendModeForSharp(blendModeRequested);
     const effectiveOpacity = Number.isFinite(Number(pl.blendOpacity)) ? Number(pl.blendOpacity) : 0.9;
 
     /**
@@ -330,7 +347,7 @@ function buildPreviewBlankRender({ db, storage, functions, sharp }) {
       designOriginalPx: { w: originalDesignW, h: originalDesignH },
       designCroppedPx: { w: designWidth, h: designHeight },
       designResizedPx: { w: actualW, h: actualH },
-      placementUsed: { x, y, scale: effectiveScale, blendMode, blendOpacity: effectiveOpacity },
+      placementUsed: { x, y, scale: effectiveScale, blendMode: blendModeRequested, blendOpacity: effectiveOpacity },
       variantId: variant ? variant.variantId : null,
     };
   };

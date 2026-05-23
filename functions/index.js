@@ -7697,8 +7697,13 @@ exports.onMockJobCreated = functions
       const actualW = resizedResult.info.width;
       const actualH = resizedResult.info.height;
 
-      // Per RALLY_PHASE1_DETERMINISTIC_PRODUCT_RENDERER: blend (soft-light for print-on-fabric look) + 80–90% opacity
-      const blendMode = placement.blendMode || "soft-light";
+      // Per RALLY_PHASE1_DETERMINISTIC_PRODUCT_RENDERER: blend (soft-light for print-on-fabric look) + 80–90% opacity.
+      // Sharp uses "over" for the normal/source-over op, not "normal"; CSS / editor speak "normal", so normalize.
+      const blendModeRequested = placement.blendMode || "soft-light";
+      const blendMode =
+        blendModeRequested === "normal" || blendModeRequested === "source" || blendModeRequested === "source-over"
+          ? "over"
+          : blendModeRequested;
       const effectiveOpacity = placement.blendOpacity ?? 0.9;
 
       /**
