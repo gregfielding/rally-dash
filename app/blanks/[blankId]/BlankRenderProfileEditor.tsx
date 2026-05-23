@@ -80,6 +80,8 @@ import {
   DESIGN_ARTBOARD_WIDTH_PX,
 } from "@/lib/render/designArtboardSpec";
 import { proxiedImageUrlForCanvas } from "@/lib/storageImageProxyUrl";
+import { httpsCallable } from "firebase/functions";
+import { functions as firebaseFunctions } from "@/lib/firebase/config";
 import {
   RENDER_STYLE_PRESET_LABELS,
   RENDER_STYLE_PRESET_ORDER,
@@ -874,6 +876,24 @@ export function BlankRenderProfileEditor({
    * not persisted. Default `off` so the canvas isn't decorated until requested.
    */
   const [blankMaskOverlayMode, setBlankMaskOverlayMode] = useState<"off" | "outline" | "filled">("off");
+  /**
+   * Real Sharp-composite preview rendered by the `previewBlankRender` callable. Distinct
+   * from the CSS approximation in the canvas — this is what the deterministic compositor
+   * actually outputs, with the rp_blank_masks multiply applied. See RALLY_BLANK_PREVIEW_RENDER.md.
+   */
+  type RealPreviewResult = {
+    previewUrl: string;
+    width: number;
+    height: number;
+    bytes: number;
+    maskApplied: boolean;
+    maskMean: number | null;
+    placementUsed: { x: number; y: number; scale: number; blendMode: string; blendOpacity: number };
+    variantId: string | null;
+  };
+  const [realPreview, setRealPreview] = useState<RealPreviewResult | null>(null);
+  const [realPreviewLoading, setRealPreviewLoading] = useState(false);
+  const [realPreviewError, setRealPreviewError] = useState<string | null>(null);
   const [lastExplicitRenderStyle, setLastExplicitRenderStyle] = useState<RenderStylePresetId>("soft_print");
   const [explicitCustomStyle, setExplicitCustomStyle] = useState(false);
   const [renderProfileStatus, setRenderProfileStatus] = useState<"draft" | "approved">(
@@ -1627,6 +1647,73 @@ export function BlankRenderProfileEditor({
           ) as Record<RpRenderTarget, RpRenderTargetSettings>);
     setTargetSettingsMap(nextMap);
     showToast("Reverted to last saved render profile", "success");
+  };
+
+  /**
+   * Run the same Stage A Sharp compose the production pipeline runs, with the operator's
+   * current tuning (unsaved is fine). Lets you validate a blank end-to-end before bulk
+   * generating products. See RALLY_BLANK_PREVIEW_RENDER.md.
+   */
+  const handleRealRenderPreview = async () => {
+    if (!firebaseFunctions || !blank?.blankId) {
+      setRealPreviewError("Firebase functions not available");
+      return;
+    }
+    if (!previewDesignId) {
+      setRealPreviewError("Pick a Preview design first (top of the page).");
+      return;
+    }
+    if (!tuning) {
+      setRealPreviewError("No tuning available for the current render target.");
+      return;
+    }
+    setRealPreviewError(null);
+    setRealPreviewLoading(true);
+    try {
+      const fn = httpsCallable<
+        {
+          blankId: string;
+          variantId: string | null;
+          designId: string;
+          view: "front" | "back";
+          placement: {
+            x: number;
+            y: number;
+            scale: number;
+            blendMode?: string;
+            blendOpacity?: number;
+          };
+        },
+        RealPreviewResult
+      >(firebaseFunctions, "previewBlankRender");
+      const effectiveBlend = is8394SimpleBackUi
+        ? { blendMode: zoneBlendFor8394BlendedPreview.blendMode, blendOpacity: zoneBlendFor8394BlendedPreview.blendOpacity }
+        : { blendMode: zoneBlend.blendMode, blendOpacity: zoneBlend.blendOpacity };
+      const result = await fn({
+        blankId: blank.blankId,
+        variantId: previewVariant?.variantId ?? null,
+        designId: previewDesignId,
+        view: previewSide,
+        placement: {
+          x: tuning.placement.x,
+          y: tuning.placement.y,
+          scale: tuning.placement.scale,
+          blendMode: effectiveBlend.blendMode,
+          blendOpacity: effectiveBlend.blendOpacity,
+        },
+      });
+      setRealPreview(result.data);
+    } catch (err: any) {
+      console.error("[BlankRenderProfileEditor] real preview failed:", err);
+      setRealPreviewError(err?.message || "Render preview failed");
+    } finally {
+      setRealPreviewLoading(false);
+    }
+  };
+
+  const dismissRealPreview = () => {
+    setRealPreview(null);
+    setRealPreviewError(null);
   };
 
   const [saving, setSaving] = useState(false);
@@ -3525,6 +3612,21 @@ export function BlankRenderProfileEditor({
                   {aiMaskGeneratingForView === previewSide ? "Asking SAM…" : "🪄 Generate AI mask"}
                 </button>
               ) : null}
+              {/* Real Sharp-composite preview. Same pipeline production renders use, with
+                  the current (possibly unsaved) tuning. The CSS canvas above is an approximation. */}
+              <button
+                type="button"
+                onClick={handleRealRenderPreview}
+                disabled={realPreviewLoading || !previewDesignId}
+                className="ml-2 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                title={
+                  previewDesignId
+                    ? "Run a real Sharp composite with current tuning (mask + blend applied). Validates the blank before bulk product generation."
+                    : "Pick a Preview design first (top of the page) so the render has artwork to composite."
+                }
+              >
+                {realPreviewLoading ? "Rendering…" : "🖼️ Render preview"}
+              </button>
             </div>
             {is8394SimpleBackUi && previewSideAllowsPrinting ? (
               <p className="text-[10px] text-neutral-400 mt-1 max-w-lg">
@@ -3963,6 +4065,63 @@ export function BlankRenderProfileEditor({
           )}
         </div>
       </div>
+
+      {/* Real Sharp-composite result. Sits below the CSS canvas so the operator can compare. */}
+      {realPreviewError ? (
+        <div className="mt-4 p-3 border border-red-200 bg-red-50 rounded-lg text-sm text-red-800">
+          <strong>Render preview error:</strong> {realPreviewError}
+          <button
+            onClick={() => setRealPreviewError(null)}
+            className="ml-3 text-red-700 underline text-xs hover:no-underline"
+          >
+            dismiss
+          </button>
+        </div>
+      ) : null}
+      {realPreview ? (
+        <div className="mt-4 border border-indigo-200 bg-indigo-50 rounded-lg overflow-hidden">
+          <div className="px-4 py-2 border-b border-indigo-200 bg-indigo-100 flex items-center justify-between text-xs">
+            <h4 className="font-semibold text-indigo-900">
+              🖼️ Real render — what production will output
+            </h4>
+            <div className="flex items-center gap-3 text-indigo-800 font-mono">
+              <span>
+                {realPreview.placementUsed.blendMode} · op {realPreview.placementUsed.blendOpacity.toFixed(2)} · scale {realPreview.placementUsed.scale.toFixed(2)}
+              </span>
+              <span
+                className={`px-1.5 py-0.5 rounded-full font-semibold ${
+                  realPreview.maskApplied
+                    ? "bg-emerald-200 text-emerald-900"
+                    : "bg-amber-200 text-amber-900"
+                }`}
+                title={
+                  realPreview.maskApplied
+                    ? `Mask multiplied onto design (mean=${realPreview.maskMean})`
+                    : realPreview.maskMean != null
+                      ? `Mask skipped — looked inverted (mean=${realPreview.maskMean})`
+                      : "No mask uploaded for this view"
+                }
+              >
+                {realPreview.maskApplied ? "Mask applied" : "No mask"}
+              </span>
+              <button
+                type="button"
+                onClick={dismissRealPreview}
+                className="text-indigo-700 underline hover:no-underline"
+              >
+                dismiss
+              </button>
+            </div>
+          </div>
+          <div className="p-4 flex items-center justify-center bg-neutral-50">
+            <img
+              src={proxiedImageUrlForCanvas(realPreview.previewUrl)}
+              alt="Real render preview"
+              className="max-h-[min(72vh,720px)] w-auto max-w-full rounded border border-neutral-200"
+            />
+          </div>
+        </div>
+      ) : null}
 
       {previewLightbox && previewGarmentUrl ? (
         <div

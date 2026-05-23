@@ -106,6 +106,7 @@ const {
   buildGenerateBlankMaskViaSam,
   buildCommitBlankMaskFromPreview,
 } = require("./lib/blankMaskGeneration");
+const { buildPreviewBlankRender } = require("./lib/blankPreviewRender");
 
 // Check if placeholder worker mode is enabled (default: true for safety)
 function usePlaceholderWorker() {
@@ -7369,6 +7370,15 @@ exports.generateBlankMaskViaSam = functions
 exports.commitBlankMaskFromPreview = functions
   .runWith({ memory: "512MB", timeoutSeconds: 60 })
   .https.onCall(buildCommitBlankMaskFromPreview({ db, admin, storage, functions, sharp: require("sharp") }));
+
+/**
+ * Blank-level real-render preview. Runs the same Stage A Sharp compose `onMockJobCreated`
+ * uses (with the rp_blank_masks multiply step), but takes placement/blend from the caller
+ * so the editor can preview unsaved changes. Spec: RALLY_BLANK_PREVIEW_RENDER.md.
+ */
+exports.previewBlankRender = functions
+  .runWith({ memory: "2GB", timeoutSeconds: 60 })
+  .https.onCall(buildPreviewBlankRender({ db, storage, functions, sharp: require("sharp") }));
 
 /**
  * Create a mock generation job
