@@ -47,13 +47,16 @@ function pickRefImage(blank, variant, view) {
 }
 
 /**
- * Mirror `designPngUrlForProcessing` in index.js: delegates to the shared resolver in
- * designFileMergeCore (which handles `files.{side}.lightPng.downloadUrl` etc.) so this
- * preview matches what the production pipeline picks for the same design.
+ * Pick the design PNG honoring the operator's Artwork variant choice (light / dark / white)
+ * from the Render profile tab. Falls back through reasonable alternatives if the requested
+ * variant isn't uploaded. Production (`onMockJobCreated`) currently always picks light-first;
+ * the preview supports the explicit override so the editor can validate dark/white designs.
  */
-function pickDesignPngUrl(design) {
+function pickDesignPngUrl(design, artworkMode) {
   if (!design) return null;
   const u = resolveDesignAssetUrls(design);
+  if (artworkMode === "dark") return u.darkPng || u.lightPng || u.whitePng || null;
+  if (artworkMode === "white") return u.whitePng || u.lightPng || u.darkPng || null;
   return u.lightPng || u.darkPng || u.whitePng || null;
 }
 
@@ -132,7 +135,8 @@ function buildPreviewBlankRender({ db, storage, functions, sharp }) {
   return async (data, context) => {
     await assertAdmin(db, functions, context && context.auth && context.auth.uid);
 
-    const { blankId, variantId, designId, view, placement: pl } = data || {};
+    const { blankId, variantId, designId, view, placement: pl, artworkMode: artworkModeIn } = data || {};
+    const artworkMode = artworkModeIn === "dark" || artworkModeIn === "white" ? artworkModeIn : "light";
     if (!blankId || typeof blankId !== "string") {
       throw new functions.https.HttpsError("invalid-argument", "blankId is required");
     }
@@ -171,7 +175,7 @@ function buildPreviewBlankRender({ db, storage, functions, sharp }) {
     const designSnap = await db.collection("designs").doc(designId).get();
     if (!designSnap.exists) throw new functions.https.HttpsError("not-found", `Design ${designId} not found`);
     const design = designSnap.data();
-    const designPngUrl = pickDesignPngUrl(design);
+    const designPngUrl = pickDesignPngUrl(design, artworkMode);
     if (!designPngUrl) {
       throw new functions.https.HttpsError("failed-precondition", "Design has no usable PNG (lightPng / darkPng / files.*.png)");
     }
@@ -344,6 +348,7 @@ function buildPreviewBlankRender({ db, storage, functions, sharp }) {
       maskApplied,
       maskMean: maskMean != null ? Math.round(maskMean) : null,
       maskMode,
+      artworkMode,
       designOriginalPx: { w: originalDesignW, h: originalDesignH },
       designCroppedPx: { w: designWidth, h: designHeight },
       designResizedPx: { w: actualW, h: actualH },

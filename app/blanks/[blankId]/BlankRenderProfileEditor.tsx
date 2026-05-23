@@ -890,6 +890,7 @@ export function BlankRenderProfileEditor({
     maskMean: number | null;
     placementUsed: { x: number; y: number; scale: number; blendMode: string; blendOpacity: number };
     variantId: string | null;
+    artworkMode?: "light" | "dark" | "white";
   };
   const [realPreview, setRealPreview] = useState<RealPreviewResult | null>(null);
   const [realPreviewLoading, setRealPreviewLoading] = useState(false);
@@ -1676,6 +1677,7 @@ export function BlankRenderProfileEditor({
           variantId: string | null;
           designId: string;
           view: "front" | "back";
+          artworkMode: "light" | "dark" | "white";
           placement: {
             x: number;
             y: number;
@@ -1703,6 +1705,7 @@ export function BlankRenderProfileEditor({
         variantId: previewVariant?.variantId ?? null,
         designId: previewDesignId,
         view: previewSide,
+        artworkMode: previewArtworkMode,
         placement: {
           x: tuning.placement.x,
           y: tuning.placement.y,
@@ -4096,7 +4099,7 @@ export function BlankRenderProfileEditor({
             </h4>
             <div className="flex items-center gap-3 text-indigo-800 font-mono">
               <span>
-                {realPreview.placementUsed.blendMode} · op {realPreview.placementUsed.blendOpacity.toFixed(2)} · scale {realPreview.placementUsed.scale.toFixed(2)}
+                {realPreview.artworkMode ?? "light"} · {realPreview.placementUsed.blendMode} · op {realPreview.placementUsed.blendOpacity.toFixed(2)} · scale {realPreview.placementUsed.scale.toFixed(2)}
               </span>
               <span
                 className={`px-1.5 py-0.5 rounded-full font-semibold ${
