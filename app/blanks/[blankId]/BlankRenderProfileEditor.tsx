@@ -1711,6 +1711,13 @@ export function BlankRenderProfileEditor({
         view: "front" | "back";
         artworkMode: "light" | "dark" | "white";
         withRealism?: boolean;
+        /**
+         * The exact design PNG URL the CSS canvas is rendering. Passing it through
+         * eliminates client/server resolver drift for designs with side-specific
+         * assets (e.g. files.front.darkPng vs files.back.darkPng), so Stage A
+         * composites the same image bytes the user sees in the preview canvas.
+         */
+        designUrlOverride?: string | null;
         placement: {
           x: number;
           y: number;
@@ -1756,6 +1763,8 @@ export function BlankRenderProfileEditor({
         view: previewSide,
         artworkMode: previewArtworkMode,
         withRealism,
+        /** Same PNG URL the CSS canvas is showing — guarantees Stage A composites identical bytes. */
+        designUrlOverride: effectiveOverlayArtUrl || null,
         placement: {
           x: tuning.placement.x,
           y: tuning.placement.y,

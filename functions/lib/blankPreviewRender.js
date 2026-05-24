@@ -168,69 +168,31 @@ async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, dr
   const draftBase64 = draftBuffer.toString("base64");
   const draftDataUrl = `data:image/png;base64,${draftBase64}`;
 
-  const maskDocId = `${blankId}_${view}`;
-  const maskDoc = await db.collection("rp_blank_masks").doc(maskDocId).get();
-  const maskData = maskDoc.exists ? maskDoc.data() : null;
-
-  let useMask = false;
-  let maskBase64 = null;
-  let falEndpoint = FAL_IMG2IMG_ENDPOINT;
-
-  if (maskData && maskData.mask && maskData.mask.downloadUrl) {
-    try {
-      const maskResp = await fetchFn(maskData.mask.downloadUrl);
-      if (maskResp.ok) {
-        let processedMaskBuffer = Buffer.from(await maskResp.arrayBuffer());
-        const maskMeta = await sharp(processedMaskBuffer).metadata();
-        if (maskMeta.width !== draftMeta.width || maskMeta.height !== draftMeta.height) {
-          processedMaskBuffer = await sharp(processedMaskBuffer)
-            .resize(draftMeta.width, draftMeta.height, { fit: "fill" })
-            .png()
-            .toBuffer();
-        }
-        processedMaskBuffer = await sharp(processedMaskBuffer)
-          .grayscale()
-          .threshold(128)
-          .png()
-          .toBuffer();
-        maskBase64 = processedMaskBuffer.toString("base64");
-        useMask = true;
-        falEndpoint = FAL_INPAINT_ENDPOINT;
-      }
-    } catch (maskErr) {
-      console.warn("[previewBlankRender Stage B] mask processing failed:", maskErr && maskErr.message);
-    }
-  }
-
   /**
-   * Use the queue endpoint (matches onMockJobCreated). Sync (`fal.run`) returned
-   * "Path /dev/inpainting not found" because fal.run doesn't accept multi-segment
-   * endpoint slugs. The flux endpoints return images directly in the status response
-   * once COMPLETED, so we don't need to fetch response_url at all.
+   * Stage A already multiplied the rp_blank_masks PNG onto the design RGBA, so the
+   * composite we hand fal.ai already has the print clipped to the printable zone.
+   * Stage B just needs a global img2img realism pass — no mask is sent to fal.ai.
+   *
+   * The previous behavior (inpainting endpoint when a mask exists) used the
+   * `fal-ai/flux/dev/inpainting` slug, which now 404s with `Path /dev/inpainting
+   * not found` — that variant was deprecated from fal.ai's catalog. The
+   * `fal-ai/flux/dev/image-to-image` endpoint is still live (per fal.ai docs)
+   * and works for the realism pass. Low strength preserves the design's geometry
+   * and edges; fal.ai adds fabric texture / lighting / wrinkle integration.
    */
+  const falEndpoint = FAL_IMG2IMG_ENDPOINT;
+  const useMask = false;
   const falUrl = `https://queue.fal.run/${falEndpoint}`;
-  const falPayload = useMask && maskBase64
-    ? {
-        image_url: draftDataUrl,
-        mask_url: `data:image/png;base64,${maskBase64}`,
-        prompt: REALISM_PROMPT,
-        negative_prompt: REALISM_NEGATIVE,
-        strength: 0.25,
-        num_inference_steps: 28,
-        guidance_scale: 3.5,
-        num_images: 1,
-        enable_safety_checker: false,
-      }
-    : {
-        image_url: draftDataUrl,
-        prompt: REALISM_PROMPT,
-        negative_prompt: REALISM_NEGATIVE,
-        strength: 0.2,
-        num_inference_steps: 28,
-        guidance_scale: 3.5,
-        num_images: 1,
-        enable_safety_checker: false,
-      };
+  const falPayload = {
+    image_url: draftDataUrl,
+    prompt: REALISM_PROMPT,
+    negative_prompt: REALISM_NEGATIVE,
+    strength: 0.2,
+    num_inference_steps: 28,
+    guidance_scale: 3.5,
+    num_images: 1,
+    enable_safety_checker: false,
+  };
 
   const submitResp = await fetchFn(falUrl, {
     method: "POST",
@@ -244,6 +206,10 @@ async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, dr
   const submitJson = await submitResp.json();
   const requestId = submitJson.request_id || submitJson.id;
   const statusUrl = submitJson.status_url;
+  const responseUrl = submitJson.response_url;
+  console.log(
+    `[realism] submit: status=${submitJson.status} request_id=${requestId} status_url=${statusUrl} response_url=${responseUrl} keys=${JSON.stringify(Object.keys(submitJson))}`
+  );
   if (!statusUrl) {
     throw new Error(
       `fal.ai submit returned no status_url (request_id=${requestId || "missing"}). Submit shape: ${JSON.stringify(Object.keys(submitJson))}`
@@ -264,6 +230,7 @@ async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, dr
     let completed = false;
     /** Pass `?logs=1` so fal.ai includes intermediate fields in the status payload. */
     const statusUrlWithLogs = statusUrl.includes("?") ? `${statusUrl}&logs=1` : `${statusUrl}?logs=1`;
+    let lastStatusJson = null;
     for (let i = 0; i < REALISM_MAX_POLL_ATTEMPTS && !completed; i++) {
       await new Promise((resolve) => setTimeout(resolve, REALISM_POLL_INTERVAL_MS));
       const statusResp = await fetchFn(statusUrlWithLogs, {
@@ -271,16 +238,40 @@ async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, dr
       });
       if (!statusResp.ok) continue;
       const statusJson = await statusResp.json();
+      lastStatusJson = statusJson;
       if (statusJson.status === "FAILED") {
         throw new Error(`fal.ai realism job failed: ${statusJson.error || "unknown"}`);
       }
+      /** Inline images in status response (some fal endpoints do this). */
       if (statusJson.images || (statusJson.output && statusJson.output.images)) {
         resultJson = statusJson;
         completed = true;
+        break;
+      }
+      /** COMPLETED without inline images → fetch response_url to get the actual result. */
+      if (statusJson.status === "COMPLETED" && responseUrl) {
+        console.log(`[realism] status COMPLETED, fetching response_url: ${responseUrl}`);
+        const finalResp = await fetchFn(responseUrl, {
+          headers: { Authorization: `Key ${falApiKey}` },
+        });
+        const finalText = await finalResp.text();
+        if (!finalResp.ok) {
+          throw new Error(`fal.ai response_url returned HTTP ${finalResp.status} at ${responseUrl}: ${finalText.slice(0, 200)}`);
+        }
+        try {
+          resultJson = JSON.parse(finalText);
+          console.log(`[realism] response_url returned keys=${JSON.stringify(Object.keys(resultJson))}`);
+        } catch (e) {
+          throw new Error(`fal.ai response_url returned non-JSON: ${finalText.slice(0, 200)}`);
+        }
+        completed = true;
+        break;
       }
     }
     if (!completed) {
-      throw new Error("fal.ai realism job timed out without returning images");
+      throw new Error(
+        `fal.ai realism job timed out. Last status: ${lastStatusJson ? JSON.stringify({ status: lastStatusJson.status, keys: Object.keys(lastStatusJson) }) : "no successful status response"}`
+      );
     }
   }
 
@@ -315,7 +306,7 @@ async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, dr
  * catches and writes the error message into the job doc.
  */
 function validatePreviewInput(functions, data) {
-  const { blankId, variantId, designId, view, placement: pl, artworkMode: artworkModeIn, withRealism: withRealismIn } = data || {};
+  const { blankId, variantId, designId, view, placement: pl, artworkMode: artworkModeIn, withRealism: withRealismIn, designUrlOverride: designUrlOverrideIn } = data || {};
   const artworkMode = artworkModeIn === "dark" || artworkModeIn === "white" ? artworkModeIn : "light";
   if (!blankId || typeof blankId !== "string") {
     throw new functions.https.HttpsError("invalid-argument", "blankId is required");
@@ -337,6 +328,8 @@ function validatePreviewInput(functions, data) {
     artworkMode,
     placement: pl,
     withRealism: withRealismIn === true,
+    designUrlOverride:
+      typeof designUrlOverrideIn === "string" && designUrlOverrideIn.length > 0 ? designUrlOverrideIn : null,
   };
 }
 
@@ -372,10 +365,24 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
   const designSnap = await db.collection("designs").doc(designId).get();
   if (!designSnap.exists) throw new functions.https.HttpsError("not-found", `Design ${designId} not found`);
   const design = designSnap.data();
-  const designPngUrl = pickDesignPngUrl(design, artworkMode);
+  /**
+   * Trust the caller's resolved URL when provided — the editor uses `pickDesignPreviewPng`
+   * (lib/designs/designHelpers.ts via resolveDesignSideAssets) which handles side-specific
+   * `assets[side]` / `files[side]` paths. The server's `pickDesignPngUrl` uses a slightly
+   * different resolver (`resolveDesignAssetUrls` in designFileMergeCore) and can pick a
+   * different variant for designs with side-specific assets. Passing the editor's URL
+   * here guarantees CSS preview and Stage A composite the same image bytes.
+   */
+  const designPngUrl =
+    (input.designUrlOverride && typeof input.designUrlOverride === "string"
+      ? input.designUrlOverride
+      : null) || pickDesignPngUrl(design, artworkMode);
   if (!designPngUrl) {
     throw new functions.https.HttpsError("failed-precondition", "Design has no usable PNG (lightPng / darkPng / files.*.png)");
   }
+  console.log(
+    `[composeStageA] designUrl=${designPngUrl} source=${input.designUrlOverride ? "client-override" : "server-resolved"} artworkMode=${artworkMode}`
+  );
 
   const blankResp = await fetch(refImageUrl);
   if (!blankResp.ok) throw new functions.https.HttpsError("internal", `Failed to fetch garment image (HTTP ${blankResp.status})`);
@@ -508,21 +515,25 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
          * and clipped most of the design away. The extract path is geometrically
          * correct: only the bit of the mask actually under the design gets multiplied.
          */
+        /**
+         * Read the mask as SINGLE-channel grayscale raw bytes. Critically, NO ensureAlpha —
+         * that turned the raw stride into 2 bytes/pixel (Y+A) while my loop walks 4 bytes/pixel
+         * to match the design RGBA. Result: mask values were read at every-other-pixel offsets
+         * AND the buffer ran out halfway through, zeroing the bottom half of the design (where
+         * "69" lives). Now: mask buffer is `numPixels` bytes, design is `numPixels * 4` bytes,
+         * and we walk both with explicit pixel index `p`.
+         */
         const maskResult = await sharp(await maskResp.arrayBuffer())
           .resize(blankWidth, blankHeight, { fit: "fill" })
           .extract({ left: designLeft, top: designTop, width: actualW, height: actualH })
           .grayscale()
-          .ensureAlpha()
           .raw()
           .toBuffer({ depth: 8, resolveWithObject: true });
         const maskBuffer = maskResult.data;
+        const numPixels = maskBuffer.length;
         let sum = 0;
-        let count = 0;
-        for (let i = 0; i < maskBuffer.length; i += 4) {
-          sum += maskBuffer[i];
-          count++;
-        }
-        maskMean = count > 0 ? sum / count : 0;
+        for (let p = 0; p < numPixels; p++) sum += maskBuffer[p];
+        maskMean = numPixels > 0 ? sum / numPixels : 0;
         /**
          * Empty-mask sanity check. The extracted region is the part of the mask under
          * the design's footprint, NOT the whole mask. Three cases:
@@ -540,8 +551,10 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
          */
         const looksUsable = maskMean >= 5;
         if (looksUsable) {
-          for (let i = 0; i < resizedDesignRaw.length; i += 4) {
-            const m = maskBuffer[i];
+          /** Walk both buffers by pixel index: mask is 1 byte/px, design is 4 bytes/px. */
+          for (let p = 0; p < numPixels; p++) {
+            const m = maskBuffer[p];
+            const i = p * 4;
             resizedDesignRaw[i] = Math.round((resizedDesignRaw[i] * m) / 255);
             resizedDesignRaw[i + 1] = Math.round((resizedDesignRaw[i + 1] * m) / 255);
             resizedDesignRaw[i + 2] = Math.round((resizedDesignRaw[i + 2] * m) / 255);
@@ -688,6 +701,8 @@ function buildPreviewBlankRender({ db, storage, functions, sharp, admin }) {
         view: input.view,
         artworkMode: input.artworkMode,
         placement: input.placement,
+        /** Persist the editor's resolved design URL so the trigger composites the same image. */
+        designUrlOverride: input.designUrlOverride,
         withRealism: true,
         status: "queued",
         error: null,
@@ -754,6 +769,7 @@ function buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp })
         artworkMode: job.artworkMode || "light",
         placement: job.placement || {},
         withRealism: job.withRealism === true,
+        designUrlOverride: typeof job.designUrlOverride === "string" ? job.designUrlOverride : null,
       };
 
       const stageAResult = await composeStageA({ db, storage, sharp, functions, input });

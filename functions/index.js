@@ -7773,29 +7773,30 @@ exports.onMockJobCreated = functions
              * silhouette) into a thin band — clipped most of the design. Aligned with
              * composeStageA in functions/lib/blankPreviewRender.js.
              */
+            // Single-channel grayscale raw — no ensureAlpha. The stride mismatch
+            // (mask 2 bytes/px with ensureAlpha vs design 4 bytes/px) was zeroing the
+            // bottom half of the design. Aligned with composeStageA in blankPreviewRender.
             const maskResult = await sharp(await maskResp.arrayBuffer())
               .resize(blankWidth, blankHeight, { fit: "fill" })
               .extract({ left: designLeft, top: designTop, width: actualW, height: actualH })
               .grayscale()
-              .ensureAlpha()
               .raw()
               .toBuffer({ depth: 8, resolveWithObject: true });
             const maskBuffer = maskResult.data;
+            const maskNumPixels = maskBuffer.length;
             let maskSum = 0;
-            let maskCount = 0;
-            for (let i = 0; i < maskBuffer.length; i += 4) {
-              maskSum += maskBuffer[i];
-              maskCount++;
-            }
-            const maskMean = maskCount > 0 ? maskSum / maskCount : 0;
+            for (let p = 0; p < maskNumPixels; p++) maskSum += maskBuffer[p];
+            const maskMean = maskNumPixels > 0 ? maskSum / maskNumPixels : 0;
             // Empty-mask sanity check. The extracted region is the part of the mask under
             // the design's footprint. Mean ~0 → design outside print zone, skip (multiply
             // would zero the design). Mean ~255 → design fully inside print zone, apply as
             // no-op (multiplying by white = identity). Keep aligned with composeStageA in
             // functions/lib/blankPreviewRender.js.
             if (maskMean >= 5) {
-              for (let i = 0; i < resizedDesignRaw.length; i += 4) {
-                const m = maskBuffer[i];
+              // Walk by pixel index: mask 1 byte/px, design 4 bytes/px.
+              for (let p = 0; p < maskNumPixels; p++) {
+                const m = maskBuffer[p];
+                const i = p * 4;
                 resizedDesignRaw[i] = Math.round((resizedDesignRaw[i] * m) / 255);
                 resizedDesignRaw[i + 1] = Math.round((resizedDesignRaw[i + 1] * m) / 255);
                 resizedDesignRaw[i + 2] = Math.round((resizedDesignRaw[i + 2] * m) / 255);
