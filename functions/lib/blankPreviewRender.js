@@ -309,311 +309,408 @@ async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, dr
   };
 }
 
-function buildPreviewBlankRender({ db, storage, functions, sharp }) {
-  return async (data, context) => {
-    await assertAdmin(db, functions, context && context.auth && context.auth.uid);
+/**
+ * Validate + normalize a job's input fields the same way for sync callable and async
+ * trigger entry points. Throws an `HttpsError` for the sync callable; the trigger
+ * catches and writes the error message into the job doc.
+ */
+function validatePreviewInput(functions, data) {
+  const { blankId, variantId, designId, view, placement: pl, artworkMode: artworkModeIn, withRealism: withRealismIn } = data || {};
+  const artworkMode = artworkModeIn === "dark" || artworkModeIn === "white" ? artworkModeIn : "light";
+  if (!blankId || typeof blankId !== "string") {
+    throw new functions.https.HttpsError("invalid-argument", "blankId is required");
+  }
+  if (!designId || typeof designId !== "string") {
+    throw new functions.https.HttpsError("invalid-argument", "designId is required");
+  }
+  if (view !== "front" && view !== "back") {
+    throw new functions.https.HttpsError("invalid-argument", "view must be 'front' or 'back'");
+  }
+  if (!pl || typeof pl !== "object") {
+    throw new functions.https.HttpsError("invalid-argument", "placement is required");
+  }
+  return {
+    blankId,
+    variantId: variantId || null,
+    designId,
+    view,
+    artworkMode,
+    placement: pl,
+    withRealism: withRealismIn === true,
+  };
+}
 
-    const {
-      blankId,
-      variantId,
-      designId,
-      view,
-      placement: pl,
-      artworkMode: artworkModeIn,
-      withRealism: withRealismIn,
-    } = data || {};
-    const artworkMode = artworkModeIn === "dark" || artworkModeIn === "white" ? artworkModeIn : "light";
-    if (!blankId || typeof blankId !== "string") {
-      throw new functions.https.HttpsError("invalid-argument", "blankId is required");
-    }
-    if (!designId || typeof designId !== "string") {
-      throw new functions.https.HttpsError("invalid-argument", "designId is required");
-    }
-    if (view !== "front" && view !== "back") {
-      throw new functions.https.HttpsError("invalid-argument", "view must be 'front' or 'back'");
-    }
-    if (!pl || typeof pl !== "object") {
-      throw new functions.https.HttpsError("invalid-argument", "placement is required");
-    }
+/**
+ * Stage A composite — same algorithm `onMockJobCreated` Stage A uses, in lib form so
+ * both the sync callable (`previewBlankRender` with withRealism=false) and the async
+ * trigger (`onBlankPreviewJobCreated`) call the same code path.
+ *
+ * Returns the persisted `stageA` summary plus the in-memory buffer/meta needed to chain
+ * into Stage B without re-loading from Storage.
+ */
+async function composeStageA({ db, storage, sharp, functions, input }) {
+  const { blankId, variantId, designId, view, artworkMode, placement: pl } = input;
 
-    const blankSnap = await db.collection("rp_blanks").doc(blankId).get();
-    if (!blankSnap.exists) throw new functions.https.HttpsError("not-found", `Blank ${blankId} not found`);
-    const blank = blankSnap.data();
+  const blankSnap = await db.collection("rp_blanks").doc(blankId).get();
+  if (!blankSnap.exists) throw new functions.https.HttpsError("not-found", `Blank ${blankId} not found`);
+  const blank = blankSnap.data();
 
-    /**
-     * variantId can be a stored variants[].variantId or null (use first available).
-     * Treat absence as "first variant with the required view image."
-     */
-    const variants = Array.isArray(blank.variants) ? blank.variants : [];
-    const variant =
-      (variantId && variants.find((v) => v && v.variantId === variantId)) ||
-      variants.find((v) => v && pickRefImage(blank, v, view)) ||
-      null;
+  const variants = Array.isArray(blank.variants) ? blank.variants : [];
+  const variant =
+    (variantId && variants.find((v) => v && v.variantId === variantId)) ||
+    variants.find((v) => v && pickRefImage(blank, v, view)) ||
+    null;
 
-    const refImageUrl = pickRefImage(blank, variant, view);
-    if (!refImageUrl) {
-      throw new functions.https.HttpsError(
-        "failed-precondition",
-        `No ${view} image for this blank — upload a variant photo or a master image first`
-      );
-    }
+  const refImageUrl = pickRefImage(blank, variant, view);
+  if (!refImageUrl) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      `No ${view} image for this blank — upload a variant photo or a master image first`
+    );
+  }
 
-    const designSnap = await db.collection("designs").doc(designId).get();
-    if (!designSnap.exists) throw new functions.https.HttpsError("not-found", `Design ${designId} not found`);
-    const design = designSnap.data();
-    const designPngUrl = pickDesignPngUrl(design, artworkMode);
-    if (!designPngUrl) {
-      throw new functions.https.HttpsError("failed-precondition", "Design has no usable PNG (lightPng / darkPng / files.*.png)");
-    }
+  const designSnap = await db.collection("designs").doc(designId).get();
+  if (!designSnap.exists) throw new functions.https.HttpsError("not-found", `Design ${designId} not found`);
+  const design = designSnap.data();
+  const designPngUrl = pickDesignPngUrl(design, artworkMode);
+  if (!designPngUrl) {
+    throw new functions.https.HttpsError("failed-precondition", "Design has no usable PNG (lightPng / darkPng / files.*.png)");
+  }
 
-    const blankResp = await fetch(refImageUrl);
-    if (!blankResp.ok) throw new functions.https.HttpsError("internal", `Failed to fetch garment image (HTTP ${blankResp.status})`);
-    const blankBuffer = Buffer.from(await blankResp.arrayBuffer());
+  const blankResp = await fetch(refImageUrl);
+  if (!blankResp.ok) throw new functions.https.HttpsError("internal", `Failed to fetch garment image (HTTP ${blankResp.status})`);
+  const blankBuffer = Buffer.from(await blankResp.arrayBuffer());
 
-    const designResp = await fetch(designPngUrl);
-    if (!designResp.ok) throw new functions.https.HttpsError("internal", `Failed to fetch design PNG (HTTP ${designResp.status})`);
-    let designBuffer = Buffer.from(await designResp.arrayBuffer());
+  const designResp = await fetch(designPngUrl);
+  if (!designResp.ok) throw new functions.https.HttpsError("internal", `Failed to fetch design PNG (HTTP ${designResp.status})`);
+  let designBuffer = Buffer.from(await designResp.arrayBuffer());
 
-    const designMetaOriginal = await sharp(designBuffer).metadata();
-    const originalDesignW = designMetaOriginal.width || 1;
-    const originalDesignH = designMetaOriginal.height || 1;
-    const cropResult = await cropDesignToArtworkBounds(sharp, designBuffer);
-    designBuffer = cropResult.buffer;
-    const designWidth = cropResult.width;
-    const designHeight = cropResult.height;
+  const cropResult = await cropDesignToArtworkBounds(sharp, designBuffer);
+  designBuffer = cropResult.buffer;
+  const designWidth = cropResult.width;
+  const designHeight = cropResult.height;
 
-    const blankMeta = await sharp(blankBuffer).metadata();
-    const blankWidth = blankMeta.width;
-    const blankHeight = blankMeta.height;
-    if (!blankWidth || !blankHeight) {
-      throw new functions.https.HttpsError("internal", "Garment image has no readable dimensions");
-    }
+  const blankMeta = await sharp(blankBuffer).metadata();
+  const blankWidth = blankMeta.width;
+  const blankHeight = blankMeta.height;
+  if (!blankWidth || !blankHeight) {
+    throw new functions.https.HttpsError("internal", "Garment image has no readable dimensions");
+  }
 
-    /** Match the placement math `onMockJobCreated` uses (lines ~7637–7659). */
-    const x = Number.isFinite(Number(pl.x)) ? Number(pl.x) : 0.5;
-    const y = Number.isFinite(Number(pl.y)) ? Number(pl.y) : 0.5;
-    const effectiveScale = Number.isFinite(Number(pl.scale)) ? Number(pl.scale) : 0.6;
-    const centerXpx = Math.round(x * blankWidth);
-    const centerYpx = Math.round(y * blankHeight);
-    let artBoxPxW, artBoxPxH, left, top;
-    if (Number.isFinite(Number(pl.width)) && Number.isFinite(Number(pl.height)) && Number(pl.width) > 0 && Number(pl.height) > 0) {
-      const fullPrintW = blankWidth * Number(pl.width);
-      const fullPrintH = blankHeight * Number(pl.height);
-      artBoxPxW = Math.round(fullPrintW * effectiveScale);
-      artBoxPxH = Math.round(fullPrintH * effectiveScale);
-    } else {
-      const modalBase = 0.5;
-      artBoxPxW = Math.round(blankWidth * modalBase * effectiveScale);
-      artBoxPxH = Math.round(blankHeight * modalBase * effectiveScale);
-    }
-    left = Math.round(centerXpx - artBoxPxW / 2);
-    top = Math.round(centerYpx - artBoxPxH / 2);
+  const x = Number.isFinite(Number(pl.x)) ? Number(pl.x) : 0.5;
+  const y = Number.isFinite(Number(pl.y)) ? Number(pl.y) : 0.5;
+  const effectiveScale = Number.isFinite(Number(pl.scale)) ? Number(pl.scale) : 0.6;
+  const centerXpx = Math.round(x * blankWidth);
+  const centerYpx = Math.round(y * blankHeight);
+  let artBoxPxW;
+  let artBoxPxH;
+  if (Number.isFinite(Number(pl.width)) && Number.isFinite(Number(pl.height)) && Number(pl.width) > 0 && Number(pl.height) > 0) {
+    artBoxPxW = Math.round(blankWidth * Number(pl.width) * effectiveScale);
+    artBoxPxH = Math.round(blankHeight * Number(pl.height) * effectiveScale);
+  } else {
+    artBoxPxW = Math.round(blankWidth * 0.5 * effectiveScale);
+    artBoxPxH = Math.round(blankHeight * 0.5 * effectiveScale);
+  }
+  let left = Math.round(centerXpx - artBoxPxW / 2);
+  let top = Math.round(centerYpx - artBoxPxH / 2);
 
-    const designAspect = designWidth / designHeight;
-    const boxAspect = artBoxPxW / artBoxPxH;
-    let resizedWidth;
-    let resizedHeight;
-    if (designAspect >= boxAspect) {
-      resizedWidth = artBoxPxW;
-      resizedHeight = Math.round(artBoxPxW / designAspect);
-    } else {
-      resizedHeight = artBoxPxH;
-      resizedWidth = Math.round(artBoxPxH * designAspect);
-    }
+  const designAspect = designWidth / designHeight;
+  const boxAspect = artBoxPxW / artBoxPxH;
+  let resizedWidth;
+  let resizedHeight;
+  if (designAspect >= boxAspect) {
+    resizedWidth = artBoxPxW;
+    resizedHeight = Math.round(artBoxPxW / designAspect);
+  } else {
+    resizedHeight = artBoxPxH;
+    resizedWidth = Math.round(artBoxPxH * designAspect);
+  }
 
-    const printBlurSigma = Number.isFinite(Number(pl.printBlurSigma)) ? Number(pl.printBlurSigma) : 0.3;
-    const printSaturation = Number.isFinite(Number(pl.printSaturation)) ? Number(pl.printSaturation) : 0.96;
-    const resizedResult = await sharp(designBuffer)
-      .resize(resizedWidth, resizedHeight, { fit: "inside" })
-      .blur(printBlurSigma)
-      .modulate({ saturation: printSaturation })
-      .ensureAlpha()
-      .raw()
-      .toBuffer({ depth: 8, resolveWithObject: true });
-    let resizedDesignRaw = resizedResult.data;
-    const actualW = resizedResult.info.width;
-    const actualH = resizedResult.info.height;
+  const printBlurSigma = Number.isFinite(Number(pl.printBlurSigma)) ? Number(pl.printBlurSigma) : 0.3;
+  const printSaturation = Number.isFinite(Number(pl.printSaturation)) ? Number(pl.printSaturation) : 0.96;
+  const resizedResult = await sharp(designBuffer)
+    .resize(resizedWidth, resizedHeight, { fit: "inside" })
+    .blur(printBlurSigma)
+    .modulate({ saturation: printSaturation })
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ depth: 8, resolveWithObject: true });
+  const resizedDesignRaw = resizedResult.data;
+  const actualW = resizedResult.info.width;
+  const actualH = resizedResult.info.height;
 
-    const blendModeRequested = typeof pl.blendMode === "string" && pl.blendMode.length > 0 ? pl.blendMode : "soft-light";
-    const blendMode = normalizeBlendModeForSharp(blendModeRequested);
-    const effectiveOpacity = Number.isFinite(Number(pl.blendOpacity)) ? Number(pl.blendOpacity) : 0.9;
+  const blendModeRequested = typeof pl.blendMode === "string" && pl.blendMode.length > 0 ? pl.blendMode : "soft-light";
+  const blendMode = normalizeBlendModeForSharp(blendModeRequested);
+  const effectiveOpacity = Number.isFinite(Number(pl.blendOpacity)) ? Number(pl.blendOpacity) : 0.9;
 
-    /**
-     * Multiply rp_blank_masks/{blankId}_{view} onto the design RGBA. Three gates, same as
-     * onMockJobCreated:
-     *   1. `placement.maskConfig.mode === "none"` → skip (operator opted out).
-     *      Null/undefined or "blank_mask_doc" → apply if a mask doc exists.
-     *   2. Mask doc must exist with a downloadUrl.
-     *   3. Mask must not look inverted (mean > 80).
-     */
-    let maskApplied = false;
-    let maskMean = null;
-    const maskMode =
-      pl.maskConfig && typeof pl.maskConfig.mode === "string" ? pl.maskConfig.mode : null;
-    try {
-      if (maskMode === "none") {
-        console.log("[previewBlankRender] Skipping fabric mask (maskConfig.mode='none')");
-      }
-      const maskDocId = `${blankId}_${view}`;
-      const maskDoc = maskMode === "none" ? null : await db.collection("rp_blank_masks").doc(maskDocId).get();
-      const maskData = maskDoc && maskDoc.exists ? maskDoc.data() : null;
-      if (maskData && maskData.mask && maskData.mask.downloadUrl) {
-        const maskResp = await fetch(maskData.mask.downloadUrl);
-        if (maskResp.ok) {
-          const maskResult = await sharp(await maskResp.arrayBuffer())
-            .resize(actualW, actualH, { fit: "fill" })
-            .grayscale()
-            .ensureAlpha()
-            .raw()
-            .toBuffer({ depth: 8, resolveWithObject: true });
-          const maskBuffer = maskResult.data;
-          let sum = 0;
-          let count = 0;
-          for (let i = 0; i < maskBuffer.length; i += 4) {
-            sum += maskBuffer[i];
-            count++;
+  let maskApplied = false;
+  let maskMean = null;
+  const maskMode = pl.maskConfig && typeof pl.maskConfig.mode === "string" ? pl.maskConfig.mode : null;
+  try {
+    const maskDocId = `${blankId}_${view}`;
+    const maskDoc = maskMode === "none" ? null : await db.collection("rp_blank_masks").doc(maskDocId).get();
+    const maskData = maskDoc && maskDoc.exists ? maskDoc.data() : null;
+    if (maskData && maskData.mask && maskData.mask.downloadUrl) {
+      const maskResp = await fetch(maskData.mask.downloadUrl);
+      if (maskResp.ok) {
+        const maskResult = await sharp(await maskResp.arrayBuffer())
+          .resize(actualW, actualH, { fit: "fill" })
+          .grayscale()
+          .ensureAlpha()
+          .raw()
+          .toBuffer({ depth: 8, resolveWithObject: true });
+        const maskBuffer = maskResult.data;
+        let sum = 0;
+        let count = 0;
+        for (let i = 0; i < maskBuffer.length; i += 4) {
+          sum += maskBuffer[i];
+          count++;
+        }
+        maskMean = count > 0 ? sum / count : 0;
+        if (maskMean > 80) {
+          for (let i = 0; i < resizedDesignRaw.length; i += 4) {
+            const m = maskBuffer[i];
+            resizedDesignRaw[i] = Math.round((resizedDesignRaw[i] * m) / 255);
+            resizedDesignRaw[i + 1] = Math.round((resizedDesignRaw[i + 1] * m) / 255);
+            resizedDesignRaw[i + 2] = Math.round((resizedDesignRaw[i + 2] * m) / 255);
+            resizedDesignRaw[i + 3] = Math.round((resizedDesignRaw[i + 3] * m) / 255);
           }
-          maskMean = count > 0 ? sum / count : 0;
-          if (maskMean > 80) {
-            for (let i = 0; i < resizedDesignRaw.length; i += 4) {
-              const m = maskBuffer[i];
-              resizedDesignRaw[i] = Math.round((resizedDesignRaw[i] * m) / 255);
-              resizedDesignRaw[i + 1] = Math.round((resizedDesignRaw[i + 1] * m) / 255);
-              resizedDesignRaw[i + 2] = Math.round((resizedDesignRaw[i + 2] * m) / 255);
-              resizedDesignRaw[i + 3] = Math.round((resizedDesignRaw[i + 3] * m) / 255);
-            }
-            maskApplied = true;
-          }
+          maskApplied = true;
         }
       }
-    } catch (maskErr) {
-      console.warn("[previewBlankRender] mask apply failed:", maskErr && maskErr.message);
     }
+  } catch (maskErr) {
+    console.warn("[composeStageA] mask apply failed:", maskErr && maskErr.message);
+  }
 
-    const designWithOpacity = applyOpacityToRgbaBuffer(resizedDesignRaw, effectiveOpacity);
-    const designPremultiplied = premultiplyRgbaBuffer(designWithOpacity);
-    const designForComposite = await sharp(designPremultiplied, {
-      raw: { width: actualW, height: actualH, channels: 4, premultiplied: true },
-    })
-      .png()
-      .toBuffer();
+  const designWithOpacity = applyOpacityToRgbaBuffer(resizedDesignRaw, effectiveOpacity);
+  const designPremultiplied = premultiplyRgbaBuffer(designWithOpacity);
+  const designForComposite = await sharp(designPremultiplied, {
+    raw: { width: actualW, height: actualH, channels: 4, premultiplied: true },
+  })
+    .png()
+    .toBuffer();
 
-    left = Math.round(left + (artBoxPxW - actualW) / 2);
-    top = Math.round(top + (artBoxPxH - actualH) / 2);
-    left = Math.max(0, Math.min(left, blankWidth - actualW));
-    top = Math.max(0, Math.min(top, blankHeight - actualH));
+  left = Math.round(left + (artBoxPxW - actualW) / 2);
+  top = Math.round(top + (artBoxPxH - actualH) / 2);
+  left = Math.max(0, Math.min(left, blankWidth - actualW));
+  top = Math.max(0, Math.min(top, blankHeight - actualH));
 
-    const previewBuffer = await sharp(blankBuffer)
-      .composite([{ input: designForComposite, left, top, blend: blendMode, premultiplied: true }])
-      .png()
-      .toBuffer();
+  const previewBuffer = await sharp(blankBuffer)
+    .composite([{ input: designForComposite, left, top, blend: blendMode, premultiplied: true }])
+    .png()
+    .toBuffer();
 
-    const timestamp = Date.now();
-    const variantSuffix = variant && variant.variantId ? `_${variant.variantId}` : "";
-    const storagePath = `rp/blank_previews/${blankId}/${view}/_preview${variantSuffix}_${timestamp}.png`;
-    const bucket = storage.bucket();
-    const file = bucket.file(storagePath);
-    const downloadToken = `${timestamp}_${Math.floor(Math.random() * 1e6).toString(16)}`;
-    await file.save(previewBuffer, {
+  const timestamp = Date.now();
+  const variantSuffix = variant && variant.variantId ? `_${variant.variantId}` : "";
+  const storagePath = `rp/blank_previews/${blankId}/${view}/_preview${variantSuffix}_${timestamp}.png`;
+  const bucket = storage.bucket();
+  const file = bucket.file(storagePath);
+  const downloadToken = `${timestamp}_${Math.floor(Math.random() * 1e6).toString(16)}`;
+  await file.save(previewBuffer, {
+    contentType: "image/png",
+    metadata: {
       contentType: "image/png",
-      metadata: {
-        contentType: "image/png",
-        metadata: { firebaseStorageDownloadTokens: downloadToken },
-      },
-      resumable: false,
-    });
-    const downloadUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(storagePath)}?alt=media&token=${downloadToken}`;
+      metadata: { firebaseStorageDownloadTokens: downloadToken },
+    },
+    resumable: false,
+  });
+  const downloadUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(storagePath)}?alt=media&token=${downloadToken}`;
+  const stageAMeta = await sharp(previewBuffer).metadata();
 
-    const stageAMeta = await sharp(previewBuffer).metadata();
-
-    /**
-     * Stage B (AI realism) is opt-in via `withRealism: true`. Costs $ + 20–60s of latency;
-     * the operator triggers it explicitly when they want a realism-pass preview before
-     * bulk-generating products. Mirrors `onMockJobCreated` Stage B with the same fal.ai
-     * endpoints and prompts.
-     */
-    let realismResult = null;
-    if (withRealismIn === true) {
-      const falApiKey = getFalApiKey(functions);
-      if (!falApiKey) {
-        throw new functions.https.HttpsError(
-          "failed-precondition",
-          "FAL_API_KEY is not configured — cannot run AI realism pass"
-        );
-      }
-      const realism = await runRealismPass({
-        sharp,
-        db,
-        fetchFn: fetch,
-        falApiKey,
-        blankId,
-        view,
-        draftBuffer: previewBuffer,
-        draftMeta: stageAMeta,
-      });
-      const realismMeta = await sharp(realism.buffer).metadata();
-      const realismToken = `${timestamp}_realism_${Math.floor(Math.random() * 1e6).toString(16)}`;
-      const realismPath = `rp/blank_previews/${blankId}/${view}/_preview${variantSuffix}_${timestamp}_realism.png`;
-      const realismFile = bucket.file(realismPath);
-      await realismFile.save(realism.buffer, {
-        contentType: "image/png",
-        metadata: {
-          contentType: "image/png",
-          metadata: { firebaseStorageDownloadTokens: realismToken },
-        },
-        resumable: false,
-      });
-      const realismUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(realismPath)}?alt=media&token=${realismToken}`;
-      realismResult = {
-        previewUrl: realismUrl,
-        storagePath: realismPath,
-        bytes: realism.buffer.length,
-        width: realismMeta.width || stageAMeta.width || blankWidth,
-        height: realismMeta.height || stageAMeta.height || blankHeight,
-        falEndpoint: realism.falEndpoint,
-        usedMask: realism.useMask,
-        params: realism.params,
-      };
-    }
-
-    /**
-     * When realism ran, return its URL as the "primary" so the UI just shows the final pass.
-     * Stage A is still available under `stageA` for comparison if a future UI wants it.
-     */
-    const primary = realismResult ?? {
+  return {
+    stageA: {
       previewUrl: downloadUrl,
       storagePath,
-      bytes: previewBuffer.length,
       width: stageAMeta.width || blankWidth,
       height: stageAMeta.height || blankHeight,
-    };
-
-    return {
-      previewUrl: primary.previewUrl,
-      storagePath: primary.storagePath,
-      width: primary.width,
-      height: primary.height,
-      bytes: primary.bytes,
-      stage: realismResult ? "B" : "A",
-      stageA: {
-        previewUrl: downloadUrl,
-        storagePath,
-        width: stageAMeta.width || blankWidth,
-        height: stageAMeta.height || blankHeight,
-        bytes: previewBuffer.length,
-      },
-      stageB: realismResult,
+      bytes: previewBuffer.length,
       maskApplied,
       maskMean: maskMean != null ? Math.round(maskMean) : null,
       maskMode,
-      artworkMode,
-      designOriginalPx: { w: originalDesignW, h: originalDesignH },
-      designCroppedPx: { w: designWidth, h: designHeight },
-      designResizedPx: { w: actualW, h: actualH },
       placementUsed: { x, y, scale: effectiveScale, blendMode: blendModeRequested, blendOpacity: effectiveOpacity },
+    },
+    /** Chained handoff for Stage B — kept in memory so we don't re-fetch. */
+    draftBuffer: previewBuffer,
+    draftMeta: stageAMeta,
+    variantSuffix,
+    timestamp,
+    variant,
+  };
+}
+
+/**
+ * Stage B (AI realism) — runs fal.ai realism pass on Stage A output, saves the result
+ * to Storage, returns the persisted `stageB` summary.
+ */
+async function composeStageB({ db, storage, sharp, functions, blankId, view, draftBuffer, draftMeta, variantSuffix, timestamp }) {
+  const falApiKey = getFalApiKey(functions);
+  if (!falApiKey) {
+    throw new Error("FAL_API_KEY is not configured — cannot run AI realism pass");
+  }
+  const realism = await runRealismPass({
+    sharp,
+    db,
+    fetchFn: fetch,
+    falApiKey,
+    blankId,
+    view,
+    draftBuffer,
+    draftMeta,
+  });
+  const realismMeta = await sharp(realism.buffer).metadata();
+  const realismToken = `${timestamp}_realism_${Math.floor(Math.random() * 1e6).toString(16)}`;
+  const realismPath = `rp/blank_previews/${blankId}/${view}/_preview${variantSuffix}_${timestamp}_realism.png`;
+  const bucket = storage.bucket();
+  const realismFile = bucket.file(realismPath);
+  await realismFile.save(realism.buffer, {
+    contentType: "image/png",
+    metadata: {
+      contentType: "image/png",
+      metadata: { firebaseStorageDownloadTokens: realismToken },
+    },
+    resumable: false,
+  });
+  const realismUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(realismPath)}?alt=media&token=${realismToken}`;
+  return {
+    stageB: {
+      previewUrl: realismUrl,
+      storagePath: realismPath,
+      bytes: realism.buffer.length,
+      width: realismMeta.width || draftMeta.width,
+      height: realismMeta.height || draftMeta.height,
+      falEndpoint: realism.falEndpoint,
+      usedMask: realism.useMask,
+      params: realism.params,
+    },
+  };
+}
+
+function buildPreviewBlankRender({ db, storage, functions, sharp, admin }) {
+  return async (data, context) => {
+    const uid = context && context.auth && context.auth.uid;
+    await assertAdmin(db, functions, uid);
+    const input = validatePreviewInput(functions, data);
+
+    /**
+     * Async path: when realism is requested, the sync HTTP gateway times out at ~60s
+     * (flux inpaint + polling = 30–60s). Enqueue a job doc and return its ID; the
+     * trigger `onBlankPreviewJobCreated` runs Stage A then Stage B and writes results
+     * back to the doc. The client subscribes via `onSnapshot` and progresses the UI.
+     */
+    if (input.withRealism) {
+      const now = admin.firestore.FieldValue.serverTimestamp();
+      const jobData = {
+        blankId: input.blankId,
+        variantId: input.variantId,
+        designId: input.designId,
+        view: input.view,
+        artworkMode: input.artworkMode,
+        placement: input.placement,
+        withRealism: true,
+        status: "queued",
+        error: null,
+        stageA: null,
+        stageB: null,
+        createdAt: now,
+        createdByUid: uid,
+        updatedAt: now,
+      };
+      const jobRef = await db.collection("rp_blank_preview_jobs").add(jobData);
+      return { jobId: jobRef.id, status: "queued" };
+    }
+
+    /** Sync path: Stage A only — fast enough to finish well within the gateway window. */
+    const { stageA, variant } = await composeStageA({ db, storage, sharp, functions, input });
+    return {
+      previewUrl: stageA.previewUrl,
+      storagePath: stageA.storagePath,
+      width: stageA.width,
+      height: stageA.height,
+      bytes: stageA.bytes,
+      stage: "A",
+      stageA,
+      stageB: null,
+      maskApplied: stageA.maskApplied,
+      maskMean: stageA.maskMean,
+      maskMode: stageA.maskMode,
+      artworkMode: input.artworkMode,
+      placementUsed: stageA.placementUsed,
       variantId: variant ? variant.variantId : null,
     };
   };
 }
 
-module.exports = { buildPreviewBlankRender };
+/**
+ * Firestore trigger that drains `rp_blank_preview_jobs/{jobId}`. Runs Stage A → writes
+ * `stageA`, then (when `withRealism`) Stage B → writes `stageB`, then sets
+ * status="completed". On any error, writes status="failed" + error message.
+ *
+ * The client subscribes to the doc via `onSnapshot` and renders progressive UI
+ * (queued → stageA visible → stageB visible / failed). This bypasses the synchronous
+ * Firebase callable HTTP gateway's ~60s ceiling.
+ */
+function buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp }) {
+  return async (snap, eventContext) => {
+    const job = snap.data();
+    const jobId = eventContext && eventContext.params ? eventContext.params.jobId : (snap.id || "?");
+    if (!job || job.status !== "queued") {
+      console.log(`[onBlankPreviewJobCreated] Job ${jobId} not queued (status=${job && job.status}), skipping`);
+      return;
+    }
+
+    const jobRef = db.collection("rp_blank_preview_jobs").doc(jobId);
+    const tick = () => admin.firestore.FieldValue.serverTimestamp();
+
+    try {
+      await jobRef.update({ status: "processing", updatedAt: tick() });
+
+      const input = {
+        blankId: job.blankId,
+        variantId: job.variantId || null,
+        designId: job.designId,
+        view: job.view,
+        artworkMode: job.artworkMode || "light",
+        placement: job.placement || {},
+        withRealism: job.withRealism === true,
+      };
+
+      const stageAResult = await composeStageA({ db, storage, sharp, functions, input });
+      await jobRef.update({ stageA: stageAResult.stageA, updatedAt: tick() });
+      console.log(`[onBlankPreviewJobCreated] Job ${jobId} Stage A done`);
+
+      if (input.withRealism) {
+        const stageBResult = await composeStageB({
+          db,
+          storage,
+          sharp,
+          functions,
+          blankId: input.blankId,
+          view: input.view,
+          draftBuffer: stageAResult.draftBuffer,
+          draftMeta: stageAResult.draftMeta,
+          variantSuffix: stageAResult.variantSuffix,
+          timestamp: stageAResult.timestamp,
+        });
+        await jobRef.update({ stageB: stageBResult.stageB, updatedAt: tick() });
+        console.log(`[onBlankPreviewJobCreated] Job ${jobId} Stage B done`);
+      }
+
+      await jobRef.update({ status: "completed", updatedAt: tick() });
+      console.log(`[onBlankPreviewJobCreated] Job ${jobId} completed`);
+    } catch (err) {
+      console.error(`[onBlankPreviewJobCreated] Job ${jobId} failed:`, err && err.message);
+      await jobRef
+        .update({
+          status: "failed",
+          error: err && err.message ? String(err.message) : "Unknown error",
+          updatedAt: tick(),
+        })
+        .catch((updateErr) => {
+          console.error(`[onBlankPreviewJobCreated] Failed to record error on ${jobId}:`, updateErr && updateErr.message);
+        });
+    }
+  };
+}
+
+module.exports = { buildPreviewBlankRender, buildOnBlankPreviewJobCreated };

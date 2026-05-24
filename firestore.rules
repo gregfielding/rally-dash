@@ -246,6 +246,15 @@ service cloud.firestore {
       allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
     }
 
+    // rp_blank_preview_jobs/{jobId} — async pipeline that drives the Render profile
+    // tab's "🖼️ Render preview" + "✨ + AI realism" buttons. Created by the
+    // previewBlankRender callable; written by onBlankPreviewJobCreated trigger; read
+    // by the editor via onSnapshot. RALLY_BLANK_PREVIEW_RENDER.md §5.
+    match /rp_blank_preview_jobs/{jobId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
     // rp_product_assets/{assetId}
     match /rp_product_assets/{assetId} {
       allow read: if isAdmin();

@@ -81,21 +81,18 @@ import {
 } from "@/lib/render/designArtboardSpec";
 import { proxiedImageUrlForCanvas } from "@/lib/storageImageProxyUrl";
 import { httpsCallable } from "firebase/functions";
-import { functions as firebaseFunctions } from "@/lib/firebase/config";
+import { functions as firebaseFunctions, db as firebaseDb } from "@/lib/firebase/config";
+import { doc as firestoreDoc, onSnapshot } from "firebase/firestore";
+import type { RPBlankPreviewJob } from "@/lib/types/firestore";
 
 /**
- * Feature flag for the "+ AI realism" button in the preview toolbar.
- *
- * Disabled because the synchronous Firebase callable gateway times out at ~60s before
- * the fal.ai realism pass (20–60s) consistently completes; the function itself runs
- * 300s but the HTTP front-end gives up sooner. The backend (previewBlankRender's
- * `withRealism: true` path) is fully implemented and still deployed — once we refactor
- * to an async job pattern (submit → Firestore job doc → client subscribes, same shape
- * as `rp_generation_jobs`), flip this flag back on.
- *
- * Tracking: RALLY_BLANK_PREVIEW_RENDER.md "§5 Out of scope (v1)".
+ * AI realism preview uses async pipeline (rp_blank_preview_jobs + onSnapshot) so the
+ * synchronous callable HTTP gateway (~60s ceiling) doesn't cut off long fal.ai
+ * inferences. The callable enqueues a job and returns immediately; the editor watches
+ * the doc and progresses the UI as Stage A then Stage B land.
+ * Spec: RALLY_BLANK_PREVIEW_RENDER.md §5.
  */
-const AI_REALISM_PREVIEW_ENABLED = false;
+const AI_REALISM_PREVIEW_ENABLED = true;
 import {
   RENDER_STYLE_PRESET_LABELS,
   RENDER_STYLE_PRESET_ORDER,
@@ -918,6 +915,8 @@ export function BlankRenderProfileEditor({
   /** Loading state — "A" = Stage A only (fast), "B" = Stage A + AI realism (slow, $). */
   const [realPreviewLoading, setRealPreviewLoading] = useState<"A" | "B" | null>(null);
   const [realPreviewError, setRealPreviewError] = useState<string | null>(null);
+  /** Active onSnapshot unsubscribe for the realism job — kept in a ref so re-renders don't leak listeners. */
+  const realPreviewJobUnsubRef = useRef<(() => void) | null>(null);
   const [lastExplicitRenderStyle, setLastExplicitRenderStyle] = useState<RenderStylePresetId>("soft_print");
   const [explicitCustomStyle, setExplicitCustomStyle] = useState(false);
   const [renderProfileStatus, setRenderProfileStatus] = useState<"draft" | "approved">(
@@ -1695,36 +1694,27 @@ export function BlankRenderProfileEditor({
     setRealPreviewError(null);
     setRealPreviewLoading(withRealism ? "B" : "A");
     try {
-      const fn = httpsCallable<
-        {
-          blankId: string;
-          variantId: string | null;
-          designId: string;
-          view: "front" | "back";
-          artworkMode: "light" | "dark" | "white";
-          withRealism?: boolean;
-          placement: {
-            x: number;
-            y: number;
-            scale: number;
-            width?: number;
-            height?: number;
-            blendMode?: string;
-            blendOpacity?: number;
-            maskConfig?: { mode?: string | null } | null;
-          };
-        },
-        RealPreviewResult
-      >(
-        firebaseFunctions,
-        "previewBlankRender",
-        /**
-         * Stage A completes in ~3-5s; Stage B (fal.ai realism) is 20-60s. The default
-         * client-side timeout (70s) was tripping during AI realism even when the
-         * function was still running. Match the server's 300s timeout.
-         */
-        { timeout: 300000 }
-      );
+      type PreviewInput = {
+        blankId: string;
+        variantId: string | null;
+        designId: string;
+        view: "front" | "back";
+        artworkMode: "light" | "dark" | "white";
+        withRealism?: boolean;
+        placement: {
+          x: number;
+          y: number;
+          scale: number;
+          width?: number;
+          height?: number;
+          blendMode?: string;
+          blendOpacity?: number;
+          maskConfig?: { mode?: string | null } | null;
+        };
+      };
+      /** Sync path returns RealPreviewResult; async (withRealism) returns just the jobId. */
+      type PreviewOutput = RealPreviewResult | { jobId: string; status: "queued" };
+      const fn = httpsCallable<PreviewInput, PreviewOutput>(firebaseFunctions, "previewBlankRender");
       const effectiveBlend = is8394SimpleBackUi
         ? { blendMode: zoneBlendFor8394BlendedPreview.blendMode, blendOpacity: zoneBlendFor8394BlendedPreview.blendOpacity }
         : { blendMode: zoneBlend.blendMode, blendOpacity: zoneBlend.blendOpacity };
@@ -1743,6 +1733,12 @@ export function BlankRenderProfileEditor({
        * of the legacy "0.5 × blank × scale" default).
        */
       const safeAreaForPreview = selected?.safeArea;
+      /** Tear down any prior realism subscription before starting a new render. */
+      if (realPreviewJobUnsubRef.current) {
+        realPreviewJobUnsubRef.current();
+        realPreviewJobUnsubRef.current = null;
+      }
+
       const result = await fn({
         blankId: blank.blankId,
         variantId: previewVariant?.variantId ?? null,
@@ -1761,18 +1757,123 @@ export function BlankRenderProfileEditor({
           maskConfig: maskConfigForPreview,
         },
       });
-      setRealPreview(result.data);
+
+      const data = result.data as PreviewOutput;
+      const isAsyncJob =
+        data && typeof data === "object" && "jobId" in (data as Record<string, unknown>) &&
+        !("previewUrl" in (data as Record<string, unknown>));
+
+      if (isAsyncJob) {
+        const { jobId } = data as { jobId: string };
+        /**
+         * Subscribe to the job doc and update the preview UI as stageA → stageB land.
+         * Stays loading until status flips to completed / failed; the doc is the
+         * source of truth, so re-renders from React don't double-fire fal.ai.
+         */
+        const unsub = onSnapshot(
+          firestoreDoc(firebaseDb!, "rp_blank_preview_jobs", jobId),
+          (snap) => {
+            if (!snap.exists()) return;
+            const job = snap.data() as RPBlankPreviewJob & { id?: string };
+            if (job.status === "failed") {
+              setRealPreviewError(job.error || "Render preview failed");
+              setRealPreviewLoading(null);
+              if (realPreviewJobUnsubRef.current) {
+                realPreviewJobUnsubRef.current();
+                realPreviewJobUnsubRef.current = null;
+              }
+              return;
+            }
+            const stageBPresent = !!(job.stageB && job.stageB.previewUrl);
+            const stageAPresent = !!(job.stageA && job.stageA.previewUrl);
+            if (!stageAPresent && !stageBPresent) {
+              return; /* still queued / early processing — keep loading state */
+            }
+            const primary = stageBPresent ? job.stageB! : job.stageA!;
+            const stage: "A" | "B" = stageBPresent ? "B" : "A";
+            setRealPreview({
+              previewUrl: primary.previewUrl,
+              width: primary.width,
+              height: primary.height,
+              bytes: primary.bytes,
+              stage,
+              stageA: stageAPresent
+                ? {
+                    previewUrl: job.stageA!.previewUrl,
+                    width: job.stageA!.width,
+                    height: job.stageA!.height,
+                    bytes: job.stageA!.bytes,
+                  }
+                : undefined,
+              stageB: stageBPresent
+                ? {
+                    previewUrl: job.stageB!.previewUrl,
+                    falEndpoint: job.stageB!.falEndpoint,
+                    usedMask: job.stageB!.usedMask,
+                    params: job.stageB!.params,
+                  }
+                : null,
+              maskApplied: stageAPresent ? job.stageA!.maskApplied : false,
+              maskMean: stageAPresent ? job.stageA!.maskMean ?? null : null,
+              placementUsed:
+                stageAPresent && job.stageA!.placementUsed
+                  ? job.stageA!.placementUsed
+                  : {
+                      x: tuning!.placement.x,
+                      y: tuning!.placement.y,
+                      scale: tuning!.placement.scale,
+                      blendMode: effectiveBlend.blendMode || "soft-light",
+                      blendOpacity: effectiveBlend.blendOpacity ?? 0.9,
+                    },
+              variantId: job.variantId ?? null,
+              artworkMode: job.artworkMode,
+            });
+            /** Once final stage is in (Stage B if requested, else Stage A), stop the spinner. */
+            if (job.status === "completed") {
+              setRealPreviewLoading(null);
+              if (realPreviewJobUnsubRef.current) {
+                realPreviewJobUnsubRef.current();
+                realPreviewJobUnsubRef.current = null;
+              }
+            }
+          },
+          (subErr) => {
+            console.error("[BlankRenderProfileEditor] preview-job snapshot error:", subErr);
+            setRealPreviewError(subErr?.message || "Preview job subscription failed");
+            setRealPreviewLoading(null);
+          }
+        );
+        realPreviewJobUnsubRef.current = unsub;
+        return; /* loading stays on until the snapshot completes or errors */
+      }
+
+      setRealPreview(data as RealPreviewResult);
+      setRealPreviewLoading(null);
     } catch (err: any) {
       console.error("[BlankRenderProfileEditor] real preview failed:", err);
       setRealPreviewError(err?.message || "Render preview failed");
-    } finally {
       setRealPreviewLoading(null);
     }
   };
 
+  /** Cleanup any open job subscription on unmount so we don't leak listeners. */
+  useEffect(() => {
+    return () => {
+      if (realPreviewJobUnsubRef.current) {
+        realPreviewJobUnsubRef.current();
+        realPreviewJobUnsubRef.current = null;
+      }
+    };
+  }, []);
+
   const dismissRealPreview = () => {
     setRealPreview(null);
     setRealPreviewError(null);
+    if (realPreviewJobUnsubRef.current) {
+      realPreviewJobUnsubRef.current();
+      realPreviewJobUnsubRef.current = null;
+    }
+    setRealPreviewLoading(null);
   };
 
   const [saving, setSaving] = useState(false);

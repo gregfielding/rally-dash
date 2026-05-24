@@ -3576,3 +3576,70 @@ export interface RPBlankMask {
   updatedAt: Timestamp;
   updatedByUid: string;
 }
+
+/**
+ * Async preview-render job. The synchronous Firebase callable HTTP gateway times out
+ * at ~60s — too short for fal.ai realism (20–60s + polling). This collection lets the
+ * `previewBlankRender` callable enqueue work, return immediately, and have a Firestore
+ * trigger process Stage A → Stage B in the background. The editor subscribes via
+ * `onSnapshot` and progresses the UI as fields land. See RALLY_BLANK_PREVIEW_RENDER.md.
+ */
+export type RPBlankPreviewJobStatus = "queued" | "processing" | "completed" | "failed";
+
+export interface RPBlankPreviewJobPlacementInput {
+  x: number;
+  y: number;
+  scale: number;
+  /** safeArea.w in fraction of blank — Option A safeArea-based sizing. */
+  width?: number | null;
+  height?: number | null;
+  blendMode?: string | null;
+  blendOpacity?: number | null;
+  maskConfig?: { mode?: string | null } | null;
+}
+
+export interface RPBlankPreviewJobStageA {
+  previewUrl: string;
+  storagePath: string;
+  width: number;
+  height: number;
+  bytes: number;
+  maskApplied: boolean;
+  maskMean?: number | null;
+  maskMode?: string | null;
+  placementUsed?: { x: number; y: number; scale: number; blendMode: string; blendOpacity: number };
+}
+
+export interface RPBlankPreviewJobStageB {
+  previewUrl: string;
+  storagePath: string;
+  width: number;
+  height: number;
+  bytes: number;
+  falEndpoint: string;
+  usedMask: boolean;
+  params: { strength: number; num_inference_steps: number; guidance_scale: number };
+}
+
+export interface RPBlankPreviewJob {
+  id: string;
+  blankId: string;
+  variantId?: string | null;
+  designId: string;
+  view: "front" | "back";
+  artworkMode?: "light" | "dark" | "white";
+  placement: RPBlankPreviewJobPlacementInput;
+  /** When true, the trigger runs Stage A then Stage B; otherwise Stage A only. */
+  withRealism: boolean;
+
+  status: RPBlankPreviewJobStatus;
+  /** Populated when `status === "failed"`. */
+  error?: string | null;
+
+  stageA?: RPBlankPreviewJobStageA | null;
+  stageB?: RPBlankPreviewJobStageB | null;
+
+  createdAt: Timestamp;
+  createdByUid: string;
+  updatedAt: Timestamp;
+}

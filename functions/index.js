@@ -106,7 +106,10 @@ const {
   buildGenerateBlankMaskViaSam,
   buildCommitBlankMaskFromPreview,
 } = require("./lib/blankMaskGeneration");
-const { buildPreviewBlankRender } = require("./lib/blankPreviewRender");
+const {
+  buildPreviewBlankRender,
+  buildOnBlankPreviewJobCreated,
+} = require("./lib/blankPreviewRender");
 
 // Check if placeholder worker mode is enabled (default: true for safety)
 function usePlaceholderWorker() {
@@ -7377,8 +7380,18 @@ exports.commitBlankMaskFromPreview = functions
  * so the editor can preview unsaved changes. Spec: RALLY_BLANK_PREVIEW_RENDER.md.
  */
 exports.previewBlankRender = functions
-  .runWith({ memory: "2GB", timeoutSeconds: 300 })
-  .https.onCall(buildPreviewBlankRender({ db, storage, functions, sharp: require("sharp") }));
+  .runWith({ memory: "2GB", timeoutSeconds: 60 })
+  .https.onCall(buildPreviewBlankRender({ db, storage, functions, sharp: require("sharp"), admin }));
+
+/**
+ * Async drain for `rp_blank_preview_jobs` — runs the compose pipeline outside the
+ * synchronous callable gateway so Stage B can take its full ~30–60s without timing
+ * out the client. Spec: RALLY_BLANK_PREVIEW_RENDER.md §5.
+ */
+exports.onBlankPreviewJobCreated = functions
+  .runWith({ memory: "2GB", timeoutSeconds: 540 })
+  .firestore.document("rp_blank_preview_jobs/{jobId}")
+  .onCreate(buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp: require("sharp") }));
 
 /**
  * Create a mock generation job
