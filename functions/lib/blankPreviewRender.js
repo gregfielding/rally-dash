@@ -13,6 +13,31 @@
 
 const { resolveDesignAssetUrls } = require("./designFileMergeCore");
 
+/**
+ * Realism-pass prompts copied verbatim from `onMockJobCreated` Stage B (functions/index.js
+ * ~line 8043). Keeping them in sync ensures preview output matches production. If you
+ * tune these here, update production too.
+ */
+const REALISM_PROMPT =
+  "Studio product photo of the same garment. The artwork is screen printed directly onto the fabric. Preserve garment shape, seams, and lighting. The print follows fabric texture and wrinkles with subtle ink absorption and shading. Keep the artwork geometry and edges exactly the same. Do not change background.";
+const REALISM_NEGATIVE =
+  "distort logo, change text, redraw artwork, add text, change garment shape, change straps/waistband, change background, add objects, blur";
+const FAL_INPAINT_ENDPOINT = "fal-ai/flux/dev/inpainting";
+const FAL_IMG2IMG_ENDPOINT = "fal-ai/flux/dev/image-to-image";
+/** 90 attempts × 1500ms = 135s polling budget. Stage B usually completes within 30-60s. */
+const REALISM_MAX_POLL_ATTEMPTS = 90;
+const REALISM_POLL_INTERVAL_MS = 1500;
+
+function getFalApiKey(functions) {
+  try {
+    const cfg = functions.config && functions.config();
+    const keyFromConfig = cfg && cfg.fal && cfg.fal.key;
+    return process.env.FAL_API_KEY || keyFromConfig;
+  } catch (e) {
+    return process.env.FAL_API_KEY;
+  }
+}
+
 const VARIANT_FLAT_FRONT_KEYS = ["flatFront", "front"];
 const VARIANT_FLAT_BACK_KEYS = ["flatBack", "back"];
 
@@ -131,11 +156,172 @@ async function assertAdmin(db, functions, uid) {
   if (!snap.exists) throw new functions.https.HttpsError("permission-denied", "Admins only");
 }
 
+/**
+ * Run the Stage B AI realism pass on a Stage A composite buffer. Mirrors
+ * `onMockJobCreated` Stage B (functions/index.js ~lines 8032-8200) — inpaint if a mask
+ * exists for this blank+view, img2img otherwise. Returns the realism PNG buffer + the
+ * model endpoint actually used (for telemetry).
+ *
+ * Costs $ per call (fal.ai) and takes ~20-60s. Only run when explicitly requested.
+ */
+async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, draftBuffer, draftMeta }) {
+  const draftBase64 = draftBuffer.toString("base64");
+  const draftDataUrl = `data:image/png;base64,${draftBase64}`;
+
+  const maskDocId = `${blankId}_${view}`;
+  const maskDoc = await db.collection("rp_blank_masks").doc(maskDocId).get();
+  const maskData = maskDoc.exists ? maskDoc.data() : null;
+
+  let useMask = false;
+  let maskBase64 = null;
+  let falEndpoint = FAL_IMG2IMG_ENDPOINT;
+
+  if (maskData && maskData.mask && maskData.mask.downloadUrl) {
+    try {
+      const maskResp = await fetchFn(maskData.mask.downloadUrl);
+      if (maskResp.ok) {
+        let processedMaskBuffer = Buffer.from(await maskResp.arrayBuffer());
+        const maskMeta = await sharp(processedMaskBuffer).metadata();
+        if (maskMeta.width !== draftMeta.width || maskMeta.height !== draftMeta.height) {
+          processedMaskBuffer = await sharp(processedMaskBuffer)
+            .resize(draftMeta.width, draftMeta.height, { fit: "fill" })
+            .png()
+            .toBuffer();
+        }
+        processedMaskBuffer = await sharp(processedMaskBuffer)
+          .grayscale()
+          .threshold(128)
+          .png()
+          .toBuffer();
+        maskBase64 = processedMaskBuffer.toString("base64");
+        useMask = true;
+        falEndpoint = FAL_INPAINT_ENDPOINT;
+      }
+    } catch (maskErr) {
+      console.warn("[previewBlankRender Stage B] mask processing failed:", maskErr && maskErr.message);
+    }
+  }
+
+  /**
+   * Use the queue endpoint (matches onMockJobCreated). Sync (`fal.run`) returned
+   * "Path /dev/inpainting not found" because fal.run doesn't accept multi-segment
+   * endpoint slugs. The flux endpoints return images directly in the status response
+   * once COMPLETED, so we don't need to fetch response_url at all.
+   */
+  const falUrl = `https://queue.fal.run/${falEndpoint}`;
+  const falPayload = useMask && maskBase64
+    ? {
+        image_url: draftDataUrl,
+        mask_url: `data:image/png;base64,${maskBase64}`,
+        prompt: REALISM_PROMPT,
+        negative_prompt: REALISM_NEGATIVE,
+        strength: 0.25,
+        num_inference_steps: 28,
+        guidance_scale: 3.5,
+        num_images: 1,
+        enable_safety_checker: false,
+      }
+    : {
+        image_url: draftDataUrl,
+        prompt: REALISM_PROMPT,
+        negative_prompt: REALISM_NEGATIVE,
+        strength: 0.2,
+        num_inference_steps: 28,
+        guidance_scale: 3.5,
+        num_images: 1,
+        enable_safety_checker: false,
+      };
+
+  const submitResp = await fetchFn(falUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Key ${falApiKey}` },
+    body: JSON.stringify(falPayload),
+  });
+  if (!submitResp.ok) {
+    const errText = await submitResp.text();
+    throw new Error(`fal.ai realism submit failed (${submitResp.status}): ${errText}`);
+  }
+  const submitJson = await submitResp.json();
+  const requestId = submitJson.request_id || submitJson.id;
+  const statusUrl = submitJson.status_url;
+  if (!statusUrl) {
+    throw new Error(
+      `fal.ai submit returned no status_url (request_id=${requestId || "missing"}). Submit shape: ${JSON.stringify(Object.keys(submitJson))}`
+    );
+  }
+
+  /**
+   * Poll status_url until images appear (or status flips to COMPLETED with images
+   * inline). The flux endpoints embed result `images[]` in the status response itself
+   * once inference completes — same pattern onMockJobCreated reads at index.js:8169.
+   * Some status responses include `images` even while status is still "IN_PROGRESS";
+   * treat either signal as completion.
+   */
+  let resultJson = null;
+  if (submitJson.images || (submitJson.output && submitJson.output.images)) {
+    resultJson = submitJson;
+  } else {
+    let completed = false;
+    /** Pass `?logs=1` so fal.ai includes intermediate fields in the status payload. */
+    const statusUrlWithLogs = statusUrl.includes("?") ? `${statusUrl}&logs=1` : `${statusUrl}?logs=1`;
+    for (let i = 0; i < REALISM_MAX_POLL_ATTEMPTS && !completed; i++) {
+      await new Promise((resolve) => setTimeout(resolve, REALISM_POLL_INTERVAL_MS));
+      const statusResp = await fetchFn(statusUrlWithLogs, {
+        headers: { Authorization: `Key ${falApiKey}` },
+      });
+      if (!statusResp.ok) continue;
+      const statusJson = await statusResp.json();
+      if (statusJson.status === "FAILED") {
+        throw new Error(`fal.ai realism job failed: ${statusJson.error || "unknown"}`);
+      }
+      if (statusJson.images || (statusJson.output && statusJson.output.images)) {
+        resultJson = statusJson;
+        completed = true;
+      }
+    }
+    if (!completed) {
+      throw new Error("fal.ai realism job timed out without returning images");
+    }
+  }
+
+  const resultImages = resultJson.images || (resultJson.output && resultJson.output.images) || [];
+  if (!Array.isArray(resultImages) || resultImages.length === 0) {
+    throw new Error(
+      `fal.ai returned no realism images. Response keys: ${JSON.stringify(Object.keys(resultJson))}`
+    );
+  }
+  const resultUrl = typeof resultImages[0] === "string" ? resultImages[0] : resultImages[0].url;
+  if (!resultUrl) throw new Error("fal.ai realism result missing image URL");
+
+  const dlResp = await fetchFn(resultUrl);
+  if (!dlResp.ok) throw new Error(`Failed to download realism image (HTTP ${dlResp.status})`);
+  const realismBuffer = Buffer.from(await dlResp.arrayBuffer());
+
+  return {
+    buffer: realismBuffer,
+    falEndpoint,
+    useMask,
+    params: {
+      strength: useMask ? 0.25 : 0.2,
+      num_inference_steps: 28,
+      guidance_scale: 3.5,
+    },
+  };
+}
+
 function buildPreviewBlankRender({ db, storage, functions, sharp }) {
   return async (data, context) => {
     await assertAdmin(db, functions, context && context.auth && context.auth.uid);
 
-    const { blankId, variantId, designId, view, placement: pl, artworkMode: artworkModeIn } = data || {};
+    const {
+      blankId,
+      variantId,
+      designId,
+      view,
+      placement: pl,
+      artworkMode: artworkModeIn,
+      withRealism: withRealismIn,
+    } = data || {};
     const artworkMode = artworkModeIn === "dark" || artworkModeIn === "white" ? artworkModeIn : "light";
     if (!blankId || typeof blankId !== "string") {
       throw new functions.https.HttpsError("invalid-argument", "blankId is required");
@@ -338,13 +524,85 @@ function buildPreviewBlankRender({ db, storage, functions, sharp }) {
     });
     const downloadUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(storagePath)}?alt=media&token=${downloadToken}`;
 
-    const finalMeta = await sharp(previewBuffer).metadata();
-    return {
+    const stageAMeta = await sharp(previewBuffer).metadata();
+
+    /**
+     * Stage B (AI realism) is opt-in via `withRealism: true`. Costs $ + 20–60s of latency;
+     * the operator triggers it explicitly when they want a realism-pass preview before
+     * bulk-generating products. Mirrors `onMockJobCreated` Stage B with the same fal.ai
+     * endpoints and prompts.
+     */
+    let realismResult = null;
+    if (withRealismIn === true) {
+      const falApiKey = getFalApiKey(functions);
+      if (!falApiKey) {
+        throw new functions.https.HttpsError(
+          "failed-precondition",
+          "FAL_API_KEY is not configured — cannot run AI realism pass"
+        );
+      }
+      const realism = await runRealismPass({
+        sharp,
+        db,
+        fetchFn: fetch,
+        falApiKey,
+        blankId,
+        view,
+        draftBuffer: previewBuffer,
+        draftMeta: stageAMeta,
+      });
+      const realismMeta = await sharp(realism.buffer).metadata();
+      const realismToken = `${timestamp}_realism_${Math.floor(Math.random() * 1e6).toString(16)}`;
+      const realismPath = `rp/blank_previews/${blankId}/${view}/_preview${variantSuffix}_${timestamp}_realism.png`;
+      const realismFile = bucket.file(realismPath);
+      await realismFile.save(realism.buffer, {
+        contentType: "image/png",
+        metadata: {
+          contentType: "image/png",
+          metadata: { firebaseStorageDownloadTokens: realismToken },
+        },
+        resumable: false,
+      });
+      const realismUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(realismPath)}?alt=media&token=${realismToken}`;
+      realismResult = {
+        previewUrl: realismUrl,
+        storagePath: realismPath,
+        bytes: realism.buffer.length,
+        width: realismMeta.width || stageAMeta.width || blankWidth,
+        height: realismMeta.height || stageAMeta.height || blankHeight,
+        falEndpoint: realism.falEndpoint,
+        usedMask: realism.useMask,
+        params: realism.params,
+      };
+    }
+
+    /**
+     * When realism ran, return its URL as the "primary" so the UI just shows the final pass.
+     * Stage A is still available under `stageA` for comparison if a future UI wants it.
+     */
+    const primary = realismResult ?? {
       previewUrl: downloadUrl,
       storagePath,
-      width: finalMeta.width || blankWidth,
-      height: finalMeta.height || blankHeight,
       bytes: previewBuffer.length,
+      width: stageAMeta.width || blankWidth,
+      height: stageAMeta.height || blankHeight,
+    };
+
+    return {
+      previewUrl: primary.previewUrl,
+      storagePath: primary.storagePath,
+      width: primary.width,
+      height: primary.height,
+      bytes: primary.bytes,
+      stage: realismResult ? "B" : "A",
+      stageA: {
+        previewUrl: downloadUrl,
+        storagePath,
+        width: stageAMeta.width || blankWidth,
+        height: stageAMeta.height || blankHeight,
+        bytes: previewBuffer.length,
+      },
+      stageB: realismResult,
       maskApplied,
       maskMean: maskMean != null ? Math.round(maskMean) : null,
       maskMode,

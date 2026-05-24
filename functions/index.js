@@ -7377,7 +7377,7 @@ exports.commitBlankMaskFromPreview = functions
  * so the editor can preview unsaved changes. Spec: RALLY_BLANK_PREVIEW_RENDER.md.
  */
 exports.previewBlankRender = functions
-  .runWith({ memory: "2GB", timeoutSeconds: 60 })
+  .runWith({ memory: "2GB", timeoutSeconds: 300 })
   .https.onCall(buildPreviewBlankRender({ db, storage, functions, sharp: require("sharp") }));
 
 /**

@@ -94,7 +94,14 @@ No schema changes. No new collections. Storage gets a new top-level prefix (`rp/
 
 ## 5. Out of scope (v1)
 
-- Stage B (fal.ai realism). Add later as a separate "Run AI realism" button.
+- Stage B (fal.ai realism). **Backend is implemented and deployed** under
+  `withRealism: true` on the `previewBlankRender` callable; UI button is hidden behind
+  `AI_REALISM_PREVIEW_ENABLED` in `BlankRenderProfileEditor.tsx`. Reason: the synchronous
+  Firebase callable HTTP gateway gives up at ~60s while flux inpaint/img2img typically
+  needs 20–60s plus polling overhead, so the call regularly fails with `408 / CORS`
+  even though the function is still running. Re-enable after refactoring to an async
+  job pattern (submit → Firestore job doc → client subscribes via onSnapshot, same shape
+  as `rp_generation_jobs`).
 - Comparison sliders / side-by-side. Just show the new render.
 - Caching preview by content hash. Re-run on every click.
 - Model-on views (`model_front`, `model_back`). Flat targets first; model views need warp/displacement which lives in `compositor8394::applyDesignWarp8394` and isn't generic yet.

@@ -82,6 +82,20 @@ import {
 import { proxiedImageUrlForCanvas } from "@/lib/storageImageProxyUrl";
 import { httpsCallable } from "firebase/functions";
 import { functions as firebaseFunctions } from "@/lib/firebase/config";
+
+/**
+ * Feature flag for the "+ AI realism" button in the preview toolbar.
+ *
+ * Disabled because the synchronous Firebase callable gateway times out at ~60s before
+ * the fal.ai realism pass (20–60s) consistently completes; the function itself runs
+ * 300s but the HTTP front-end gives up sooner. The backend (previewBlankRender's
+ * `withRealism: true` path) is fully implemented and still deployed — once we refactor
+ * to an async job pattern (submit → Firestore job doc → client subscribes, same shape
+ * as `rp_generation_jobs`), flip this flag back on.
+ *
+ * Tracking: RALLY_BLANK_PREVIEW_RENDER.md "§5 Out of scope (v1)".
+ */
+const AI_REALISM_PREVIEW_ENABLED = false;
 import {
   RENDER_STYLE_PRESET_LABELS,
   RENDER_STYLE_PRESET_ORDER,
@@ -886,6 +900,14 @@ export function BlankRenderProfileEditor({
     width: number;
     height: number;
     bytes: number;
+    stage: "A" | "B";
+    stageA?: { previewUrl: string; width: number; height: number; bytes: number };
+    stageB?: {
+      previewUrl: string;
+      falEndpoint: string;
+      usedMask: boolean;
+      params: { strength: number; num_inference_steps: number; guidance_scale: number };
+    } | null;
     maskApplied: boolean;
     maskMean: number | null;
     placementUsed: { x: number; y: number; scale: number; blendMode: string; blendOpacity: number };
@@ -893,7 +915,8 @@ export function BlankRenderProfileEditor({
     artworkMode?: "light" | "dark" | "white";
   };
   const [realPreview, setRealPreview] = useState<RealPreviewResult | null>(null);
-  const [realPreviewLoading, setRealPreviewLoading] = useState(false);
+  /** Loading state — "A" = Stage A only (fast), "B" = Stage A + AI realism (slow, $). */
+  const [realPreviewLoading, setRealPreviewLoading] = useState<"A" | "B" | null>(null);
   const [realPreviewError, setRealPreviewError] = useState<string | null>(null);
   const [lastExplicitRenderStyle, setLastExplicitRenderStyle] = useState<RenderStylePresetId>("soft_print");
   const [explicitCustomStyle, setExplicitCustomStyle] = useState(false);
@@ -1655,7 +1678,8 @@ export function BlankRenderProfileEditor({
    * current tuning (unsaved is fine). Lets you validate a blank end-to-end before bulk
    * generating products. See RALLY_BLANK_PREVIEW_RENDER.md.
    */
-  const handleRealRenderPreview = async () => {
+  const handleRealRenderPreview = async (opts?: { withRealism?: boolean }) => {
+    const withRealism = opts?.withRealism === true;
     if (!firebaseFunctions || !blank?.blankId) {
       setRealPreviewError("Firebase functions not available");
       return;
@@ -1669,7 +1693,7 @@ export function BlankRenderProfileEditor({
       return;
     }
     setRealPreviewError(null);
-    setRealPreviewLoading(true);
+    setRealPreviewLoading(withRealism ? "B" : "A");
     try {
       const fn = httpsCallable<
         {
@@ -1678,13 +1702,12 @@ export function BlankRenderProfileEditor({
           designId: string;
           view: "front" | "back";
           artworkMode: "light" | "dark" | "white";
+          withRealism?: boolean;
           placement: {
             x: number;
             y: number;
             scale: number;
-            /** safeArea.w as the print-zone width (fraction of blank). See RALLY_BLANK_PREVIEW_RENDER.md "Option A". */
             width?: number;
-            /** safeArea.h as the print-zone height (fraction of blank). */
             height?: number;
             blendMode?: string;
             blendOpacity?: number;
@@ -1692,7 +1715,16 @@ export function BlankRenderProfileEditor({
           };
         },
         RealPreviewResult
-      >(firebaseFunctions, "previewBlankRender");
+      >(
+        firebaseFunctions,
+        "previewBlankRender",
+        /**
+         * Stage A completes in ~3-5s; Stage B (fal.ai realism) is 20-60s. The default
+         * client-side timeout (70s) was tripping during AI realism even when the
+         * function was still running. Match the server's 300s timeout.
+         */
+        { timeout: 300000 }
+      );
       const effectiveBlend = is8394SimpleBackUi
         ? { blendMode: zoneBlendFor8394BlendedPreview.blendMode, blendOpacity: zoneBlendFor8394BlendedPreview.blendOpacity }
         : { blendMode: zoneBlend.blendMode, blendOpacity: zoneBlend.blendOpacity };
@@ -1717,6 +1749,7 @@ export function BlankRenderProfileEditor({
         designId: previewDesignId,
         view: previewSide,
         artworkMode: previewArtworkMode,
+        withRealism,
         placement: {
           x: tuning.placement.x,
           y: tuning.placement.y,
@@ -1733,7 +1766,7 @@ export function BlankRenderProfileEditor({
       console.error("[BlankRenderProfileEditor] real preview failed:", err);
       setRealPreviewError(err?.message || "Render preview failed");
     } finally {
-      setRealPreviewLoading(false);
+      setRealPreviewLoading(null);
     }
   };
 
@@ -3642,8 +3675,8 @@ export function BlankRenderProfileEditor({
                   the current (possibly unsaved) tuning. The CSS canvas above is an approximation. */}
               <button
                 type="button"
-                onClick={handleRealRenderPreview}
-                disabled={realPreviewLoading || !previewDesignId}
+                onClick={() => handleRealRenderPreview()}
+                disabled={realPreviewLoading !== null || !previewDesignId}
                 className="ml-2 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
                 title={
                   previewDesignId
@@ -3651,8 +3684,22 @@ export function BlankRenderProfileEditor({
                     : "Pick a Preview design first (top of the page) so the render has artwork to composite."
                 }
               >
-                {realPreviewLoading ? "Rendering…" : "🖼️ Render preview"}
+                {realPreviewLoading === "A" ? "Rendering…" : "🖼️ Render preview"}
               </button>
+              {/* Stage A + AI realism via fal.ai. Hidden until async refactor lands —
+                  the Firebase callable gateway times out before fal.ai completes. See
+                  AI_REALISM_PREVIEW_ENABLED constant at top of file. */}
+              {AI_REALISM_PREVIEW_ENABLED ? (
+                <button
+                  type="button"
+                  onClick={() => handleRealRenderPreview({ withRealism: true })}
+                  disabled={realPreviewLoading !== null || !previewDesignId}
+                  className="ml-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-purple-600 text-white hover:bg-purple-700 disabled:opacity-50"
+                  title="Stage A composite + fal.ai realism pass (inpaint if a mask exists, img2img otherwise). Takes 20-60s and costs $ per call."
+                >
+                  {realPreviewLoading === "B" ? "Running AI realism… (~30s)" : "✨ + AI realism"}
+                </button>
+              ) : null}
             </div>
             {is8394SimpleBackUi && previewSideAllowsPrinting ? (
               <p className="text-[10px] text-neutral-400 mt-1 max-w-lg">
@@ -4105,12 +4152,19 @@ export function BlankRenderProfileEditor({
         </div>
       ) : null}
       {realPreview ? (
-        <div className="mt-4 border border-indigo-200 bg-indigo-50 rounded-lg overflow-hidden">
-          <div className="px-4 py-2 border-b border-indigo-200 bg-indigo-100 flex items-center justify-between text-xs">
-            <h4 className="font-semibold text-indigo-900">
-              🖼️ Real render — what production will output
+        <div className={`mt-4 border rounded-lg overflow-hidden ${realPreview.stage === "B" ? "border-purple-300 bg-purple-50" : "border-indigo-200 bg-indigo-50"}`}>
+          <div className={`px-4 py-2 border-b flex items-center justify-between text-xs ${realPreview.stage === "B" ? "border-purple-200 bg-purple-100" : "border-indigo-200 bg-indigo-100"}`}>
+            <h4 className={`font-semibold ${realPreview.stage === "B" ? "text-purple-900" : "text-indigo-900"}`}>
+              {realPreview.stage === "B"
+                ? "✨ AI realism — Stage B (fal.ai)"
+                : "🖼️ Real render — Stage A (deterministic)"}
             </h4>
-            <div className="flex items-center gap-3 text-indigo-800 font-mono">
+            <div className={`flex items-center gap-3 font-mono ${realPreview.stage === "B" ? "text-purple-800" : "text-indigo-800"}`}>
+              {realPreview.stage === "B" && realPreview.stageB ? (
+                <span>
+                  {realPreview.stageB.usedMask ? "inpaint" : "img2img"} · strength {realPreview.stageB.params.strength.toFixed(2)}
+                </span>
+              ) : null}
               <span>
                 {realPreview.artworkMode ?? "light"} · {realPreview.placementUsed.blendMode} · op {realPreview.placementUsed.blendOpacity.toFixed(2)} · scale {realPreview.placementUsed.scale.toFixed(2)}
               </span>
@@ -4133,7 +4187,7 @@ export function BlankRenderProfileEditor({
               <button
                 type="button"
                 onClick={dismissRealPreview}
-                className="text-indigo-700 underline hover:no-underline"
+                className={`underline hover:no-underline ${realPreview.stage === "B" ? "text-purple-700" : "text-indigo-700"}`}
               >
                 dismiss
               </button>
