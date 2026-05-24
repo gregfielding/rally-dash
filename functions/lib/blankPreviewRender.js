@@ -14,16 +14,21 @@
 const { resolveDesignAssetUrls } = require("./designFileMergeCore");
 
 /**
- * Realism-pass prompts copied verbatim from `onMockJobCreated` Stage B (functions/index.js
- * ~line 8043). Keeping them in sync ensures preview output matches production. If you
- * tune these here, update production too.
+ * Stage B uses fal.ai's Kontext model (`fal-ai/flux-pro/kontext`) for image editing.
+ * Kontext is designed for "edit this image to..." tasks and implicitly understands
+ * the garment's fabric structure from the input image — no separate depth/control
+ * map needed. The previous endpoint (`fal-ai/flux/dev/inpainting`) is deprecated;
+ * `fal-ai/flux/dev/image-to-image` works but produces sticker-like prints.
+ *
+ * Kontext payload is just `prompt` + `image_url` — no strength knob, so prompt
+ * carries the full burden of controlling how much the image changes. The prompt is
+ * tuned to: (a) integrate the print into the fabric, (b) preserve design geometry.
  */
 const REALISM_PROMPT =
-  "Studio product photo of the same garment. The artwork is screen printed directly onto the fabric. Preserve garment shape, seams, and lighting. The print follows fabric texture and wrinkles with subtle ink absorption and shading. Keep the artwork geometry and edges exactly the same. Do not change background.";
+  "Make the printed design integrate naturally with the sweatshirt fabric. The print should follow the wrinkles, folds, and shadows of the garment, with subtle ink absorption visible. Preserve the design's text, colors, position, and geometry exactly — do not redraw, move, or alter the artwork. Keep the garment shape and the background unchanged. Photoreal studio product photo lighting.";
 const REALISM_NEGATIVE =
   "distort logo, change text, redraw artwork, add text, change garment shape, change straps/waistband, change background, add objects, blur";
-const FAL_INPAINT_ENDPOINT = "fal-ai/flux/dev/inpainting";
-const FAL_IMG2IMG_ENDPOINT = "fal-ai/flux/dev/image-to-image";
+const FAL_REALISM_ENDPOINT = "fal-ai/flux-pro/kontext";
 /** 90 attempts × 1500ms = 135s polling budget. Stage B usually completes within 30-60s. */
 const REALISM_MAX_POLL_ATTEMPTS = 90;
 const REALISM_POLL_INTERVAL_MS = 1500;
@@ -169,29 +174,21 @@ async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, dr
   const draftDataUrl = `data:image/png;base64,${draftBase64}`;
 
   /**
-   * Stage A already multiplied the rp_blank_masks PNG onto the design RGBA, so the
-   * composite we hand fal.ai already has the print clipped to the printable zone.
-   * Stage B just needs a global img2img realism pass — no mask is sent to fal.ai.
-   *
-   * The previous behavior (inpainting endpoint when a mask exists) used the
-   * `fal-ai/flux/dev/inpainting` slug, which now 404s with `Path /dev/inpainting
-   * not found` — that variant was deprecated from fal.ai's catalog. The
-   * `fal-ai/flux/dev/image-to-image` endpoint is still live (per fal.ai docs)
-   * and works for the realism pass. Low strength preserves the design's geometry
-   * and edges; fal.ai adds fabric texture / lighting / wrinkle integration.
+   * Switched from `fal-ai/flux/dev/image-to-image` (strength-controlled img2img) to
+   * `fal-ai/flux-pro/kontext` (image-editing model). Kontext's prompt carries the
+   * editing intent — there's no strength knob — so we lean on a directive prompt that
+   * says "integrate the print into the fabric, do not redraw the artwork." The model
+   * implicitly understands the garment's fabric structure from the input image, so
+   * no separate depth/control map is required for this first iteration.
    */
-  const falEndpoint = FAL_IMG2IMG_ENDPOINT;
+  const falEndpoint = FAL_REALISM_ENDPOINT;
   const useMask = false;
   const falUrl = `https://queue.fal.run/${falEndpoint}`;
   const falPayload = {
     image_url: draftDataUrl,
     prompt: REALISM_PROMPT,
-    negative_prompt: REALISM_NEGATIVE,
-    strength: 0.2,
-    num_inference_steps: 28,
     guidance_scale: 3.5,
-    num_images: 1,
-    enable_safety_checker: false,
+    num_inference_steps: 28,
   };
 
   const submitResp = await fetchFn(falUrl, {
@@ -293,7 +290,8 @@ async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, dr
     falEndpoint,
     useMask,
     params: {
-      strength: useMask ? 0.25 : 0.2,
+      /** Kontext has no strength knob — prompt drives the edit intensity. Strength field kept on the schema for backward compatibility; value is a label, not a real parameter. */
+      strength: 0,
       num_inference_steps: 28,
       guidance_scale: 3.5,
     },
