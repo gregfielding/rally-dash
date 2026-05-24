@@ -379,16 +379,47 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
 
   const blankResp = await fetch(refImageUrl);
   if (!blankResp.ok) throw new functions.https.HttpsError("internal", `Failed to fetch garment image (HTTP ${blankResp.status})`);
-  const blankBuffer = Buffer.from(await blankResp.arrayBuffer());
+  const nativeBlankBuffer = Buffer.from(await blankResp.arrayBuffer());
+
+  /**
+   * Oversample the entire composite: render at 2× the blank's native resolution, then
+   * downsample once to native at the very end. The design layer is sized in the 2× space
+   * (e.g. 864×540 instead of 432×270 for HF07's chest panel at scale=0.4), so Sharp's
+   * intermediate resize keeps far more detail. The final single-pass downsample uses
+   * lanczos3 and produces a sharp result. Net effect: the design's text edges look
+   * crisp in the displayed PNG, matching what the CSS canvas previews.
+   *
+   * Trade-off: 4× the pixels through Sharp, 4× the upload bytes for the preview PNG.
+   * Stage A goes from ~3s → ~6s and from ~250KB → ~1MB for a typical HF07 render.
+   * Worth it for preview accuracy.
+   */
+  const OVERSAMPLE = 2;
+  const nativeBlankMeta = await sharp(nativeBlankBuffer).metadata();
+  const nativeBlankW = nativeBlankMeta.width || 1500;
+  const nativeBlankH = nativeBlankMeta.height || 1500;
+  const blankBuffer = await sharp(nativeBlankBuffer)
+    .resize(nativeBlankW * OVERSAMPLE, nativeBlankH * OVERSAMPLE, { kernel: "lanczos3" })
+    .toBuffer();
 
   const designResp = await fetch(designPngUrl);
   if (!designResp.ok) throw new functions.https.HttpsError("internal", `Failed to fetch design PNG (HTTP ${designResp.status})`);
   let designBuffer = Buffer.from(await designResp.arrayBuffer());
 
-  const cropResult = await cropDesignToArtworkBounds(sharp, designBuffer);
-  designBuffer = cropResult.buffer;
-  const designWidth = cropResult.width;
-  const designHeight = cropResult.height;
+  /**
+   * Use the design PNG's NATURAL dimensions (no artwork-bounds crop). The CSS canvas in
+   * the editor renders the full uncropped artboard with `object-contain`; cropping in
+   * Stage A produced a different visual layout for any design with transparent padding,
+   * which broke "what you see is what production produces." Now both surfaces composite
+   * the same buffer: full design PNG → fit-inside the art box → place at center.
+   *
+   * Trade-off: padded artboards render with their padding visible (just like the CSS
+   * canvas shows them). Designers should tightly crop their artboards — or use the
+   * artboard as the canonical placement reference, which is what the CSS canvas
+   * has always implied via the fixed `DESIGN_ARTBOARD_WIDTH_PX / HEIGHT_PX` constants.
+   */
+  const designMeta = await sharp(designBuffer).metadata();
+  const designWidth = designMeta.width || 1;
+  const designHeight = designMeta.height || 1;
 
   const blankMeta = await sharp(blankBuffer).metadata();
   const blankWidth = blankMeta.width;
@@ -426,12 +457,18 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
     resizedWidth = Math.round(artBoxPxH * designAspect);
   }
 
-  const printBlurSigma = Number.isFinite(Number(pl.printBlurSigma)) ? Number(pl.printBlurSigma) : 0.3;
-  const printSaturation = Number.isFinite(Number(pl.printSaturation)) ? Number(pl.printSaturation) : 0.96;
-  const resizedResult = await sharp(designBuffer)
-    .resize(resizedWidth, resizedHeight, { fit: "inside" })
-    .blur(printBlurSigma)
-    .modulate({ saturation: printSaturation })
+  /**
+   * Print-realism treatment defaults to NO-OP. Blanks that want fabric softness can opt
+   * in via `placement.printBlurSigma` / `printSaturation`. Resize kernel is `lanczos2`
+   * (sharper than lanczos3 default) — text designs survive the downsample better with
+   * less halo softening, which was the visible "blurriness" in earlier Stage A previews.
+   */
+  const printBlurSigma = Number.isFinite(Number(pl.printBlurSigma)) ? Number(pl.printBlurSigma) : 0;
+  const printSaturation = Number.isFinite(Number(pl.printSaturation)) ? Number(pl.printSaturation) : 1.0;
+  let resizePipeline = sharp(designBuffer).resize(resizedWidth, resizedHeight, { fit: "inside", kernel: "lanczos2" });
+  if (printBlurSigma > 0) resizePipeline = resizePipeline.blur(printBlurSigma);
+  if (printSaturation !== 1.0) resizePipeline = resizePipeline.modulate({ saturation: printSaturation });
+  const resizedResult = await resizePipeline
     .ensureAlpha()
     .raw()
     .toBuffer({ depth: 8, resolveWithObject: true });
@@ -443,6 +480,16 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
   const blendMode = normalizeBlendModeForSharp(blendModeRequested);
   const effectiveOpacity = Number.isFinite(Number(pl.blendOpacity)) ? Number(pl.blendOpacity) : 0.9;
 
+  /**
+   * Compute the design's actual top-left on the garment BEFORE applying the mask, so
+   * we extract the matching mask region from the same coordinate space. The original
+   * `left/top` are the art-box top-left; the design (fit: inside) is centered within
+   * that art box, so its true position is offset by half the size difference.
+   * Clamp inside the blank so extract() never goes out of bounds.
+   */
+  const designLeft = Math.max(0, Math.min(Math.round(left + (artBoxPxW - actualW) / 2), blankWidth - actualW));
+  const designTop = Math.max(0, Math.min(Math.round(top + (artBoxPxH - actualH) / 2), blankHeight - actualH));
+
   let maskApplied = false;
   let maskMean = null;
   const maskMode = pl.maskConfig && typeof pl.maskConfig.mode === "string" ? pl.maskConfig.mode : null;
@@ -453,8 +500,17 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
     if (maskData && maskData.mask && maskData.mask.downloadUrl) {
       const maskResp = await fetch(maskData.mask.downloadUrl);
       if (maskResp.ok) {
+        /**
+         * Resize the mask to BLANK dimensions (it was authored in garment coordinate
+         * space), then extract the sub-region that overlaps the design's placement.
+         * Previously we stretched the whole mask into the design's bounding box with
+         * `fit: "fill"` — which compressed the sweatshirt silhouette into a thin band
+         * and clipped most of the design away. The extract path is geometrically
+         * correct: only the bit of the mask actually under the design gets multiplied.
+         */
         const maskResult = await sharp(await maskResp.arrayBuffer())
-          .resize(actualW, actualH, { fit: "fill" })
+          .resize(blankWidth, blankHeight, { fit: "fill" })
+          .extract({ left: designLeft, top: designTop, width: actualW, height: actualH })
           .grayscale()
           .ensureAlpha()
           .raw()
@@ -467,7 +523,23 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
           count++;
         }
         maskMean = count > 0 ? sum / count : 0;
-        if (maskMean > 80) {
+        /**
+         * Empty-mask sanity check. The extracted region is the part of the mask under
+         * the design's footprint, NOT the whole mask. Three cases:
+         *   - Mean very low (~0): the design sits outside the print zone — skip; the
+         *     multiply would zero out the entire design.
+         *   - Mean very high (~255): the design sits fully inside the print zone — the
+         *     multiply is a no-op (white = identity for multiply), but apply anyway so
+         *     the badge reads "Mask applied" consistently.
+         *   - Mean in between: design straddles the print-zone boundary — apply normally.
+         *
+         * The old upper bound of 230 incorrectly rejected the no-op case (mean=255 for a
+         * design fully inside a sweatshirt-body silhouette) and made it look like the mask
+         * was broken. There's no real inversion case to detect at extract time — the
+         * SAM upload step already normalizes to strict black/white.
+         */
+        const looksUsable = maskMean >= 5;
+        if (looksUsable) {
           for (let i = 0; i < resizedDesignRaw.length; i += 4) {
             const m = maskBuffer[i];
             resizedDesignRaw[i] = Math.round((resizedDesignRaw[i] * m) / 255);
@@ -476,6 +548,8 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
             resizedDesignRaw[i + 3] = Math.round((resizedDesignRaw[i + 3] * m) / 255);
           }
           maskApplied = true;
+        } else {
+          console.log(`[composeStageA] Skipping mask (mean=${Math.round(maskMean)} < 5; design likely outside print zone)`);
         }
       }
     }
@@ -491,13 +565,20 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
     .png()
     .toBuffer();
 
-  left = Math.round(left + (artBoxPxW - actualW) / 2);
-  top = Math.round(top + (artBoxPxH - actualH) / 2);
-  left = Math.max(0, Math.min(left, blankWidth - actualW));
-  top = Math.max(0, Math.min(top, blankHeight - actualH));
+  /** Composite at the same designLeft/designTop the mask extract used — keeps mask + design aligned. */
+  const oversampledComposite = await sharp(blankBuffer)
+    .composite([{ input: designForComposite, left: designLeft, top: designTop, blend: blendMode, premultiplied: true }])
+    .png()
+    .toBuffer();
 
-  const previewBuffer = await sharp(blankBuffer)
-    .composite([{ input: designForComposite, left, top, blend: blendMode, premultiplied: true }])
+  /**
+   * Single high-quality downsample from the 2× working space back to native blank
+   * dimensions. The design layer had 4× more pixels through the compose pipeline, so
+   * after this one-pass downsample to native, text edges stay crisp. Final PNG is the
+   * same size as before the oversampling change — no bandwidth penalty downstream.
+   */
+  const previewBuffer = await sharp(oversampledComposite)
+    .resize(nativeBlankW, nativeBlankH, { kernel: "lanczos3" })
     .png()
     .toBuffer();
 

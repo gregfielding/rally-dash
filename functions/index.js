@@ -7653,13 +7653,16 @@ exports.onMockJobCreated = functions
       }
       let designBuffer = Buffer.from(await designResp.arrayBuffer());
 
-      // Detect artwork bounds and crop to visible design (resilient to padded PNGs — RALLY_FIX_DESIGN_PNG_PADDING_AND_RENDERER_BOUNDS)
+      // Use the design PNG's NATURAL dimensions. We previously cropped to artwork bounds
+      // (RALLY_FIX_DESIGN_PNG_PADDING_AND_RENDERER_BOUNDS), but that produced a different
+      // visual layout from the editor's CSS canvas, which shows the full uncropped artboard
+      // with object-contain. Aligning production with the editor preview means "what you
+      // see is what you ship." Designers should tightly crop their artboards before upload.
+      // Aligned with composeStageA in functions/lib/blankPreviewRender.js.
       const designMetaOriginal = await sharp(designBuffer).metadata();
-      const originalDesignW = designMetaOriginal.width || 1;
-      const originalDesignH = designMetaOriginal.height || 1;
-      const { buffer: designBufferCropped, width: designWidth, height: designHeight } = await cropDesignToArtworkBounds(designBuffer);
-      designBuffer = designBufferCropped;
-      console.log("[onMockJobCreated] Design PNG: original", originalDesignW, "x", originalDesignH, "→ artwork bounds", designWidth, "x", designHeight);
+      const designWidth = designMetaOriginal.width || 1;
+      const designHeight = designMetaOriginal.height || 1;
+      console.log("[onMockJobCreated] Design PNG: natural", designWidth, "x", designHeight, "(no artwork-bounds crop)");
 
       // Get blank image dimensions
       const blankMeta = await sharp(blankBuffer).metadata();
@@ -7704,13 +7707,19 @@ exports.onMockJobCreated = functions
       }
       console.log("[onMockJobCreated] Scaled artwork to print area: design", designWidth, "x", designHeight, "→", resizedWidth, "x", resizedHeight, "placement:", placementId, "scale:", effectiveScale, "center:", (x ?? 0.5).toFixed(2), (y ?? 0.5).toFixed(2));
 
-      // Pipeline: resize → slight blur (removes sticker look) → desaturate (fabric ink realism) → mask → opacity → multiply
-      const printBlurSigma = placement.printBlurSigma ?? 0.3;
-      const printSaturation = placement.printSaturation ?? 0.96;
-      const resizedResult = await sharp(designBuffer)
-        .resize(resizedWidth, resizedHeight, { fit: "inside" })
-        .blur(printBlurSigma)
-        .modulate({ saturation: printSaturation })
+      // Pipeline: resize → optional print-realism (blur/desat) → mask → opacity → multiply
+      // Defaults are NO-OP (0 and 1.0) so production matches what the editor preview shows
+      // by default. Original defaults (0.3 / 0.96) were tuned for 8394 panty fabric and made
+      // HF07 crewneck prints look mushy. Per-blank opt-in via `placement.printBlurSigma` and
+      // `placement.printSaturation`. Aligned with composeStageA in blankPreviewRender lib.
+      const printBlurSigma = placement.printBlurSigma ?? 0;
+      const printSaturation = placement.printSaturation ?? 1.0;
+      // kernel: lanczos2 preserves text edges better than the default lanczos3 when designs
+      // downsample from natural (e.g. 2400px) to placement size. Aligned with composeStageA.
+      let resizePipeline = sharp(designBuffer).resize(resizedWidth, resizedHeight, { fit: "inside", kernel: "lanczos2" });
+      if (printBlurSigma > 0) resizePipeline = resizePipeline.blur(printBlurSigma);
+      if (printSaturation !== 1.0) resizePipeline = resizePipeline.modulate({ saturation: printSaturation });
+      const resizedResult = await resizePipeline
         .ensureAlpha()
         .raw()
         .toBuffer({ depth: 8, resolveWithObject: true });
@@ -7744,12 +7753,29 @@ exports.onMockJobCreated = functions
       if (maskMode === "none") {
         console.log("[onMockJobCreated] Skipping fabric mask (maskConfig.mode='none')");
       }
+      /**
+       * Pre-compute the design's actual top-left on the garment (after fit:inside
+       * centering within the art box) so the mask extract aligns with where the
+       * design is actually placed. Hoisted above the mask read because the mask
+       * extract needs these coords. Re-used below by the composite.
+       */
+      const designLeft = Math.max(0, Math.min(Math.round(left + (artBoxPxW - actualW) / 2), blankWidth - actualW));
+      const designTop = Math.max(0, Math.min(Math.round(top + (artBoxPxH - actualH) / 2), blankHeight - actualH));
+
       if (maskData?.mask?.downloadUrl) {
         try {
           const maskResp = await fetch(maskData.mask.downloadUrl);
           if (maskResp.ok) {
+            /**
+             * Mask is in BLANK coords (1500×1500 garment image). Resize to blank dims,
+             * then extract the sub-region under the design's placement. The previous
+             * stretch-to-design-bbox approach compressed sparse masks (HF07 chest panel
+             * silhouette) into a thin band — clipped most of the design. Aligned with
+             * composeStageA in functions/lib/blankPreviewRender.js.
+             */
             const maskResult = await sharp(await maskResp.arrayBuffer())
-              .resize(actualW, actualH, { fit: "fill" })
+              .resize(blankWidth, blankHeight, { fit: "fill" })
+              .extract({ left: designLeft, top: designTop, width: actualW, height: actualH })
               .grayscale()
               .ensureAlpha()
               .raw()
@@ -7762,8 +7788,12 @@ exports.onMockJobCreated = functions
               maskCount++;
             }
             const maskMean = maskCount > 0 ? maskSum / maskCount : 0;
-            // Only apply mask if it looks like "white = garment" (mean > 80). Inverted masks have low mean and would zero the design.
-            if (maskMean > 80) {
+            // Empty-mask sanity check. The extracted region is the part of the mask under
+            // the design's footprint. Mean ~0 → design outside print zone, skip (multiply
+            // would zero the design). Mean ~255 → design fully inside print zone, apply as
+            // no-op (multiplying by white = identity). Keep aligned with composeStageA in
+            // functions/lib/blankPreviewRender.js.
+            if (maskMean >= 5) {
               for (let i = 0; i < resizedDesignRaw.length; i += 4) {
                 const m = maskBuffer[i];
                 resizedDesignRaw[i] = Math.round((resizedDesignRaw[i] * m) / 255);
@@ -7787,17 +7817,12 @@ exports.onMockJobCreated = functions
         .png()
         .toBuffer();
 
-      // Center design inside the art box (design is max-fit inside artBoxPxW x artBoxPxH)
-      left = Math.round(left + (artBoxPxW - actualW) / 2);
-      top = Math.round(top + (artBoxPxH - actualH) / 2);
-      left = Math.max(0, Math.min(left, blankWidth - actualW));
-      top = Math.max(0, Math.min(top, blankHeight - actualH));
-
+      // Composite at designLeft/designTop computed above the mask read — keeps mask + design aligned.
       const draftBuffer = await sharp(blankBuffer)
         .composite([{
           input: designForComposite,
-          left,
-          top,
+          left: designLeft,
+          top: designTop,
           blend: blendMode,
           premultiplied: true,
         }])

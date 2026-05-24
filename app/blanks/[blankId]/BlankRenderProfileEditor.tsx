@@ -195,6 +195,15 @@ type GarmentPreviewCanvasProps = {
   px: number;
   py: number;
   artBase: number;
+  /**
+   * Optional override for the design overlay width fraction. When set, the design's
+   * CSS width is `(printZoneWidthFraction * scale * 100)%` instead of the legacy
+   * `(artBase * scale * 100)%`. Pass the zone's `safeArea.w` to align the CSS canvas
+   * preview with what the deterministic Sharp compositor (`onMockJobCreated` /
+   * `composeStageA`) outputs after the Option A safeArea-based sizing change.
+   * Spec: RALLY_BLANK_PREVIEW_RENDER.md follow-up.
+   */
+  printZoneWidthFraction?: number | null;
   scale: number;
   overlayOpacity: number;
   overlayMixBlendMode: CSSProperties["mixBlendMode"];
@@ -260,6 +269,7 @@ function GarmentPreviewCanvas({
   px,
   py,
   artBase,
+  printZoneWidthFraction = null,
   scale,
   overlayOpacity,
   overlayMixBlendMode,
@@ -562,7 +572,7 @@ function GarmentPreviewCanvas({
             style={{
               left: `${px * 100}%`,
               top: `${py * 100}%`,
-              width: `${artBase * scale * 100}%`,
+              width: `${(printZoneWidthFraction ?? artBase) * scale * 100}%`,
               aspectRatio: `${DESIGN_ARTBOARD_WIDTH_PX} / ${DESIGN_ARTBOARD_HEIGHT_PX}`,
               height: "auto",
               transform: overlayTransform,
@@ -4100,6 +4110,7 @@ export function BlankRenderProfileEditor({
                 px={px}
                 py={py}
                 artBase={artBase}
+                printZoneWidthFraction={!is8394 ? selected?.safeArea?.w ?? null : null}
                 scale={scale}
                 overlayOpacity={0}
                 overlayMixBlendMode="normal"
@@ -4157,6 +4168,7 @@ export function BlankRenderProfileEditor({
                     px={px}
                     py={py}
                     artBase={artBase}
+                    printZoneWidthFraction={!is8394 ? selected?.safeArea?.w ?? null : null}
                     scale={scale}
                     overlayOpacity={blended ? previewOpacity : 1}
                     overlayMixBlendMode={
@@ -4207,6 +4219,7 @@ export function BlankRenderProfileEditor({
               px={px}
               py={py}
               artBase={artBase}
+              printZoneWidthFraction={!is8394 ? selected?.safeArea?.w ?? null : null}
               scale={scale}
               overlayOpacity={canvasOpacity}
               overlayMixBlendMode={canvasMixBlend}
