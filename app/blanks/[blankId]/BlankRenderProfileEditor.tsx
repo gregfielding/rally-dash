@@ -2573,41 +2573,16 @@ export function BlankRenderProfileEditor({
             </div>
           </section>
 
-          {/* Target tuning — key resets local focus when switching matrix cell */}
+          {/*
+            Target tuning section — primary controls (Render target → Placement → Print style/blend).
+            Header + verbose explanation removed so Render Target dropdown sits visually adjacent
+            to the Artwork variant above; saves write to either blank baseline or per-variant
+            override (controlled by the Garment color save-scope selector higher up).
+          */}
           <section
             key={`tuning-cell-${variantId || "baseline"}-${selectedRenderTarget}`}
             className="space-y-3 rounded-xl border border-violet-200 bg-violet-50/40 p-4"
           >
-            <h2 className="text-xs font-bold uppercase tracking-wider text-violet-800">
-              Target tuning (render target specific)
-            </h2>
-            {is8394 ? (
-              <p className="text-xs text-violet-950/80 leading-relaxed">
-                These controls tune <strong>{RENDER_TARGET_LABELS[selectedRenderTarget]}</strong> for{" "}
-                {isMasterBlank(blank) && variantId ? (
-                  <>
-                    this color in{" "}
-                    <code className="text-[10px] bg-white/80 px-1 rounded">renderProfile.renderTargetsByColor</code> (
-                    one cell per variant × target).
-                  </>
-                ) : (
-                  <>
-                    <code className="text-[10px] bg-white/80 px-1 rounded">renderProfile.renderTargets</code> (blank
-                    baseline).
-                  </>
-                )}{" "}
-                Presets are shortcuts only.
-              </p>
-            ) : (
-              <p className="text-xs text-violet-950/80 leading-relaxed">
-                <span className="font-semibold text-neutral-900">Zone geometry</span>{" "}
-                <code className="text-[10px] bg-white/80 px-1 rounded">placements[]</code> — safe area, default zone
-                placement, side.{" "}
-                <span className="font-semibold text-neutral-900">Target tuning</span>{" "}
-                <code className="text-[10px] bg-white/80 px-1 rounded">renderProfile.renderTargets[target]</code> — x/y/scale
-                and blend curve for each garment photo (flat vs on-model).
-              </p>
-            )}
             <div>
               <label className="block text-xs font-medium text-neutral-800 mb-1">Render target</label>
               <select

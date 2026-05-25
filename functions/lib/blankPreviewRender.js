@@ -34,10 +34,22 @@ const { resolveDesignAssetUrls } = require("./designFileMergeCore");
  * Preservation of design content (text spelling, colors, position) emphasized
  * to counter Kontext's tendency to slightly re-interpret artwork.
  */
+/**
+ * Pass 2 of screen-print prompt tuning. Previous prompt produced a sticker-like
+ * uniform-fill print with sharp edges; Kontext was preserving the input too literally.
+ * New approach:
+ *  - Lead with the desired output ("water-based screen print absorbed into cotton")
+ *  - Demand visible weave / fiber texture THROUGH the ink (the key differentiator)
+ *  - Demand saturation/coverage variation across the print (no perfectly-flat color)
+ *  - Demand soft, imperfect edges (where ink soaks into fabric vs sits on top)
+ *  - Reinforce in the negative: explicit "sticker", "vinyl", "uniform color", "hard edges"
+ * Tuned for high guidance (5.5) so Kontext follows these directives even when its
+ * "preserve input" bias pulls toward the sticker look.
+ */
 const REALISM_PROMPT =
-  "Re-render the printed graphic as authentic screen-printing on cotton fleece. The ink is absorbed into the cotton fibers — soft edges where ink meets fabric, fabric weave faintly visible through the colored ink, matte finish, NO sticker-like edge lift, NO plastic sheen, NO peeling appearance. The print follows the natural wrinkles, folds, and shadows of the sweatshirt fabric. Preserve the design's text spelling, colors, position, and overall geometry exactly — do not redraw the letters, add words, or rearrange the layout. Keep the garment shape, color, and background unchanged. Photoreal studio product photo.";
+  "Photoreal studio product photo of a black cotton fleece sweatshirt with water-based screen-printing ink absorbed deep into the cotton fibers on the chest. The cotton weave texture is CLEARLY visible through the colored ink, with subtle fiber-by-fiber irregularity in the ink coverage. The ink has natural saturation variation across the print — slightly faded in some areas, slightly more vivid in others, exactly like real screen printing on heavy cotton. Edges are soft and slightly imperfect where ink meets fabric. The print follows every fold and wrinkle of the garment fabric naturally. Preserve the design's exact text spelling, colors, position, scale, and overall geometry — do not redraw letters, do not add words, do not rearrange layout. Keep the garment color, shape, and background unchanged.";
 const REALISM_NEGATIVE =
-  "sticker, decal, iron-on patch, vinyl heat transfer, peeling edges, raised print, glossy ink, plastic sheen, sharp die-cut edges, change text, misspell text, add text, redraw artwork, change garment shape, change background, blur";
+  "sticker, decal, iron-on patch, vinyl heat transfer, peeling edges, lifted edges, raised print, glossy ink, plastic sheen, shiny print, perfectly uniform color, flat solid color block, hard die-cut edges, sharp rectangular boundary, ink sitting on top of fabric, change text, misspell text, add text, redraw artwork, change garment shape, change background, blur, artifacts";
 const FAL_REALISM_ENDPOINT = "fal-ai/flux-pro/kontext";
 /** 90 attempts × 1500ms = 135s polling budget. Stage B usually completes within 30-60s. */
 const REALISM_MAX_POLL_ATTEMPTS = 90;
@@ -199,9 +211,12 @@ async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, dr
     prompt: REALISM_PROMPT,
     /** Negative prompt included for endpoints that accept it; ignored by Kontext if not supported. */
     negative_prompt: REALISM_NEGATIVE,
-    /** Slightly bumped from 3.5 → 4.5 to make Kontext follow the anti-sticker direction more strictly. */
-    guidance_scale: 4.5,
-    num_inference_steps: 28,
+    /** 5.5 pushes Kontext harder to follow the screen-print directive rather than its
+     *  default "preserve input" bias which keeps the sticker-look from the input image. */
+    guidance_scale: 5.5,
+    /** 35 steps (up from 28) gives the model more refinement passes to settle on a
+     *  consistent ink-absorption look across the whole print. */
+    num_inference_steps: 35,
   };
 
   const submitResp = await fetchFn(falUrl, {
