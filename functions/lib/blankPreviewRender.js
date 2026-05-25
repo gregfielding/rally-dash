@@ -24,10 +24,20 @@ const { resolveDesignAssetUrls } = require("./designFileMergeCore");
  * carries the full burden of controlling how much the image changes. The prompt is
  * tuned to: (a) integrate the print into the fabric, (b) preserve design geometry.
  */
+/**
+ * Tuned for screen-print realism rather than sticker / iron-on look. Key levers:
+ *  - "ink absorbed INTO cotton fibers" (vs sitting on top)
+ *  - "fabric weave faintly visible through the ink" (texture penetration)
+ *  - "soft edges where ink meets fabric" (no sharp die-cut sticker boundary)
+ *  - "matte finish, no sheen" (no plastic / vinyl appearance)
+ *  - "no sticker-like edge lift" (explicit negative for the failure mode)
+ * Preservation of design content (text spelling, colors, position) emphasized
+ * to counter Kontext's tendency to slightly re-interpret artwork.
+ */
 const REALISM_PROMPT =
-  "Make the printed design integrate naturally with the sweatshirt fabric. The print should follow the wrinkles, folds, and shadows of the garment, with subtle ink absorption visible. Preserve the design's text, colors, position, and geometry exactly — do not redraw, move, or alter the artwork. Keep the garment shape and the background unchanged. Photoreal studio product photo lighting.";
+  "Re-render the printed graphic as authentic screen-printing on cotton fleece. The ink is absorbed into the cotton fibers — soft edges where ink meets fabric, fabric weave faintly visible through the colored ink, matte finish, NO sticker-like edge lift, NO plastic sheen, NO peeling appearance. The print follows the natural wrinkles, folds, and shadows of the sweatshirt fabric. Preserve the design's text spelling, colors, position, and overall geometry exactly — do not redraw the letters, add words, or rearrange the layout. Keep the garment shape, color, and background unchanged. Photoreal studio product photo.";
 const REALISM_NEGATIVE =
-  "distort logo, change text, redraw artwork, add text, change garment shape, change straps/waistband, change background, add objects, blur";
+  "sticker, decal, iron-on patch, vinyl heat transfer, peeling edges, raised print, glossy ink, plastic sheen, sharp die-cut edges, change text, misspell text, add text, redraw artwork, change garment shape, change background, blur";
 const FAL_REALISM_ENDPOINT = "fal-ai/flux-pro/kontext";
 /** 90 attempts × 1500ms = 135s polling budget. Stage B usually completes within 30-60s. */
 const REALISM_MAX_POLL_ATTEMPTS = 90;
@@ -187,7 +197,10 @@ async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, dr
   const falPayload = {
     image_url: draftDataUrl,
     prompt: REALISM_PROMPT,
-    guidance_scale: 3.5,
+    /** Negative prompt included for endpoints that accept it; ignored by Kontext if not supported. */
+    negative_prompt: REALISM_NEGATIVE,
+    /** Slightly bumped from 3.5 → 4.5 to make Kontext follow the anti-sticker direction more strictly. */
+    guidance_scale: 4.5,
     num_inference_steps: 28,
   };
 

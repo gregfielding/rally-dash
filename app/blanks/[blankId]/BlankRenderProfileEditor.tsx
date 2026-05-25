@@ -2870,6 +2870,14 @@ export function BlankRenderProfileEditor({
                     />
                   </div>
                 </div>
+                <details className="rounded-lg border border-neutral-200 bg-neutral-50/40 px-3 py-2">
+                  <summary className="cursor-pointer text-[11px] font-bold uppercase tracking-wide text-neutral-600 list-none flex items-center gap-2">
+                    <span aria-hidden>▸</span>
+                    Legacy: Print style / blend &middot; now handled by AI realism
+                  </summary>
+                  <p className="text-[10px] text-neutral-500 italic mt-2 mb-3 leading-snug">
+                    Stage B (Kontext) now integrates the print into fabric automatically. These sliders only affect the deterministic Stage A composite shown in the editor preview — keep them at defaults unless you&rsquo;re tuning a specific look the AI doesn&rsquo;t capture.
+                  </p>
                 <div>
                   <h3 className="text-[11px] font-bold uppercase tracking-wide text-neutral-600 mb-2">
                     Print style / blend (this target)
@@ -2939,6 +2947,15 @@ export function BlankRenderProfileEditor({
                     </div>
                   </div>
                 </div>
+                </details>
+                <details className="rounded-lg border border-neutral-200 bg-neutral-50/40 px-3 py-2">
+                  <summary className="cursor-pointer text-[11px] font-bold uppercase tracking-wide text-neutral-600 list-none flex items-center gap-2">
+                    <span aria-hidden>▸</span>
+                    Legacy: Warp &middot; now handled by AI realism
+                  </summary>
+                  <p className="text-[10px] text-neutral-500 italic mt-2 mb-3 leading-snug">
+                    Per-target CSS warp (3D skew). Stage B (Kontext) drapes the print over fabric folds naturally — only enable warp for blanks like 8394 panties where the deterministic compositor needs it.
+                  </p>
                 <div>
                   <h3 className="text-[11px] font-bold uppercase tracking-wide text-neutral-600 mb-2">Warp (saved)</h3>
                   <label className="flex items-center gap-2 text-sm text-neutral-800 mb-2">
@@ -3011,6 +3028,7 @@ export function BlankRenderProfileEditor({
                     enabled.
                   </p>
                 </div>
+                </details>
                 <div>
                   <h3 className="text-[11px] font-bold uppercase tracking-wide text-neutral-600 mb-2">Mask (saved)</h3>
                   <label className="flex items-center gap-2 text-sm text-neutral-800 mb-2">
