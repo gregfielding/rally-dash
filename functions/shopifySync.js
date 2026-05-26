@@ -448,9 +448,16 @@ async function runProductSync(product, variantDocs, store, accessToken) {
       inventoryItem,
       inventoryPolicy: "CONTINUE",
     };
-    if (shape.variantTitle && String(shape.variantTitle).trim()) {
-      row.title = String(shape.variantTitle).trim().slice(0, 255);
-    }
+    /**
+     * NOTE (2026-05-25): `title` field intentionally NOT set on variant rows.
+     * Shopify's `productSet` GraphQL mutation rejects `title` on
+     * `ProductVariantSetInput` with "Field is not defined" — variant titles
+     * are auto-derived from `optionValues` (e.g. "Black / S"). The legacy code
+     * that called `row.title = shape.variantTitle` here was harmless on older
+     * API versions that silently ignored unknown fields; current strict
+     * validation throws. Removed; option-based title generation handles it.
+     */
+    void shape; // shape.variantTitle reserved for non-Shopify code paths
     if (shape.colorSizeOptions) {
       row.optionValues = [
         { optionName: "Color", name: color },
@@ -532,7 +539,17 @@ async function runProductSync(product, variantDocs, store, accessToken) {
       (product.descriptionHtml || product.description || "").slice(0, 100000) || null,
     productType: (product.productType || "").slice(0, 255) || null,
     vendor: (product.brand && String(product.brand).trim()) || "Rally",
-    status: "ACTIVE",
+    /**
+     * Default ACTIVE so anyone calling sync today gets the same live-on-Shopify
+     * behavior. Opt-in DRAFT/ARCHIVED via `product.shopifyStatus` — used for
+     * smoke tests (see functions/scripts/shopify-smoke-push.js) and any future
+     * scheduled-launch flow where a product needs to be staged in Shopify
+     * before it becomes customer-visible.
+     */
+    status:
+      product.shopifyStatus === "DRAFT" || product.shopifyStatus === "ARCHIVED"
+        ? product.shopifyStatus
+        : "ACTIVE",
     tags: (Array.isArray(product.tags) && product.tags.length > 0
       ? product.tags
       : buildShopifyTags(product)

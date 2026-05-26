@@ -113,9 +113,18 @@ function isEmpty(v) {
 
 async function main() {
   console.log(`[patch-tank] Looking up blank with styleCode="${styleCode}"…`);
+  /**
+   * v2 (2026-05-25): filter to the ACTIVE MASTER (schemaVersion=2, status=active).
+   * Earlier version used just `.where("styleCode", "==", styleCode).limit(1)`
+   * which grabbed whichever doc Firestore returned first — often a draft
+   * duplicate, not the master. Result: the patches wrote to non-master docs
+   * and the real master never got the description template.
+   */
   const snapshot = await db
     .collection("rp_blanks")
     .where("styleCode", "==", styleCode)
+    .where("status", "==", "active")
+    .where("schemaVersion", "==", 2)
     .limit(1)
     .get();
 
