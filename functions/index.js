@@ -33,6 +33,7 @@ const runCreateProductFromDesignBlankCore = require("./lib/runCreateProductFromD
 const { startInitialProductAssetBatch } = require("./lib/startInitialProductAssetBatch");
 const { executeTeamProductVariantCreation } = require("./lib/executeTeamProductVariantCreation");
 const { launchProductsFromDesign } = require("./lib/launchProductsFromDesign");
+const { buildOnDesignCreated } = require("./lib/onDesignCreated");
 const {
   bulkMarkProductsReviewed,
   bulkSyncProductsToShopify,
@@ -1875,31 +1876,53 @@ exports.launchProductsFromDesign = functions.https.onCall(async (data, context) 
     throw new functions.https.HttpsError("unauthenticated", "User must be authenticated");
   }
 
-  const { designId, blankId, blankVariantIds, forceAssetBatch, autoSyncShopify, queue8394Secondary } = data || {};
+  const { designId, blankId, blankVariantIds, forceAssetBatch, autoSyncShopify, queue8394Secondary, forceMatrix } = data || {};
   if (!designId || typeof designId !== "string") {
     throw new functions.https.HttpsError("invalid-argument", "designId is required");
   }
   if (!blankId || typeof blankId !== "string") {
     throw new functions.https.HttpsError("invalid-argument", "blankId is required");
   }
-  if (!Array.isArray(blankVariantIds) || blankVariantIds.length === 0) {
-    throw new functions.https.HttpsError(
-      "invalid-argument",
-      "blankVariantIds must be a non-empty array of variant ids"
-    );
-  }
-  if (blankVariantIds.length > 48) {
-    throw new functions.https.HttpsError("invalid-argument", "Too many variants (max 48 per request)");
-  }
 
   const uid = context.auth.uid;
-  const uniqueIds = [...new Set(blankVariantIds.map((x) => String(x || "").trim()).filter(Boolean))];
-  if (uniqueIds.length === 0) {
-    throw new functions.https.HttpsError("invalid-argument", "No valid blankVariantIds after dedupe");
-  }
-
   const blankSnap = await db.collection("rp_blanks").doc(blankId).get();
   const blankData = blankSnap.exists ? blankSnap.data() : null;
+
+  // `forceMatrix=true` means "use every active variant on this blank" — bypasses the UI's
+  // team-catalog-matrix gate so callers (UI buttons, triggers) can auto-launch without
+  // requiring an admin to opt the team into each color first.
+  let uniqueIds;
+  if (forceMatrix === true) {
+    if (!blankData) {
+      throw new functions.https.HttpsError("not-found", `Blank not found: ${blankId}`);
+    }
+    const variants = Array.isArray(blankData.variants) ? blankData.variants : [];
+    const derived = variants
+      .filter((v) => v && v.isActive !== false)
+      .map((v) => v.variantId)
+      .filter(Boolean);
+    if (derived.length === 0) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        `Blank ${blankId} has no active variants — cannot launch with forceMatrix`
+      );
+    }
+    uniqueIds = [...new Set(derived.map((x) => String(x || "").trim()).filter(Boolean))];
+  } else {
+    if (!Array.isArray(blankVariantIds) || blankVariantIds.length === 0) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "blankVariantIds must be a non-empty array of variant ids (or pass forceMatrix:true)"
+      );
+    }
+    if (blankVariantIds.length > 48) {
+      throw new functions.https.HttpsError("invalid-argument", "Too many variants (max 48 per request)");
+    }
+    uniqueIds = [...new Set(blankVariantIds.map((x) => String(x || "").trim()).filter(Boolean))];
+    if (uniqueIds.length === 0) {
+      throw new functions.https.HttpsError("invalid-argument", "No valid blankVariantIds after dedupe");
+    }
+  }
 
   console.log(
     JSON.stringify({
@@ -1908,6 +1931,7 @@ exports.launchProductsFromDesign = functions.https.onCall(async (data, context) 
       designId,
       blankId,
       selectedBlankVariantIds: uniqueIds,
+      forceMatrix: forceMatrix === true,
       autoSyncShopify: autoSyncShopify === true,
       queue8394Secondary: queue8394Secondary === true,
       userId: uid,
@@ -1941,6 +1965,39 @@ exports.launchProductsFromDesign = functions.https.onCall(async (data, context) 
     queue8394Secondary: queue8394Secondary === true,
   });
 });
+
+/**
+ * Phase 2: auto-launch products for every active master blank when a design is created
+ * (or first gets a PNG attached). One product per (design × team × active master blank)
+ * using all active blank variants. Idempotent: stamps `autoLaunchProductsAt` and skips
+ * subsequent writes. No-op when the design lacks a teamId, is archived, or has no PNG yet.
+ *
+ * Uses onWrite so we can wait for the PNG-attach update — bulk + single-design flows both
+ * create the doc with `files.lightPng = null` and patch it after upload.
+ */
+exports.onDesignCreated = functions.firestore
+  .document("designs/{designId}")
+  .onWrite(async (change, context) => {
+    // Lazy: helpers below are defined later in this file (TDZ at module-load time).
+    const handler = buildOnDesignCreated({
+      db,
+      admin,
+      functions,
+      runCreateProductFromDesignBlankCore,
+      designPngUrlForProcessing,
+      buildInitialRenderSetupForProduct,
+      resolveBlankVariantForProduct,
+      buildProductIdentityKey,
+      buildParentProductIdentityKey,
+      MASTER_BLANK_SCHEMA_VERSION,
+      sanitizeForFirestore,
+      deriveAvailableSizesFromBlank,
+      deriveSizesForProductMatrix,
+      merchandisingAtCreate,
+      resolveBlankTemplates,
+    });
+    return handler(change, context);
+  });
 
 /** Bulk approve or hold products after human review (moves approved rows to `shopify_ready`). */
 exports.bulkMarkProductsReviewed = functions.https.onCall(async (data, context) => {

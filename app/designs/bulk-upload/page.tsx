@@ -532,6 +532,13 @@ export default function BulkDesignUploadPage() {
                   {commitSummary.updated}, skipped {commitSummary.skipped}, blocked {commitSummary.blocked}, failed{" "}
                   {commitSummary.failed}.
                 </p>
+                {commitSummary.created > 0 && (
+                  <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-blue-900 text-sm">
+                    <strong>Auto-launch:</strong> Products are being created in the background for each new design ×
+                    active master blank. Watch the <Link href="/products" className="underline">Products</Link> page —
+                    rows will appear shortly and renders will queue automatically.
+                  </div>
+                )}
                 <ul className="space-y-2 text-sm">
                   {commitResults.map((r) => (
                     <li key={r.itemId} className="flex flex-wrap gap-2 items-baseline">
