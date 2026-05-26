@@ -82,7 +82,7 @@ import {
 import { proxiedImageUrlForCanvas } from "@/lib/storageImageProxyUrl";
 import { httpsCallable } from "firebase/functions";
 import { functions as firebaseFunctions, db as firebaseDb } from "@/lib/firebase/config";
-import { doc as firestoreDoc, onSnapshot } from "firebase/firestore";
+import { doc as firestoreDoc, onSnapshot, updateDoc as firestoreUpdateDoc } from "firebase/firestore";
 import type { RPBlankPreviewJob } from "@/lib/types/firestore";
 
 /**
@@ -913,7 +913,16 @@ export function BlankRenderProfileEditor({
       previewUrl: string;
       falEndpoint: string;
       usedMask: boolean;
-      params: { strength: number; num_inference_steps: number; guidance_scale: number };
+      params: {
+        strength: number;
+        num_inference_steps: number;
+        guidance_scale: number;
+        /** v5 telemetry — Stage B records the slider values it actually saw plus the
+         *  derived pre-Kontext blur so the badge can prove the sliders reached AI. */
+        fabric_feel?: number;
+        print_strength?: number;
+        pre_blur_sigma?: number;
+      };
     } | null;
     maskApplied: boolean;
     maskMean: number | null;
@@ -940,6 +949,17 @@ export function BlankRenderProfileEditor({
       ? blank.preferredFlatLook8394
       : ""
   );
+  /**
+   * Autosave indicator state for the blank-wide fields. The main "Save render profile"
+   * button is per-color and per-target; these fields (status / supported sides / notes)
+   * belong to the whole blank and now autosave directly to Firestore on change with a
+   * short debounce, with a transient "Saved" indicator next to the section header.
+   * Decouples scopes so operators don't have to bundle blank-wide changes into a
+   * per-color save click.
+   */
+  const [blankAutosaveState, setBlankAutosaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const blankAutosaveErrorRef = useRef<string | null>(null);
+  const blankFieldsHydratedRef = useRef(false);
 
   const [selectedRenderTarget, setSelectedRenderTarget] = useState<RpRenderTarget>("flat_front");
   const [targetSettingsMap, setTargetSettingsMap] = useState<Record<RpRenderTarget, RpRenderTargetSettings>>(() =>
@@ -1013,6 +1033,72 @@ export function BlankRenderProfileEditor({
     blank.renderProfileNotes,
     blank.supportedRenderViews,
     blank.styleCode,
+    blank.preferredFlatLook8394,
+  ]);
+
+  /**
+   * Autosave blank-wide fields (status / supported sides / notes / 8394 preferred
+   * flat look) directly to Firestore on change with a 600ms debounce. Decoupled
+   * from the main per-color / per-target "Save render profile" button so operators
+   * can flip Approved or edit blank notes without triggering a per-color save.
+   *
+   * Guarded by an equality check vs the loaded `blank.*` props so the post-save
+   * Firestore snapshot re-hydration doesn't trigger a redundant write loop.
+   * (Sequence: write → snapshot fires → hydration effect updates state to the
+   *  same values → this effect re-runs → no diff → skip write.)
+   */
+  useEffect(() => {
+    if (!firebaseDb) return;
+    const supportedRenderViews = [
+      ...(supportedFront ? ["front" as const] : []),
+      ...(supportedBack ? ["back" as const] : []),
+    ];
+    const trimmedNotes = renderProfileNotes.trim();
+    const loadedStatus = blank.renderProfileStatus === "approved" ? "approved" : "draft";
+    const loadedNotes = (blank.renderProfileNotes ?? "").trim();
+    const loadedSides = (blank.supportedRenderViews ?? []).slice().sort().join(",");
+    const loadedFlat = (blank.preferredFlatLook8394 ?? "") || "";
+    const nextSides = supportedRenderViews.slice().sort().join(",");
+    const nextFlat = (preferredFlatLook8394 || "");
+    const noDiff =
+      renderProfileStatus === loadedStatus &&
+      trimmedNotes === loadedNotes &&
+      nextSides === loadedSides &&
+      nextFlat === loadedFlat;
+    if (noDiff) return;
+    const timer = setTimeout(async () => {
+      try {
+        setBlankAutosaveState("saving");
+        const payload: Record<string, unknown> = {
+          renderProfileStatus,
+          renderProfileNotes: trimmedNotes.length > 0 ? trimmedNotes : null,
+          supportedRenderViews: supportedRenderViews.length ? supportedRenderViews : null,
+        };
+        if (is8394) {
+          payload.preferredFlatLook8394 = preferredFlatLook8394 === "" ? null : preferredFlatLook8394;
+        }
+        await firestoreUpdateDoc(firestoreDoc(firebaseDb!, "rp_blanks", blank.blankId), payload);
+        setBlankAutosaveState("saved");
+        /** Fade the "Saved" indicator back to idle after a beat so it doesn't stick. */
+        setTimeout(() => setBlankAutosaveState("idle"), 2000);
+      } catch (err) {
+        console.error("[autosave blank-wide] failed:", err);
+        blankAutosaveErrorRef.current = err instanceof Error ? err.message : String(err);
+        setBlankAutosaveState("error");
+      }
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [
+    renderProfileStatus,
+    renderProfileNotes,
+    supportedFront,
+    supportedBack,
+    preferredFlatLook8394,
+    is8394,
+    blank.blankId,
+    blank.renderProfileStatus,
+    blank.renderProfileNotes,
+    blank.supportedRenderViews,
     blank.preferredFlatLook8394,
   ]);
 
@@ -1726,6 +1812,15 @@ export function BlankRenderProfileEditor({
           height?: number;
           blendMode?: string;
           blendOpacity?: number;
+          /**
+           * Raw fabric-feel + print-strength sliders (0–1). Stage A already encodes these
+           * indirectly via `blendMode`/`blendOpacity`, but Stage B (Kontext) needs them
+           * RAW so the prompt + pre-blur can scale: higher fabric feel → stronger
+           * "ink absorbed into weave" directive + bigger softening blur, lower
+           * print strength → "faded vintage" framing.
+           */
+          fabricFeel?: number;
+          printStrength?: number;
           maskConfig?: { mode?: string | null } | null;
         };
       };
@@ -1740,8 +1835,18 @@ export function BlankRenderProfileEditor({
        * Render profile dropdown (none vs use uploaded mask) the same way production
        * onMockJobCreated will after this PR.
        */
-      const maskConfigForPreview = selected && selected.maskConfig
-        ? { mode: selected.maskConfig.mode ?? null }
+      /**
+       * v10.1: auto-promote `none`/unset → `blank_mask_doc` whenever a mask doc
+       * exists for the current blank+view. Mirrors the editor dropdown's
+       * effective-mode logic so the backend renders with the same mask the
+       * operator sees as "Auto-default" in the UI.
+       */
+      const savedMaskMode = selected?.maskConfig?.mode;
+      const effectiveMaskModeForPreview = currentBlankMaskUrl && (savedMaskMode == null || savedMaskMode === "none")
+        ? "blank_mask_doc"
+        : (savedMaskMode ?? null);
+      const maskConfigForPreview = selected
+        ? { mode: effectiveMaskModeForPreview }
         : null;
       /**
        * Option A safeArea sizing (RALLY_BLANK_PREVIEW_RENDER.md follow-up): pass the zone's
@@ -1773,6 +1878,9 @@ export function BlankRenderProfileEditor({
           height: safeAreaForPreview?.h,
           blendMode: effectiveBlend.blendMode,
           blendOpacity: effectiveBlend.blendOpacity,
+          /** Raw sliders so Stage B prompt + pre-blur can scale (see callable input typedef above). */
+          fabricFeel: tuning.blend.fabricFeel,
+          printStrength: tuning.blend.printStrength,
           maskConfig: maskConfigForPreview,
         },
       });
@@ -2364,11 +2472,50 @@ export function BlankRenderProfileEditor({
   const blendModeForBlendedCanvas = is8394SimpleBackUi
     ? zoneBlendFor8394BlendedPreview.blendMode
     : zoneBlend.blendMode;
-  const canvasMixBlend = useBlendedCanvas
+  /**
+   * v9 (2026-05-25): non-destructive slider preview.
+   *
+   * The original sliders drove `mix-blend-mode: multiply` at low opacity, which on a
+   * black garment made the design near-invisible (e.g. ff=80% → multiply · op 0.49).
+   * v8.3 disabled that entirely → sliders moved but nothing changed in preview, which
+   * is its own UX failure.
+   *
+   * v9 splits the difference: sliders apply a *safe, always-visible* CSS effect that
+   * approximates the AI realism look. Backend Stage A still renders clean (so Flux
+   * Fill gets a color-anchored input), but the live canvas now responds to slider
+   * motion within a non-destructive range:
+   *
+   *   - Print strength → opacity in [0.85, 1.00] (never below 0.85 → design always
+   *     clearly visible; high end gives fully vivid ink).
+   *   - Fabric feel    → `saturate()` in [0.82, 1.00] + `blur()` in [0, 1.2px]
+   *     (slight desaturation + softness simulates ink absorbing into cotton fibers,
+   *     never destructive).
+   *
+   * 8394 path retains its bespoke blend logic so in-progress 8394 tuning isn't
+   * disturbed; only the non-8394 path (HF07 + future garments) gets this preview.
+   */
+  const aiPreviewOpacity = tuning && !is8394SimpleBackUi
+    ? 0.85 + tuning.blend.printStrength * 0.15
+    : 1;
+  const aiPreviewSaturation = tuning && !is8394SimpleBackUi
+    ? 1.0 - tuning.blend.fabricFeel * 0.18
+    : 1.0;
+  const aiPreviewBlurPx = tuning && !is8394SimpleBackUi
+    ? tuning.blend.fabricFeel * 1.2
+    : 0;
+  const aiPreviewFilter = tuning && !is8394SimpleBackUi
+    ? `saturate(${aiPreviewSaturation.toFixed(2)}) blur(${aiPreviewBlurPx.toFixed(2)}px)`
+    : undefined;
+  const force8394LegacyBlend = is8394SimpleBackUi;
+  const canvasMixBlend = useBlendedCanvas && force8394LegacyBlend
     ? (cssMixBlendMode(blendModeForBlendedCanvas) as React.CSSProperties["mixBlendMode"])
     : "normal";
-  const canvasOpacity = useBlendedCanvas ? previewOpacity : 1;
-  const canvasFilter = useBlendedCanvas && is8394 && tuning ? previewFilter : undefined;
+  const canvasOpacity = useBlendedCanvas && force8394LegacyBlend
+    ? previewOpacity
+    : (useBlendedCanvas ? aiPreviewOpacity : 1);
+  const canvasFilter = useBlendedCanvas && is8394 && tuning
+    ? previewFilter
+    : (useBlendedCanvas ? aiPreviewFilter : undefined);
 
   const canvas8394Warp = is8394 && tuning ? preview8394WarpMask.warp : undefined;
   const canvas8394Mask = is8394 && tuning ? preview8394WarpMask.mask : undefined;
@@ -2571,24 +2718,12 @@ export function BlankRenderProfileEditor({
                 </button>
               </div>
             </div>
-          </section>
-
-          {/*
-            Target tuning section — primary controls (Render target → Placement → Print style/blend).
-            Header + verbose explanation removed so Render Target dropdown sits visually adjacent
-            to the Artwork variant above; saves write to either blank baseline or per-variant
-            override (controlled by the Garment color save-scope selector higher up).
-          */}
-          <section
-            key={`tuning-cell-${variantId || "baseline"}-${selectedRenderTarget}`}
-            className="space-y-3 rounded-xl border border-violet-200 bg-violet-50/40 p-4"
-          >
             <div>
-              <label className="block text-xs font-medium text-neutral-800 mb-1">Render target</label>
+              <label className="block text-sm font-medium text-neutral-800 mb-1">Render target</label>
               <select
                 value={selectedRenderTarget}
                 onChange={(e) => setSelectedRenderTarget(e.target.value as RpRenderTarget)}
-                className="w-full border border-violet-200 rounded-lg px-3 py-2 text-sm bg-white text-neutral-900"
+                className="w-full border border-neutral-300 rounded-lg px-3 py-2.5 text-sm bg-white text-neutral-900"
               >
                 {RENDER_TARGETS.map((t) => (
                   <option key={t} value={t}>
@@ -2596,10 +2731,404 @@ export function BlankRenderProfileEditor({
                   </option>
                 ))}
               </select>
-              <p className="text-[11px] text-neutral-600 mt-1.5">
-                Defaults to Flat Front / Flat Back when you switch render zone. Preview image follows this target.
+              <p className="text-xs text-neutral-500 mt-1.5 leading-snug">
+                Defaults to Flat Front / Flat Back when you switch render zone. Preview image follows this target. Placement and print style below are saved per target.
               </p>
             </div>
+            {/*
+              Target tuning (placement + print style + diagnostics) lives inline in the same
+              section as Render target above so the sliders sit immediately below the dropdown
+              with no card break. Re-keyed on (variantId × selectedRenderTarget) to remount
+              child state cleanly when either changes. Saves write to either blank baseline or
+              per-variant override (controlled by the Garment color save-scope selector higher up).
+            */}
+            <div
+              key={`tuning-cell-${variantId || "baseline"}-${selectedRenderTarget}`}
+              className="space-y-3"
+            >
+            {/*
+              Sliders block (placement + legacy print style) sits FIRST in this section so it
+              renders directly under the Render target dropdown above. All 8394 diagnostics
+              (warnings, matrix-cell inspector, copy buttons) and the non-8394 Resolved Tuning
+              read-only QA block move below the sliders.
+            */}
+            {tuning && is8394 ? (
+              <TargetTuning8394Panel
+                tuning={tuning}
+                patchTargetTuning={patchTargetTuning}
+                selected={selected}
+                selectedRenderTarget={selectedRenderTarget}
+                resolvedTargetForEngine={resolvedTargetForEngine}
+                engineBlendResolved={engineBlendResolved}
+                sx={sx}
+                sy={sy}
+                sw={sw}
+                sh={sh}
+                artBase={artBase}
+                showSafeArea={showSafeArea}
+                setShowSafeArea={setShowSafeArea}
+                showClipHint={showClipHint}
+                setShowClipHint={setShowClipHint}
+                is8394SimpleBackUi={is8394SimpleBackUi}
+                updateSelected={updateSelected}
+                previewQa8394={previewQa8394}
+              />
+            ) : tuning ? (
+              <div className="space-y-5">
+                <div>
+                  <h3 className="text-[11px] font-bold uppercase tracking-wide text-neutral-600 mb-2">
+                    Placement tuning (this target)
+                  </h3>
+                  <p className="text-[11px] text-neutral-500 mb-2">
+                    Overlay position/size for this photo only. Drag on preview updates these values.
+                  </p>
+                  <div>
+                    <div className="flex justify-between text-xs text-neutral-600 mb-1">
+                      <span className="font-medium text-neutral-800">Scale</span>
+                      <span>{scalePercentFromEngine(tuning.placement.scale)}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={SCALE_PCT_MIN}
+                      max={SCALE_PCT_MAX}
+                      step={1}
+                      value={scalePercentFromEngine(tuning.placement.scale)}
+                      onChange={(e) =>
+                        patchTargetTuning({
+                          placement: {
+                            ...tuning.placement,
+                            scale: scaleEngineFromPercent(Number(e.target.value)),
+                          },
+                        })
+                      }
+                      className="w-full accent-violet-600"
+                    />
+                  </div>
+                  <div className="mt-3">
+                    <div className="flex justify-between text-xs text-neutral-600 mb-1">
+                      <span className="font-medium text-neutral-800">Horizontal</span>
+                      <span>{Math.round(tuning.placement.x * 100)}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={1}
+                      value={Math.round(tuning.placement.x * 100)}
+                      onChange={(e) =>
+                        patchTargetTuning({
+                          placement: {
+                            ...tuning.placement,
+                            x: Number(e.target.value) / 100,
+                          },
+                        })
+                      }
+                      className="w-full accent-violet-600"
+                    />
+                  </div>
+                  <div className="mt-3">
+                    <div className="flex justify-between text-xs text-neutral-600 mb-1">
+                      <span className="font-medium text-neutral-800">Vertical</span>
+                      <span>{Math.round(tuning.placement.y * 100)}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      step={1}
+                      value={Math.round(tuning.placement.y * 100)}
+                      onChange={(e) =>
+                        patchTargetTuning({
+                          placement: {
+                            ...tuning.placement,
+                            y: Number(e.target.value) / 100,
+                          },
+                        })
+                      }
+                      className="w-full accent-violet-600"
+                    />
+                  </div>
+                </div>
+                {/*
+                  AI realism tuning — replaced continuous sliders with 3-button pickers
+                  (2026-05-25) because the Stage B prompt buckets each slider into 3 bands
+                  internally (low/med/high). Continuous sliders gave the illusion of fine
+                  control but ff=20 vs ff=39 produced the identical prompt. The picker UI
+                  is honest about the underlying 6-preset reality and faster to tune.
+                  Underlying storage stays numeric (`tuning.blend.fabricFeel`,
+                  `tuning.blend.printStrength`) — buttons pin to band-center values
+                  (0.2 / 0.55 / 0.85) so existing saves and backend bucketing both work.
+                */}
+                {(() => {
+                  const ffValue = tuning.blend.fabricFeel;
+                  const psValue = tuning.blend.printStrength;
+                  const fabricBands = [
+                    { value: 0.20, label: "Clean", caption: "Subtle fiber texture, mostly opaque ink" },
+                    { value: 0.55, label: "Textured", caption: "Visible weave through ink, soft edges" },
+                    { value: 0.85, label: "Worn", caption: "Pronounced fiber mottling, broken-up coverage" },
+                  ] as const;
+                  const strengthBands = [
+                    { value: 0.20, label: "Faded", caption: "Lightly faded, washed-out" },
+                    { value: 0.55, label: "Vivid", caption: "Fresh full saturation" },
+                    { value: 0.85, label: "Bold", caption: "Extra bold, freshly printed" },
+                  ] as const;
+                  const activeFabricBand = fabricBands.reduce((acc, b) =>
+                    Math.abs(b.value - ffValue) < Math.abs(acc.value - ffValue) ? b : acc, fabricBands[1]);
+                  const activeStrengthBand = strengthBands.reduce((acc, b) =>
+                    Math.abs(b.value - psValue) < Math.abs(acc.value - psValue) ? b : acc, strengthBands[1]);
+                  return (
+                    <div>
+                      <h3 className="text-[11px] font-bold uppercase tracking-wide text-neutral-600 mb-1">
+                        Product preview tuning
+                      </h3>
+                      <p className="text-[11px] text-neutral-500 mb-3 leading-snug">
+                        Live canvas previews each pick. Click <strong className="text-neutral-700">Product Preview</strong> above for the real output.
+                      </p>
+                      <div className="space-y-4">
+                        <div>
+                          <span className="block text-xs font-medium text-neutral-700 mb-1.5">Fabric feel</span>
+                          <div className="inline-flex flex-wrap rounded-lg border border-neutral-200 p-0.5 bg-neutral-50 gap-0.5 w-full">
+                            {fabricBands.map((b) => {
+                              const isActive = b.value === activeFabricBand.value;
+                              return (
+                                <button
+                                  key={b.label}
+                                  type="button"
+                                  onClick={() => patchTargetTuning({ blend: { ...tuning.blend, fabricFeel: b.value } })}
+                                  className={`flex-1 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors ${
+                                    isActive
+                                      ? "bg-white text-neutral-900 shadow-sm"
+                                      : "text-neutral-600 hover:text-neutral-900"
+                                  }`}
+                                >
+                                  {b.label}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <p className="text-[10px] text-neutral-500 mt-1 leading-snug">{activeFabricBand.caption}</p>
+                        </div>
+                        <div>
+                          <span className="block text-xs font-medium text-neutral-700 mb-1.5">Print strength</span>
+                          <div className="inline-flex flex-wrap rounded-lg border border-neutral-200 p-0.5 bg-neutral-50 gap-0.5 w-full">
+                            {strengthBands.map((b) => {
+                              const isActive = b.value === activeStrengthBand.value;
+                              return (
+                                <button
+                                  key={b.label}
+                                  type="button"
+                                  onClick={() => patchTargetTuning({ blend: { ...tuning.blend, printStrength: b.value } })}
+                                  className={`flex-1 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors ${
+                                    isActive
+                                      ? "bg-white text-neutral-900 shadow-sm"
+                                      : "text-neutral-600 hover:text-neutral-900"
+                                  }`}
+                                >
+                                  {b.label}
+                                </button>
+                              );
+                            })}
+                          </div>
+                          <p className="text-[10px] text-neutral-500 mt-1 leading-snug">{activeStrengthBand.caption}</p>
+                        </div>
+                        {/*
+                          DISABLED v10 (2026-05-25): "Mode (optional)" dropdown wrote to
+                          `tuning.blend.mode` but is no longer read anywhere in the active
+                          pipeline:
+                            - Stage A backend (v8.3): forces normal blend, ignores mode.
+                            - CSS canvas (v8.3): forces normal blend, ignores mode.
+                            - Stage B Flux Fill prompt (v10): builds dynamic prompt from
+                              ff/ps band only, never references blend.mode.
+                          Hidden to declutter; restore if a later pipeline wires it back in.
+                        <div>
+                          <label className="block text-xs font-medium text-neutral-700 mb-1">Mode (optional)</label>
+                          <select
+                            value={tuning.blend.mode ?? ""}
+                            onChange={(e) =>
+                              patchTargetTuning({
+                                blend: {
+                                  ...tuning.blend,
+                                  mode:
+                                    e.target.value === ""
+                                      ? undefined
+                                      : (e.target.value as NonNullable<typeof tuning.blend.mode>),
+                                },
+                              })
+                            }
+                            className="w-full border border-neutral-300 rounded-lg px-2 py-2 text-sm bg-white text-neutral-900"
+                          >
+                            <option value="">Engine curve (default)</option>
+                            <option value="clean">Clean</option>
+                            <option value="soft">Soft</option>
+                            <option value="vintage">Vintage</option>
+                            <option value="bold">Bold</option>
+                          </select>
+                        </div>
+                        */}
+                      </div>
+                    </div>
+                  );
+                })()}
+                {/*
+                  DISABLED v10 (2026-05-25): Legacy CSS warp (3D skew) was only ever used
+                  by the 8394 deterministic compositor. AI realism (Flux Fill) now drapes
+                  prints over fabric folds, so this is fully redundant for HF07 and any
+                  future garment. Saved warp data on Firestore is still readable but no
+                  longer surfaced in the UI. If 8394 panty needs warp tuning again,
+                  re-enable behind an `is8394` guard.
+                {is8394 ? (
+                <details className="rounded-lg border border-neutral-200 bg-neutral-50/40 px-3 py-2">
+                  <summary className="cursor-pointer text-[11px] font-bold uppercase tracking-wide text-neutral-600 list-none flex items-center gap-2">
+                    <span aria-hidden>▸</span>
+                    Legacy: Warp &middot; now handled by AI realism
+                  </summary>
+                  <p className="text-[10px] text-neutral-500 italic mt-2 mb-3 leading-snug">
+                    Per-target CSS warp (3D skew). Stage B (Kontext) drapes the print over fabric folds naturally — only enable warp for blanks like 8394 panties where the deterministic compositor needs it.
+                  </p>
+                <div>
+                  <h3 className="text-[11px] font-bold uppercase tracking-wide text-neutral-600 mb-2">Warp (saved)</h3>
+                  <label className="flex items-center gap-2 text-sm text-neutral-800 mb-2">
+                    <input
+                      type="checkbox"
+                      checked={tuning.warp?.enabled === true}
+                      onChange={(e) =>
+                        patchTargetTuning({
+                          warp: { ...(tuning.warp ?? { enabled: false }), enabled: e.target.checked },
+                        })
+                      }
+                    />
+                    Enabled
+                  </label>
+                  <div className="grid grid-cols-1 gap-2 text-xs">
+                    <label className="flex flex-col gap-0.5">
+                      <span className="text-neutral-600">Warp strength</span>
+                      <input
+                        type="number"
+                        step={0.01}
+                        value={tuning.warp?.warpStrength ?? 0}
+                        onChange={(e) =>
+                          patchTargetTuning({
+                            warp: {
+                              ...(tuning.warp ?? { enabled: false }),
+                              warpStrength: Number(e.target.value),
+                            },
+                          })
+                        }
+                        className="border border-neutral-300 rounded px-2 py-1 bg-white text-neutral-900"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-0.5">
+                      <span className="text-neutral-600">Vertical stretch</span>
+                      <input
+                        type="number"
+                        step={0.01}
+                        value={tuning.warp?.verticalStretch ?? 0}
+                        onChange={(e) =>
+                          patchTargetTuning({
+                            warp: {
+                              ...(tuning.warp ?? { enabled: false }),
+                              verticalStretch: Number(e.target.value),
+                            },
+                          })
+                        }
+                        className="border border-neutral-300 rounded px-2 py-1 bg-white text-neutral-900"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-0.5">
+                      <span className="text-neutral-600">Horizontal warp</span>
+                      <input
+                        type="number"
+                        step={0.01}
+                        value={tuning.warp?.horizontalWarp ?? 0}
+                        onChange={(e) =>
+                          patchTargetTuning({
+                            warp: {
+                              ...(tuning.warp ?? { enabled: false }),
+                              horizontalWarp: Number(e.target.value),
+                            },
+                          })
+                        }
+                        className="border border-neutral-300 rounded px-2 py-1 bg-white text-neutral-900"
+                      />
+                    </label>
+                  </div>
+                  <p className="text-[10px] text-neutral-500 mt-1">
+                    Preview applies a CSS warp approximation (3D + skew). Sharp production may use mesh warp when
+                    enabled.
+                  </p>
+                </div>
+                </details>
+                ) : null}
+                — end of disabled Legacy: Warp block —
+                */}
+                {/*
+                  DISABLED v10 (2026-05-25): Mask (saved) Feather + Edge fade values used
+                  to tune a CSS feather effect at compositor time. With v10's hybrid letter
+                  mask + Flux Fill inpainting + post-composite blend, the feather is now
+                  derived automatically from the design alpha (fixed sigma 4 in oversample
+                  space, ~2px native). These knobs save but no longer drive any output.
+                  Hidden to declutter the sidebar.
+                <div>
+                  <h3 className="text-[11px] font-bold uppercase tracking-wide text-neutral-600 mb-2">Mask (saved)</h3>
+                  <label className="flex items-center gap-2 text-sm text-neutral-800 mb-2">
+                    <input
+                      type="checkbox"
+                      checked={tuning.mask?.enabled === true}
+                      onChange={(e) =>
+                        patchTargetTuning({
+                          mask: { ...(tuning.mask ?? { enabled: false }), enabled: e.target.checked },
+                        })
+                      }
+                    />
+                    Enabled
+                  </label>
+                  <div className="grid grid-cols-2 gap-2 text-xs">
+                    <label className="flex flex-col gap-0.5">
+                      <span className="text-neutral-600">Feather</span>
+                      <input
+                        type="number"
+                        step={0.01}
+                        value={tuning.mask?.feather ?? 0}
+                        onChange={(e) =>
+                          patchTargetTuning({
+                            mask: {
+                              ...(tuning.mask ?? { enabled: false }),
+                              feather: Number(e.target.value),
+                            },
+                          })
+                        }
+                        className="border border-neutral-300 rounded px-2 py-1 bg-white text-neutral-900"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-0.5">
+                      <span className="text-neutral-600">Edge fade</span>
+                      <input
+                        type="number"
+                        step={0.01}
+                        value={tuning.mask?.edgeFade ?? 0}
+                        onChange={(e) =>
+                          patchTargetTuning({
+                            mask: {
+                              ...(tuning.mask ?? { enabled: false }),
+                              edgeFade: Number(e.target.value),
+                            },
+                          })
+                        }
+                        className="border border-neutral-300 rounded px-2 py-1 bg-white text-neutral-900"
+                      />
+                    </label>
+                  </div>
+                  <p className="text-[10px] text-neutral-500 mt-1">
+                    These knobs ({"feather"} / {"edge fade"}) tune the soft-edge look applied at compositor time.
+                    Use the <strong>MASK</strong> toggle in the preview header to overlay the uploaded
+                    {" "}<code className="text-[9px]">rp_blank_masks</code> PNG on the canvas.
+                  </p>
+                </div>
+                — end of disabled Mask (saved) block —
+                */}
+              </div>
+            ) : null}
+            {/* —— Diagnostics & resolved-tuning QA (below the sliders) —— */}
             {is8394 && isMasterBlank(blank) && variantId && persistedCellResolution && !persistedCellResolution.qa.colorMatrixCellExisted ? (
               <p
                 className="text-[11px] text-amber-950 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 leading-snug"
@@ -2693,11 +3222,18 @@ export function BlankRenderProfileEditor({
               </div>
             ) : null}
             {selected && !is8394 ? (
-              <div className="rounded-lg border border-emerald-300/80 bg-emerald-50/70 px-3 py-2.5">
-                <h3 className="text-[10px] font-bold uppercase tracking-wide text-emerald-900 mb-1">
+              /*
+                Collapsed v10 (2026-05-25): debug-only telemetry showing merged tuning
+                values + flags (blank row present, variant override, product placement).
+                Useful when answering "did my save persist?" but otherwise takes vertical
+                space. Wrapped in <details> so it's one click away when needed.
+              */
+              <details className="rounded-lg border border-emerald-300/80 bg-emerald-50/70 px-3 py-2 group">
+                <summary className="cursor-pointer text-[10px] font-bold uppercase tracking-wide text-emerald-900 list-none flex items-center gap-2">
+                  <span aria-hidden className="group-open:rotate-90 transition-transform">▸</span>
                   Resolved target tuning (read-only QA)
-                </h3>
-                <p className="text-[10px] text-emerald-900/85 mb-2 leading-snug">
+                </summary>
+                <p className="text-[10px] text-emerald-900/85 mt-2 mb-2 leading-snug">
                   Effective values for <strong>{RENDER_TARGET_LABELS[selectedRenderTarget]}</strong> with the preview
                   variant (no product overrides). Matches the compositor merge order for this blank.
                 </p>
@@ -2746,325 +3282,20 @@ export function BlankRenderProfileEditor({
                   {resolvedTargetForEngine.qa.variantTargetOverrideExisted ? "yes" : "no"} · product placement{" "}
                   {resolvedTargetForEngine.qa.productPlacementApplied ? "applied" : "no"}
                 </p>
-              </div>
+              </details>
             ) : null}
-            {tuning && is8394 ? (
-              <TargetTuning8394Panel
-                tuning={tuning}
-                patchTargetTuning={patchTargetTuning}
-                selected={selected}
-                selectedRenderTarget={selectedRenderTarget}
-                resolvedTargetForEngine={resolvedTargetForEngine}
-                engineBlendResolved={engineBlendResolved}
-                sx={sx}
-                sy={sy}
-                sw={sw}
-                sh={sh}
-                artBase={artBase}
-                showSafeArea={showSafeArea}
-                setShowSafeArea={setShowSafeArea}
-                showClipHint={showClipHint}
-                setShowClipHint={setShowClipHint}
-                is8394SimpleBackUi={is8394SimpleBackUi}
-                updateSelected={updateSelected}
-                previewQa8394={previewQa8394}
-              />
-            ) : tuning ? (
-              <div className="space-y-5 pt-2 border-t border-violet-200/80">
-                <div>
-                  <h3 className="text-[11px] font-bold uppercase tracking-wide text-neutral-600 mb-2">
-                    Placement tuning (this target)
-                  </h3>
-                  <p className="text-[11px] text-neutral-500 mb-2">
-                    Overlay position/size for this photo only. Drag on preview updates these values.
-                  </p>
-                  <div>
-                    <div className="flex justify-between text-xs text-neutral-600 mb-1">
-                      <span className="font-medium text-neutral-800">Scale</span>
-                      <span>{scalePercentFromEngine(tuning.placement.scale)}%</span>
-                    </div>
-                    <input
-                      type="range"
-                      min={SCALE_PCT_MIN}
-                      max={SCALE_PCT_MAX}
-                      step={1}
-                      value={scalePercentFromEngine(tuning.placement.scale)}
-                      onChange={(e) =>
-                        patchTargetTuning({
-                          placement: {
-                            ...tuning.placement,
-                            scale: scaleEngineFromPercent(Number(e.target.value)),
-                          },
-                        })
-                      }
-                      className="w-full accent-violet-600"
-                    />
-                  </div>
-                  <div className="mt-3">
-                    <div className="flex justify-between text-xs text-neutral-600 mb-1">
-                      <span className="font-medium text-neutral-800">Horizontal</span>
-                      <span>{Math.round(tuning.placement.x * 100)}%</span>
-                    </div>
-                    <input
-                      type="range"
-                      min={0}
-                      max={100}
-                      step={1}
-                      value={Math.round(tuning.placement.x * 100)}
-                      onChange={(e) =>
-                        patchTargetTuning({
-                          placement: {
-                            ...tuning.placement,
-                            x: Number(e.target.value) / 100,
-                          },
-                        })
-                      }
-                      className="w-full accent-violet-600"
-                    />
-                  </div>
-                  <div className="mt-3">
-                    <div className="flex justify-between text-xs text-neutral-600 mb-1">
-                      <span className="font-medium text-neutral-800">Vertical</span>
-                      <span>{Math.round(tuning.placement.y * 100)}%</span>
-                    </div>
-                    <input
-                      type="range"
-                      min={0}
-                      max={100}
-                      step={1}
-                      value={Math.round(tuning.placement.y * 100)}
-                      onChange={(e) =>
-                        patchTargetTuning({
-                          placement: {
-                            ...tuning.placement,
-                            y: Number(e.target.value) / 100,
-                          },
-                        })
-                      }
-                      className="w-full accent-violet-600"
-                    />
-                  </div>
-                </div>
-                <details className="rounded-lg border border-neutral-200 bg-neutral-50/40 px-3 py-2">
-                  <summary className="cursor-pointer text-[11px] font-bold uppercase tracking-wide text-neutral-600 list-none flex items-center gap-2">
-                    <span aria-hidden>▸</span>
-                    Legacy: Print style / blend &middot; now handled by AI realism
-                  </summary>
-                  <p className="text-[10px] text-neutral-500 italic mt-2 mb-3 leading-snug">
-                    Stage B (Kontext) now integrates the print into fabric automatically. These sliders only affect the deterministic Stage A composite shown in the editor preview — keep them at defaults unless you&rsquo;re tuning a specific look the AI doesn&rsquo;t capture.
-                  </p>
-                <div>
-                  <h3 className="text-[11px] font-bold uppercase tracking-wide text-neutral-600 mb-2">
-                    Print style / blend (this target)
-                  </h3>
-                  <div className="grid grid-cols-1 gap-3">
-                    <div>
-                      <div className="flex justify-between text-xs text-neutral-600 mb-1">
-                        <span className="font-medium text-neutral-800">Fabric feel</span>
-                        <span>{Math.round(tuning.blend.fabricFeel * 100)}%</span>
-                      </div>
-                      <input
-                        type="range"
-                        min={0}
-                        max={100}
-                        step={1}
-                        value={Math.round(tuning.blend.fabricFeel * 100)}
-                        onChange={(e) =>
-                          patchTargetTuning({
-                            blend: { ...tuning.blend, fabricFeel: Number(e.target.value) / 100 },
-                          })
-                        }
-                        className="w-full accent-violet-600"
-                      />
-                    </div>
-                    <div>
-                      <div className="flex justify-between text-xs text-neutral-600 mb-1">
-                        <span className="font-medium text-neutral-800">Print strength</span>
-                        <span>{Math.round(tuning.blend.printStrength * 100)}%</span>
-                      </div>
-                      <input
-                        type="range"
-                        min={0}
-                        max={100}
-                        step={1}
-                        value={Math.round(tuning.blend.printStrength * 100)}
-                        onChange={(e) =>
-                          patchTargetTuning({
-                            blend: { ...tuning.blend, printStrength: Number(e.target.value) / 100 },
-                          })
-                        }
-                        className="w-full accent-violet-600"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-neutral-700 mb-1">Mode (optional)</label>
-                      <select
-                        value={tuning.blend.mode ?? ""}
-                        onChange={(e) =>
-                          patchTargetTuning({
-                            blend: {
-                              ...tuning.blend,
-                              mode:
-                                e.target.value === ""
-                                  ? undefined
-                                  : (e.target.value as NonNullable<typeof tuning.blend.mode>),
-                            },
-                          })
-                        }
-                        className="w-full border border-neutral-300 rounded-lg px-2 py-2 text-sm bg-white text-neutral-900"
-                      >
-                        <option value="">Engine curve (default)</option>
-                        <option value="clean">Clean</option>
-                        <option value="soft">Soft</option>
-                        <option value="vintage">Vintage</option>
-                        <option value="bold">Bold</option>
-                      </select>
-                    </div>
-                  </div>
-                </div>
-                </details>
-                <details className="rounded-lg border border-neutral-200 bg-neutral-50/40 px-3 py-2">
-                  <summary className="cursor-pointer text-[11px] font-bold uppercase tracking-wide text-neutral-600 list-none flex items-center gap-2">
-                    <span aria-hidden>▸</span>
-                    Legacy: Warp &middot; now handled by AI realism
-                  </summary>
-                  <p className="text-[10px] text-neutral-500 italic mt-2 mb-3 leading-snug">
-                    Per-target CSS warp (3D skew). Stage B (Kontext) drapes the print over fabric folds naturally — only enable warp for blanks like 8394 panties where the deterministic compositor needs it.
-                  </p>
-                <div>
-                  <h3 className="text-[11px] font-bold uppercase tracking-wide text-neutral-600 mb-2">Warp (saved)</h3>
-                  <label className="flex items-center gap-2 text-sm text-neutral-800 mb-2">
-                    <input
-                      type="checkbox"
-                      checked={tuning.warp?.enabled === true}
-                      onChange={(e) =>
-                        patchTargetTuning({
-                          warp: { ...(tuning.warp ?? { enabled: false }), enabled: e.target.checked },
-                        })
-                      }
-                    />
-                    Enabled
-                  </label>
-                  <div className="grid grid-cols-1 gap-2 text-xs">
-                    <label className="flex flex-col gap-0.5">
-                      <span className="text-neutral-600">Warp strength</span>
-                      <input
-                        type="number"
-                        step={0.01}
-                        value={tuning.warp?.warpStrength ?? 0}
-                        onChange={(e) =>
-                          patchTargetTuning({
-                            warp: {
-                              ...(tuning.warp ?? { enabled: false }),
-                              warpStrength: Number(e.target.value),
-                            },
-                          })
-                        }
-                        className="border border-neutral-300 rounded px-2 py-1 bg-white text-neutral-900"
-                      />
-                    </label>
-                    <label className="flex flex-col gap-0.5">
-                      <span className="text-neutral-600">Vertical stretch</span>
-                      <input
-                        type="number"
-                        step={0.01}
-                        value={tuning.warp?.verticalStretch ?? 0}
-                        onChange={(e) =>
-                          patchTargetTuning({
-                            warp: {
-                              ...(tuning.warp ?? { enabled: false }),
-                              verticalStretch: Number(e.target.value),
-                            },
-                          })
-                        }
-                        className="border border-neutral-300 rounded px-2 py-1 bg-white text-neutral-900"
-                      />
-                    </label>
-                    <label className="flex flex-col gap-0.5">
-                      <span className="text-neutral-600">Horizontal warp</span>
-                      <input
-                        type="number"
-                        step={0.01}
-                        value={tuning.warp?.horizontalWarp ?? 0}
-                        onChange={(e) =>
-                          patchTargetTuning({
-                            warp: {
-                              ...(tuning.warp ?? { enabled: false }),
-                              horizontalWarp: Number(e.target.value),
-                            },
-                          })
-                        }
-                        className="border border-neutral-300 rounded px-2 py-1 bg-white text-neutral-900"
-                      />
-                    </label>
-                  </div>
-                  <p className="text-[10px] text-neutral-500 mt-1">
-                    Preview applies a CSS warp approximation (3D + skew). Sharp production may use mesh warp when
-                    enabled.
-                  </p>
-                </div>
-                </details>
-                <div>
-                  <h3 className="text-[11px] font-bold uppercase tracking-wide text-neutral-600 mb-2">Mask (saved)</h3>
-                  <label className="flex items-center gap-2 text-sm text-neutral-800 mb-2">
-                    <input
-                      type="checkbox"
-                      checked={tuning.mask?.enabled === true}
-                      onChange={(e) =>
-                        patchTargetTuning({
-                          mask: { ...(tuning.mask ?? { enabled: false }), enabled: e.target.checked },
-                        })
-                      }
-                    />
-                    Enabled
-                  </label>
-                  <div className="grid grid-cols-2 gap-2 text-xs">
-                    <label className="flex flex-col gap-0.5">
-                      <span className="text-neutral-600">Feather</span>
-                      <input
-                        type="number"
-                        step={0.01}
-                        value={tuning.mask?.feather ?? 0}
-                        onChange={(e) =>
-                          patchTargetTuning({
-                            mask: {
-                              ...(tuning.mask ?? { enabled: false }),
-                              feather: Number(e.target.value),
-                            },
-                          })
-                        }
-                        className="border border-neutral-300 rounded px-2 py-1 bg-white text-neutral-900"
-                      />
-                    </label>
-                    <label className="flex flex-col gap-0.5">
-                      <span className="text-neutral-600">Edge fade</span>
-                      <input
-                        type="number"
-                        step={0.01}
-                        value={tuning.mask?.edgeFade ?? 0}
-                        onChange={(e) =>
-                          patchTargetTuning({
-                            mask: {
-                              ...(tuning.mask ?? { enabled: false }),
-                              edgeFade: Number(e.target.value),
-                            },
-                          })
-                        }
-                        className="border border-neutral-300 rounded px-2 py-1 bg-white text-neutral-900"
-                      />
-                    </label>
-                  </div>
-                  <p className="text-[10px] text-neutral-500 mt-1">
-                    These knobs ({"feather"} / {"edge fade"}) tune the soft-edge look applied at compositor time.
-                    Use the <strong>MASK</strong> toggle in the preview header to overlay the uploaded
-                    {" "}<code className="text-[9px]">rp_blank_masks</code> PNG on the canvas.
-                  </p>
-                </div>
-              </div>
-            ) : null}
+            </div>
           </section>
 
-          {/* Which placements[] row is active (front vs back) — not the same as Render target (flat vs model photo) */}
+          {/*
+            DISABLED v10 (2026-05-25): Placement zone (Zone row + Zone row status) was
+            relevant when blanks could have multiple `placements[]` rows per side. For
+            current-scope blanks (HF07 + the 4 LA Apparel garments at 1 zone per side),
+            the Render target dropdown above already picks the right placement row
+            implicitly via view (front/back). Zone row status is workflow nicety that
+            duplicates the blank-wide "render readiness" status further down.
+            Re-enable for multi-zone blanks if/when those appear.
+          (Which placements[] row is active (front vs back) — not the same as Render target)
           <section className="space-y-3 pt-2 border-t border-neutral-100">
             <h2 className="text-xs font-bold uppercase tracking-wider text-neutral-500">Placement zone</h2>
             <p className="text-[11px] text-neutral-500 leading-snug">
@@ -3102,8 +3333,18 @@ export function BlankRenderProfileEditor({
               </div>
             </div>
           </section>
+          */}
 
-          {/* 2. Zone geometry (placements[]) — full section; 8394 uses Advanced in Target tuning instead */}
+          {/*
+            DISABLED v10 (2026-05-25): "2. Zone geometry (placements[])" duplicates the
+            Placement Tuning sliders above. The two were meant to be:
+              - Placement Tuning = per-photo override (target-level)
+              - Zone Geometry    = baseline default for the zone (row-level)
+            In practice operators only use the per-photo target tuning. Baseline values
+            either come from blank seed data or get patched directly via the target
+            override path. Hiding to declutter; safe-area visibility checkboxes are
+            re-added inline above the canvas if/when needed.
+          (2. Zone geometry — non-8394 only; 8394 uses Advanced in Target tuning)
           {!is8394 ? (
           <section className="space-y-4 pt-2 border-t border-neutral-100">
             <h2 className="text-xs font-bold uppercase tracking-wider text-neutral-500">
@@ -3173,10 +3414,21 @@ export function BlankRenderProfileEditor({
             ) : null}
           </section>
           ) : null}
+          */}
 
+          {/*
+            DISABLED v10 (2026-05-25): "3. Print style" + "4. Print size" preset rows are
+            redundant with controls higher up in the sidebar:
+              - Print style presets wrote `fabricFeel`/`printStrength` — now controlled
+                by the AI realism 3-button pickers (Clean/Textured/Worn × Faded/Vivid/Bold).
+              - Print size presets wrote `defaultScale` — now controlled by the Scale
+                slider in the Placement Tuning block at the top of the sidebar.
+            Both sections were the operator's "quick set" path; the per-target overrides
+            above now do the same job with finer (and slider-driven) control. Hiding the
+            full <> fragment that wraps both sections.
           {!is8394 ? (
             <>
-              {/* 3. Print style */}
+              (3. Print style)
               <section className="space-y-3 pt-2 border-t border-neutral-100">
                 <h2 className="text-xs font-bold uppercase tracking-wider text-neutral-500">3. Print style</h2>
                 {!is8394SimpleBackUi && !hasExplicitZoneBlend ? (
@@ -3272,7 +3524,7 @@ export function BlankRenderProfileEditor({
                 ) : null}
               </section>
 
-              {/* 4. Print size */}
+              (4. Print size)
               <section className="space-y-3 pt-2 border-t border-neutral-100">
                 <h2 className="text-xs font-bold uppercase tracking-wider text-neutral-500">4. Print size</h2>
                 <p className="text-xs text-neutral-500">Controls overall visual size relative to garment.</p>
@@ -3305,6 +3557,71 @@ export function BlankRenderProfileEditor({
               </section>
             </>
           ) : null}
+          — end of disabled "3. Print style" + "4. Print size" block —
+          */}
+
+          {/*
+            Mask section (v10.1, 2026-05-25): hoisted out of the Advanced details below
+            to sit prominently above Actions. If a mask doc exists for this blank+view
+            (rp_blank_masks/{blankId}_{view}), the picker defaults to "Use uploaded mask"
+            — operators no longer need to actively select it for every render.
+            The auto-promote treats `mode === "none"` as "unset by default" when a mask
+            exists; operators can still explicitly pick None to opt out per zone.
+          */}
+          {!is8394SimpleBackUi ? (() => {
+            const savedMode = selected?.maskConfig?.mode;
+            const effectiveMode = currentBlankMaskUrl && (savedMode == null || savedMode === "none")
+              ? "blank_mask_doc"
+              : (savedMode ?? defaultMaskModeForCurrentView);
+            const isAutoDefault = currentBlankMaskUrl && (savedMode == null || savedMode === "none");
+            return (
+              <section className="space-y-2 pt-2 border-t border-neutral-100">
+                <h2 className="text-xs font-bold uppercase tracking-wider text-neutral-500">Mask</h2>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs text-neutral-600">Mask / clip strategy</span>
+                  <select
+                    value={effectiveMode}
+                    onChange={(e) => updateSelected({ maskConfig: { mode: e.target.value } })}
+                    className="border border-neutral-300 rounded-lg px-3 py-2 text-sm bg-white text-neutral-900"
+                  >
+                    <option value="none">None — no clipping</option>
+                    <option value="blank_mask_doc">Use uploaded mask (rp_blank_masks)</option>
+                    <option value="safe_area_clip" disabled>
+                      Clip to safe area (not implemented)
+                    </option>
+                  </select>
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] mt-1">
+                    {currentBlankMaskDoc && currentBlankMaskUrl ? (
+                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-900 font-medium">
+                        Mask uploaded
+                        {currentBlankMaskDoc.mask?.width && currentBlankMaskDoc.mask?.height
+                          ? ` · ${currentBlankMaskDoc.mask.width}×${currentBlankMaskDoc.mask.height}`
+                          : ""}
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-neutral-100 border border-neutral-200 text-neutral-700">
+                        No mask uploaded for {previewSide}
+                      </span>
+                    )}
+                    {isAutoDefault ? (
+                      <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-indigo-50 border border-indigo-200 text-indigo-900 font-medium">
+                        Auto-default
+                      </span>
+                    ) : null}
+                    {onManageMasks ? (
+                      <button
+                        type="button"
+                        onClick={() => onManageMasks(previewSide)}
+                        className="text-indigo-700 hover:underline font-medium"
+                      >
+                        Manage masks →
+                      </button>
+                    ) : null}
+                  </div>
+                </label>
+              </section>
+            );
+          })() : null}
 
           {/* 5. Actions */}
           <section className="space-y-3 pt-2 border-t border-neutral-100">
@@ -3351,20 +3668,50 @@ export function BlankRenderProfileEditor({
               {perColorSaveScope ? (
                 <>
                   Saving writes placement and scale overrides for <strong>the selected color variant</strong> only. Choose{" "}
-                  <strong>Blank baseline (all colors)</strong> above to edit defaults shared by every color.
+                  <strong>Blank baseline (all colors)</strong> above to edit defaults shared by every color.{" "}
+                  <span className="text-neutral-600">
+                    The <strong>Blank render readiness</strong> section below (Approved / Sides / Notes) autosaves
+                    separately — it applies to the whole blank, not this color.
+                  </span>
                 </>
               ) : (
                 <>
                   Saving updates the default placement for <strong>all products</strong> using this blank (all colors
-                  unless they have their own color overrides).
+                  unless they have their own color overrides).{" "}
+                  <span className="text-neutral-600">
+                    The <strong>Blank render readiness</strong> section below autosaves separately on change.
+                  </span>
                 </>
               )}
             </p>
           </section>
 
-          {/* Blank-level gates (compact) */}
+          {/* Blank-level gates (compact). Autosaves on change — see autosave effect above. */}
           <section className="rounded-xl border border-neutral-200 bg-neutral-50/80 p-4 space-y-3">
-            <h3 className="text-sm font-semibold text-neutral-900">Blank render readiness</h3>
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="text-sm font-semibold text-neutral-900">Blank render readiness</h3>
+              {blankAutosaveState === "saving" ? (
+                <span className="inline-flex items-center gap-1 text-[11px] font-medium text-neutral-500">
+                  <span className="inline-block w-2 h-2 rounded-full bg-neutral-400 animate-pulse" aria-hidden />
+                  Saving…
+                </span>
+              ) : blankAutosaveState === "saved" ? (
+                <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700">
+                  <span aria-hidden>✓</span>
+                  Saved
+                </span>
+              ) : blankAutosaveState === "error" ? (
+                <span
+                  className="inline-flex items-center gap-1 text-[11px] font-medium text-rose-700"
+                  title={blankAutosaveErrorRef.current ?? "Autosave failed — use Save render profile to persist."}
+                >
+                  <span aria-hidden>⚠</span>
+                  Autosave failed
+                </span>
+              ) : (
+                <span className="text-[11px] font-medium text-neutral-400">Autosaves on change</span>
+              )}
+            </div>
             <div className="flex flex-wrap gap-4 items-end">
               <div>
                 <label className="block text-xs font-medium text-neutral-600 mb-1">Overall status</label>
@@ -3442,6 +3789,16 @@ export function BlankRenderProfileEditor({
             ) : null}
           </section>
 
+          {/*
+            DISABLED v10.1 (2026-05-25): the "Advanced — numeric & mask metadata"
+            collapsible held a grab-bag of fields that are now either:
+              - Already exposed cleanly higher up (Mask / clip strategy → Mask section
+                above 5. Actions; sliders → AI realism pickers; placement → Placement
+                tuning sliders).
+              - Wrote dead data that's no longer read by the v10 pipeline
+                (blend.mode select, design asset mode, artboard/zone notes, etc.).
+            Hiding to declutter; restore behind an admin flag if anyone needs the
+            raw numeric editing surface for debugging.
           {!is8394 ? (
           <details className="rounded-xl border border-neutral-200 bg-neutral-50 p-4 text-sm">
             <summary className="cursor-pointer font-medium text-neutral-800">Advanced — numeric &amp; mask metadata</summary>
@@ -3654,7 +4011,7 @@ export function BlankRenderProfileEditor({
                       Clip to safe area (not implemented)
                     </option>
                   </select>
-                  {/* Status + Manage masks link for the side this zone affects. */}
+                  (Status + Manage masks link for the side this zone affects.)
                   <div className="flex flex-wrap items-center gap-2 text-[11px] mt-0.5">
                     {currentBlankMaskDoc && currentBlankMaskUrl ? (
                       <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-900 font-medium">
@@ -3701,6 +4058,8 @@ export function BlankRenderProfileEditor({
             </label>
           </details>
           ) : null}
+          — end of disabled Advanced details block —
+          */}
         </aside>
 
         {/* —— C: Preview (~60%) —— sticky on desktop so controls can scroll on the page */}
@@ -3716,21 +4075,22 @@ export function BlankRenderProfileEditor({
               )}
             </p>
             <div className="flex flex-wrap items-center gap-2">
-              <span className="text-xs font-semibold text-neutral-500 uppercase tracking-wide">View</span>
-              {(["clean", "blended", "compare"] as const).map((m) => (
-                <button
-                  key={m}
-                  type="button"
-                  onClick={() => setPreviewMode(m)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors ${
-                    previewMode === m
-                      ? "bg-indigo-600 text-white border-indigo-600"
-                      : "bg-white text-neutral-700 border-neutral-200 hover:border-indigo-300"
-                  }`}
-                >
-                  {m === "clean" ? "Clean" : m === "blended" ? "Blended" : "Side-by-side"}
-                </button>
-              ))}
+              {/*
+                Cleaned up v10.2 (2026-05-25): collapsed preview header to just
+                "+ AI realism" (the only button operators actually need) plus a
+                small "Enlarge garment" text link. Hidden buttons:
+                  - VIEW Clean/Blended/Side-by-side: CSS canvas already shows Blended
+                    by default; Clean = view minus design (rare); Side-by-side
+                    duplicates the AI realism result pane.
+                  - MASK Off/Outline/Filled: debug visualization of rp_blank_masks
+                    on the canvas. With auto-default mask application (v10.1), the
+                    mask is always used — visualizing it is dev/QA only.
+                  - Generate AI mask: one-time setup per blank+view. Lives behind
+                    "Manage masks →" in the new Mask section above 5. Actions.
+                  - Render preview (Stage A): redundant since AI realism runs
+                    Stage A internally before Stage B. Operators iterating on
+                    placement use the live CSS canvas (instant) instead.
+              */}
               {previewGarmentUrl ? (
                 <button
                   type="button"
@@ -3740,80 +4100,32 @@ export function BlankRenderProfileEditor({
                   Enlarge garment
                 </button>
               ) : null}
-              {/* MASK toggle: visualizes rp_blank_masks/{blankId}_{previewSide}. Disabled when no mask exists. */}
-              <span
-                className="ml-2 text-xs font-semibold text-neutral-500 uppercase tracking-wide"
-                title={
-                  currentBlankMaskUrl
-                    ? `Overlay mask for ${previewSide} on the preview`
-                    : `No mask uploaded for ${previewSide} — upload on the Rendering tab`
-                }
-              >
-                Mask
-              </span>
-              {(["off", "outline", "filled"] as const).map((m) => {
-                const disabled = !currentBlankMaskUrl && m !== "off";
-                return (
-                  <button
-                    key={m}
-                    type="button"
-                    onClick={() => setBlankMaskOverlayMode(m)}
-                    disabled={disabled}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors ${
-                      blankMaskOverlayMode === m
-                        ? "bg-pink-600 text-white border-pink-600"
-                        : disabled
-                          ? "bg-neutral-50 text-neutral-300 border-neutral-200 cursor-not-allowed"
-                          : "bg-white text-neutral-700 border-neutral-200 hover:border-pink-300"
-                    }`}
-                  >
-                    {m === "off" ? "Off" : m === "outline" ? "Outline" : "Filled"}
-                  </button>
-                );
-              })}
-              {/* Shortcut: kick off AI mask generation for the currently-previewed side. Parent
-                  switches to Rendering tab where the preview / Save / Refresh card lives. */}
-              {onGenerateAiMask ? (
-                <button
-                  type="button"
-                  onClick={() => onGenerateAiMask(previewSide)}
-                  disabled={aiMaskGeneratingForView !== null && aiMaskGeneratingForView !== undefined}
-                  className="ml-2 px-3 py-1.5 rounded-lg text-xs font-semibold bg-pink-600 text-white hover:bg-pink-700 disabled:opacity-50"
-                  title="Ask SAM to find the printable region of this garment (no design needed)"
-                >
-                  {aiMaskGeneratingForView === previewSide ? "Asking SAM…" : "🪄 Generate AI mask"}
-                </button>
-              ) : null}
-              {/* Real Sharp-composite preview. Same pipeline production renders use, with
-                  the current (possibly unsaved) tuning. The CSS canvas above is an approximation. */}
-              <button
-                type="button"
-                onClick={() => handleRealRenderPreview()}
-                disabled={realPreviewLoading !== null || !previewDesignId}
-                className="ml-2 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
-                title={
-                  previewDesignId
-                    ? "Run a real Sharp composite with current tuning (mask + blend applied). Validates the blank before bulk product generation."
-                    : "Pick a Preview design first (top of the page) so the render has artwork to composite."
-                }
-              >
-                {realPreviewLoading === "A" ? "Rendering…" : "🖼️ Render preview"}
-              </button>
-              {/* Stage A + AI realism via fal.ai. Hidden until async refactor lands —
-                  the Firebase callable gateway times out before fal.ai completes. See
-                  AI_REALISM_PREVIEW_ENABLED constant at top of file. */}
               {AI_REALISM_PREVIEW_ENABLED ? (
                 <button
                   type="button"
                   onClick={() => handleRealRenderPreview({ withRealism: true })}
                   disabled={realPreviewLoading !== null || !previewDesignId}
                   className="ml-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-purple-600 text-white hover:bg-purple-700 disabled:opacity-50"
-                  title="Stage A composite + fal.ai realism pass (inpaint if a mask exists, img2img otherwise). Takes 20-60s and costs $ per call."
+                  title="Stage A composite + fal.ai Flux Fill inpaint pass with auto-applied mask. Takes 20-60s and costs $ per call."
                 >
-                  {realPreviewLoading === "B" ? "Running AI realism… (~30s)" : "✨ + AI realism"}
+                  {realPreviewLoading === "B" ? "Generating product preview… (~30s)" : "✨ Product Preview"}
                 </button>
               ) : null}
             </div>
+            {/*
+              DISABLED v10.2 (2026-05-25): original preview header button row.
+              Kept as commented reference so we can restore individual controls
+              (e.g. Render preview for cheap Stage-A-only iteration, or MASK
+              overlay for debugging) without retyping the JSX. To restore one
+              button, paste its block back into the live <div> above.
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs font-semibold text-neutral-500 uppercase tracking-wide">View</span>
+                (View buttons: Clean / Blended / Side-by-side mapped through previewMode state)
+                (MASK overlay buttons: Off / Outline / Filled mapped through blankMaskOverlayMode state)
+                (Generate AI mask button: triggers onGenerateAiMask(previewSide))
+                (Render preview button: triggers handleRealRenderPreview() — Stage A only)
+              </div>
+            */}
             {is8394SimpleBackUi && previewSideAllowsPrinting ? (
               <p className="text-[10px] text-neutral-400 mt-1 max-w-lg">
                 Blended preview uses garment × artwork-aware blend (normal / screen where multiply would hide ink on dark
@@ -4272,14 +4584,41 @@ export function BlankRenderProfileEditor({
           <div className={`px-4 py-2 border-b flex items-center justify-between text-xs ${realPreview.stage === "B" ? "border-purple-200 bg-purple-100" : "border-indigo-200 bg-indigo-100"}`}>
             <h4 className={`font-semibold ${realPreview.stage === "B" ? "text-purple-900" : "text-indigo-900"}`}>
               {realPreview.stage === "B"
-                ? "✨ AI realism — Stage B (fal.ai)"
+                ? "✨ Product Preview"
                 : "🖼️ Real render — Stage A (deterministic)"}
             </h4>
             <div className={`flex items-center gap-3 font-mono ${realPreview.stage === "B" ? "text-purple-800" : "text-indigo-800"}`}>
               {realPreview.stage === "B" && realPreview.stageB ? (
-                <span>
-                  {realPreview.stageB.usedMask ? "inpaint" : "img2img"} · strength {realPreview.stageB.params.strength.toFixed(2)}
-                </span>
+                /*
+                  Kontext (`fal-ai/flux-pro/kontext`) doesn't use the strength knob — its
+                  edit intensity comes from `guidance_scale` + prompt. Show endpoint-aware
+                  telemetry so "strength 0.00" doesn't get misread as "AI didn't do anything."
+                  v5: include the fabric_feel / print_strength values Stage B actually saw,
+                  so the operator can confirm sliders reached AI. If "ff 0.07 · ps 0.88"
+                  shows up in the badge but the result still looks like a sticker, that's
+                  the sliders telling Kontext to keep it sticker-like.
+                */
+                (() => {
+                  const isKontext = (realPreview.stageB?.falEndpoint ?? "").toLowerCase().includes("kontext");
+                  const ff = realPreview.stageB.params.fabric_feel;
+                  const ps = realPreview.stageB.params.print_strength;
+                  const blur = realPreview.stageB.params.pre_blur_sigma;
+                  const sliderTrail = ff != null && ps != null
+                    ? ` · ff ${ff.toFixed(2)} · ps ${ps.toFixed(2)}${blur != null ? ` · blur ${blur.toFixed(2)}` : ""}`
+                    : "";
+                  if (isKontext) {
+                    return (
+                      <span title={realPreview.stageB.falEndpoint}>
+                        kontext · cfg {realPreview.stageB.params.guidance_scale.toFixed(1)} · steps {realPreview.stageB.params.num_inference_steps}{sliderTrail}
+                      </span>
+                    );
+                  }
+                  return (
+                    <span title={realPreview.stageB.falEndpoint}>
+                      {realPreview.stageB.usedMask ? "inpaint" : "img2img"} · strength {realPreview.stageB.params.strength.toFixed(2)}{sliderTrail}
+                    </span>
+                  );
+                })()
               ) : null}
               <span>
                 {realPreview.artworkMode ?? "light"} · {realPreview.placementUsed.blendMode} · op {realPreview.placementUsed.blendOpacity.toFixed(2)} · scale {realPreview.placementUsed.scale.toFixed(2)}

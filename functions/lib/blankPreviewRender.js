@@ -46,11 +46,39 @@ const { resolveDesignAssetUrls } = require("./designFileMergeCore");
  * Tuned for high guidance (5.5) so Kontext follows these directives even when its
  * "preserve input" bias pulls toward the sticker look.
  */
+/**
+ * Re-tuned for screen-print realism (v4, 2026-05-25): v3 outputs were softer but
+ * still showed opaque uniform ink coverage — letters looked painted-on rather than
+ * absorbed into the fabric. The fix: lead with CRITICAL emphasis on "ink absorbed
+ * INTO the weave, not COATING it," anchor with a concrete vintage reference
+ * ("thrifted band tee washed dozens of times"), and put "opaque ink coverage" /
+ * "solid uniform color fill" at the very top of the negative so Kontext sees them
+ * as the primary failure modes. Guidance bumped 7.5 → 8.5 to push the model
+ * further past its "preserve input" bias.
+ */
 const REALISM_PROMPT =
-  "Photoreal studio product photo of a black cotton fleece sweatshirt with water-based screen-printing ink absorbed deep into the cotton fibers on the chest. The cotton weave texture is CLEARLY visible through the colored ink, with subtle fiber-by-fiber irregularity in the ink coverage. The ink has natural saturation variation across the print — slightly faded in some areas, slightly more vivid in others, exactly like real screen printing on heavy cotton. Edges are soft and slightly imperfect where ink meets fabric. The print follows every fold and wrinkle of the garment fabric naturally. Preserve the design's exact text spelling, colors, position, scale, and overall geometry — do not redraw letters, do not add words, do not rearrange layout. Keep the garment color, shape, and background unchanged.";
+  "A photorealistic studio product photo of a black cotton fleece crewneck sweatshirt with a worn-in vintage water-based SCREEN PRINT on the chest. CRITICAL: the ink must look ABSORBED INTO the cotton weave, not COATING it — the texture of the cotton fibers must be visibly showing THROUGH the print color, breaking up the ink coverage with fine fiber-level mottling and tiny micro-gaps where the weave threads peek through. The print has the appearance of a thrifted band tee that has been washed dozens of times: edges are slightly soft and irregular, color saturation varies subtly across the print, the ink looks matte and fibrous (NEVER glossy, NEVER plastic, NEVER perfectly uniform). The print drapes and follows every fold of the fabric naturally. Preserve the EXACT text spelling, layout, position, scale, colors, and overall geometry of the existing design — do not redraw or rearrange letters, do not add or remove words. The garment color, shape, lighting, and background must remain identical to the input photo.";
 const REALISM_NEGATIVE =
-  "sticker, decal, iron-on patch, vinyl heat transfer, peeling edges, lifted edges, raised print, glossy ink, plastic sheen, shiny print, perfectly uniform color, flat solid color block, hard die-cut edges, sharp rectangular boundary, ink sitting on top of fabric, change text, misspell text, add text, redraw artwork, change garment shape, change background, blur, artifacts";
-const FAL_REALISM_ENDPOINT = "fal-ai/flux-pro/kontext";
+  "opaque ink coverage, solid uniform color fill, ink fully covering fabric texture, painted-on look, flat ink, ink sitting on top of fabric, no fabric texture showing through, vinyl sticker, decal, iron-on patch, heat transfer, plastisol ink, glossy ink, plastic sheen, shiny print, wet appearance, raised 3D print, embossed, peeling edges, lifted corners, hard die-cut edges, sharp rectangular boundary around print, change text, misspell text, add words, redraw artwork, change garment color, change garment shape, change background, blurry, low-quality, artifacts";
+/**
+ * v8 ESCALATION (2026-05-25): switched from img2img → Flux Fill (inpainting).
+ * img2img at strength 0.43 STILL produced sticker output even though the
+ * garment shape warped — the model preferentially preserved the high-contrast
+ * print region as the lowest-loss reconstruction. No whole-image transform
+ * approach works for this because the print IS what we want transformed.
+ *
+ * Flux Fill is proper inpainting: with a letter-shaped mask, the model is
+ * FORCED to regenerate only the ink pixels using the surrounding cotton
+ * fabric as the prior. It cannot preserve the input ink — those pixels are
+ * masked out. The only reference it has for what to paint is "cotton fleece
+ * texture" from the surrounding fabric + the prompt. So the result must be
+ * cotton-textured ink, not a flat overlay.
+ *
+ * Garment / fabric / background outside the mask are byte-identical — no
+ * shrinking, no warping, no color shift. Text geometry is enforced by the
+ * mask shape itself, not by hoping the prompt overrides the model's prior.
+ */
+const FAL_REALISM_ENDPOINT = "fal-ai/flux-pro/v1/fill";
 /** 90 attempts × 1500ms = 135s polling budget. Stage B usually completes within 30-60s. */
 const REALISM_MAX_POLL_ATTEMPTS = 90;
 const REALISM_POLL_INTERVAL_MS = 1500;
@@ -191,9 +219,226 @@ async function assertAdmin(db, functions, uid) {
  *
  * Costs $ per call (fal.ai) and takes ~20-60s. Only run when explicitly requested.
  */
-async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, draftBuffer, draftMeta }) {
+/**
+ * Hex → coarse color name. Flux Fill responds better to color names than raw hex.
+ * Buckets keyed on dominant HSV region — close enough for the model to paint the
+ * right hue, not a precision color match. The hex is still appended after the
+ * name for fine-tuning ("orange (#FF6B00)").
+ */
+function hexToColorName(hex) {
+  if (typeof hex !== "string" || !hex.startsWith("#")) return null;
+  const h = hex.replace("#", "").toLowerCase();
+  if (h.length !== 6) return null;
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const delta = max - min;
+  if (max < 32) return "black";
+  if (min > 220) return "white";
+  if (delta < 25 && max > 100 && max < 200) return "gray";
+  // Hue calc
+  let hue = 0;
+  if (delta > 0) {
+    if (max === r) hue = ((g - b) / delta) % 6;
+    else if (max === g) hue = (b - r) / delta + 2;
+    else hue = (r - g) / delta + 4;
+    hue *= 60;
+    if (hue < 0) hue += 360;
+  }
+  if (hue < 15 || hue >= 345) return "red";
+  if (hue < 40) return "orange";
+  if (hue < 70) return "yellow";
+  if (hue < 165) return "green";
+  if (hue < 200) return "cyan";
+  if (hue < 255) return "blue";
+  if (hue < 290) return "purple";
+  return "magenta";
+}
+
+/**
+ * Build a letter-shaped grayscale mask for Stage B inpainting from a design RGBA buffer.
+ *
+ * White pixels (255) in the output indicate "regenerate" (where the design ink is);
+ * black pixels (0) indicate "preserve" (everything else). A soft 2px feather is applied
+ * at the edges so Flux Fill has room to integrate the ink with surrounding fabric.
+ *
+ * Inputs:
+ *   sharp                — the sharp module instance.
+ *   resizedDesignRaw     — RGBA pixel buffer of the design at placement size (oversampled space).
+ *   actualW, actualH     — design buffer dimensions (oversampled space).
+ *   designLeft, designTop — placement top-left of the design on the canvas (oversampled space).
+ *   nativeBlankW, nativeBlankH — final NATIVE output dimensions (mask is returned at this size).
+ *   OVERSAMPLE           — oversample factor used for the design / canvas (1 if no oversampling).
+ *
+ * Returns: PNG Buffer of the grayscale mask at native blank dimensions.
+ */
+async function buildLetterMaskFromDesignRgba({
+  sharp,
+  resizedDesignRaw,
+  actualW,
+  actualH,
+  designLeft,
+  designTop,
+  nativeBlankW,
+  nativeBlankH,
+  OVERSAMPLE,
+}) {
+  const oversample = Number.isFinite(Number(OVERSAMPLE)) && Number(OVERSAMPLE) > 0 ? Number(OVERSAMPLE) : 1;
+  const alphaCanvasBuffer = Buffer.alloc(actualW * actualH * 4);
+  for (let p = 0; p < actualW * actualH; p++) {
+    const a = resizedDesignRaw[p * 4 + 3];
+    const v = a > 32 ? 255 : 0;
+    alphaCanvasBuffer[p * 4] = v;
+    alphaCanvasBuffer[p * 4 + 1] = v;
+    alphaCanvasBuffer[p * 4 + 2] = v;
+    alphaCanvasBuffer[p * 4 + 3] = 255;
+  }
+  const designMaskRegion = await sharp(alphaCanvasBuffer, {
+    raw: { width: actualW, height: actualH, channels: 4 },
+  })
+    /** sigma scaled with oversample so the feather measures ~2px in native space regardless of
+     *  whether the caller oversamples (preview path = 2x → sigma 4) or runs at native (production
+     *  path = 1x → sigma 2). Soft enough for the inpaint model to integrate ink edges with
+     *  surrounding fabric, not so soft that the letters lose definition. */
+    .blur(2 * oversample)
+    .png()
+    .toBuffer();
+  const letterMaskOversampled = await sharp({
+    create: {
+      width: nativeBlankW * oversample,
+      height: nativeBlankH * oversample,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 1 },
+    },
+  })
+    .composite([{ input: designMaskRegion, left: designLeft, top: designTop, blend: "over" }])
+    .png()
+    .toBuffer();
+  // Single high-quality downsample to native dimensions (no-op when oversample === 1).
+  const letterMaskBuffer = await sharp(letterMaskOversampled)
+    .resize(nativeBlankW, nativeBlankH, { kernel: "lanczos3" })
+    .grayscale()
+    .png()
+    .toBuffer();
+  return letterMaskBuffer;
+}
+
+async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, draftBuffer, draftMeta, letterMaskBuffer, designColors, fabricFeel, printStrength }) {
+  /**
+   * Slider-driven realism (v6, 2026-05-25): v5 had two structural bugs that
+   * Greg's "still very much a peeled sticker" feedback exposed:
+   *
+   *   (a) At low fabric feel my prompt literally read "ink sits closer to the
+   *       surface, retaining defined edges, mostly opaque coverage" — that's
+   *       a description of a sticker. Kontext faithfully delivered it. There
+   *       should be NO slider position that asks for a sticker; every band
+   *       must describe screen-printing on cotton, just with different
+   *       degrees of weave-through visibility.
+   *
+   *   (b) At low fabric feel the pre-Kontext blur dropped to sigma 0.4-0.5,
+   *       which on a ~1500px image is essentially imperceptible. Kontext saw
+   *       pixel-perfect letter edges and preserved them. The blur formula now
+   *       has a floor of 1.0 (visible softening) at ff=0, up to 2.5 at ff=1.
+   *
+   * If v6 still produces sticker output even with high fabric feel + low print
+   * strength, Kontext is fundamentally not transforming enough. Escalation
+   * path is img2img with strength 0.5+ (forces redraw) or true inpainting on
+   * the printable-zone mask. See block-comment at top of file for context.
+   */
+  const ff = Number.isFinite(Number(fabricFeel)) ? Math.max(0, Math.min(1, Number(fabricFeel))) : 0.5;
+  const ps = Number.isFinite(Number(printStrength)) ? Math.max(0, Math.min(1, Number(printStrength))) : 0.7;
+
+  /**
+   * v8: no pre-blur of the canvas. Flux Fill inpaints the mask region from scratch
+   * using surrounding context — pre-blurring the input doesn't help and actually
+   * hurts the surrounding fabric reference (model sees blurry fabric, paints blurry
+   * fabric edges adjacent to the inpaint region). PRE_KONTEXT_BLUR_SIGMA kept as a
+   * telemetry-only field equal to 0 so the badge/schema stays consistent.
+   */
+  const PRE_KONTEXT_BLUR_SIGMA = 0;
   const draftBase64 = draftBuffer.toString("base64");
   const draftDataUrl = `data:image/png;base64,${draftBase64}`;
+  /** Letter-shaped mask from composeStageA: white = regenerate, black = preserve. */
+  const maskBase64 = letterMaskBuffer ? letterMaskBuffer.toString("base64") : null;
+  const maskDataUrl = maskBase64 ? `data:image/png;base64,${maskBase64}` : null;
+  if (!maskDataUrl) {
+    throw new Error("v8 Flux Fill requires letterMaskBuffer from composeStageA but it was not provided");
+  }
+  console.log(
+    `[realism] v8 Flux Fill: fabricFeel=${ff.toFixed(2)} printStrength=${ps.toFixed(2)} mask_bytes=${letterMaskBuffer.length}`
+  );
+
+  /**
+   * v9 (2026-05-25): rewrote the slider→prompt mapping to fix two failure modes:
+   *
+   *   (a) Earlier bands described "vintage band tee washed dozens of times" at
+   *       high fabric feel — that's a distressed-vintage look, NOT a fresh
+   *       screen-print look. The model dutifully produced faded ghost prints
+   *       with washed-out colors. Greg's actual target is a vivid, fresh
+   *       screen-print with subtle fabric texture interaction — not a thrift
+   *       store relic.
+   *
+   *   (b) Print strength at 45% was triggering "vintage softness, washed
+   *       several times, slightly faded" which destroyed color saturation.
+   *       ps now controls vividness ONLY (faded → bold), not aging.
+   *
+   * New semantics:
+   *   - Fabric feel = how much cotton texture shows THROUGH the ink (subtle →
+   *     pronounced). At every band, the print is fresh and vivid; only the
+   *     texture interaction varies. No "worn / washed / thrifted" language.
+   *   - Print strength = ink vividness (faded → extra bold). At ps≥0.5 the
+   *     print is fresh and saturated. Below that it's gradually faded.
+   */
+  const fabricPhrase =
+    ff >= 0.7
+      ? "the cotton weave texture is clearly visible through the ink coverage, with pronounced fiber-level mottling and small micro-gaps where individual weave threads break up the ink"
+      : ff >= 0.4
+        ? "the cotton weave texture is visible through the ink coverage with light fiber-level mottling, and softly imperfect edges where the ink meets the fabric fibers"
+        : "subtle cotton fiber texture is visible at the print edges and surface, with mostly clean ink coverage and slightly soft (NOT hard die-cut) boundaries";
+  const strengthPhrase =
+    ps >= 0.7
+      ? "vivid, bold, fully-saturated ink coverage like a freshly-printed garment — colors are at full intensity, matte but NEVER glossy or plastic"
+      : ps >= 0.4
+        ? "vivid screen-print saturation at natural intensity — fresh, clearly legible, fully-pigmented ink (NOT faded, NOT washed-out, NOT vintage)"
+        : "slightly faded screen-print saturation, like a print washed a few times — still legible and clearly coloured, but a touch less vivid than fresh";
+
+  /**
+   * v8.1: explicit ink color injection. Flux Fill regenerates the masked region
+   * from prompt alone (it doesn't condition on the input pixels inside the mask),
+   * so without color info the result comes out monochrome / gray. We derive
+   * coarse color names from the design's `colors[].hex` and inject them into
+   * the prompt as a "rendered in X and Y ink" clause.
+   */
+  const colorList = Array.isArray(designColors)
+    ? designColors
+        .map((c) => {
+          const hex = c && typeof c.hex === "string" ? c.hex : null;
+          const name = hexToColorName(hex);
+          if (!hex || !name) return null;
+          return `${name} (${hex})`;
+        })
+        .filter(Boolean)
+    : [];
+  /**
+   * v9: stronger color directive. Earlier phrasing ("rendered in orange and
+   * white screen-printing ink") was a single weak mention — Flux Fill happily
+   * drifted toward gray for white and brown for orange. The "MUST" + "stay
+   * exactly" framing plus an explicit anti-gray clause for white is meant to
+   * dominate the model's tendency to mute saturated colors during inpainting.
+   */
+  const hasWhite = colorList.some((c) => c.startsWith("white"));
+  const whiteEmphasis = hasWhite
+    ? " The white ink MUST stay pure bright white — never gray, never beige, never muted."
+    : "";
+  const colorClause = colorList.length > 0
+    ? `The print MUST be rendered in these EXACT screen-printing ink colors: ${colorList.join(" and ")}. The ink colors stay vivid and at full saturation.${whiteEmphasis} `
+    : "";
+  console.log(`[realism] v8.1 prompt colors: ${colorList.join(", ") || "(none detected, prompt will not specify)"}`);
+
+  const dynamicPrompt =
+    `A photorealistic studio product photo of a black cotton fleece crewneck sweatshirt with a water-based SCREEN-PRINTED design on the chest. ${colorClause}The ink has been pressed INTO the cotton fabric using a silkscreen process — it is NEVER a sticker, NEVER a decal, NEVER vinyl, NEVER iron-on, NEVER plastic, NEVER raised 3D. The ink finish is matte and fibrous, sitting WITH the cotton fibers, not on top. CRITICAL TEXTURE: ${fabricPhrase}. CRITICAL SATURATION: ${strengthPhrase}. Color saturation varies subtly across the print like real screen-printing on heavy cotton. The print drapes and follows every fold of the fabric naturally. Preserve the EXACT text spelling, layout, position, scale, colors, and overall geometry of the existing design — do not redraw or rearrange letters, do not add or remove words. The garment color, shape, lighting, and background must remain identical to the input photo.`;
 
   /**
    * Switched from `fal-ai/flux/dev/image-to-image` (strength-controlled img2img) to
@@ -204,20 +449,45 @@ async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, dr
    * no separate depth/control map is required for this first iteration.
    */
   const falEndpoint = FAL_REALISM_ENDPOINT;
-  const useMask = false;
+  const useMask = true;
   const falUrl = `https://queue.fal.run/${falEndpoint}`;
+  /**
+   * v8.2: deterministic seed so re-running with the same inputs produces the same
+   * output. Without a seed, Flux Fill gets a fresh random seed each call and
+   * outputs vary wildly between runs (muted vs vivid, gray vs white, etc.) — saw
+   * this empirically: same {blankId, designId, ff, ps} produced very different
+   * results across two consecutive clicks. The seed is a simple deterministic
+   * hash of the inputs so any tuning iteration is repeatable.
+   */
+  const seedInput = `${blankId}|${view}|ff:${ff.toFixed(3)}|ps:${ps.toFixed(3)}`;
+  let seedHash = 0;
+  for (let i = 0; i < seedInput.length; i++) {
+    seedHash = ((seedHash << 5) - seedHash) + seedInput.charCodeAt(i);
+    seedHash |= 0; // force i32
+  }
+  const stableSeed = Math.abs(seedHash) % 1000000;
+
   const falPayload = {
     image_url: draftDataUrl,
-    prompt: REALISM_PROMPT,
-    /** Negative prompt included for endpoints that accept it; ignored by Kontext if not supported. */
+    mask_url: maskDataUrl,
+    /** v5 dynamic prompt drives what the mask region is repainted as. With Flux Fill
+     *  the prompt no longer needs to fight geometry preservation (the mask handles
+     *  that) — it only needs to describe the desired ink texture. */
+    prompt: dynamicPrompt,
+    /** Anti-sticker negative — Flux Fill honors this. */
     negative_prompt: REALISM_NEGATIVE,
-    /** 5.5 pushes Kontext harder to follow the screen-print directive rather than its
-     *  default "preserve input" bias which keeps the sticker-look from the input image. */
-    guidance_scale: 5.5,
-    /** 35 steps (up from 28) gives the model more refinement passes to settle on a
-     *  consistent ink-absorption look across the whole print. */
-    num_inference_steps: 35,
+    /** v9: 5.0 — bumped from 3.5 because the color directive ("vivid orange,
+     *  bright white, NEVER gray") wasn't being followed strongly enough at 3.5.
+     *  Flux Fill drifted toward muted brown / gray for the print. 5.0 pushes
+     *  it to honor the color clause without oversaturating the result. */
+    guidance_scale: 5.0,
+    /** 28 steps — Flux Fill default. Inpainting converges faster than text2img. */
+    num_inference_steps: 28,
+    seed: stableSeed,
   };
+  console.log(
+    `[realism] v8.2 Flux Fill: endpoint=${falEndpoint} cfg=${falPayload.guidance_scale} steps=${falPayload.num_inference_steps} seed=${stableSeed} draft_bytes=${draftBuffer.length}`
+  );
 
   const submitResp = await fetchFn(falUrl, {
     method: "POST",
@@ -311,17 +581,108 @@ async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, dr
 
   const dlResp = await fetchFn(resultUrl);
   if (!dlResp.ok) throw new Error(`Failed to download realism image (HTTP ${dlResp.status})`);
-  const realismBuffer = Buffer.from(await dlResp.arrayBuffer());
+  const fluxFillBuffer = Buffer.from(await dlResp.arrayBuffer());
+
+  /**
+   * v10 HYBRID COMPOSITE (2026-05-25) — preserve Stage A colors, take Flux
+   * Fill's texture only.
+   *
+   * The story so far:
+   *   - v8.1 post-composite fixed outside-mask preservation (garment intact).
+   *   - v9 prompts + cfg 5.0 + explicit color injection failed to stop Flux
+   *     Fill from drifting toward muted brown / gray inside the mask. The model
+   *     has a fundamental color-fidelity problem for this use case that no
+   *     amount of prompt engineering overcomes.
+   *
+   * v10 splits the inside-mask region into a weighted blend:
+   *
+   *   outside-mask:  Stage A pixel       (byte-identical, garment unchanged)
+   *   inside-mask:   Stage A · (1-α) + FluxFill · α   per-channel
+   *                  where α scales with `Fabric feel` (more Worn → more AI
+   *                  texture pulled through; Clean → mostly Stage A's vivid
+   *                  ink with just edge softening from the mask feather).
+   *
+   * Net effect: vivid orange + white from Stage A always wins on color; Flux
+   * Fill contributes ink-mottling + fabric-texture variation that breaks up
+   * Stage A's perfectly flat ink without changing the color identity.
+   *
+   * α range tied to fabric feel band:
+   *   Clean   (ff≈0.20) → α = 0.20  (mostly Stage A; subtle texture)
+   *   Textured(ff≈0.55) → α = 0.35  (balanced)
+   *   Worn    (ff≈0.85) → α = 0.55  (heavier AI contribution, more visible
+   *                                   weave-through but Stage A still anchors)
+   */
+  const stageADims = await sharp(draftBuffer).metadata();
+  const fluxResized = await sharp(fluxFillBuffer)
+    .resize(stageADims.width, stageADims.height, { fit: "fill" })
+    .removeAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const maskResized = await sharp(letterMaskBuffer)
+    .resize(stageADims.width, stageADims.height, { fit: "fill" })
+    .grayscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const stageARgb = await sharp(draftBuffer)
+    .removeAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const fluxChannels = fluxResized.info.channels;
+  const stageAChannels = stageARgb.info.channels;
+  const numPixels = fluxResized.info.width * fluxResized.info.height;
+
+  /** Map fabricFeel band to Flux Fill blend weight α inside the mask. */
+  const blendAlpha = ff >= 0.7 ? 0.55 : ff >= 0.4 ? 0.35 : 0.20;
+  const inv = 1 - blendAlpha;
+
+  const hybridWithMaskAlpha = Buffer.alloc(numPixels * 4);
+  for (let p = 0; p < numPixels; p++) {
+    const sa = p * stageAChannels;
+    const fx = p * fluxChannels;
+    hybridWithMaskAlpha[p * 4]     = Math.round(stageARgb.data[sa]     * inv + fluxResized.data[fx]     * blendAlpha);
+    hybridWithMaskAlpha[p * 4 + 1] = Math.round(stageARgb.data[sa + 1] * inv + fluxResized.data[fx + 1] * blendAlpha);
+    hybridWithMaskAlpha[p * 4 + 2] = Math.round(stageARgb.data[sa + 2] * inv + fluxResized.data[fx + 2] * blendAlpha);
+    hybridWithMaskAlpha[p * 4 + 3] = maskResized.data[p];
+  }
+
+  const realismBuffer = await sharp(draftBuffer)
+    .composite([
+      {
+        input: hybridWithMaskAlpha,
+        raw: {
+          width: fluxResized.info.width,
+          height: fluxResized.info.height,
+          channels: 4,
+        },
+        blend: "over",
+      },
+    ])
+    .png()
+    .toBuffer();
+
+  console.log(
+    `[realism] v10 hybrid composite: stageA=${stageADims.width}x${stageADims.height} flux=${fluxResized.info.width}x${fluxResized.info.height} blendAlpha=${blendAlpha} (ff=${ff.toFixed(2)}) → final=${realismBuffer.length} bytes`
+  );
 
   return {
     buffer: realismBuffer,
     falEndpoint,
+    /** v8: TRUE inpainting via Flux Fill — letter-shaped mask enforces geometry,
+     *  surrounding cotton fabric becomes the prior for what to paint in the mask. */
     useMask,
     params: {
-      /** Kontext has no strength knob — prompt drives the edit intensity. Strength field kept on the schema for backward compatibility; value is a label, not a real parameter. */
+      /** Flux Fill has no strength knob — the mask is the boundary. Kept at 0 for
+       *  badge / schema backward compat. */
       strength: 0,
-      num_inference_steps: 28,
-      guidance_scale: 3.5,
+      num_inference_steps: falPayload.num_inference_steps,
+      guidance_scale: falPayload.guidance_scale,
+      /** v5 telemetry: surface the slider values that drove the prompt + blur so the
+       *  editor badge can show "ff 0.07 · ps 0.88 → blur 0.51" — instantly answers
+       *  "did the AI actually see my slider settings?" */
+      fabric_feel: ff,
+      print_strength: ps,
+      pre_blur_sigma: PRE_KONTEXT_BLUR_SIGMA,
     },
   };
 }
@@ -509,9 +870,35 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
   const actualW = resizedResult.info.width;
   const actualH = resizedResult.info.height;
 
-  const blendModeRequested = typeof pl.blendMode === "string" && pl.blendMode.length > 0 ? pl.blendMode : "soft-light";
+  /**
+   * v8.3 (2026-05-25): force clean blend for Stage A regardless of what the
+   * editor's "Print style / blend" sliders compute.
+   *
+   * Why: those sliders predate AI realism. They used to push Stage A toward
+   * an "absorbed-look" via multiply / soft-light blends with low opacity —
+   * which on a black garment made the design nearly invisible (e.g., at
+   * `fabricFeel=80%` the editor sent `multiply · op 0.49`, rendering an
+   * essentially black ghost of the design). Two problems followed:
+   *
+   *   1. The "Real render — Stage A" preview operators use for placement
+   *      validation was unreadable.
+   *   2. Flux Fill (Stage B) consumed that near-invisible Stage A as
+   *      `image_url`. With no visible color anchor in the input, it fell
+   *      back to its own prior and produced grayscale output even though
+   *      the prompt explicitly named the orange + white ink colors.
+   *
+   * v8.3 decouples: Stage A is always a clean, fully-saturated composite of
+   * the design on the garment. The fabricFeel / printStrength sliders still
+   * reach Stage B's prompt + (future) blur — they're for the AI now, not the
+   * deterministic preview. The editor's blendMode/blendOpacity send is
+   * intentionally ignored here.
+   */
+  const blendModeRequested = "normal";
   const blendMode = normalizeBlendModeForSharp(blendModeRequested);
-  const effectiveOpacity = Number.isFinite(Number(pl.blendOpacity)) ? Number(pl.blendOpacity) : 0.9;
+  const effectiveOpacity = 1.0;
+  console.log(
+    `[composeStageA] v8.3 clean blend: forced normal/1.0 (editor sent ${pl.blendMode || "default"}/${pl.blendOpacity != null ? pl.blendOpacity : "default"}, sliders now drive Stage B prompt only)`
+  );
 
   /**
    * Compute the design's actual top-left on the garment BEFORE applying the mask, so
@@ -596,6 +983,32 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
     console.warn("[composeStageA] mask apply failed:", maskErr && maskErr.message);
   }
 
+  /**
+   * v8 LETTER MASK FOR INPAINTING (2026-05-25): build a binary mask that's white
+   * exactly where the design's ink is and black everywhere else. Stage B (Flux Fill)
+   * uses this mask to regenerate ONLY the ink pixels — leaving the entire garment,
+   * fabric, and background byte-identical. With img2img / Kontext, the whole image
+   * was transformed and the model preferentially preserved the high-contrast print
+   * region we wanted transformed. With a letter mask, the model is forced to paint
+   * those exact pixels from scratch using the surrounding cotton fabric as context,
+   * so it must produce cotton-textured ink instead of preserving the sticker.
+   *
+   * Mask is built BEFORE we mutate `resizedDesignRaw` with opacity/premultiply so
+   * the alpha values still reflect the design's natural shape. Slight blur applied
+   * for feathered edges (gives the inpaint model room to soften letter boundaries).
+   */
+  const letterMaskBuffer = await buildLetterMaskFromDesignRgba({
+    sharp,
+    resizedDesignRaw,
+    actualW,
+    actualH,
+    designLeft,
+    designTop,
+    nativeBlankW,
+    nativeBlankH,
+    OVERSAMPLE,
+  });
+
   const designWithOpacity = applyOpacityToRgbaBuffer(resizedDesignRaw, effectiveOpacity);
   const designPremultiplied = premultiplyRgbaBuffer(designWithOpacity);
   const designForComposite = await sharp(designPremultiplied, {
@@ -653,6 +1066,14 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
     /** Chained handoff for Stage B — kept in memory so we don't re-fetch. */
     draftBuffer: previewBuffer,
     draftMeta: stageAMeta,
+    /** v8: letter-shaped mask built from the design's alpha. Stage B uses this to
+     *  inpaint ONLY the ink pixels. White=regenerate, black=preserve. */
+    letterMaskBuffer,
+    /** v8.1: ink colors threaded into the Flux Fill prompt so the regenerated
+     *  pixels aren't gray. Flux Fill doesn't condition on the input pixels
+     *  inside the mask — it regenerates from prompt alone. Without color info
+     *  the masked region comes out monochrome. */
+    designColors: Array.isArray(design.colors) ? design.colors : [],
     variantSuffix,
     timestamp,
     variant,
@@ -663,7 +1084,7 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
  * Stage B (AI realism) — runs fal.ai realism pass on Stage A output, saves the result
  * to Storage, returns the persisted `stageB` summary.
  */
-async function composeStageB({ db, storage, sharp, functions, blankId, view, draftBuffer, draftMeta, variantSuffix, timestamp }) {
+async function composeStageB({ db, storage, sharp, functions, blankId, view, draftBuffer, draftMeta, letterMaskBuffer, designColors, variantSuffix, timestamp, fabricFeel, printStrength }) {
   const falApiKey = getFalApiKey(functions);
   if (!falApiKey) {
     throw new Error("FAL_API_KEY is not configured — cannot run AI realism pass");
@@ -677,6 +1098,14 @@ async function composeStageB({ db, storage, sharp, functions, blankId, view, dra
     view,
     draftBuffer,
     draftMeta,
+    /** v8: letter mask drives Flux Fill inpaint. Only ink pixels regenerate. */
+    letterMaskBuffer,
+    /** v8.1: ink colors injected into the Flux Fill prompt. */
+    designColors,
+    /** Operator-set sliders (0–1). Stage B prompt + pre-blur scale with these so they're
+     *  no longer Stage-A-only knobs that AI realism silently ignores. */
+    fabricFeel: Number.isFinite(Number(fabricFeel)) ? Number(fabricFeel) : 0.5,
+    printStrength: Number.isFinite(Number(printStrength)) ? Number(printStrength) : 0.7,
   });
   const realismMeta = await sharp(realism.buffer).metadata();
   const realismToken = `${timestamp}_realism_${Math.floor(Math.random() * 1e6).toString(16)}`;
@@ -812,8 +1241,19 @@ function buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp })
           view: input.view,
           draftBuffer: stageAResult.draftBuffer,
           draftMeta: stageAResult.draftMeta,
+          /** v8: letter-mask threads from Stage A → Flux Fill. */
+          letterMaskBuffer: stageAResult.letterMaskBuffer,
+          /** v8.1: ink colors threaded from design doc → Flux Fill prompt. */
+          designColors: stageAResult.designColors,
           variantSuffix: stageAResult.variantSuffix,
           timestamp: stageAResult.timestamp,
+          /** Slider values reach the prompt + pre-blur via this path. */
+          fabricFeel: Number.isFinite(Number(input.placement && input.placement.fabricFeel))
+            ? Number(input.placement.fabricFeel)
+            : 0.5,
+          printStrength: Number.isFinite(Number(input.placement && input.placement.printStrength))
+            ? Number(input.placement.printStrength)
+            : 0.7,
         });
         await jobRef.update({ stageB: stageBResult.stageB, updatedAt: tick() });
         console.log(`[onBlankPreviewJobCreated] Job ${jobId} Stage B done`);
@@ -836,4 +1276,10 @@ function buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp })
   };
 }
 
-module.exports = { buildPreviewBlankRender, buildOnBlankPreviewJobCreated };
+module.exports = {
+  buildPreviewBlankRender,
+  buildOnBlankPreviewJobCreated,
+  runRealismPass,
+  hexToColorName,
+  buildLetterMaskFromDesignRgba,
+};

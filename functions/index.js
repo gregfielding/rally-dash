@@ -109,6 +109,9 @@ const {
 const {
   buildPreviewBlankRender,
   buildOnBlankPreviewJobCreated,
+  runRealismPass,
+  hexToColorName,
+  buildLetterMaskFromDesignRgba,
 } = require("./lib/blankPreviewRender");
 
 // Check if placeholder worker mode is enabled (default: true for safety)
@@ -7497,6 +7500,13 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
      * (`0.5 × blank × scale` in onMockJobCreated) only triggers when neither is set —
      * effectively unreachable now for blanks with a safeArea.
      */
+    /**
+     * Surface the blank's `blendSettings.fabricFeel` / `printStrength` (the editor
+     * preview "Fabric feel" / "Print strength" sliders persist into the blank doc) so
+     * the Stage B v10 realism pass in `onMockJobCreated` can read the same values the
+     * editor preview uses. Falls back to {0.5, 0.7} downstream when unset.
+     */
+    const blendSettings = blank.blendSettings || {};
     placement = {
       x: printArea.x ?? blankPlacement.defaultX ?? placement.x,
       y: printArea.y ?? blankPlacement.defaultY ?? placement.y,
@@ -7509,6 +7519,18 @@ exports.createMockJob = functions.https.onCall(async (data, context) => {
       blendOpacity: blankPlacement.blendOpacity ?? 0.87,
       // Operator's chosen clip strategy — read by onMockJobCreated to gate mask application.
       maskConfig: blankPlacement.maskConfig ?? null,
+      fabricFeel:
+        Number.isFinite(Number(blankPlacement.fabricFeel))
+          ? Number(blankPlacement.fabricFeel)
+          : Number.isFinite(Number(blendSettings.fabricFeel))
+            ? Number(blendSettings.fabricFeel)
+            : null,
+      printStrength:
+        Number.isFinite(Number(blankPlacement.printStrength))
+          ? Number(blankPlacement.printStrength)
+          : Number.isFinite(Number(blendSettings.printStrength))
+            ? Number(blendSettings.printStrength)
+            : null,
     };
   }
 
@@ -7727,14 +7749,30 @@ exports.onMockJobCreated = functions
       const actualW = resizedResult.info.width;
       const actualH = resizedResult.info.height;
 
-      // Per RALLY_PHASE1_DETERMINISTIC_PRODUCT_RENDERER: blend (soft-light for print-on-fabric look) + 80–90% opacity.
-      // Sharp uses "over" for the normal/source-over op, not "normal"; CSS / editor speak "normal", so normalize.
-      const blendModeRequested = placement.blendMode || "soft-light";
-      const blendMode =
-        blendModeRequested === "normal" || blendModeRequested === "source" || blendModeRequested === "source-over"
-          ? "over"
-          : blendModeRequested;
-      const effectiveOpacity = placement.blendOpacity ?? 0.9;
+      /**
+       * v10.3 (2026-05-25): force CLEAN BLEND for Stage A to match the editor preview
+       * pipeline (functions/lib/blankPreviewRender.js > composeStageA v8.3).
+       *
+       * Stage A is no longer the final output — Stage B v10 (Flux Fill hybrid composite)
+       * runs on top of it for `quality === "final"` renders. Stage A's job is now to be
+       * a CLEAN vivid color reference that anchors the hybrid composite. The old
+       * "soft-light + 0.9 opacity" defaults mattered when Stage A WAS the final output
+       * (Phase 1 deterministic-only); they don't help Stage B and actively desaturate
+       * the colors Flux Fill needs to anchor on inside the mask region.
+       *
+       * Editor preview forces normal/1.0 always; production now matches so the
+       * hybrid composite gets the same color anchor in both pipelines.
+       *
+       * `placement.blendMode` / `placement.blendOpacity` are intentionally ignored
+       * here. The "Print style / blend" sliders predate v10 — they're for the AI
+       * prompt now (via fabricFeel/printStrength), not for Stage A appearance.
+       */
+      const blendModeRequested = "normal";
+      const blendMode = "over"; // Sharp's name for "normal" / source-over
+      const effectiveOpacity = 1.0;
+      console.log(
+        `[onMockJobCreated] v10.3 clean Stage A blend: forced normal/1.0 (editor sent ${placement.blendMode || "default"}/${placement.blendOpacity != null ? placement.blendOpacity : "default"}, sliders now drive Stage B prompt only)`
+      );
 
       /**
        * Fabric mask: design × mask for fabric integration. Three gates:
@@ -8068,194 +8106,97 @@ exports.onMockJobCreated = functions
         }
       }
 
-      // --- Stage B: AI realism pass (Phase 2 only; Phase 1 = deterministic only) ---
+      // --- Stage B v10 (2026-05-25): Flux Fill inpaint + hybrid composite ---
+      // Ported from editor preview pipeline (functions/lib/blankPreviewRender.js).
+      // Replaces the old img2img / Phase 1-gated Stage B. The legacy gate
+      // `MOCK_PHASE1_DETERMINISTIC_ONLY` is intentionally NOT consulted here — v10 is
+      // the new default for `quality === "final"` renders. The const is kept around
+      // (line ~7279) for backward compat with any other code that may reference it.
+      // To opt out of AI realism for a specific job, the launch caller can set
+      // `quality` to anything other than `"final"` (e.g. `"draft"`).
       let finalAssetId = null;
-      if (quality === "final" && !MOCK_PHASE1_DETERMINISTIC_ONLY) {
-        console.log("[onMockJobCreated] Processing Stage B: AI realism pass");
-        
+      if (quality === "final") {
+        console.log("[onMockJobCreated] Processing Stage B v10: Flux Fill realism pass");
+
         const FAL_API_KEY = getFalApiKey();
         if (!FAL_API_KEY) {
-          console.warn("[onMockJobCreated] FAL_API_KEY not set - skipping final pass");
+          console.warn("[onMockJobCreated] FAL_API_KEY not set - shipping Stage A only");
         } else {
           try {
-            // Prompts per spec
-            const REALISM_PROMPT = "Studio product photo of the same garment. The artwork is screen printed directly onto the fabric. Preserve garment shape, seams, and lighting. The print follows fabric texture and wrinkles with subtle ink absorption and shading. Keep the artwork geometry and edges exactly the same. Do not change background.";
-            const REALISM_NEGATIVE = "distort logo, change text, redraw artwork, add text, change garment shape, change straps/waistband, change background, add objects, blur";
-            
-            // Convert draft buffer to base64 data URL
-            const draftBase64 = draftBuffer.toString("base64");
-            const draftDataUrl = `data:image/png;base64,${draftBase64}`;
-            
-            // --- Phase 3: Check for mask and use inpaint if available ---
-            const maskDocId = `${blankId}_${view}`;
-            const maskDoc = await db.collection("rp_blank_masks").doc(maskDocId).get();
-            const maskData = maskDoc.exists ? maskDoc.data() : null;
-            
-            let useMask = false;
-            let maskBase64 = null;
-            let falEndpoint = "fal-ai/flux/dev/image-to-image";
-            
-            if (maskData && maskData.mask && maskData.mask.downloadUrl) {
-              console.log("[onMockJobCreated] Mask found for", maskDocId, "- using inpaint mode");
-              
-              try {
-                // Fetch the mask image
-                const maskResp = await fetch(maskData.mask.downloadUrl);
-                if (maskResp.ok) {
-                  const maskBuffer = Buffer.from(await maskResp.arrayBuffer());
-                  
-                  // Resize mask to match draft dimensions if needed
-                  const maskMeta = await sharp(maskBuffer).metadata();
-                  let processedMaskBuffer = maskBuffer;
-                  
-                  if (maskMeta.width !== draftMeta.width || maskMeta.height !== draftMeta.height) {
-                    console.log("[onMockJobCreated] Resizing mask from", maskMeta.width, "x", maskMeta.height, "to", draftMeta.width, "x", draftMeta.height);
-                    processedMaskBuffer = await sharp(maskBuffer)
-                      .resize(draftMeta.width, draftMeta.height, { fit: "fill" })
-                      .png()
-                      .toBuffer();
-                  }
-                  
-                  // Normalize mask to strict black (0) / white (255) via threshold
-                  // This ensures no gray pixels or anti-aliased edges confuse the inpainting model
-                  console.log("[onMockJobCreated] Normalizing mask to strict black/white");
-                  processedMaskBuffer = await sharp(processedMaskBuffer)
-                    .grayscale()
-                    .threshold(128) // pixels >= 128 become white (255), else black (0)
-                    .png()
-                    .toBuffer();
-                  
-                  maskBase64 = processedMaskBuffer.toString("base64");
-                  useMask = true;
-                  falEndpoint = "fal-ai/flux/dev/inpainting";
-                } else {
-                  console.warn("[onMockJobCreated] Failed to fetch mask:", maskResp.status, "- falling back to img2img");
-                }
-              } catch (maskErr) {
-                console.warn("[onMockJobCreated] Error processing mask:", maskErr.message, "- falling back to img2img");
-              }
-            } else {
-              console.log("[onMockJobCreated] No mask found for", maskDocId, "- using img2img");
-            }
-            
-            const falUrl = resolveFalUrl(falEndpoint);
-            console.log("[onMockJobCreated] Calling fal.ai", useMask ? "inpaint" : "img2img", ":", falUrl);
-            
-            // Build payload based on mode
-            let falPayload;
-            if (useMask && maskBase64) {
-              // Inpaint mode - mask defines editable region
-              // With inpaint, we can use slightly higher strength since we're only editing the masked region
-              falPayload = {
-                image_url: draftDataUrl,
-                mask_url: `data:image/png;base64,${maskBase64}`,
-                prompt: REALISM_PROMPT,
-                negative_prompt: REALISM_NEGATIVE,
-                strength: 0.25, // Slightly higher strength for inpaint (spec recommends 0.20-0.30)
-                num_inference_steps: 28,
-                guidance_scale: 3.5,
-                num_images: 1,
-                enable_safety_checker: false,
-              };
-            } else {
-              // img2img mode - global edit
-              falPayload = {
-                image_url: draftDataUrl,
-                prompt: REALISM_PROMPT,
-                negative_prompt: REALISM_NEGATIVE,
-                strength: 0.20, // Low strength to preserve logo
-                num_inference_steps: 28,
-                guidance_scale: 3.5,
-                num_images: 1,
-                enable_safety_checker: false,
-              };
-            }
-            
-            const falResponse = await fetch(falUrl, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Key ${FAL_API_KEY}`,
-              },
-              body: JSON.stringify(falPayload),
+            // Build letter mask from the design alpha buffer (same logic as preview).
+            // onMockJobCreated composites at native (no oversample), so OVERSAMPLE=1
+            // and designLeft/designTop are already in native blank coordinates.
+            const letterMaskBuffer = await buildLetterMaskFromDesignRgba({
+              sharp,
+              resizedDesignRaw,
+              actualW,
+              actualH,
+              designLeft,
+              designTop,
+              nativeBlankW: blankWidth,
+              nativeBlankH: blankHeight,
+              OVERSAMPLE: 1,
             });
-            
-            if (!falResponse.ok) {
-              const errorText = await falResponse.text();
-              throw new Error(`fal.ai API error (${falResponse.status}): ${errorText}`);
+
+            // Resolve design colors for prompt injection — fetch the design doc fresh
+            // here since onMockJobCreated doesn't have the design object in scope from
+            // earlier (only designId via the job).
+            let designColors = [];
+            try {
+              const designSnapForRealism = await db.collection("designs").doc(designId).get();
+              const designForRealism = designSnapForRealism.exists ? designSnapForRealism.data() : null;
+              designColors = designForRealism && Array.isArray(designForRealism.colors)
+                ? designForRealism.colors
+                : [];
+            } catch (designErr) {
+              console.warn("[onMockJobCreated] Could not load design colors for Stage B:", designErr && designErr.message);
             }
-            
-            let falResult = await falResponse.json();
-            let falRequestId = falResult.request_id || falResult.id;
-            
-            // Poll for completion if async
-            if (falResult.status === "IN_QUEUE" || falResult.status === "IN_PROGRESS") {
-              const statusUrl = falResult.status_url || `${falUrl}/requests/${falRequestId}/status`;
-              const maxAttempts = 60; // 5 minutes max
-              let attempts = 0;
-              let completed = false;
-              
-              while (!completed && attempts < maxAttempts) {
-                await new Promise((resolve) => setTimeout(resolve, 5000));
-                attempts++;
-                
-                const statusResponse = await fetch(statusUrl, {
-                  headers: { Authorization: `Key ${FAL_API_KEY}` },
-                });
-                
-                if (statusResponse.ok) {
-                  const statusData = await statusResponse.json();
-                  if (statusData.status === "COMPLETED" || statusData.images) {
-                    falResult = statusData;
-                    completed = true;
-                  } else if (statusData.status === "FAILED") {
-                    throw new Error(`fal.ai job failed: ${statusData.error || "Unknown error"}`);
-                  }
-                }
-              }
-              
-              if (!completed) {
-                throw new Error("fal.ai job timed out");
-              }
-            }
-            
-            // Get the result image
-            const resultImages = falResult.images || falResult.output?.images || [];
-            if (resultImages.length === 0) {
-              throw new Error("No images returned from fal.ai");
-            }
-            
-            const resultImageUrl = resultImages[0].url || resultImages[0];
-            console.log("[onMockJobCreated] fal.ai returned image:", resultImageUrl);
-            
-            // Download the final image
-            const finalImageResp = await fetch(resultImageUrl);
-            if (!finalImageResp.ok) {
-              throw new Error(`Failed to download fal.ai result: ${finalImageResp.status}`);
-            }
-            const finalBuffer = Buffer.from(await finalImageResp.arrayBuffer());
+
+            // Slider values from the resolved placement (createMockJob surfaces these
+            // from blank.placements[i].fabricFeel / blank.blendSettings.fabricFeel).
+            const fabricFeel = Number.isFinite(Number(placement.fabricFeel)) ? Number(placement.fabricFeel) : 0.5;
+            const printStrength = Number.isFinite(Number(placement.printStrength)) ? Number(placement.printStrength) : 0.7;
+
+            // Run v10 realism: Flux Fill inpaint + hybrid composite back onto Stage A.
+            const realism = await runRealismPass({
+              sharp,
+              db,
+              fetchFn: fetch,
+              falApiKey: FAL_API_KEY,
+              blankId,
+              view: view || "front",
+              draftBuffer,
+              draftMeta,
+              letterMaskBuffer,
+              designColors,
+              fabricFeel,
+              printStrength,
+            });
+
+            const finalBuffer = realism.buffer;
             const finalMeta = await sharp(finalBuffer).metadata();
-            
-            // Save final image to Storage
+
+            // Save final image to Storage at the same `final.png` path the legacy block used.
             const finalStoragePath = `rp/mocks/${designId}/${blankId}/${view}/${timestamp}/final.png`;
             const finalFile = bucket.file(finalStoragePath);
-            
             await finalFile.save(finalBuffer, {
               contentType: "image/png",
-              metadata: {
-                cacheControl: "public, max-age=31536000",
-              },
+              metadata: { cacheControl: "public, max-age=31536000" },
             });
-            
             await finalFile.makePublic();
             const finalDownloadUrl = `https://storage.googleapis.com/${bucket.name}/${finalStoragePath}`;
-            
-            console.log("[onMockJobCreated] Saved final to:", finalStoragePath);
-            
-            // Create prompt hash for provenance
-            const promptHash = crypto.createHash("md5").update(REALISM_PROMPT).digest("hex").substring(0, 8);
-            
-            // Create the final mock asset document
+            console.log("[onMockJobCreated] Saved final v10 realism to:", finalStoragePath, "endpoint:", realism.falEndpoint);
+
+            // Provenance: prompt hash kept for parity with the legacy block (consumers
+            // expect provenance.promptHash). v10's prompt is dynamic (per fabricFeel /
+            // printStrength bands) so we hash the params + endpoint as a stand-in.
+            const promptHashSource = JSON.stringify({
+              endpoint: realism.falEndpoint,
+              params: realism.params,
+              colors: designColors.map((c) => c && c.hex).filter(Boolean),
+            });
+            const promptHash = crypto.createHash("md5").update(promptHashSource).digest("hex").substring(0, 8);
+
             const finalAssetData = {
               designId,
               blankId,
@@ -8273,13 +8214,11 @@ exports.onMockJobCreated = functions
               provenance: {
                 jobId,
                 modelProvider: "fal",
-                modelName: falEndpoint,
+                modelName: realism.falEndpoint,
                 params: {
-                  strength: useMask ? 0.25 : 0.20,
-                  num_inference_steps: 28,
-                  guidance_scale: 3.5,
-                  usedMask: useMask,
-                  maskDocId: useMask ? maskDocId : null,
+                  ...realism.params,
+                  usedMask: realism.useMask === true,
+                  pipeline: "stageB_v10_flux_fill_hybrid",
                 },
                 promptHash,
               },
@@ -8287,12 +8226,14 @@ exports.onMockJobCreated = functions
               createdAt: admin.firestore.FieldValue.serverTimestamp(),
               createdByUid: job.createdByUid,
             };
-            
+
             const finalAssetRef = await db.collection("rp_mock_assets").add(finalAssetData);
             finalAssetId = finalAssetRef.id;
-            console.log("[onMockJobCreated] Created final asset:", finalAssetId, useMask ? "(with mask/inpaint)" : "(img2img)");
+            console.log("[onMockJobCreated] Created final asset (v10):", finalAssetId);
 
-            // Overwrite product mockup with final image when job is linked to a product
+            // Overwrite product mockup with the realism image when this job is linked to a product.
+            // Same pattern the legacy Stage B used — keeps downstream consumers (gallery, displayMedia,
+            // bulk-job awaiting_mock unblocking) on the same path regardless of v10 vs legacy.
             if (job.productId) {
               const parentIdFinal = job.productId;
               const vidFinal =
@@ -8360,7 +8301,7 @@ exports.onMockJobCreated = functions
               } catch (galErr) {
                 console.warn("[onMockJobCreated] Could not update gallery asset after final:", galErr && galErr.message);
               }
-              console.log("[onMockJobCreated] Updated product mockup with final:", productMockPath);
+              console.log("[onMockJobCreated] Updated product mockup with v10 final:", productMockPath);
               // Unblock bulk job items waiting for this product's mock (two-layer architecture)
               const awaitingItemsFinal = await db.collection("rp_bulk_generation_job_items")
                 .where("productId", "==", job.productId)
@@ -8379,10 +8320,12 @@ exports.onMockJobCreated = functions
               }
             }
 
-          } catch (falError) {
-            console.error("[onMockJobCreated] Stage B failed:", falError.message);
-            // Don't fail the whole job - draft was still created successfully
-            // Just log the error and continue
+          } catch (realismErr) {
+            console.error(
+              "[onMockJobCreated] v10 Stage B failed, shipping Stage A:",
+              realismErr && realismErr.message ? realismErr.message : realismErr
+            );
+            // Don't fail the whole job - Stage A draft was still created successfully.
           }
         }
       }
