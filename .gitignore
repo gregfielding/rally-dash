@@ -27,6 +27,12 @@ yarn-error.log*
 # local env files
 .env*.local
 .env
+# Firebase Cloud Functions project-specific env files (Gen 1 + Gen 2 pattern).
+# `firebase deploy` bundles these into the function's runtime env vars. They
+# hold production secrets (SHOPIFY_ACCESS_TOKEN, etc.) so they MUST NOT be
+# committed. Pattern matches `.env.rally-dash`, `.env.staging`, etc.
+functions/.env
+functions/.env.*
 
 # vercel
 .vercel
