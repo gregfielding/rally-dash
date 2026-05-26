@@ -19,8 +19,19 @@ import { useCreateMockJob } from "@/lib/hooks/useMockAssets";
 import { useScenePresets as useRPScenePresets } from "@/lib/hooks/useRPScenePresets";
 import { RpProduct, RpProductStatus, RpProductCategory } from "@/lib/types/firestore";
 import { isMasterBlank, getBlankVariants, inferDefaultPrintSides } from "@/lib/blanks";
+import { isProductReadyForShopify } from "@/lib/shopify/isProductReadyForShopify";
 import useSWR from "swr";
-import { collection, getDocs, query, orderBy, doc, deleteDoc } from "firebase/firestore";
+import {
+  collection,
+  getDocs,
+  query,
+  orderBy,
+  doc,
+  deleteDoc,
+  onSnapshot,
+  writeBatch,
+  serverTimestamp,
+} from "firebase/firestore";
 import { db } from "@/lib/firebase/config";
 
 function StatusBadge({ status }: { status: RpProductStatus }) {
@@ -115,6 +126,21 @@ function ProductsContent() {
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const [launchOpsFilter, setLaunchOpsFilter] = useState<LaunchOpsFilter>("all");
   const [bulkOpsBusy, setBulkOpsBusy] = useState(false);
+
+  // Phase 6: Shopify push state — per-product live status + aggregate progress banner.
+  // After a push, each affected product is subscribed via onSnapshot; the row reflects
+  // launchStatus / shopify.status transitions in real time without waiting for refetch.
+  type ShopifyPushRowStatus = "queued" | "syncing" | "synced" | "error";
+  const [shopifyPushStatus, setShopifyPushStatus] = useState<Record<string, ShopifyPushRowStatus>>({});
+  const [shopifyPushErrors, setShopifyPushErrors] = useState<Record<string, string>>({});
+  const [shopifyPushBanner, setShopifyPushBanner] = useState<{
+    inFlight: boolean;
+    total: number;
+    done: number;
+    failed: number;
+    label: string;
+  } | null>(null);
+  const [shopifyPushUnsubs, setShopifyPushUnsubs] = useState<Array<() => void>>([]);
 
   const [isGenTeamProductsOpen, setIsGenTeamProductsOpen] = useState(false);
   const [isDesignBlankOpen, setIsDesignBlankOpen] = useState(false);
@@ -222,6 +248,214 @@ function ProductsContent() {
     });
     console.info("[PRODUCT_LIST:READ]", JSON.stringify({ total: products.length, sample }));
   }, [products, loading]);
+
+  // Tear down any active Shopify push snapshot subscriptions on unmount.
+  useEffect(() => {
+    return () => {
+      shopifyPushUnsubs.forEach((u) => {
+        try {
+          u();
+        } catch {
+          /* ignore */
+        }
+      });
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Per-row Shopify readiness: server-computed `shopifyReady` is the authoritative
+  // gate (it mirrors `functions/shopifySync.readinessCheck()`). For parent rows we
+  // also require `launchStatus === "shopify_ready"` — the bulk callable rejects
+  // anything else with `not_ready_for_sync`. Falls back to the client-side check
+  // when the server hasn't computed a value yet (legacy / pre-launch docs).
+  const isProductPushable = (p: RpProduct): { ok: boolean; reason?: string } => {
+    if (p.launchStatus && p.launchStatus !== "shopify_ready" && p.launchStatus !== "live" && p.launchStatus !== "failed") {
+      return { ok: false, reason: `launch=${p.launchStatus}` };
+    }
+    if (typeof p.shopifyReady === "boolean") {
+      if (!p.shopifyReady) {
+        const miss = (p.shopifyReadinessMissing || []).filter(Boolean).slice(0, 3).join(", ");
+        return { ok: false, reason: miss || "not shopify-ready" };
+      }
+      return { ok: true };
+    }
+    // Fallback: client compute (no variant subcollection on list page).
+    const r = isProductReadyForShopify(p);
+    if (!r.ready) {
+      return { ok: false, reason: r.missing.slice(0, 3).join(", ") || "missing fields" };
+    }
+    return { ok: true };
+  };
+
+  // Aggregate readiness summary for the currently selected products.
+  const selectedPushabilitySummary = useMemo(() => {
+    const ids = Array.from(selectedProducts);
+    const notReady: Array<{ id: string; name: string; reason: string }> = [];
+    let readyCount = 0;
+    for (const id of ids) {
+      const p = products.find((x) => x.id === id);
+      if (!p) {
+        notReady.push({ id, name: id, reason: "not loaded" });
+        continue;
+      }
+      const r = isProductPushable(p);
+      if (r.ok) readyCount += 1;
+      else notReady.push({ id, name: p.title || p.name || p.slug || id, reason: r.reason || "not ready" });
+    }
+    return { total: ids.length, readyCount, notReady };
+  }, [selectedProducts, products]);
+
+  /**
+   * Phase 6: push selected products to Shopify with explicit DRAFT / ACTIVE intent.
+   * - Patches each product's `shopifyStatus` field so `shopifySync.js` reads DRAFT or
+   *   ACTIVE (defaults to ACTIVE when unset). Uses a Firestore batch.
+   * - Calls `bulkSyncProductsToShopify` callable (max 50 per call — chunks if needed).
+   * - Subscribes to each affected `rp_products` doc via `onSnapshot` and reflects
+   *   live `shopify.status` / `launchStatus` transitions on the row.
+   * - Idempotent: products with an existing `shopify.productId` will be updated by
+   *   `productSet`, not duplicated (Shopify-side dedupe by handle identifier).
+   */
+  const handleBulkPushToShopify = async (intent: "DRAFT" | "ACTIVE") => {
+    if (!db || selectedProducts.size === 0) return;
+    const ids = Array.from(selectedProducts);
+    const pushableIds: string[] = [];
+    for (const id of ids) {
+      const p = products.find((x) => x.id === id);
+      if (p && isProductPushable(p).ok) pushableIds.push(id);
+    }
+    if (pushableIds.length === 0) {
+      alert("None of the selected products are Shopify-ready.");
+      return;
+    }
+    if (
+      intent === "ACTIVE" &&
+      !window.confirm(
+        `Push ${pushableIds.length} product${pushableIds.length === 1 ? "" : "s"} to Shopify as ACTIVE?\n\nProducts will go LIVE to customers immediately.`
+      )
+    ) {
+      return;
+    }
+
+    setBulkOpsBusy(true);
+    setShopifyPushStatus(() => Object.fromEntries(pushableIds.map((id) => [id, "queued" as const])));
+    setShopifyPushErrors({});
+    setShopifyPushBanner({
+      inFlight: true,
+      total: pushableIds.length,
+      done: 0,
+      failed: 0,
+      label: intent === "DRAFT" ? "Pushing as DRAFT" : "Pushing as ACTIVE (live)",
+    });
+
+    // 1) Patch shopifyStatus before queueing so the sync worker reads the right intent.
+    try {
+      const CHUNK = 400;
+      for (let i = 0; i < pushableIds.length; i += CHUNK) {
+        const batch = writeBatch(db);
+        for (const id of pushableIds.slice(i, i + CHUNK)) {
+          batch.update(doc(db, "rp_products", id), {
+            shopifyStatus: intent,
+            updatedAt: serverTimestamp(),
+          });
+        }
+        await batch.commit();
+      }
+    } catch (err) {
+      console.error("[Products] Failed to set shopifyStatus before push:", err);
+      alert("Failed to update product status — aborting push.");
+      setBulkOpsBusy(false);
+      setShopifyPushBanner(null);
+      return;
+    }
+
+    // 2) Subscribe to each product doc for live row status. Subscribe BEFORE the
+    // callable returns so we never miss the syncing→synced transition.
+    const newUnsubs: Array<() => void> = [];
+    const finalized = new Set<string>();
+    for (const id of pushableIds) {
+      const unsub = onSnapshot(doc(db, "rp_products", id), (snap) => {
+        if (!snap.exists()) return;
+        const d = snap.data() as RpProduct;
+        const shopifyState = (d.shopify as any)?.status as string | undefined;
+        const launch = d.launchStatus;
+        let next: ShopifyPushRowStatus = "queued";
+        if (shopifyState === "error" || launch === "failed") next = "error";
+        else if (shopifyState === "synced" || launch === "live") next = "synced";
+        else if (launch === "syncing_shopify" || shopifyState === "syncing") next = "syncing";
+        setShopifyPushStatus((prev) => ({ ...prev, [id]: next }));
+        if (next === "error") {
+          const msg = (d.shopify as any)?.lastSyncError || d.lastPipelineError || "Sync failed";
+          setShopifyPushErrors((prev) => ({ ...prev, [id]: String(msg) }));
+        }
+        if ((next === "synced" || next === "error") && !finalized.has(id)) {
+          finalized.add(id);
+          setShopifyPushBanner((prev) => {
+            if (!prev) return prev;
+            const failedDelta = next === "error" ? 1 : 0;
+            const doneNext = prev.done + 1;
+            const failedNext = prev.failed + failedDelta;
+            const allDone = doneNext >= prev.total;
+            return {
+              ...prev,
+              done: doneNext,
+              failed: failedNext,
+              inFlight: !allDone,
+            };
+          });
+        }
+      });
+      newUnsubs.push(unsub);
+    }
+    setShopifyPushUnsubs((prev) => [...prev, ...newUnsubs]);
+
+    // 3) Call the bulk sync callable. Server callable enforces 50/call — chunk if needed.
+    let queuedOk = 0;
+    let queuedFailed = 0;
+    const queueErrors: string[] = [];
+    try {
+      const CALL_CHUNK = 50;
+      for (let i = 0; i < pushableIds.length; i += CALL_CHUNK) {
+        const slice = pushableIds.slice(i, i + CALL_CHUNK);
+        const out = await bulkSyncProductsToShopify({ productIds: slice });
+        for (const r of out.results || []) {
+          if (r.ok) {
+            queuedOk += 1;
+          } else {
+            queuedFailed += 1;
+            queueErrors.push(`${r.productId}: ${r.reason || "queue failed"}`);
+            // Mark as error immediately so the banner finalizes for never-queued items.
+            setShopifyPushStatus((prev) => ({ ...prev, [r.productId]: "error" }));
+            setShopifyPushErrors((prev) => ({
+              ...prev,
+              [r.productId]: r.reason || "Queue failed",
+            }));
+            if (!finalized.has(r.productId)) {
+              finalized.add(r.productId);
+              setShopifyPushBanner((prev) =>
+                prev
+                  ? { ...prev, done: prev.done + 1, failed: prev.failed + 1, inFlight: prev.done + 1 < prev.total }
+                  : prev
+              );
+            }
+          }
+        }
+      }
+    } catch (e) {
+      const err = e as { message?: string };
+      alert(err?.message || "Bulk push failed at queue step.");
+      console.error("[Products] bulkSyncProductsToShopify call failed:", e);
+    } finally {
+      setBulkOpsBusy(false);
+    }
+
+    // 4) Clear selection after kicking off — operator's intent is "done with this batch".
+    setSelectedProducts(new Set());
+    await refetch();
+    console.info(
+      "[SHOPIFY_BULK_PUSH:REQUEST]",
+      JSON.stringify({ intent, requested: pushableIds.length, queuedOk, queuedFailed, queueErrors: queueErrors.slice(0, 5) })
+    );
+  };
 
   const handleCreateFromDesignBlank = async (e: FormEvent) => {
     e.preventDefault();
@@ -815,7 +1049,28 @@ function ProductsContent() {
                     {/* thumb */}
                   </th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Product
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="checkbox"
+                        aria-label="Select all visible products"
+                        checked={products.length > 0 && products.every((p) => selectedProducts.has(p.id || ""))}
+                        ref={(el) => {
+                          if (!el) return;
+                          const total = products.length;
+                          const sel = products.filter((p) => selectedProducts.has(p.id || "")).length;
+                          el.indeterminate = sel > 0 && sel < total;
+                        }}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setSelectedProducts(new Set(products.map((p) => p.id || "").filter(Boolean)));
+                          } else {
+                            setSelectedProducts(new Set());
+                          }
+                        }}
+                        className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                      />
+                      <span>Product</span>
+                    </div>
                   </th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                     Launch
@@ -923,7 +1178,37 @@ function ProductsContent() {
                       </div>
                     </td>
                     <td className="px-4 py-3 whitespace-nowrap align-top">
-                      <BoolChip ok={product.shopifyReady} label="Ready" />
+                      <div className="flex flex-col gap-1">
+                        <BoolChip ok={product.shopifyReady} label="Ready" />
+                        {(() => {
+                          const live = shopifyPushStatus[product.id || ""];
+                          if (!live) return null;
+                          const cls =
+                            live === "synced"
+                              ? "bg-emerald-100 text-emerald-900"
+                              : live === "error"
+                                ? "bg-red-100 text-red-900"
+                                : live === "syncing"
+                                  ? "bg-sky-100 text-sky-900"
+                                  : "bg-amber-100 text-amber-900";
+                          const label =
+                            live === "synced"
+                              ? "synced"
+                              : live === "error"
+                                ? "error"
+                                : live === "syncing"
+                                  ? "syncing"
+                                  : "queued";
+                          return (
+                            <span
+                              className={`inline-flex px-2 py-0.5 rounded text-[11px] font-semibold capitalize ${cls}`}
+                              title={shopifyPushErrors[product.id || ""] || ""}
+                            >
+                              {label}
+                            </span>
+                          );
+                        })()}
+                      </div>
                     </td>
                     <td className="px-4 py-3 whitespace-nowrap align-top">
                       <BoolChip ok={fulfillmentReady} label="Ready" />
@@ -1214,6 +1499,122 @@ function ProductsContent() {
           </div>
         </form>
       </Modal>
+
+      {/* Phase 6: Shopify push progress banner (fixed under top of viewport) */}
+      {shopifyPushBanner && (
+        <div className="fixed top-4 right-4 z-50 max-w-md rounded-lg shadow-lg border border-gray-200 bg-white px-4 py-3">
+          <div className="flex items-start gap-3">
+            <div className="flex-1">
+              <p className="text-sm font-semibold text-gray-900">
+                {shopifyPushBanner.label}
+              </p>
+              <p className="text-xs text-gray-600 mt-1">
+                {shopifyPushBanner.done}/{shopifyPushBanner.total} complete
+                {shopifyPushBanner.failed > 0 ? (
+                  <span className="ml-1 text-red-700">· {shopifyPushBanner.failed} failed</span>
+                ) : null}
+              </p>
+              <div className="mt-2 h-1.5 w-full rounded-full bg-gray-200 overflow-hidden">
+                <div
+                  className={`h-full ${shopifyPushBanner.failed > 0 ? "bg-amber-500" : "bg-emerald-600"}`}
+                  style={{
+                    width: `${shopifyPushBanner.total === 0 ? 0 : Math.round((shopifyPushBanner.done / shopifyPushBanner.total) * 100)}%`,
+                    transition: "width 200ms ease-out",
+                  }}
+                />
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShopifyPushBanner(null)}
+              className="text-gray-400 hover:text-gray-600 text-lg leading-none"
+              aria-label="Dismiss"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Phase 6: floating bulk-push action bar (Push to Shopify as DRAFT / ACTIVE). */}
+      {selectedProducts.size > 0 && (
+        <div className="fixed bottom-0 inset-x-0 z-40 border-t border-gray-200 bg-white/95 backdrop-blur shadow-[0_-2px_8px_rgba(0,0,0,0.04)]">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex flex-wrap items-center gap-3">
+            <div className="text-sm">
+              <span className="font-semibold text-gray-900">
+                {selectedProducts.size} selected
+              </span>
+              {selectedPushabilitySummary.readyCount !== selectedProducts.size && (
+                <span className="ml-2 text-amber-700">
+                  ({selectedPushabilitySummary.readyCount} ready ·{" "}
+                  {selectedPushabilitySummary.notReady.length} blocked)
+                </span>
+              )}
+            </div>
+
+            <div className="flex-1" />
+
+            {/* DRAFT button — primary, safe default */}
+            <button
+              type="button"
+              disabled={bulkOpsBusy || selectedPushabilitySummary.readyCount === 0}
+              onClick={() => handleBulkPushToShopify("DRAFT")}
+              title={
+                selectedPushabilitySummary.notReady.length > 0
+                  ? `Will push ${selectedPushabilitySummary.readyCount} ready; skipping:\n${selectedPushabilitySummary.notReady
+                      .slice(0, 8)
+                      .map((n) => `• ${n.name} — ${n.reason}`)
+                      .join("\n")}${selectedPushabilitySummary.notReady.length > 8 ? `\n…and ${selectedPushabilitySummary.notReady.length - 8} more` : ""}`
+                  : "Push selected products to Shopify as DRAFT (hidden from customers)"
+              }
+              className="px-4 py-2 text-sm font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {bulkOpsBusy
+                ? "Working..."
+                : `Push to Shopify as DRAFT${selectedPushabilitySummary.readyCount > 0 ? ` (${selectedPushabilitySummary.readyCount})` : ""}`}
+            </button>
+
+            {/* ACTIVE button — warning styling, confirms before sending live */}
+            <button
+              type="button"
+              disabled={bulkOpsBusy || selectedPushabilitySummary.readyCount === 0}
+              onClick={() => handleBulkPushToShopify("ACTIVE")}
+              title="Push as ACTIVE — products will be live to customers immediately"
+              className="px-4 py-2 text-sm font-semibold rounded-lg border border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100 disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5"
+            >
+              <span aria-hidden>⚠</span>
+              Push as ACTIVE (live)
+            </button>
+
+            <button
+              type="button"
+              disabled={bulkOpsBusy}
+              onClick={() => setSelectedProducts(new Set())}
+              className="px-3 py-2 text-sm text-gray-600 hover:text-gray-900 disabled:opacity-50"
+            >
+              Clear selection
+            </button>
+          </div>
+
+          {selectedPushabilitySummary.notReady.length > 0 && (
+            <div className="border-t border-amber-100 bg-amber-50 px-4 sm:px-6 lg:px-8 py-2 max-w-7xl mx-auto text-xs text-amber-900">
+              <span className="font-medium">Blocked: </span>
+              {selectedPushabilitySummary.notReady.slice(0, 4).map((n, i) => (
+                <span key={n.id}>
+                  {i > 0 ? " · " : ""}
+                  {n.name} ({n.reason})
+                </span>
+              ))}
+              {selectedPushabilitySummary.notReady.length > 4 && (
+                <span> · …and {selectedPushabilitySummary.notReady.length - 4} more</span>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Bottom padding so the action bar never overlaps the table tail */}
+      {selectedProducts.size > 0 && <div className="h-24" aria-hidden />}
     </div>
   );
 }

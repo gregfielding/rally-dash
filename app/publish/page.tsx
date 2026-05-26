@@ -146,6 +146,21 @@ function PublishContent() {
 
   return (
     <div className="space-y-8">
+      <div className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 flex items-start gap-3">
+        <span className="text-amber-700 text-lg leading-none mt-0.5" aria-hidden>ⓘ</span>
+        <div className="text-sm text-amber-900">
+          <p className="font-semibold">Pushing to Shopify is now on the Products page.</p>
+          <p className="mt-1">
+            Multi-select products in{" "}
+            <Link href="/products" className="font-medium underline hover:no-underline">
+              /products
+            </Link>
+            {" "}and use the new <span className="font-medium">Push to Shopify as DRAFT / ACTIVE</span> bar at the
+            bottom. This view stays available for read-only triage and may be removed later.
+          </p>
+        </div>
+      </div>
+
       <div>
         <h1 className="text-3xl font-bold text-gray-900">Publish</h1>
         <p className="text-gray-600 mt-2 max-w-2xl">
