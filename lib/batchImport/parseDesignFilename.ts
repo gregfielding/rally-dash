@@ -83,7 +83,20 @@ function baseNameWithoutExt(filename: string): string {
   return filename.slice(0, lastDot);
 }
 
-function splitMiddleForTeamAndFamily(middle: string[]): { designFamily: string; team: string } {
+/**
+ * Normalize a slug token for comparison: lowercase, hyphens → underscores.
+ * Both `sf-giants` (Firestore convention) and `sf_giants` (filename token)
+ * should compare equal so operators don't have to remember which separator
+ * goes where.
+ */
+function normalizeSlugForCompare(s: string): string {
+  return s.toLowerCase().replace(/-/g, "_");
+}
+
+function splitMiddleForTeamAndFamily(
+  middle: string[],
+  options?: { knownTeamSlugs?: Set<string> }
+): { designFamily: string; team: string } {
   if (middle.length === 0) {
     return { designFamily: "", team: "" };
   }
@@ -112,12 +125,89 @@ function splitMiddleForTeamAndFamily(middle: string[]): { designFamily: string; 
     };
   }
 
+  /**
+   * v2 (2026-05-25): registry-aware multi-token team matching.
+   *
+   * Previous behavior: team = last middle token, designFamily = everything
+   * before. Brittle — `mlb_sf_giants_pillows_dark` parsed team="pillows"
+   * (wrong) because the team slug "sf_giants" spans two tokens.
+   *
+   * New behavior when `knownTeamSlugs` is passed: try multi-token windows
+   * against the registry (normalized: lowercase, hyphens treated as
+   * underscores). Pick the FIRST match found in this priority order:
+   *   1. Tail-first (current convention): try middle.slice(-n).join("_")
+   *      for n from len down to 2. Matches `mlb_pillows_sf_giants_dark`
+   *      where team=sf_giants is trailing.
+   *   2. Head-first (natural English order): try middle.slice(0, n).join("_")
+   *      for n from len down to 2. Matches `mlb_sf_giants_pillows_dark`
+   *      where team=sf_giants is leading.
+   *   3. Single-token tail fallback (legacy behavior): team = last token,
+   *      designFamily = everything before.
+   *
+   * Falls back to legacy single-token behavior when `knownTeamSlugs` is
+   * undefined OR no multi-token window matches a registered team.
+   */
+  if (options?.knownTeamSlugs && options.knownTeamSlugs.size > 0) {
+    const normalizedRegistry = new Set<string>();
+    for (const slug of options.knownTeamSlugs) {
+      normalizedRegistry.add(normalizeSlugForCompare(slug));
+    }
+
+    /** Tail-first: try the longest trailing window first. */
+    for (let n = middle.length; n >= 2; n--) {
+      const candidate = middle.slice(-n).join("_").toLowerCase();
+      if (normalizedRegistry.has(candidate)) {
+        return {
+          designFamily: middle.slice(0, -n).join("_"),
+          team: candidate,
+        };
+      }
+    }
+
+    /** Head-first: try the longest leading window. */
+    for (let n = middle.length; n >= 2; n--) {
+      const candidate = middle.slice(0, n).join("_").toLowerCase();
+      if (normalizedRegistry.has(candidate)) {
+        return {
+          designFamily: middle.slice(n).join("_"),
+          team: candidate,
+        };
+      }
+    }
+
+    /** Single-token head match (e.g., `mlb_dodgers_pillows_dark`). */
+    const headSingle = middle[0]!.toLowerCase();
+    if (normalizedRegistry.has(headSingle)) {
+      return {
+        designFamily: middle.slice(1).join("_"),
+        team: headSingle,
+      };
+    }
+  }
+
+  /** Legacy single-token tail fallback. */
   const team = middle[middle.length - 1]!;
   const designFamily = middle.slice(0, -1).join("_");
   return { designFamily, team };
 }
 
-export function parseDesignFilename(filePathOrName: string): ParseResult {
+/**
+ * Parse options.
+ *
+ * `knownTeamSlugs` — optional registry of team slugs from `design_teams`
+ * collection (or wherever teams are stored). When provided, the parser
+ * attempts multi-token team matches before falling back to the legacy
+ * "team = last middle token" rule. Hyphens and underscores in slugs are
+ * compared as equal so `sf-giants` (Firestore) matches `sf_giants` (filename).
+ */
+export interface ParseDesignFilenameOptions {
+  knownTeamSlugs?: Set<string>;
+}
+
+export function parseDesignFilename(
+  filePathOrName: string,
+  options?: ParseDesignFilenameOptions
+): ParseResult {
   const filename = filePathOrName.split(/[/\\]/).pop() ?? filePathOrName;
   const ext = getExtension(filename);
   if (!ext) {
@@ -182,7 +272,7 @@ export function parseDesignFilename(filePathOrName: string): ParseResult {
     designKey = [league, ...middle].join("_");
   }
 
-  const { designFamily, team } = splitMiddleForTeamAndFamily(middle);
+  const { designFamily, team } = splitMiddleForTeamAndFamily(middle, options);
   const garmentTone = garmentToneRaw;
 
   const parsed: ParsedDesignFilename = {

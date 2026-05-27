@@ -135,8 +135,22 @@ export function buildBulkReviewItems(
   const parseFailures: { name: string; message: string }[] = [];
   const results: Array<{ file: File; result: ParseResult }> = [];
 
+  /**
+   * Build a registry of known team slugs (and any short variants) so the
+   * parser can match multi-token team slugs like `sf_giants` and
+   * `san_francisco_giants` in the filename without requiring operators to
+   * remember the hyphen-vs-underscore convention or token order.
+   */
+  const knownTeamSlugs = new Set<string>();
+  for (const t of teams) {
+    if (t.slug) knownTeamSlugs.add(t.slug);
+    /** Some teams may also have a shortSlug or alias; include if present. */
+    const anyT = t as unknown as { shortSlug?: string };
+    if (anyT.shortSlug) knownTeamSlugs.add(anyT.shortSlug);
+  }
+
   for (const { file, ext } of accepted) {
-    const result = parseDesignFilename(file.name);
+    const result = parseDesignFilename(file.name, { knownTeamSlugs });
     if (result.status !== "valid" || !result.parsed) {
       parseFailures.push({
         name: file.name,

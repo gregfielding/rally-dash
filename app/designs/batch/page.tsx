@@ -108,9 +108,23 @@ function BatchImportContent() {
     [teams]
   );
 
+  /**
+   * Build the known team-slug registry so the parser can match multi-token
+   * team slugs like `sf_giants` regardless of where in the filename the team
+   * appears. Hyphens vs underscores are normalized inside the parser.
+   */
+  const knownTeamSlugs = useMemo(() => {
+    const set = new Set<string>();
+    for (const t of teams) {
+      if (t.slug) set.add(t.slug);
+      const anyT = t as unknown as { shortSlug?: string };
+      if (anyT.shortSlug) set.add(anyT.shortSlug);
+    }
+    return set;
+  }, [teams]);
   const parseResults: Array<{ file: File; result: ParseResult }> = files.map((file) => ({
     file,
-    result: parseDesignFilename(file.name),
+    result: parseDesignFilename(file.name, { knownTeamSlugs }),
   }));
 
   const grouped = groupParsedFiles(parseResults);
