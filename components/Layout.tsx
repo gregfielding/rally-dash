@@ -17,22 +17,37 @@ type NavItem = {
   roles: string[];
 };
 
+/**
+ * Phase 4 nav restructure (2026-05-25): collapsed from 4 primary + 8 dropdown
+ * to 3 primary + 1 admin dropdown.
+ *
+ * Primary nav = the daily-use workflow (upload designs → products auto-spawn →
+ * push to Shopify from /products). Admin = setup + observability + occasional
+ * ops tools.
+ *
+ * Hidden from old nav but still routable via URL (so bookmarks survive):
+ *   - /catalog  → moved under Admin (taxonomy hub, not daily action)
+ *   - /publish  → moved under Admin (deprecated; Phase 6 added bulk push on
+ *                 /products. /publish has a deprecation banner pointing
+ *                 operators back to /products).
+ */
 const primaryNav: NavItem[] = [
   { name: "Dashboard", href: "/dashboard", roles: ["viewer", "editor", "ops", "admin"] },
-  { name: "Catalog", href: "/catalog", roles: ["viewer", "editor", "ops", "admin"] },
+  { name: "Designs", href: "/designs", roles: ["ops", "admin"] },
   { name: "Products", href: "/products", roles: ["ops", "admin"] },
-  { name: "Publish", href: "/publish", roles: ["ops", "admin", "editor"] },
 ];
 
+/** Renamed in the UI from "More" → "Admin" to make scope clear. */
 const moreNav: NavItem[] = [
-  { name: "Design system", href: "/design-system", roles: ["viewer", "editor", "ops", "admin"] },
-  { name: "Team roster", href: "/design-teams", roles: ["viewer", "editor", "ops", "admin"] },
-  { name: "Designs", href: "/designs", roles: ["ops", "admin"] },
+  { name: "Catalog", href: "/catalog", roles: ["viewer", "editor", "ops", "admin"] },
   { name: "Blanks", href: "/blanks", roles: ["ops", "admin"] },
+  { name: "Team roster", href: "/design-teams", roles: ["viewer", "editor", "ops", "admin"] },
+  { name: "Design system", href: "/design-system", roles: ["viewer", "editor", "ops", "admin"] },
   { name: "Inspirations", href: "/inspirations", roles: ["ops", "admin", "editor"] },
   { name: "Analytics", href: "/analytics", roles: ["ops", "admin"] },
   { name: "LoRA Ops", href: "/lora", roles: ["ops", "admin"] },
   { name: "Asset review", href: "/review", roles: ["ops", "admin", "editor"] },
+  { name: "Publish (legacy)", href: "/publish", roles: ["ops", "admin", "editor"] },
 ];
 
 export default function Layout({ children }: LayoutProps) {
@@ -111,7 +126,7 @@ export default function Layout({ children }: LayoutProps) {
                       aria-expanded={moreOpen}
                       aria-haspopup="menu"
                     >
-                      More
+                      Admin
                       <span className="ml-2 text-gray-500">▾</span>
                     </button>
                     {moreOpen && (
