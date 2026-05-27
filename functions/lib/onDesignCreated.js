@@ -92,19 +92,34 @@ function buildOnDesignCreated(deps) {
     }
 
     // Load active master blanks (schemaVersion=2 + status=active).
+    //
+    // **8394-only gate (2026-05-27):** `startInitialProductAssetBatch` currently returns
+    // `skipped: not_8394` for any blank whose styleCode is not "8394" (panty). The other
+    // master blanks (8390 thong, TR3008 tank, HF07 crewneck) have catalog entries but no
+    // asset-generation pipeline — auto-launching them would create products stuck at
+    // `launchStatus: generating_assets` forever with no batch behind them. Until those
+    // pipelines exist, restrict auto-launch to the 8394 panty so we don't spawn dead stubs.
+    //
+    // Side benefit: this also avoids the cross-blank SKU collision where the panty failed
+    // to create because tank/thong's SKUs (RP-…-COLOR-SIZE, no blank code) consumed the
+    // same slots first.
     const blanksSnap = await db
       .collection("rp_blanks")
       .where("status", "==", "active")
       .get();
     const masterBlanks = blanksSnap.docs
       .map((d) => ({ id: d.id, data: d.data() }))
-      .filter((b) => Number(b.data.schemaVersion) === MASTER_BLANK_SCHEMA_VERSION);
+      .filter(
+        (b) =>
+          Number(b.data.schemaVersion) === MASTER_BLANK_SCHEMA_VERSION &&
+          String(b.data.styleCode || "").trim() === "8394"
+      );
 
     if (masterBlanks.length === 0) {
       console.log(
         JSON.stringify({
           tag: "[ON_DESIGN_CREATED:NOOP]",
-          reason: "no_active_master_blanks",
+          reason: "no_active_8394_master_blanks",
           designId,
         })
       );
