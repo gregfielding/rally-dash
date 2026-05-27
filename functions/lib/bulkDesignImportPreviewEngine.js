@@ -25,7 +25,16 @@ function baseNameNoExt(filename) {
   return filename.slice(0, i);
 }
 
-function splitMiddleForTeamAndFamily(middle) {
+/**
+ * Normalize a slug token for comparison: lowercase, hyphens → underscores.
+ * Mirrors normalizeSlugForCompare in lib/batchImport/parseDesignFilename.ts so
+ * `sf-giants` (Firestore slug) compares equal to `sf_giants` (filename token).
+ */
+function normalizeSlugForCompare(s) {
+  return String(s).toLowerCase().replace(/-/g, "_");
+}
+
+function splitMiddleForTeamAndFamily(middle, options) {
   if (middle.length === 0) return { designFamily: "", team: "" };
   const isCity69 =
     middle.length >= 2 &&
@@ -47,6 +56,56 @@ function splitMiddleForTeamAndFamily(middle) {
       team: identity.join("_"),
     };
   }
+
+  /**
+   * Registry-aware multi-token matching (mirror of
+   * lib/batchImport/parseDesignFilename.ts). When `knownTeamSlugs` is passed,
+   * try multi-token windows against the registry to handle slugs like
+   * `sf_giants` that span two tokens. Falls back to legacy single-token tail
+   * matching when no registry is available or no window matches.
+   *
+   * Without this, `mlb_pillows_sf_giants_dark` parsed team=`giants` which then
+   * fuzzy-matched the wrong team in matchDesignTeam (alphabetical iteration
+   * picked `new_york_giants` over `sf_giants`).
+   */
+  if (options && options.knownTeamSlugs && options.knownTeamSlugs.size > 0) {
+    const normalizedRegistry = new Set();
+    for (const slug of options.knownTeamSlugs) {
+      normalizedRegistry.add(normalizeSlugForCompare(slug));
+    }
+
+    /** Tail-first: try the longest trailing window first. */
+    for (let n = middle.length; n >= 2; n--) {
+      const candidate = middle.slice(-n).join("_").toLowerCase();
+      if (normalizedRegistry.has(candidate)) {
+        return {
+          designFamily: middle.slice(0, -n).join("_"),
+          team: candidate,
+        };
+      }
+    }
+
+    /** Head-first: try the longest leading window. */
+    for (let n = middle.length; n >= 2; n--) {
+      const candidate = middle.slice(0, n).join("_").toLowerCase();
+      if (normalizedRegistry.has(candidate)) {
+        return {
+          designFamily: middle.slice(n).join("_"),
+          team: candidate,
+        };
+      }
+    }
+
+    /** Single-token head match (e.g., `mlb_dodgers_pillows_dark`). */
+    const headSingle = middle[0].toLowerCase();
+    if (normalizedRegistry.has(headSingle)) {
+      return {
+        designFamily: middle.slice(1).join("_"),
+        team: headSingle,
+      };
+    }
+  }
+
   const team = middle[middle.length - 1];
   const designFamily = middle.slice(0, -1).join("_");
   return { designFamily, team };
@@ -87,7 +146,7 @@ function importKindForParsed(parsed) {
   return designFileKindFromToneExt(parsed.garmentTone, parsed.extension);
 }
 
-function parseDesignFilename(filePathOrName) {
+function parseDesignFilename(filePathOrName, options) {
   const filename = filePathOrName.split(/[/\\]/).pop() || filePathOrName;
   const ext = getExt(filename);
   if (!ext) return { parsed: null, status: "invalid_format", message: "No extension" };
@@ -140,7 +199,7 @@ function parseDesignFilename(filePathOrName) {
     }
     designKey = [league, ...middle].join("_");
   }
-  const { designFamily, team } = splitMiddleForTeamAndFamily(middle);
+  const { designFamily, team } = splitMiddleForTeamAndFamily(middle, options);
   return {
     parsed: {
       league,
@@ -268,6 +327,28 @@ function resolveTeamSlugForMatch(parsedTeam, inferred) {
   return pt || inf;
 }
 
+/**
+ * Build a set of candidate team slugs to try (in priority order) so that
+ * matchDesignTeam can recover when the parser's `parsedTeam` doesn't match a
+ * registered team but `inferred.teamSlugCandidate` does. Each candidate is
+ * tried independently against the full match chain.
+ */
+function buildTeamSlugCandidates(parsedTeam, inferred) {
+  const out = [];
+  const seen = new Set();
+  const push = (v) => {
+    const s = String(v ?? "").trim();
+    if (s && !seen.has(s.toLowerCase())) {
+      seen.add(s.toLowerCase());
+      out.push(s);
+    }
+  };
+  push(resolveTeamSlugForMatch(parsedTeam, inferred));
+  push(inferred.teamSlugCandidate);
+  push(parsedTeam);
+  return out;
+}
+
 function matchDesignTeam(teamSlugCandidate, teams, options) {
   const warnings = [];
   const cand = String(teamSlugCandidate).trim();
@@ -293,26 +374,57 @@ function matchDesignTeam(teamSlugCandidate, teams, options) {
     if (t.teamCode && normKey(t.teamCode) === candNorm) return { team: t, warnings };
     if (t.name && normKey(t.name) === candNorm) return { team: t, warnings };
   }
-  for (const t of teams) {
-    if (normKey(t.id).includes(candNorm) || candNorm.includes(normKey(t.id))) {
-      warnings.push(`Team matched loosely by id overlap: ${t.id}`);
-      return { team: t, warnings };
+
+  /**
+   * Loose-overlap fallback is dangerous when the candidate is a single short
+   * nickname like "giants" (matches both `sf_giants` AND `new_york_giants`).
+   * Require leagueHint to disambiguate and require a unique match — otherwise
+   * fail closed.
+   */
+  {
+    const overlap = teams.filter(
+      (t) =>
+        leagueMatchesTeam(t, leagueHint) &&
+        (normKey(t.id).includes(candNorm) || candNorm.includes(normKey(t.id)))
+    );
+    if (overlap.length === 1) {
+      warnings.push(`Team matched loosely by id overlap: ${overlap[0].id}`);
+      return { team: overlap[0], warnings };
+    }
+    if (overlap.length > 1) {
+      warnings.push(
+        `Ambiguous loose match for "${teamSlugCandidate}" within league ${leagueHint || "(any)"}: ${overlap
+          .map((t) => t.id)
+          .join(", ")}`
+      );
     }
   }
+
   const candParts = cand.split("_").filter(Boolean);
-  for (const t of teams) {
-    const nameNorm = normKey(t.name || "");
-    const hit = candParts.every((p) => p.length > 2 && nameNorm.includes(normKey(p)));
-    if (hit) {
-      warnings.push(`Team matched by name tokens: ${t.name}`);
-      return { team: t, warnings };
+  {
+    const byName = teams.filter((t) => {
+      if (!leagueMatchesTeam(t, leagueHint)) return false;
+      const nameNorm = normKey(t.name || "");
+      return candParts.every((p) => p.length > 2 && nameNorm.includes(normKey(p)));
+    });
+    if (byName.length === 1) {
+      warnings.push(`Team matched by name tokens: ${byName[0].name}`);
+      return { team: byName[0], warnings };
+    }
+    if (byName.length > 1) {
+      warnings.push(
+        `Ambiguous name-token match for "${teamSlugCandidate}" within league ${leagueHint || "(any)"}: ${byName
+          .map((t) => t.id)
+          .join(", ")}`
+      );
     }
   }
+
   const lastTok = candParts.length ? candParts[candParts.length - 1] : "";
   if (lastTok.length > 2) {
     const nick = normKey(lastTok);
     const byNick = teams.filter(
-      t =>
+      (t) =>
         leagueMatchesTeam(t, leagueHint) &&
         t.teamName &&
         normKey(t.teamName) === nick
@@ -321,9 +433,33 @@ function matchDesignTeam(teamSlugCandidate, teams, options) {
       warnings.push(`Team matched by nickname + league: ${byNick[0].teamName}`);
       return { team: byNick[0], warnings };
     }
+    if (byNick.length > 1) {
+      warnings.push(
+        `Ambiguous nickname+league match for "${teamSlugCandidate}" in ${leagueHint || "(any)"}: ${byNick
+          .map((t) => t.id)
+          .join(", ")}`
+      );
+    }
   }
   warnings.push(`No design_teams match for slug "${teamSlugCandidate}"`);
   return { team: null, warnings };
+}
+
+/**
+ * Try each candidate slug through `matchDesignTeam`; return the first hit.
+ * Used to recover when the parsed team token is ambiguous (e.g., `giants`)
+ * but the inferred candidate from designKey is specific (e.g., `pillows_sf`).
+ */
+function matchDesignTeamMulti(candidates, teams, options) {
+  const aggregatedWarnings = [];
+  for (const cand of candidates) {
+    const { team, warnings } = matchDesignTeam(cand, teams, options);
+    if (team) {
+      return { team, warnings: [...aggregatedWarnings, ...warnings] };
+    }
+    aggregatedWarnings.push(...warnings);
+  }
+  return { team: null, warnings: aggregatedWarnings };
 }
 
 const KIND_TO_COVERAGE = {
@@ -476,6 +612,19 @@ function buildPreviewItems(descriptors, designRows, teamRows, options) {
   const accepted = [];
   const ignored = [];
 
+  /**
+   * Build a registry of known team slugs (slug + shortSlug + id) so the parser
+   * can resolve multi-token team names like `sf_giants`. Hyphens normalized
+   * to underscores by `normalizeSlugForCompare` inside splitMiddleForTeamAndFamily.
+   */
+  const knownTeamSlugs = new Set();
+  for (const t of teamRows) {
+    if (t.slug) knownTeamSlugs.add(t.slug);
+    if (t.shortSlug) knownTeamSlugs.add(t.shortSlug);
+    if (t.id) knownTeamSlugs.add(t.id);
+  }
+  const parseOptions = { knownTeamSlugs };
+
   for (const d of descriptors) {
     const f = filterServerDescriptor(d);
     if (!f.ok) {
@@ -483,7 +632,7 @@ function buildPreviewItems(descriptors, designRows, teamRows, options) {
       continue;
     }
     const ext = getExt(d.originalFilename);
-    const pr = parseDesignFilename(d.originalFilename);
+    const pr = parseDesignFilename(d.originalFilename, parseOptions);
     if (pr.status !== "valid" || !pr.parsed) {
       parseFailures.push({
         name: d.originalFilename,
@@ -532,8 +681,8 @@ function buildPreviewItems(descriptors, designRows, teamRows, options) {
     const groupKey = row.designKey;
     const inferred = inferIdentityFromDesignKey(groupKey);
     const parsed = row.parsed;
-    const teamSlugForMatch = resolveTeamSlugForMatch(parsed.team, inferred);
-    const { team, warnings: teamWarnings } = matchDesignTeam(teamSlugForMatch, teamRows, {
+    const teamSlugCandidates = buildTeamSlugCandidates(parsed.team, inferred);
+    const { team, warnings: teamWarnings } = matchDesignTeamMulti(teamSlugCandidates, teamRows, {
       leagueHint: inferred.leagueCode,
     });
 

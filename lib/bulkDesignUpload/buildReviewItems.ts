@@ -6,7 +6,7 @@ import type { DesignDoc } from "@/lib/types/firestore";
 import type { DesignTeam } from "@/lib/types/firestore";
 import { groupParsedFiles, parseDesignFilename, type ParseResult } from "@/lib/batchImport/parseDesignFilename";
 import { inferIdentityFromDesignKey, identityKeyToSlug } from "@/lib/bulkDesignUpload/inferIdentity";
-import { matchDesignTeam, resolveTeamSlugForMatch } from "@/lib/bulkDesignUpload/matchTeam";
+import { buildTeamSlugCandidates, matchDesignTeamMulti } from "@/lib/bulkDesignUpload/matchTeam";
 import {
   coverageFromKind,
   emptyCoverage,
@@ -144,6 +144,7 @@ export function buildBulkReviewItems(
   const knownTeamSlugs = new Set<string>();
   for (const t of teams) {
     if (t.slug) knownTeamSlugs.add(t.slug);
+    if (t.id) knownTeamSlugs.add(t.id);
     /** Some teams may also have a shortSlug or alias; include if present. */
     const anyT = t as unknown as { shortSlug?: string };
     if (anyT.shortSlug) knownTeamSlugs.add(anyT.shortSlug);
@@ -172,8 +173,8 @@ export function buildBulkReviewItems(
     const groupKey = row.designKey;
     const inferred = inferIdentityFromDesignKey(groupKey);
     const parsed = row.parsed;
-    const teamSlugForMatch = resolveTeamSlugForMatch(parsed.team, inferred);
-    const { team, warnings: teamWarnings } = matchDesignTeam(teamSlugForMatch, teams, {
+    const teamSlugCandidates = buildTeamSlugCandidates(parsed.team, inferred);
+    const { team, warnings: teamWarnings } = matchDesignTeamMulti(teamSlugCandidates, teams, {
       leagueHint: inferred.leagueCode,
     });
 
