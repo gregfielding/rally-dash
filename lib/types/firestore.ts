@@ -3191,6 +3191,16 @@ export interface DesignDoc {
    * here cannot spawn dead stubs.
    */
   targetBlankIds?: string[] | null;
+
+  /**
+   * Opt-out from auto-launching products. When `true`, `onDesignCreated`
+   * returns early without spawning anything — the design lives in the library
+   * but no `rp_products` are created. Set by the bulk-upload "Commit to
+   * library" path; unset by default. Operators can still launch products
+   * later by calling `launchProductsFromDesign` manually (the stored
+   * `targetBlankIds` remain valid for that deferred launch).
+   */
+  skipAutoLaunch?: boolean | null;
   /**
    * Which garment sides this artwork may print on (front / back). Authoritative for generation
    * when set (e.g. batch import derives from which side keys have assets). Firestore field name unchanged.

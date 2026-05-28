@@ -382,6 +382,14 @@ export interface CommitBulkDesignUploadItemDecision {
 export interface CommitBulkDesignUploadInput {
   jobId: string;
   items: CommitBulkDesignUploadItemDecision[];
+  /**
+   * "with_products" (default) lets onDesignCreated auto-launch products via
+   * each item's targetBlankIds. "library" stamps `skipAutoLaunch:true` on
+   * every newly-created design so the trigger no-ops — files land in the
+   * library but no rp_products are created. Operators can call
+   * launchProductsFromDesign manually later.
+   */
+  commitMode?: "with_products" | "library";
 }
 
 /**

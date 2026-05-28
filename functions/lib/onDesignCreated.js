@@ -62,6 +62,37 @@ function buildOnDesignCreated(deps) {
       return null;
     }
 
+    /**
+     * Opt-out: bulk-upload "Commit to library" path stamps `skipAutoLaunch:true`
+     * so the design lives in the library without spawning products. Operators
+     * can still launch later by calling `launchProductsFromDesign` manually
+     * (the stored `targetBlankIds` remain valid).
+     */
+    if (after.skipAutoLaunch === true) {
+      console.log(
+        JSON.stringify({
+          tag: "[ON_DESIGN_CREATED:SKIP]",
+          reason: "skipAutoLaunch_set_true",
+          designId,
+        })
+      );
+      try {
+        await change.after.ref.update({
+          autoLaunchProductsStatus: "skipped_library_only",
+          autoLaunchProductsAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (markerErr) {
+        console.error(
+          "[ON_DESIGN_CREATED:SKIP_MARKER_ERROR]",
+          JSON.stringify({
+            designId,
+            message: markerErr && markerErr.message ? markerErr.message : String(markerErr),
+          })
+        );
+      }
+      return null;
+    }
+
     const teamId = (after.teamId || "").trim();
     if (!teamId) {
       // Common during initial create when team binding isn't resolved yet — quiet log.

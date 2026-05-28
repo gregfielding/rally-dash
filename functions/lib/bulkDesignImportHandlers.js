@@ -326,6 +326,7 @@ async function createDesignDocument(db, userId, payload) {
     importBatchId,
     importVersion,
     targetBlankIds,
+    skipAutoLaunch,
   } = payload;
 
   const teamSnap = await db.collection("design_teams").doc(teamId).get();
@@ -447,6 +448,10 @@ async function createDesignDocument(db, userId, payload) {
   /** Read by onDesignCreated to gate which master blanks get auto-launched. Null = 8394-only fallback. */
   if (Array.isArray(targetBlankIds) && targetBlankIds.length > 0) {
     designData.targetBlankIds = targetBlankIds;
+  }
+  /** Library-only commit mode → trigger no-ops. Only stamped on create. */
+  if (skipAutoLaunch === true) {
+    designData.skipAutoLaunch = true;
   }
 
   const designRef = await db.collection("designs").add(designData);
@@ -611,6 +616,14 @@ function commitBulkDesignUploadImpl(db, storage) {
     if (decisions.length === 0) {
       throw new functions.https.HttpsError("invalid-argument", "items array is required");
     }
+    /**
+     * `commitMode`: "with_products" (default) auto-launches products via
+     * `onDesignCreated`; "library" creates the design docs only, stamping
+     * `skipAutoLaunch:true` so the trigger no-ops. The stored `targetBlankIds`
+     * stay valid in either case so a later manual launch can use them.
+     */
+    const commitMode = data && data.commitMode === "library" ? "library" : "with_products";
+    const skipAutoLaunchForNewDesigns = commitMode === "library";
 
     const jobRef = db.collection("rp_design_import_jobs").doc(jobId);
     const jobSnap = await jobRef.get();
@@ -820,6 +833,12 @@ function commitBulkDesignUploadImpl(db, storage) {
               : (Array.isArray(item.defaultTargetBlankIds) && item.defaultTargetBlankIds.length > 0
                   ? item.defaultTargetBlankIds
                   : null),
+            /**
+             * Library-only commit: stamp skipAutoLaunch so onDesignCreated
+             * no-ops. Only applies to newly-created designs; existing designs
+             * being updated keep their prior skipAutoLaunch value untouched.
+             */
+            skipAutoLaunch: skipAutoLaunchForNewDesigns,
           });
           designId = createdRes.designId;
           created++;

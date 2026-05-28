@@ -290,7 +290,7 @@ export default function BulkDesignUploadPage() {
     return { perItem, totalCollisionGroups };
   }, [effectiveItems, targetBlanksByItem]);
 
-  const runCommit = useCallback(async () => {
+  const runCommit = useCallback(async (commitMode: "with_products" | "library" = "with_products") => {
     if (!jobId) return;
     setImporting(true);
     setImportError(null);
@@ -311,7 +311,7 @@ export default function BulkDesignUploadPage() {
         targetBlankIds: targetBlanksByItem[it.itemId] ?? it.defaultTargetBlankIds ?? [],
       }));
 
-      const out = await commitBulkImport({ jobId, items: decisions });
+      const out = await commitBulkImport({ jobId, items: decisions, commitMode });
       setCommitSummary(out.summary);
       setCommitResults(
         (out.results || []).map((r) => ({
@@ -329,7 +329,14 @@ export default function BulkDesignUploadPage() {
     } finally {
       setImporting(false);
     }
-  }, [jobId, effectiveItems, nameOverrides, commitBulkImport, mutateDesigns]);
+  }, [
+    jobId,
+    effectiveItems,
+    nameOverrides,
+    targetBlanksByItem,
+    commitBulkImport,
+    mutateDesigns,
+  ]);
 
   return (
     <ProtectedRoute requiredRole="ops">
@@ -428,14 +435,26 @@ export default function BulkDesignUploadPage() {
               >
                 Start over
               </button>
-              <button
-                type="button"
-                onClick={runCommit}
-                disabled={effectiveItems.length === 0 || importing}
-                className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium disabled:opacity-50"
-              >
-                Commit import
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => runCommit("library")}
+                  disabled={effectiveItems.length === 0 || importing}
+                  title="Save the design files to the library only. No products are spawned. You can launch products later from the design page."
+                  className="px-4 py-2 bg-white border border-gray-300 text-gray-800 rounded-lg text-sm font-medium hover:bg-gray-50 disabled:opacity-50"
+                >
+                  Commit to library
+                </button>
+                <button
+                  type="button"
+                  onClick={() => runCommit("with_products")}
+                  disabled={effectiveItems.length === 0 || importing}
+                  title="Save the design files AND auto-launch a product for each blank checked in the Apply to blanks column."
+                  className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
+                >
+                  Commit + create products
+                </button>
+              </div>
             </div>
 
             {(ignoredClient.length > 0 || ignoredServer.length > 0) && (
