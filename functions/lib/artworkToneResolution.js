@@ -4,6 +4,8 @@
  * Mirrors lib/designs/artworkToneResolution.ts — deterministic artwork tone chains for PNG/SVG/PDF picks.
  */
 
+const { resolveEffectivePreferredTone } = require("./colorTonePreferences");
+
 function fallbackChainForPreferredTone(preferred) {
   if (preferred === "white") return ["white", "dark", "light"];
   if (preferred === "dark") return ["dark", "white", "light"];
@@ -22,11 +24,20 @@ function slotUrl(u, tone) {
   return u.whitePng && String(u.whitePng).trim() ? String(u.whitePng).trim() : null;
 }
 
-function pickRasterUrlForVariant(u, garmentColorFamily, preferredArtworkTone) {
-  const pref =
-    preferredArtworkTone === "light" || preferredArtworkTone === "dark" || preferredArtworkTone === "white"
-      ? preferredArtworkTone
-      : null;
+/**
+ * Pick the raster URL for a variant.
+ *
+ * Resolution order:
+ *   1. variant explicit `preferredArtworkTone` (per-variant override)
+ *   2. global `colorName` rule (e.g. "Pink" → white) — only consulted when
+ *      `colorName` is passed by the caller
+ *   3. light/dark garment family fallback chain
+ *
+ * `colorName` is optional; existing callers that don't pass it keep the
+ * pre-rule behavior.
+ */
+function pickRasterUrlForVariant(u, garmentColorFamily, preferredArtworkTone, colorName) {
+  const pref = resolveEffectivePreferredTone(colorName, preferredArtworkTone);
   const chain = pref ? fallbackChainForPreferredTone(pref) : fallbackChainForGarmentFamily(garmentColorFamily);
   for (const tone of chain) {
     const url = slotUrl(u, tone);

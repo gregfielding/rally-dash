@@ -4,6 +4,7 @@
  */
 
 import type { RPBlankArtworkTone, RPBlankColorFamily } from "@/lib/types/firestore";
+import { resolveEffectivePreferredTone } from "@/lib/blanks/colorTonePreferences";
 
 export type ArtworkToneSlot = "light" | "dark" | "white";
 
@@ -45,18 +46,23 @@ export type ToneTriple = {
   white: string | null;
 };
 
-/** Same resolution as `pickRasterUrlForVariant`, for SVG/PDF triples on a side. */
+/**
+ * Same resolution as `pickRasterUrlForVariant`, for SVG/PDF triples on a side.
+ * Optional `colorName` lets the resolver apply the global color-name → tone map
+ * (e.g. "Pink" → white) when no per-variant `preferredArtworkTone` is set.
+ */
 export function pickAssetUrlForVariant(
   triple: ToneTriple,
   garmentColorFamily: RPBlankColorFamily,
-  preferredArtworkTone: RPBlankArtworkTone | null | undefined
+  preferredArtworkTone: RPBlankArtworkTone | null | undefined,
+  colorName?: string | null
 ): { url: string | null; ref: ArtworkToneSlot | null } {
   const u: SideRasterUrls = {
     lightPng: triple.light,
     darkPng: triple.dark,
     whitePng: triple.white,
   };
-  return pickRasterUrlForVariant(u, garmentColorFamily, preferredArtworkTone);
+  return pickRasterUrlForVariant(u, garmentColorFamily, preferredArtworkTone, colorName);
 }
 
 function slotUrl(u: SideRasterUrls, tone: ArtworkToneSlot): string | null {
@@ -67,18 +73,21 @@ function slotUrl(u: SideRasterUrls, tone: ArtworkToneSlot): string | null {
 
 /**
  * Resolve which raster URL to use for a blank variant.
- * 1. If `preferredArtworkTone` is set, try that tone first, then follow its fallback chain.
- * 2. Otherwise use garment-family default chain.
+ * 1. If `preferredArtworkTone` is set on the variant, try that tone first.
+ * 2. Otherwise, if `colorName` matches a global color-name rule (e.g. "Pink" →
+ *    white), use that tone first.
+ * 3. Otherwise use the light/dark garment-family default chain.
+ *
+ * Pass `colorName` when you have it on hand — without it, step 2 is skipped
+ * and the resolver behaves identically to the pre-rule version.
  */
 export function pickRasterUrlForVariant(
   u: SideRasterUrls,
   garmentColorFamily: RPBlankColorFamily,
-  preferredArtworkTone: RPBlankArtworkTone | null | undefined
+  preferredArtworkTone: RPBlankArtworkTone | null | undefined,
+  colorName?: string | null
 ): { url: string | null; ref: ArtworkToneSlot | null } {
-  const pref =
-    preferredArtworkTone === "light" || preferredArtworkTone === "dark" || preferredArtworkTone === "white"
-      ? preferredArtworkTone
-      : null;
+  const pref = resolveEffectivePreferredTone(colorName, preferredArtworkTone);
 
   const chain: ArtworkToneSlot[] = pref
     ? fallbackChainForPreferredTone(pref)
