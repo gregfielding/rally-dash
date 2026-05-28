@@ -423,8 +423,8 @@ export default function BulkDesignUploadPage() {
             )}
 
             <div className="overflow-x-auto border border-gray-200 rounded-lg">
-              <table className="min-w-full text-sm">
-                <thead className="bg-gray-50 border-b">
+              <table className="min-w-full text-sm text-gray-900">
+                <thead className="bg-gray-50 border-b text-gray-800 font-semibold">
                   <tr>
                     <th className="text-left py-2 px-3">Name</th>
                     <th className="text-left py-2 px-3">Slug / key</th>
@@ -443,7 +443,7 @@ export default function BulkDesignUploadPage() {
                     <th className="text-left py-2 px-3">Action</th>
                   </tr>
                 </thead>
-                <tbody>
+                <tbody className="text-gray-900">
                   {effectiveItems.map((it) => (
                     <tr key={it.itemId} className="border-b border-gray-100">
                       <td className="py-2 px-3 align-top">
@@ -455,7 +455,7 @@ export default function BulkDesignUploadPage() {
                           }
                         />
                       </td>
-                      <td className="py-2 px-3 align-top font-mono text-xs text-gray-700 max-w-[200px] break-all">
+                      <td className="py-2 px-3 align-top font-mono text-xs text-gray-800 max-w-[200px] break-all">
                         {it.slug}
                       </td>
                       <td className="py-2 px-3 align-top">{it.leagueCode}</td>
@@ -476,7 +476,7 @@ export default function BulkDesignUploadPage() {
                                 <label
                                   key={b.blankId}
                                   className={`flex items-center gap-1 ${
-                                    b.pipelineReady ? "text-gray-700" : "text-gray-400"
+                                    b.pipelineReady ? "text-gray-900" : "text-gray-500"
                                   }`}
                                   title={
                                     b.pipelineReady
@@ -502,7 +502,7 @@ export default function BulkDesignUploadPage() {
                                   <span className="font-mono">{b.styleCode}</span>
                                   <span className="truncate">{b.name || ""}</span>
                                   {!b.pipelineReady && (
-                                    <span className="text-[10px] italic text-gray-400">
+                                    <span className="text-[10px] italic text-gray-500">
                                       (soon)
                                     </span>
                                   )}
