@@ -183,10 +183,19 @@ export function buildBulkReviewItems(
     const teamCode = team?.teamCode ?? null;
     const leagueCode = team?.leagueCode ?? team?.leagueId ?? inferred.leagueCode;
 
+    /**
+     * Theme picker (2026-05-27): for non-city_69 themes prefer `parsed.designFamily`
+     * (registry-aware parser output — correct) over `inferred.themeSlugCandidate`
+     * (positional inference from designKey that assumes LEAGUE_TEAM_THEME order
+     * and gets confused by LEAGUE_THEME_TEAM filenames like
+     * `mlb_pillows_sf_giants` → picks "giants" instead of "pillows").
+     */
     const themeCode =
-      inferred.themeSlugCandidate?.toUpperCase().replace(/[^A-Z0-9_]/g, "_") ||
-      parsed.designFamily?.toUpperCase() ||
-      null;
+      inferred.designType === "city_69"
+        ? (inferred.themeSlugCandidate?.toUpperCase().replace(/[^A-Z0-9_]/g, "_") || null)
+        : (parsed.designFamily?.toUpperCase().replace(/[^A-Z0-9_]/g, "_") ||
+            inferred.themeSlugCandidate?.toUpperCase().replace(/[^A-Z0-9_]/g, "_") ||
+            null);
     const themeName =
       inferred.designType === "city_69"
         ? inferred.themeDisplayName
