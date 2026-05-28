@@ -241,6 +241,55 @@ export default function BulkDesignUploadPage() {
     }));
   }, [items, nameOverrides, actionOverrides, overwriteByItem]);
 
+  /**
+   * Same-team duplicate detection: any group of rows whose action ≠ "skip" that
+   * share a teamId AND target overlapping blanks would spawn multiple distinct
+   * products for the same team+blank slot — almost always because the operator
+   * dropped two filename-variants of the same design. We don't auto-merge them
+   * (the importKey + groupKey are genuinely different), but we surface a clear
+   * banner + per-row warning so they don't get committed by mistake.
+   */
+  const duplicateTeamWarnings = useMemo(() => {
+    const map = new Map<string, { itemIds: string[]; designNames: string[] }>();
+    for (const it of effectiveItems) {
+      if (it.action === "skip") continue;
+      const teamId = (it.teamId || "").trim();
+      if (!teamId) continue;
+      const selectedBlanks = (targetBlanksByItem[it.itemId] ?? it.defaultTargetBlankIds ?? [])
+        .slice()
+        .sort();
+      if (selectedBlanks.length === 0) continue;
+      for (const blankId of selectedBlanks) {
+        const key = `${teamId}::${blankId}`;
+        if (!map.has(key)) map.set(key, { itemIds: [], designNames: [] });
+        const entry = map.get(key)!;
+        entry.itemIds.push(it.itemId);
+        entry.designNames.push(it.designName);
+      }
+    }
+    /** Per-item: ids of other items it collides with on at least one (team, blank). */
+    const perItem: Record<string, { otherDesignNames: string[]; sharedBlanks: string[] }> = {};
+    for (const [key, entry] of map.entries()) {
+      if (entry.itemIds.length < 2) continue;
+      const [, blankId] = key.split("::");
+      for (const id of entry.itemIds) {
+        if (!perItem[id]) perItem[id] = { otherDesignNames: [], sharedBlanks: [] };
+        const others = entry.itemIds.filter((x) => x !== id);
+        for (const o of others) {
+          const otherName = effectiveItems.find((x) => x.itemId === o)?.designName || o;
+          if (!perItem[id].otherDesignNames.includes(otherName)) {
+            perItem[id].otherDesignNames.push(otherName);
+          }
+        }
+        if (!perItem[id].sharedBlanks.includes(blankId)) {
+          perItem[id].sharedBlanks.push(blankId);
+        }
+      }
+    }
+    const totalCollisionGroups = [...map.values()].filter((e) => e.itemIds.length > 1).length;
+    return { perItem, totalCollisionGroups };
+  }, [effectiveItems, targetBlanksByItem]);
+
   const runCommit = useCallback(async () => {
     if (!jobId) return;
     setImporting(true);
@@ -422,6 +471,24 @@ export default function BulkDesignUploadPage() {
               </div>
             )}
 
+            {duplicateTeamWarnings.totalCollisionGroups > 0 && (
+              <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900">
+                <p className="font-semibold">
+                  Possible duplicate designs detected
+                </p>
+                <p className="mt-1">
+                  {duplicateTeamWarnings.totalCollisionGroups === 1
+                    ? "Two or more rows below"
+                    : `${duplicateTeamWarnings.totalCollisionGroups} groups of rows below`}{" "}
+                  target the same team + blank slot. Committing them all would
+                  create separate products with different importKeys instead of
+                  one product. If they're really the same design under different
+                  filenames, set all-but-one to <span className="font-mono">skip</span> in
+                  the Action column. Affected rows are highlighted in amber below.
+                </p>
+              </div>
+            )}
+
             <div className="overflow-x-auto border border-gray-200 rounded-lg">
               <table className="min-w-full text-sm text-gray-900">
                 <thead className="bg-gray-50 border-b text-gray-800 font-semibold">
@@ -434,18 +501,51 @@ export default function BulkDesignUploadPage() {
                     <th className="text-left py-2 px-3">Apply to blanks</th>
                     <th className="text-left py-2 px-3">Series</th>
                     <th className="text-left py-2 px-3">Match</th>
-                    <th className="text-center py-2 px-1">Lpng</th>
-                    <th className="text-center py-2 px-1">Dpng</th>
-                    <th className="text-center py-2 px-1">Wpng</th>
-                    <th className="text-center py-2 px-1">SVG</th>
-                    <th className="text-center py-2 px-1">PDF</th>
+                    <th
+                      className="text-center py-2 px-1"
+                      title="Light-tone PNG (filename ends _light.png). Required for rendering light fabric mockups."
+                    >
+                      Light&nbsp;PNG
+                    </th>
+                    <th
+                      className="text-center py-2 px-1"
+                      title="Dark-tone PNG (filename ends _dark.png). Required for rendering dark fabric mockups."
+                    >
+                      Dark&nbsp;PNG
+                    </th>
+                    <th
+                      className="text-center py-2 px-1"
+                      title="White-tone PNG (filename ends _white.png). Optional — used for special-case high-contrast prints (e.g. pink fabric)."
+                    >
+                      White&nbsp;PNG
+                    </th>
+                    <th
+                      className="text-center py-2 px-1"
+                      title="Vector SVG (any tone). Optional — production asset; not rendered into mockups."
+                    >
+                      SVG
+                    </th>
+                    <th
+                      className="text-center py-2 px-1"
+                      title="Print PDF (any tone). Optional — production asset; not rendered into mockups."
+                    >
+                      PDF
+                    </th>
                     <th className="text-left py-2 px-3">Overwrite</th>
+                    <th className="text-left py-2 px-3">Notes</th>
                     <th className="text-left py-2 px-3">Action</th>
                   </tr>
                 </thead>
                 <tbody className="text-gray-900">
-                  {effectiveItems.map((it) => (
-                    <tr key={it.itemId} className="border-b border-gray-100">
+                  {effectiveItems.map((it) => {
+                    const dupe = duplicateTeamWarnings.perItem[it.itemId];
+                    return (
+                    <tr
+                      key={it.itemId}
+                      className={`border-b border-gray-100 ${
+                        dupe ? "bg-amber-50" : ""
+                      }`}
+                    >
                       <td className="py-2 px-3 align-top">
                         <input
                           className="w-full min-w-[180px] border border-gray-200 rounded px-2 py-1 text-xs"
@@ -480,8 +580,12 @@ export default function BulkDesignUploadPage() {
                                   }`}
                                   title={
                                     b.pipelineReady
-                                      ? `Spawn a ${b.name || b.styleCode} product on commit`
-                                      : "Renderer pipeline not ready yet for this blank"
+                                      ? `On commit, auto-spawn a ${
+                                          b.name || b.styleCode
+                                        } product for this team with all of its catalog colors as variants.`
+                                      : `Renderer pipeline for ${
+                                          b.name || b.styleCode
+                                        } is not wired yet. Only blanks whose asset-generation pipeline can produce mockups today are selectable — currently styleCode 8394 (Bikini Panty) is the only one. This blank stays in the catalog and remains orderable; it just can't auto-launch products until its render path is built.`
                                   }
                                 >
                                   <input
@@ -561,9 +665,39 @@ export default function BulkDesignUploadPage() {
                           </p>
                         )}
                       </td>
+                      <td className="py-2 px-3 align-top text-xs">
+                        <div className="flex flex-col gap-1 max-w-[260px]">
+                          {it.errors.length === 0 &&
+                            it.warnings.length === 0 &&
+                            !dupe && <span className="text-gray-400">—</span>}
+                          {it.errors.length > 0 && (
+                            <p className="text-red-700 font-medium">
+                              <span className="font-semibold">Error:</span>{" "}
+                              {it.errors.join("; ")}
+                            </p>
+                          )}
+                          {dupe && (
+                            <p className="text-amber-900 font-medium">
+                              <span className="font-semibold">Possible duplicate:</span>{" "}
+                              targets the same team + blank as{" "}
+                              {dupe.otherDesignNames
+                                .map((n) => `"${n}"`)
+                                .join(", ")}
+                              . Set this row or the other to{" "}
+                              <span className="font-mono">skip</span> before commit.
+                            </p>
+                          )}
+                          {it.warnings.length > 0 && (
+                            <p className="text-amber-800">
+                              <span className="font-semibold">Warning:</span>{" "}
+                              {it.warnings.join("; ")}
+                            </p>
+                          )}
+                        </div>
+                      </td>
                       <td className="py-2 px-3 align-top">
                         <select
-                          className="border border-gray-200 rounded text-xs"
+                          className="border border-gray-200 rounded text-xs text-gray-900"
                           value={it.action}
                           onChange={(e) =>
                             setActionOverrides((o) => ({
@@ -577,15 +711,10 @@ export default function BulkDesignUploadPage() {
                           <option value="skip">skip</option>
                           <option value="blocked">blocked</option>
                         </select>
-                        {it.warnings.length > 0 && (
-                          <p className="text-[10px] text-amber-800 mt-1">{it.warnings.join("; ")}</p>
-                        )}
-                        {it.errors.length > 0 && (
-                          <p className="text-[10px] text-red-700 mt-1">{it.errors.join("; ")}</p>
-                        )}
                       </td>
                     </tr>
-                  ))}
+                  );
+                  })}
                 </tbody>
               </table>
             </div>
