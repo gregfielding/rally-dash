@@ -91,36 +91,61 @@ function buildOnDesignCreated(deps) {
       return null;
     }
 
-    // Load active master blanks (schemaVersion=2 + status=active).
+    // Load active master blanks (schemaVersion=2 + status=active), then filter by
+    // (a) operator's per-design picker selection (`design.targetBlankIds`), if present, and
+    // (b) the pipeline-ready safety gate (currently styleCode==="8394" only — see below).
     //
-    // **8394-only gate (2026-05-27):** `startInitialProductAssetBatch` currently returns
+    // **Pipeline-ready gate:** `startInitialProductAssetBatch` returns
     // `skipped: not_8394` for any blank whose styleCode is not "8394" (panty). The other
     // master blanks (8390 thong, TR3008 tank, HF07 crewneck) have catalog entries but no
     // asset-generation pipeline — auto-launching them would create products stuck at
-    // `launchStatus: generating_assets` forever with no batch behind them. Until those
-    // pipelines exist, restrict auto-launch to the 8394 panty so we don't spawn dead stubs.
+    // `launchStatus: generating_assets` forever. When new pipelines land, broaden this set.
     //
-    // Side benefit: this also avoids the cross-blank SKU collision where the panty failed
-    // to create because tank/thong's SKUs (RP-…-COLOR-SIZE, no blank code) consumed the
-    // same slots first.
+    // The picker on the bulk-upload review screen already disables non-pipeline-ready
+    // blanks, so `targetBlankIds` should never include them — but we double-gate here so
+    // a bypassed UI cannot spawn dead stubs.
+    const PIPELINE_READY_STYLE_CODES = new Set(["8394"]);
+
     const blanksSnap = await db
       .collection("rp_blanks")
       .where("status", "==", "active")
       .get();
-    const masterBlanks = blanksSnap.docs
+    let masterBlanks = blanksSnap.docs
       .map((d) => ({ id: d.id, data: d.data() }))
       .filter(
         (b) =>
           Number(b.data.schemaVersion) === MASTER_BLANK_SCHEMA_VERSION &&
-          String(b.data.styleCode || "").trim() === "8394"
+          PIPELINE_READY_STYLE_CODES.has(String(b.data.styleCode || "").trim())
       );
+
+    const targetBlankIds = Array.isArray(after.targetBlankIds)
+      ? after.targetBlankIds.map((x) => String(x || "").trim()).filter(Boolean)
+      : [];
+    if (targetBlankIds.length > 0) {
+      const allow = new Set(targetBlankIds);
+      const before = masterBlanks.length;
+      masterBlanks = masterBlanks.filter((b) => allow.has(b.id));
+      console.log(
+        JSON.stringify({
+          tag: "[ON_DESIGN_CREATED:FILTER]",
+          designId,
+          filterReason: "targetBlankIds",
+          requested: targetBlankIds,
+          eligibleAfterPipelineGate: before,
+          spawning: masterBlanks.map((b) => b.id),
+        })
+      );
+    }
 
     if (masterBlanks.length === 0) {
       console.log(
         JSON.stringify({
           tag: "[ON_DESIGN_CREATED:NOOP]",
-          reason: "no_active_8394_master_blanks",
+          reason: targetBlankIds.length > 0
+            ? "no_pipeline_ready_blanks_in_targetBlankIds"
+            : "no_pipeline_ready_master_blanks",
           designId,
+          targetBlankIds,
         })
       );
       return null;

@@ -601,13 +601,37 @@ function filterServerDescriptor(desc) {
 }
 
 /**
+ * Style codes whose downstream render/composite pipeline is wired today.
+ * Used to flag `pipelineReady` on availableBlanks so the bulk-upload UI can
+ * disable the others. Update this as new pipelines land.
+ */
+const PIPELINE_READY_STYLE_CODES = new Set(["8394"]);
+
+/**
  * @param {Array<{originalFilename: string, storagePath: string, ext: string, size: number, contentType?: string}>} descriptors
  * @param {object[]} designRows - plain objects from Firestore designs
  * @param {object[]} teamRows - plain objects from design_teams
+ * @param {Array<{id: string, styleCode?: string, name?: string, category?: string, schemaVersion?: number, status?: string}>} masterBlanks - all active schemaVersion=2 blanks from rp_blanks
  * @param {{ requirePng?: boolean }} options
  */
-function buildPreviewItems(descriptors, designRows, teamRows, options) {
+function buildPreviewItems(descriptors, designRows, teamRows, masterBlanks, options) {
   const requirePng = options.requirePng !== false;
+
+  /**
+   * Build the shared availableBlanks payload once — same list for every design
+   * row in this preview job. `pipelineReady` lets the UI gate selection so
+   * operators only check blanks whose downstream renderer actually works.
+   */
+  const availableBlanks = (Array.isArray(masterBlanks) ? masterBlanks : []).map((b) => {
+    const styleCode = String((b && b.styleCode) || "").trim();
+    return {
+      blankId: b.id,
+      styleCode,
+      name: b.name || b.productName || null,
+      category: b.category || null,
+      pipelineReady: PIPELINE_READY_STYLE_CODES.has(styleCode),
+    };
+  });
   const parseFailures = [];
   const accepted = [];
   const ignored = [];
@@ -787,6 +811,15 @@ function buildPreviewItems(descriptors, designRows, teamRows, options) {
 
     const itemId = groupKey.replace(/[/\\]/g, "_").slice(0, 1400);
 
+    /**
+     * Default the operator's blank selection to all pipeline-ready blanks. They
+     * can uncheck on the review screen; the disabled non-pipeline-ready ones
+     * cannot be selected today.
+     */
+    const defaultTargetBlankIds = availableBlanks
+      .filter((b) => b.pipelineReady)
+      .map((b) => b.blankId);
+
     items.push({
       itemId,
       groupKey,
@@ -811,6 +844,8 @@ function buildPreviewItems(descriptors, designRows, teamRows, options) {
       overwriteWarnings,
       overwriteAllowed: false,
       duplicateKindConflicts,
+      availableBlanks,
+      defaultTargetBlankIds,
     });
   }
 

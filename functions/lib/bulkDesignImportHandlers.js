@@ -325,6 +325,7 @@ async function createDesignDocument(db, userId, payload) {
     importSource,
     importBatchId,
     importVersion,
+    targetBlankIds,
   } = payload;
 
   const teamSnap = await db.collection("design_teams").doc(teamId).get();
@@ -443,6 +444,10 @@ async function createDesignDocument(db, userId, payload) {
   if (importSource !== undefined) designData.importSource = importSource || null;
   if (importBatchId !== undefined) designData.importBatchId = importBatchId || null;
   if (importVersion !== undefined) designData.importVersion = importVersion || null;
+  /** Read by onDesignCreated to gate which master blanks get auto-launched. Null = 8394-only fallback. */
+  if (Array.isArray(targetBlankIds) && targetBlankIds.length > 0) {
+    designData.targetBlankIds = targetBlankIds;
+  }
 
   const designRef = await db.collection("designs").add(designData);
   await designRef.update({ id: designRef.id });
@@ -511,9 +516,10 @@ function parseBulkDesignUploadPreviewImpl(db, storage) {
       sanitizedFiles.push(desc);
     }
 
-    const [designsSnap, teamsSnap] = await Promise.all([
+    const [designsSnap, teamsSnap, blanksSnap] = await Promise.all([
       db.collection("designs").get(),
       db.collection("design_teams").get(),
+      db.collection("rp_blanks").where("status", "==", "active").get(),
     ]);
     const designRows = designsSnap.docs.map(d => ({ id: d.id, ...d.data() }));
     const teamRows = teamsSnap.docs.map(d => ({
@@ -526,11 +532,24 @@ function parseBulkDesignUploadPreviewImpl(db, storage) {
       leagueCode: d.data().leagueCode || d.data().leagueId,
       leagueId: d.data().leagueId,
     }));
+    /** Active **master** blanks only (schemaVersion=2); the picker shouldn't expose drafts. */
+    const masterBlanks = blanksSnap.docs
+      .map((d) => ({ id: d.id, ...d.data() }))
+      .filter((b) => Number(b.schemaVersion) === 2)
+      .map((b) => ({
+        id: b.id,
+        styleCode: b.styleCode || null,
+        name: b.name || b.productName || null,
+        category: b.category || null,
+        schemaVersion: b.schemaVersion,
+        status: b.status,
+      }));
 
     const { items, parseFailures, ignored } = buildPreviewItems(
       sanitizedFiles,
       designRows,
       teamRows,
+      masterBlanks,
       { requirePng }
     );
     const allIgnored = [...(ignored || []), ...ignoredExtra.map(x => ({ name: x.name, reason: x.reason }))];
@@ -667,6 +686,14 @@ function commitBulkDesignUploadImpl(db, storage) {
       const designSeriesOverride =
         dec.designSeries !== undefined ? normalizeDesignSeriesInput(dec.designSeries) : undefined;
       const slugOverride = dec.slug != null ? String(dec.slug).trim() : null;
+      /**
+       * Operator-selected blanks for auto-launch. Trimmed + deduped; empty array
+       * falls through to the trigger's default 8394-only behavior. Stored on the
+       * design doc so onDesignCreated can filter master blanks accordingly.
+       */
+      const targetBlankIdsOverride = Array.isArray(dec.targetBlankIds)
+        ? [...new Set(dec.targetBlankIds.map((x) => String(x || "").trim()).filter(Boolean))]
+        : null;
 
       let designName = nameOverride || item.designName;
       let teamId = teamIdOverride || item.teamId || BATCH_IMPORT_TEAM_ID;
@@ -787,6 +814,12 @@ function commitBulkDesignUploadImpl(db, storage) {
             importSource: "bulk_upload",
             importBatchId: jobId,
             importVersion: IMPORT_VERSION,
+            /** Operator's blank-picker selection; null = trigger uses 8394 fallback. */
+            targetBlankIds: targetBlankIdsOverride && targetBlankIdsOverride.length > 0
+              ? targetBlankIdsOverride
+              : (Array.isArray(item.defaultTargetBlankIds) && item.defaultTargetBlankIds.length > 0
+                  ? item.defaultTargetBlankIds
+                  : null),
           });
           designId = createdRes.designId;
           created++;

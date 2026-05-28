@@ -3183,6 +3183,15 @@ export interface DesignDoc {
   themeCode?: string | null;        // e.g. 'FUNNY_BASEBALL' for generic/humor designs
   taxonomy?: { sportName?: string; leagueName?: string; teamName?: string; themeName?: string } | null;
   /**
+   * Operator's per-design picker selection from the bulk-upload review screen:
+   * which active master blanks should `onDesignCreated` auto-launch a product
+   * for. Null/missing/empty = trigger's default fallback (currently all
+   * pipeline-ready blanks, which today means 8394 only). The trigger always
+   * further filters by the pipeline-ready style-code gate, so a stale entry
+   * here cannot spawn dead stubs.
+   */
+  targetBlankIds?: string[] | null;
+  /**
    * Which garment sides this artwork may print on (front / back). Authoritative for generation
    * when set (e.g. batch import derives from which side keys have assets). Firestore field name unchanged.
    */

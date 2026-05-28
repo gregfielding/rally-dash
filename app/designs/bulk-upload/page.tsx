@@ -17,6 +17,20 @@ import { useAuth } from "@/lib/providers/AuthProvider";
 
 type WizardStep = "upload" | "review" | "import" | "results";
 
+/**
+ * One entry of the available-blanks list the server sends on every preview row.
+ * `pipelineReady` is true only for blanks whose downstream
+ * `startInitialProductAssetBatch` pipeline is wired today (currently styleCode
+ * "8394"). The UI disables the others so operators can't queue dead stubs.
+ */
+export type AvailableBlank = {
+  blankId: string;
+  styleCode: string;
+  name: string | null;
+  category: string | null;
+  pipelineReady: boolean;
+};
+
 /** Preview row from `parseBulkDesignUploadPreview` (server). */
 export type BulkPreviewItem = {
   itemId: string;
@@ -40,6 +54,10 @@ export type BulkPreviewItem = {
   errors: string[];
   overwriteWarnings?: Record<string, boolean>;
   duplicateKindConflicts?: boolean;
+  /** All active master blanks (with pipelineReady flag), same list for every row. */
+  availableBlanks?: AvailableBlank[];
+  /** Default blank selection (pipelineReady ones), set server-side. */
+  defaultTargetBlankIds?: string[];
 };
 
 function coverageCell(ok: boolean, optional: boolean) {
@@ -82,6 +100,11 @@ export default function BulkDesignUploadPage() {
     Record<string, "create" | "update" | "skip" | "blocked">
   >({});
   const [overwriteByItem, setOverwriteByItem] = useState<Record<string, boolean>>({});
+  /**
+   * Per-item picker: which master blanks should auto-launch products. Seeded
+   * from `item.defaultTargetBlankIds` (server picks pipelineReady ones).
+   */
+  const [targetBlanksByItem, setTargetBlanksByItem] = useState<Record<string, string[]>>({});
   const [importing, setImporting] = useState(false);
   const [parsing, setParsing] = useState(false);
   const [prepareError, setPrepareError] = useState<string | null>(null);
@@ -189,12 +212,17 @@ export default function BulkDesignUploadPage() {
 
       const nextActions: Record<string, "create" | "update" | "skip" | "blocked"> = {};
       const nextOw: Record<string, boolean> = {};
+      const nextTargets: Record<string, string[]> = {};
       for (const it of serverItems) {
         nextActions[it.itemId] = it.confirmedAction || it.defaultAction;
         nextOw[it.itemId] = false;
+        nextTargets[it.itemId] = Array.isArray(it.defaultTargetBlankIds)
+          ? [...it.defaultTargetBlankIds]
+          : [];
       }
       setActionOverrides(nextActions);
       setOverwriteByItem(nextOw);
+      setTargetBlanksByItem(nextTargets);
 
       setStep("review");
     } catch (e) {
@@ -231,6 +259,7 @@ export default function BulkDesignUploadPage() {
         themeCode: undefined,
         designSeries: undefined,
         slug: undefined,
+        targetBlankIds: targetBlanksByItem[it.itemId] ?? it.defaultTargetBlankIds ?? [],
       }));
 
       const out = await commitBulkImport({ jobId, items: decisions });
@@ -402,6 +431,7 @@ export default function BulkDesignUploadPage() {
                     <th className="text-left py-2 px-3">League</th>
                     <th className="text-left py-2 px-3">Team</th>
                     <th className="text-left py-2 px-3">Theme</th>
+                    <th className="text-left py-2 px-3">Apply to blanks</th>
                     <th className="text-left py-2 px-3">Series</th>
                     <th className="text-left py-2 px-3">Match</th>
                     <th className="text-center py-2 px-1">Lpng</th>
@@ -433,6 +463,55 @@ export default function BulkDesignUploadPage() {
                         {it.teamName || <span className="text-amber-700">Unmatched</span>}
                       </td>
                       <td className="py-2 px-3 align-top text-xs">{it.themeName}</td>
+                      <td className="py-2 px-3 align-top text-xs">
+                        <div className="flex flex-col gap-1 min-w-[160px]">
+                          {(it.availableBlanks ?? []).length === 0 ? (
+                            <span className="text-gray-400">—</span>
+                          ) : (
+                            (it.availableBlanks ?? []).map((b) => {
+                              const selected = (
+                                targetBlanksByItem[it.itemId] ?? it.defaultTargetBlankIds ?? []
+                              ).includes(b.blankId);
+                              return (
+                                <label
+                                  key={b.blankId}
+                                  className={`flex items-center gap-1 ${
+                                    b.pipelineReady ? "text-gray-700" : "text-gray-400"
+                                  }`}
+                                  title={
+                                    b.pipelineReady
+                                      ? `Spawn a ${b.name || b.styleCode} product on commit`
+                                      : "Renderer pipeline not ready yet for this blank"
+                                  }
+                                >
+                                  <input
+                                    type="checkbox"
+                                    checked={selected}
+                                    disabled={!b.pipelineReady}
+                                    onChange={(e) => {
+                                      setTargetBlanksByItem((prev) => {
+                                        const cur = new Set(
+                                          prev[it.itemId] ?? it.defaultTargetBlankIds ?? []
+                                        );
+                                        if (e.target.checked) cur.add(b.blankId);
+                                        else cur.delete(b.blankId);
+                                        return { ...prev, [it.itemId]: [...cur] };
+                                      });
+                                    }}
+                                  />
+                                  <span className="font-mono">{b.styleCode}</span>
+                                  <span className="truncate">{b.name || ""}</span>
+                                  {!b.pipelineReady && (
+                                    <span className="text-[10px] italic text-gray-400">
+                                      (soon)
+                                    </span>
+                                  )}
+                                </label>
+                              );
+                            })
+                          )}
+                        </div>
+                      </td>
                       <td className="py-2 px-3 align-top text-xs">{it.designSeries ?? "—"}</td>
                       <td className="py-2 px-3 align-top text-xs">
                         {it.existingDesignId ? (

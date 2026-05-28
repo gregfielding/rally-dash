@@ -372,6 +372,11 @@ export interface CommitBulkDesignUploadItemDecision {
   themeCode?: string;
   designSeries?: string | null;
   slug?: string;
+  /**
+   * Operator's per-design blank-picker selection. Empty array or undefined
+   * falls back to the server's defaultTargetBlankIds (pipeline-ready blanks).
+   */
+  targetBlankIds?: string[];
 }
 
 export interface CommitBulkDesignUploadInput {
