@@ -27,6 +27,7 @@ import { useProductAssets } from "@/lib/hooks/useRPProductAssets";
 import { useGenerationJobs } from "@/lib/hooks/useRPGenerationJobs";
 import { useScenePresets } from "@/lib/hooks/useRPScenePresets";
 import {
+  useEnqueueProductModelRealism,
   useGenerateProductAssets,
   useGenerateProductFlatRenders,
   useGenerateProductSceneRender,
@@ -2391,6 +2392,85 @@ function ProductDetailContent() {
   const generationType = isProductOnly ? "product_only" : "on_model";
   const { generateProductAssets } = useGenerateProductAssets();
   const { generateProductFlatRenders } = useGenerateProductFlatRenders();
+  const { enqueueProductModelRealism } = useEnqueueProductModelRealism();
+  /**
+   * Per-color model-realism state: which job is in flight for which side, and
+   * the latest doc snapshot for progress display. Map key is the product
+   * variant id (so a Heather Grey job doesn't show progress on Pink).
+   */
+  const [modelRealismJobs, setModelRealismJobs] = useState<
+    Record<string, { front?: { jobId: string; status: string; error?: string | null }; back?: { jobId: string; status: string; error?: string | null } }>
+  >({});
+  const modelRealismJobUnsubsRef = useRef<Record<string, () => void>>({});
+  useEffect(() => {
+    return () => {
+      /** Tear down any active subscriptions on unmount. */
+      for (const unsub of Object.values(modelRealismJobUnsubsRef.current)) {
+        try { unsub(); } catch { /* ignore */ }
+      }
+      modelRealismJobUnsubsRef.current = {};
+    };
+  }, []);
+  /**
+   * Kick off a model-realism render. Phase 3 callable creates a job doc, the
+   * Phase 2 trigger drains it, and on Stage B completion the Phase 3b binding
+   * branch writes the URL onto `variant.flatRenders[model_<view>_designed]`.
+   */
+  const handleEnqueueModelRealism = useCallback(
+    async (productVariantId: string, blankVariantId: string, view: "front" | "back") => {
+      if (!product?.id) return;
+      try {
+        const out = await enqueueProductModelRealism({
+          productId: product.id,
+          blankVariantId,
+          view,
+        });
+        setModelRealismJobs((prev) => ({
+          ...prev,
+          [productVariantId]: {
+            ...prev[productVariantId],
+            [view]: { jobId: out.jobId, status: "queued", error: null },
+          },
+        }));
+        /** Subscribe to the job doc and surface status as it progresses. */
+        if (db) {
+          const subKey = `${productVariantId}:${view}`;
+          const prev = modelRealismJobUnsubsRef.current[subKey];
+          if (prev) { try { prev(); } catch { /* ignore */ } }
+          const unsub = onSnapshot(
+            doc(db, "rp_blank_preview_jobs", out.jobId),
+            (snap) => {
+              if (!snap.exists()) return;
+              const job = snap.data() as { status?: string; error?: string | null };
+              setModelRealismJobs((cur) => ({
+                ...cur,
+                [productVariantId]: {
+                  ...cur[productVariantId],
+                  [view]: { jobId: out.jobId, status: job.status || "queued", error: job.error ?? null },
+                },
+              }));
+              if (job.status === "completed" || job.status === "failed") {
+                /** Done; release the listener so React Firestore doesn't keep one open per render. */
+                const u = modelRealismJobUnsubsRef.current[subKey];
+                if (u) { try { u(); } catch { /* ignore */ } delete modelRealismJobUnsubsRef.current[subKey]; }
+              }
+            }
+          );
+          modelRealismJobUnsubsRef.current[subKey] = unsub;
+        }
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setModelRealismJobs((prev) => ({
+          ...prev,
+          [productVariantId]: {
+            ...prev[productVariantId],
+            [view]: { jobId: "", status: "failed", error: msg },
+          },
+        }));
+      }
+    },
+    [product?.id, enqueueProductModelRealism]
+  );
   useEffect(() => {
     setLastFlatRenderSelectionLog(null);
     setLastFlatRender8394Payload(null);
@@ -5265,6 +5345,79 @@ function ProductDetailContent() {
                         </p>
                       </div>
                     ) : null}
+                    {/**
+                     * Phase 3 — Model realism per (color, side).
+                     *
+                     * Buttons enqueue an `rp_blank_preview_jobs` doc with a
+                     * product binding; on Stage B completion the trigger writes
+                     * the realism URL to `variant.flatRenders.model_<view>_designed`
+                     * which the Shopify push reads from. Disabled when no
+                     * variant is picked.
+                     */}
+                    {shopifyPreviewVariantDoc ? (() => {
+                      const productVariantId = shopifyPreviewVariantDoc.id;
+                      const blankVariantId = (shopifyPreviewVariantDoc as { blankVariantId?: string }).blankVariantId || "";
+                      const jobs = modelRealismJobs[productVariantId] || {};
+                      const frontJob = jobs.front;
+                      const backJob = jobs.back;
+                      const renderButton = (view: "front" | "back", state?: { status: string; error?: string | null }) => {
+                        const running = state && (state.status === "queued" || state.status === "processing");
+                        const completed = state && state.status === "completed";
+                        const failed = state && state.status === "failed";
+                        const label =
+                          running ? `Generating ${view}… (~30s)` :
+                          completed ? `✓ ${view === "front" ? "Model front" : "Model back"} rendered` :
+                          failed ? `Retry ${view}` :
+                          `✨ Generate model ${view}`;
+                        return (
+                          <button
+                            key={view}
+                            type="button"
+                            disabled={!blankVariantId || running}
+                            onClick={() => void handleEnqueueModelRealism(productVariantId, blankVariantId, view)}
+                            className={`px-3 py-1.5 text-xs font-semibold rounded-md disabled:opacity-50 ${
+                              completed
+                                ? "bg-emerald-700 text-white hover:bg-emerald-800"
+                                : failed
+                                  ? "bg-red-700 text-white hover:bg-red-800"
+                                  : "bg-purple-700 text-white hover:bg-purple-800"
+                            }`}
+                            title={
+                              !blankVariantId
+                                ? "Variant has no blankVariantId yet"
+                                : `Run Phase 2 Flux Fill on the ${view === "front" ? "model_front" : "model_back"} photo and save to variant.flatRenders.model_${view}_designed. Costs $ per call.`
+                            }
+                          >
+                            {label}
+                          </button>
+                        );
+                      };
+                      const anyError = frontJob?.error || backJob?.error;
+                      return (
+                        <div className="mt-3 rounded-md border border-purple-200 bg-purple-50/60 px-3 py-2 text-xs text-purple-950">
+                          <p className="font-medium text-purple-900 mb-1">
+                            Model realism — {(shopifyPreviewVariantDoc as { colorName?: string }).colorName || "this color"}
+                          </p>
+                          <p className="text-purple-800/90 mb-2">
+                            One Flux Fill render per side. Result lands on this variant&apos;s{" "}
+                            <code className="font-mono text-[11px]">flatRenders.model_*_designed.url</code>{" "}
+                            and is picked up by the Shopify push.
+                          </p>
+                          <div className="flex flex-wrap gap-2">
+                            {renderButton("front", frontJob)}
+                            {renderButton("back", backJob)}
+                          </div>
+                          {anyError ? (
+                            <p className="text-[10px] text-red-700 mt-1.5 font-mono break-all">
+                              {anyError}
+                            </p>
+                          ) : null}
+                          <p className="text-[10px] text-purple-800/80 mt-1.5">
+                            Server rejects if the variant has no model photo for the requested side, or if no mask exists and the design overflows.
+                          </p>
+                        </div>
+                      );
+                    })() : null}
                   </div>
                 ) : (
                   <p className="text-sm text-amber-800">No variants under this product yet.</p>

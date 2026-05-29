@@ -352,6 +352,39 @@ export function useRefreshProductMerchandisingFromSources() {
 /**
  * Hook for generating product assets
  */
+/**
+ * Phase 3: enqueue a model-realism render for one (product, blankVariantId, view).
+ * Backend: `enqueueProductModelRealism` callable → creates an
+ * rp_blank_preview_jobs doc with the product binding; the existing trigger
+ * writes the result URL to the variant's flatRenders[role] slot on completion.
+ */
+export interface EnqueueProductModelRealismInput {
+  productId: string;
+  blankVariantId: string;
+  view: "front" | "back";
+  withRealism?: boolean;
+  artworkMode?: "light" | "dark" | "white";
+}
+
+export function useEnqueueProductModelRealism() {
+  const enqueueProductModelRealism = useCallback(
+    async (input: EnqueueProductModelRealismInput) => {
+      if (!functions) {
+        throw new Error("Cloud Functions not initialized");
+      }
+      const fn = httpsCallable(functions, "enqueueProductModelRealism");
+      const result = await fn(input);
+      return result.data as {
+        jobId: string;
+        status: "queued";
+        officialRole: string;
+      };
+    },
+    []
+  );
+  return { enqueueProductModelRealism };
+}
+
 export function useGenerateProductAssets() {
   const { mutate } = useSWRConfig();
 
