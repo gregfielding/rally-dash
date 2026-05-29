@@ -14,6 +14,7 @@ function sha256HexBuffer(buf) {
  */
 
 const { render8394DesignOnGarmentSharp, savePngAndReadableUrl } = require("./productFlatRenderMvp");
+const { isPipelineReadyStyleCode } = require("./pipelineReadiness");
 const { getVariantFlatBackUrl, getVariantFlatFrontUrl } = require("./variantRenderSources");
 const { resolveBackRenderTreatment, resolveBlendedPreviewBlend8394 } = require("./artworkToneResolution");
 const { getPlacementRowForSide } = require("./resolveProductRenderProfile");
@@ -85,8 +86,17 @@ async function composeOfficial8394FlatRole(ctx) {
   if (!blankSnap.exists) throw new Error("Blank not found");
   const blank = blankSnap.data();
 
-  if (String(blank.styleCode || "").trim() !== "8394") {
-    throw new Error("Official flat composition supports 8394 blanks only");
+  /**
+   * Gate by the pipeline-readiness registry instead of a hardcoded 8394 check.
+   * Function name retains "8394" historically — the underlying sharp pipeline
+   * (placement + warp + mask + blend) is generic; only the per-render config
+   * `warp.enabled` / `mask.enabled` knobs in each blank's render profile decide
+   * whether those steps actually run for a given blank/variant.
+   */
+  if (!isPipelineReadyStyleCode(blank.styleCode)) {
+    throw new Error(
+      `Official flat composition: blank styleCode "${blank.styleCode || "unknown"}" is not pipelineReady (see functions/lib/pipelineReadiness.js)`
+    );
   }
 
   const variantRow = (blank.variants || []).find((v) => v.variantId === blankVariantId);

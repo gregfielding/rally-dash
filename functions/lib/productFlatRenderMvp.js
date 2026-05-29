@@ -64,6 +64,7 @@ const { mergeRenderTargetSettings } = require("./renderTargetTuning");
 
 const MASTER_BLANK_SCHEMA_VERSION = 2;
 const MVP_STYLE_CODE = "8394";
+const { isPipelineReadyStyleCode } = require("./pipelineReadiness");
 const ART_BASE = 0.5;
 function stableStringify(value) {
   if (value === null || typeof value !== "object") {
@@ -1243,10 +1244,16 @@ async function executeProductFlatRender8394Mvp({ admin, db, storage, fetch, cryp
       }
       const blank = blankSnap.data();
 
-      if (String(blank.styleCode || "").trim() !== MVP_STYLE_CODE) {
+      /**
+       * Gate by registry instead of MVP_STYLE_CODE so manual "Generate flats"
+       * works on any pipelineReady blank (TR3008, HF07 once their renderers
+       * are flipped on). The legacy MVP_STYLE_CODE constant stays for log
+       * tags and historical identifiers.
+       */
+      if (!isPipelineReadyStyleCode(blank.styleCode)) {
         throw new functions.https.HttpsError(
           "failed-precondition",
-          `Step 10 MVP renderer only supports style ${MVP_STYLE_CODE} (this blank is ${blank.styleCode || "unknown"})`
+          `Step 10 MVP renderer: blank styleCode "${blank.styleCode || "unknown"}" is not pipelineReady (see functions/lib/pipelineReadiness.js)`
         );
       }
 

@@ -59,12 +59,22 @@ const PIPELINE_CONFIG_BY_STYLE_CODE = {
   TR3008: {
     styleCode: "TR3008",
     displayName: "Tri-blend Racerback Tank (LA Apparel)",
-    pipelineReady: false,
+    pipelineReady: true,
     requiresWarp: false,
     requiresMask: true,
     supportedSides: ["front", "back"],
-    blockingGaps:
-      "Mask missing for TR3008 variants; renderer needs requiresWarp:false branch (skip applyDesignWarp8394); scene presets not configured.",
+    /**
+     * Activated 2026-05-27. Generic sharp pipeline runs (placement, blend);
+     * warp + mask early-exit when their per-render `enabled` flags are false.
+     * Operators still need to:
+     *   - Generate a mask via the Blanks editor for cleaner edges (optional)
+     *   - Set per-variant render parameters (placement, scale, blend) for
+     *     each color via the Blank Render Profile editor
+     *   - Configure scene presets if model/scene composites are wanted
+     *     (flat composites work without presets).
+     * If mockups look wrong, run scripts/blank-pipeline-readiness-audit.js
+     * for a per-blank checklist.
+     */
   },
   HF07: {
     styleCode: "HF07",
