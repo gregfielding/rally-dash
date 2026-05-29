@@ -105,6 +105,12 @@ export default function BulkDesignUploadPage() {
    * from `item.defaultTargetBlankIds` (server picks pipelineReady ones).
    */
   const [targetBlanksByItem, setTargetBlanksByItem] = useState<Record<string, string[]>>({});
+  /**
+   * Per-item editable storefront label ("Pillows", "Subway Series", "Vintage"...).
+   * Defaults to the parser-derived themeName. Empty = use designType fallback
+   * in product naming ("Custom" for custom_one_off).
+   */
+  const [productLabelByItem, setProductLabelByItem] = useState<Record<string, string>>({});
   const [importing, setImporting] = useState(false);
   const [parsing, setParsing] = useState(false);
   const [prepareError, setPrepareError] = useState<string | null>(null);
@@ -213,16 +219,26 @@ export default function BulkDesignUploadPage() {
       const nextActions: Record<string, "create" | "update" | "skip" | "blocked"> = {};
       const nextOw: Record<string, boolean> = {};
       const nextTargets: Record<string, string[]> = {};
+      const nextLabels: Record<string, string> = {};
       for (const it of serverItems) {
         nextActions[it.itemId] = it.confirmedAction || it.defaultAction;
         nextOw[it.itemId] = false;
         nextTargets[it.itemId] = Array.isArray(it.defaultTargetBlankIds)
           ? [...it.defaultTargetBlankIds]
           : [];
+        /**
+         * Seed the Label field with the parser's themeName when it's NOT the
+         * same word as the blank category — operators usually want the parsed
+         * theme; only the "Thong"==="Thong" collision case starts empty so
+         * they're prompted to type something meaningful.
+         */
+        const parsedTheme = (it.themeName || "").trim();
+        nextLabels[it.itemId] = parsedTheme;
       }
       setActionOverrides(nextActions);
       setOverwriteByItem(nextOw);
       setTargetBlanksByItem(nextTargets);
+      setProductLabelByItem(nextLabels);
 
       setStep("review");
     } catch (e) {
@@ -309,6 +325,7 @@ export default function BulkDesignUploadPage() {
         designSeries: undefined,
         slug: undefined,
         targetBlankIds: targetBlanksByItem[it.itemId] ?? it.defaultTargetBlankIds ?? [],
+        productLabel: productLabelByItem[it.itemId] ?? "",
       }));
 
       const out = await commitBulkImport({ jobId, items: decisions, commitMode });
@@ -334,6 +351,7 @@ export default function BulkDesignUploadPage() {
     effectiveItems,
     nameOverrides,
     targetBlanksByItem,
+    productLabelByItem,
     commitBulkImport,
     mutateDesigns,
   ]);
@@ -516,7 +534,12 @@ export default function BulkDesignUploadPage() {
                     <th className="text-left py-2 px-3">Slug / key</th>
                     <th className="text-left py-2 px-3">League</th>
                     <th className="text-left py-2 px-3">Team</th>
-                    <th className="text-left py-2 px-3">Theme</th>
+                    <th
+                      className="text-left py-2 px-3"
+                      title="Storefront label used in product titles (e.g. 'Pillows', 'Subway Series'). Defaults to the parsed theme from the filename; edit to whatever should appear after the team name. Leave blank to fall back to the designType default ('Custom' for one-offs)."
+                    >
+                      Label
+                    </th>
                     <th className="text-left py-2 px-3">Apply to blanks</th>
                     <th className="text-left py-2 px-3">Series</th>
                     <th className="text-left py-2 px-3">Match</th>
@@ -581,7 +604,20 @@ export default function BulkDesignUploadPage() {
                       <td className="py-2 px-3 align-top text-xs">
                         {it.teamName || <span className="text-amber-700">Unmatched</span>}
                       </td>
-                      <td className="py-2 px-3 align-top text-xs">{it.themeName}</td>
+                      <td className="py-2 px-3 align-top text-xs">
+                        <input
+                          className="w-full min-w-[110px] border border-gray-200 rounded px-2 py-1 text-xs text-gray-900"
+                          placeholder={it.themeName || "Custom"}
+                          value={productLabelByItem[it.itemId] ?? ""}
+                          onChange={(e) =>
+                            setProductLabelByItem((o) => ({
+                              ...o,
+                              [it.itemId]: e.target.value,
+                            }))
+                          }
+                          title="Goes in product title between team name and blank type. Leave blank to use the designType default."
+                        />
+                      </td>
                       <td className="py-2 px-3 align-top text-xs">
                         <div className="flex flex-col gap-1 min-w-[160px]">
                           {(it.availableBlanks ?? []).length === 0 ? (

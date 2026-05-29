@@ -472,7 +472,9 @@ function mergeFullTaxonomyFromInfer(team, design, blank, inferred) {
  * Used by migration: same tags as create/refresh when team/design/blank are loaded.
  */
 function rebuildProductTagsSnapshotFromSources(team, design, blank) {
-  const designShortName = designTypeToStorefrontShort(design.designType);
+  /** Same productLabel override here so tag/SEO recompute on refresh stays consistent with title. */
+  const designLabelOverride = design && typeof design.productLabel === "string" ? design.productLabel.trim() : "";
+  const designShortName = designLabelOverride || designTypeToStorefrontShort(design.designType);
   const inferred = inferTaxonomyForGeneratedSportsProduct(team, design, designShortName);
   const tax = mergeFullTaxonomyFromInfer(team, design, blank, inferred);
   const tags = buildProductTags({
@@ -496,7 +498,15 @@ function buildResolvedMerchandisingBundle({
   resolvedBlankDescription,
 }) {
   const teamNameFull = buildTeamDisplayName(team, design);
-  const designShortName = designTypeToStorefrontShort(design.designType);
+  /**
+   * Prefer the operator-set `design.productLabel` over the designType-derived
+   * default. This is the slot that becomes the storefront token in titles
+   * ("Giants **Pillows** Panty") and escapes the "Custom" fallback that fires
+   * when designType is `custom_one_off`. Set via the bulk-upload review's
+   * Label column; blank string / null falls back to the legacy short name.
+   */
+  const designLabelOverride = design && typeof design.productLabel === "string" ? design.productLabel.trim() : "";
+  const designShortName = designLabelOverride || designTypeToStorefrontShort(design.designType);
   const productTypeWord = buildStorefrontProductTypeWord(blank);
   const colorTitle = toTitleCaseWords(String(colorNameForProduct || "").trim() || "Default");
 

@@ -3201,6 +3201,19 @@ export interface DesignDoc {
    * `targetBlankIds` remain valid for that deferred launch).
    */
   skipAutoLaunch?: boolean | null;
+
+  /**
+   * Operator-provided short label that becomes the storefront `designShortName`
+   * slot in product titles ("San Francisco Giants **Pillows** Panty"). When set,
+   * overrides `designTypeToStorefrontShort(designType)` — escapes the "Custom"
+   * fallback that fires when the design type is `custom_one_off`. Editable on
+   * the bulk-upload review screen.
+   *
+   * Defaults to the parser-derived themeName on bulk import; operators can
+   * blank it to use the storefront-short default, or type any short phrase
+   * (1-3 words is typical: "Pillows", "Subway Series", "City 69 Vintage").
+   */
+  productLabel?: string | null;
   /**
    * Which garment sides this artwork may print on (front / back). Authoritative for generation
    * when set (e.g. batch import derives from which side keys have assets). Firestore field name unchanged.

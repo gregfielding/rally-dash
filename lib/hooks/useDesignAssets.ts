@@ -377,6 +377,12 @@ export interface CommitBulkDesignUploadItemDecision {
    * falls back to the server's defaultTargetBlankIds (pipeline-ready blanks).
    */
   targetBlankIds?: string[];
+  /**
+   * Operator-set storefront short label. Used in product titles ("Giants
+   * **Pillows** Panty"). Empty string / undefined falls back to the
+   * designType-derived default ("Custom" for custom_one_off).
+   */
+  productLabel?: string;
 }
 
 export interface CommitBulkDesignUploadInput {

@@ -327,6 +327,7 @@ async function createDesignDocument(db, userId, payload) {
     importVersion,
     targetBlankIds,
     skipAutoLaunch,
+    productLabel,
   } = payload;
 
   const teamSnap = await db.collection("design_teams").doc(teamId).get();
@@ -452,6 +453,13 @@ async function createDesignDocument(db, userId, payload) {
   /** Library-only commit mode → trigger no-ops. Only stamped on create. */
   if (skipAutoLaunch === true) {
     designData.skipAutoLaunch = true;
+  }
+  /**
+   * Operator-set storefront label. Trim + omit when empty so an empty input
+   * doesn't stomp the merchandising fallback chain in production.
+   */
+  if (typeof productLabel === "string" && productLabel.trim()) {
+    designData.productLabel = productLabel.trim();
   }
 
   const designRef = await db.collection("designs").add(designData);
@@ -707,6 +715,8 @@ function commitBulkDesignUploadImpl(db, storage) {
       const targetBlankIdsOverride = Array.isArray(dec.targetBlankIds)
         ? [...new Set(dec.targetBlankIds.map((x) => String(x || "").trim()).filter(Boolean))]
         : null;
+      /** Operator-set storefront short label. Empty/whitespace = leave unset → fallback chain wins. */
+      const productLabelOverride = typeof dec.productLabel === "string" ? dec.productLabel.trim() : null;
 
       let designName = nameOverride || item.designName;
       let teamId = teamIdOverride || item.teamId || BATCH_IMPORT_TEAM_ID;
@@ -839,6 +849,8 @@ function commitBulkDesignUploadImpl(db, storage) {
              * being updated keep their prior skipAutoLaunch value untouched.
              */
             skipAutoLaunch: skipAutoLaunchForNewDesigns,
+            /** Storefront label override (empty = use designType fallback). */
+            productLabel: productLabelOverride,
           });
           designId = createdRes.designId;
           created++;
