@@ -100,7 +100,15 @@ function resolvePrintSidesForProductBuild(blank, design) {
   }
   let conflict = intersection.size === 0 ? "hard" : "none";
   let canGenerate = intersection.size > 0;
-  let blockMessage;
+  /**
+   * Initialize to null rather than undefined. Firestore rejects undefined in
+   * doc writes; the global sanitizeForFirestore in index.js strips it, but
+   * any caller using a different sanitizer (one-off scripts, future code
+   * paths) would surface the same "Cannot use undefined" error we hit during
+   * the 8390 thong force-start. null is a valid Firestore value and round-trips
+   * cleanly through every consumer.
+   */
+  let blockMessage = null;
   if (conflict === "hard") {
     blockMessage =
       `This blank defaults to ${blankMode === "front_only" ? "front-only" : blankMode === "back_only" ? "back-only" : "front and back"} print, ` +
@@ -121,6 +129,8 @@ function resolvePrintSidesForProductBuild(blank, design) {
   conflict = viewConstrained.conflict;
   canGenerate = viewConstrained.canGenerate;
   blockMessage = viewConstrained.blockMessage != null ? viewConstrained.blockMessage : blockMessage;
+  /** Final defensive: never return undefined to a Firestore write. */
+  if (typeof blockMessage === "undefined") blockMessage = null;
 
   let primaryPlacementSide = "front";
   if (effectiveBack && !effectiveFront) primaryPlacementSide = "back";
