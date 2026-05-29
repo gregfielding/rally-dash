@@ -66,13 +66,43 @@ export type Preview8394ParityTelemetry = {
   };
 };
 
+/**
+ * Map a CSS-style blend mode name to a Canvas2D `globalCompositeOperation`.
+ *
+ * **Bug history (2026-05-27):** the original map only covered
+ * multiply/overlay/soft-light/normal and silently downgraded every other mode
+ * (including "screen") to "multiply". The blend resolver
+ * `resolveBlendedPreviewBlend8394` returns "screen" for dark garment + dark
+ * artwork — so a Vintage Black or Blue 8394 with the City 69 dark design
+ * (orange SAN FRANCISCO + light-gray "69") was being multiply-blended instead
+ * of screen-blended, which collapses orange × blue to near-black and erases
+ * the light-gray "69" into the fabric color. Cover the full CSS blend mode
+ * vocabulary so unknown modes can't silently regress to multiply again.
+ */
 function mapBlendModeToCanvas(mode: string): GlobalCompositeOperation {
   const m = String(mode || "multiply").toLowerCase();
+  /** Lighten family — needed for light/white artwork on dark fabric. */
+  if (m === "screen") return "screen";
+  if (m === "lighten") return "lighten";
+  if (m === "color-dodge") return "color-dodge";
+  /** Darken family — for dark artwork on light fabric. */
   if (m === "multiply") return "multiply";
+  if (m === "darken") return "darken";
+  if (m === "color-burn") return "color-burn";
+  /** Contrast family — mid-tone-preserving blends. */
   if (m === "overlay") return "overlay";
   if (m === "soft-light") return "soft-light";
+  if (m === "hard-light") return "hard-light";
+  /** Comparative / HSL — rarely used but valid CSS values. */
+  if (m === "difference") return "difference";
+  if (m === "exclusion") return "exclusion";
+  if (m === "hue") return "hue";
+  if (m === "saturation") return "saturation";
+  if (m === "color") return "color";
+  if (m === "luminosity") return "luminosity";
   if (m === "normal") return "source-over";
-  return "multiply";
+  /** Default to source-over (no blend) rather than multiply — safer for unknown inputs. */
+  return "source-over";
 }
 
 export function loadImageElement(url: string): Promise<HTMLImageElement> {
