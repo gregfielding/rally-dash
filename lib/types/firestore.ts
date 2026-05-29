@@ -3698,6 +3698,12 @@ export interface RPBlankPreviewJob {
   variantId?: string | null;
   designId: string;
   view: "front" | "back";
+  /**
+   * Per-target render surface. Defaults to `flat_<view>` for legacy jobs.
+   * Model targets require a non-null variantId (each color's model photo has
+   * unique geometry, so masks + composites must be per-variant).
+   */
+  renderTarget?: "flat_front" | "flat_back" | "model_front" | "model_back";
   artworkMode?: "light" | "dark" | "white";
   placement: RPBlankPreviewJobPlacementInput;
   /** When true, the trigger runs Stage A then Stage B; otherwise Stage A only. */

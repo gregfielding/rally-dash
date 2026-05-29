@@ -1803,6 +1803,12 @@ export function BlankRenderProfileEditor({
         variantId: string | null;
         designId: string;
         view: "front" | "back";
+        /**
+         * Surface to render. Defaults to flat_<view> when omitted (legacy
+         * behavior). For model_*, the server reads variant.images.modelFront/Back
+         * and the per-pose mask {blankId}_{variantId}_model_<view>.
+         */
+        renderTarget?: "flat_front" | "flat_back" | "model_front" | "model_back";
         artworkMode: "light" | "dark" | "white";
         withRealism?: boolean;
         /**
@@ -1869,11 +1875,25 @@ export function BlankRenderProfileEditor({
         realPreviewJobUnsubRef.current = null;
       }
 
+      /**
+       * Pass through the editor's current render target so the server picks
+       * the right photo + mask. For model targets the server requires a
+       * variantId — the editor's button is disabled when one isn't selected
+       * (mirroring the AI mask button rules from Phase 1c).
+       */
+      const renderTargetForCall =
+        selectedRenderTarget === "flat_front" ||
+        selectedRenderTarget === "flat_back" ||
+        selectedRenderTarget === "model_front" ||
+        selectedRenderTarget === "model_back"
+          ? (selectedRenderTarget as "flat_front" | "flat_back" | "model_front" | "model_back")
+          : `flat_${previewSide}` as "flat_front" | "flat_back";
       const result = await fn({
         blankId: blank.blankId,
         variantId: previewVariant?.variantId ?? null,
         designId: previewDesignId,
         view: previewSide,
+        renderTarget: renderTargetForCall,
         artworkMode: previewArtworkMode,
         withRealism,
         /** Same PNG URL the CSS canvas is showing — guarantees Stage A composites identical bytes. */
@@ -4171,17 +4191,36 @@ export function BlankRenderProfileEditor({
                   Enlarge garment
                 </button>
               ) : null}
-              {AI_REALISM_PREVIEW_ENABLED ? (
-                <button
-                  type="button"
-                  onClick={() => handleRealRenderPreview({ withRealism: true })}
-                  disabled={realPreviewLoading !== null || !previewDesignId}
-                  className="ml-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-purple-600 text-white hover:bg-purple-700 disabled:opacity-50"
-                  title="Stage A composite + fal.ai Flux Fill inpaint pass with auto-applied mask. Takes 20-60s and costs $ per call."
-                >
-                  {realPreviewLoading === "B" ? "Generating product preview… (~30s)" : "✨ Product Preview"}
-                </button>
-              ) : null}
+              {AI_REALISM_PREVIEW_ENABLED ? (() => {
+                const isModelTargetForPreview =
+                  selectedRenderTarget === "model_front" || selectedRenderTarget === "model_back";
+                const variantPickedForPreview = !!(variantId && variantId.trim());
+                const modelGate = isModelTargetForPreview && !variantPickedForPreview;
+                const targetWord = isModelTargetForPreview
+                  ? selectedRenderTarget === "model_front"
+                    ? "model front"
+                    : "model back"
+                  : null;
+                return (
+                  <button
+                    type="button"
+                    onClick={() => handleRealRenderPreview({ withRealism: true })}
+                    disabled={realPreviewLoading !== null || !previewDesignId || modelGate}
+                    className="ml-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-purple-600 text-white hover:bg-purple-700 disabled:opacity-50"
+                    title={
+                      modelGate
+                        ? `Pick a specific color first — ${targetWord} previews are per-pose and need a variant.`
+                        : "Stage A composite + fal.ai Flux Fill inpaint pass with auto-applied mask. Takes 20-60s and costs $ per call."
+                    }
+                  >
+                    {realPreviewLoading === "B"
+                      ? "Generating product preview… (~30s)"
+                      : isModelTargetForPreview
+                        ? `✨ ${targetWord === "model front" ? "Model Front" : "Model Back"} Realism`
+                        : "✨ Product Preview"}
+                  </button>
+                );
+              })() : null}
             </div>
             {/*
               DISABLED v10.2 (2026-05-25): original preview header button row.

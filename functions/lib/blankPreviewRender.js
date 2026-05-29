@@ -127,6 +127,39 @@ function pickRefImage(blank, variant, view) {
 }
 
 /**
+ * Per-render-target image picker. Replaces `pickRefImage` for non-flat targets.
+ *
+ * - flat_<view>: use `pickRefImage` (variant flat photo, then blank-level fallback)
+ * - model_<view>: read `variant.images.modelFront` / `modelBack` directly. No
+ *   fallback — each variant's model photo is unique (different pose / lighting),
+ *   so an "any model photo will do" fallback would yield a wrong composite.
+ */
+function pickRefImageForTarget(blank, variant, view, renderTarget) {
+  const target = renderTarget || `flat_${view}`;
+  if (target === "model_front" || target === "model_back") {
+    if (!variant || !variant.images) return null;
+    const ref = target === "model_front" ? variant.images.modelFront : variant.images.modelBack;
+    return ref && ref.downloadUrl ? String(ref.downloadUrl) : null;
+  }
+  return pickRefImage(blank, variant, view);
+}
+
+/**
+ * Doc id for the rp_blank_masks lookup that the composite will multiply with the
+ * design alpha. Mirrors `functions/lib/blankMaskGeneration.js maskKeyFor`.
+ *
+ * - Flat masks (one per blank+view, shared across colors):  {blankId}_{view}
+ * - Model-pose masks (one per blank+variant+pose):           {blankId}_{variantId}_model_<view>
+ */
+function maskDocIdForTarget(blankId, view, renderTarget, variantId) {
+  const target = renderTarget || `flat_${view}`;
+  if ((target === "model_front" || target === "model_back") && variantId) {
+    return `${blankId}_${variantId}_${target}`;
+  }
+  return `${blankId}_${view}`;
+}
+
+/**
  * Pick the design PNG honoring the operator's Artwork variant choice (light / dark / white)
  * from the Render profile tab. Falls back through reasonable alternatives if the requested
  * variant isn't uploaded. Production (`onMockJobCreated`) currently always picks light-first;
@@ -692,8 +725,25 @@ async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, dr
  * trigger entry points. Throws an `HttpsError` for the sync callable; the trigger
  * catches and writes the error message into the job doc.
  */
+const VALID_PREVIEW_RENDER_TARGETS = new Set([
+  "flat_front",
+  "flat_back",
+  "model_front",
+  "model_back",
+]);
+
 function validatePreviewInput(functions, data) {
-  const { blankId, variantId, designId, view, placement: pl, artworkMode: artworkModeIn, withRealism: withRealismIn, designUrlOverride: designUrlOverrideIn } = data || {};
+  const {
+    blankId,
+    variantId,
+    designId,
+    view,
+    placement: pl,
+    artworkMode: artworkModeIn,
+    withRealism: withRealismIn,
+    designUrlOverride: designUrlOverrideIn,
+    renderTarget: renderTargetIn,
+  } = data || {};
   const artworkMode = artworkModeIn === "dark" || artworkModeIn === "white" ? artworkModeIn : "light";
   if (!blankId || typeof blankId !== "string") {
     throw new functions.https.HttpsError("invalid-argument", "blankId is required");
@@ -707,6 +757,24 @@ function validatePreviewInput(functions, data) {
   if (!pl || typeof pl !== "object") {
     throw new functions.https.HttpsError("invalid-argument", "placement is required");
   }
+  /**
+   * `renderTarget` is optional for backward compat — when omitted, default to
+   * the legacy flat path so existing editor callers (which only knew about
+   * flat composites) keep working. Model targets need an explicit opt-in.
+   */
+  const renderTarget = renderTargetIn || `flat_${view}`;
+  if (!VALID_PREVIEW_RENDER_TARGETS.has(renderTarget)) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      `renderTarget must be one of ${[...VALID_PREVIEW_RENDER_TARGETS].join(", ")}`
+    );
+  }
+  if ((renderTarget === "model_front" || renderTarget === "model_back") && !variantId) {
+    throw new functions.https.HttpsError(
+      "invalid-argument",
+      `variantId is required for renderTarget="${renderTarget}" — each color has its own model photo`
+    );
+  }
   return {
     blankId,
     variantId: variantId || null,
@@ -717,6 +785,7 @@ function validatePreviewInput(functions, data) {
     withRealism: withRealismIn === true,
     designUrlOverride:
       typeof designUrlOverrideIn === "string" && designUrlOverrideIn.length > 0 ? designUrlOverrideIn : null,
+    renderTarget,
   };
 }
 
@@ -730,23 +799,35 @@ function validatePreviewInput(functions, data) {
  */
 async function composeStageA({ db, storage, sharp, functions, input }) {
   const { blankId, variantId, designId, view, artworkMode, placement: pl } = input;
+  /**
+   * Default to flat for inputs that don't carry renderTarget (older callers
+   * pre-Phase-2). validatePreviewInput sets this for new callers.
+   */
+  const renderTarget = input.renderTarget || `flat_${view}`;
+  const isModelTarget = renderTarget === "model_front" || renderTarget === "model_back";
 
   const blankSnap = await db.collection("rp_blanks").doc(blankId).get();
   if (!blankSnap.exists) throw new functions.https.HttpsError("not-found", `Blank ${blankId} not found`);
   const blank = blankSnap.data();
 
   const variants = Array.isArray(blank.variants) ? blank.variants : [];
-  const variant =
-    (variantId && variants.find((v) => v && v.variantId === variantId)) ||
-    variants.find((v) => v && pickRefImage(blank, v, view)) ||
-    null;
+  /**
+   * For model targets, the variant is required and must match exactly — each
+   * variant's model photo has a unique silhouette so we can't fall back to
+   * "any variant with a model photo." Flat targets keep the legacy fallback.
+   */
+  const variant = isModelTarget
+    ? variants.find((v) => v && v.variantId === variantId) || null
+    : (variantId && variants.find((v) => v && v.variantId === variantId)) ||
+      variants.find((v) => v && pickRefImage(blank, v, view)) ||
+      null;
 
-  const refImageUrl = pickRefImage(blank, variant, view);
+  const refImageUrl = pickRefImageForTarget(blank, variant, view, renderTarget);
   if (!refImageUrl) {
-    throw new functions.https.HttpsError(
-      "failed-precondition",
-      `No ${view} image for this blank — upload a variant photo or a master image first`
-    );
+    const detail = isModelTarget
+      ? `Variant ${variantId} has no ${renderTarget === "model_front" ? "modelFront" : "modelBack"} photo — upload one on the blank's Identity tab first`
+      : `No ${view} image for this blank — upload a variant photo or a master image first`;
+    throw new functions.https.HttpsError("failed-precondition", detail);
   }
 
   const designSnap = await db.collection("designs").doc(designId).get();
@@ -914,7 +995,12 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
   let maskMean = null;
   const maskMode = pl.maskConfig && typeof pl.maskConfig.mode === "string" ? pl.maskConfig.mode : null;
   try {
-    const maskDocId = `${blankId}_${view}`;
+    /**
+     * Per-target mask doc lookup. For model targets, the doc lives at
+     * `{blankId}_{variantId}_model_<view>` (per-pose mask written by Phase 1).
+     * Flat targets keep the legacy `{blankId}_<view>` doc id.
+     */
+    const maskDocId = maskDocIdForTarget(blankId, view, renderTarget, variantId);
     const maskDoc = maskMode === "none" ? null : await db.collection("rp_blank_masks").doc(maskDocId).get();
     const maskData = maskDoc && maskDoc.exists ? maskDoc.data() : null;
     if (maskData && maskData.mask && maskData.mask.downloadUrl) {
@@ -1036,7 +1122,14 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
 
   const timestamp = Date.now();
   const variantSuffix = variant && variant.variantId ? `_${variant.variantId}` : "";
-  const storagePath = `rp/blank_previews/${blankId}/${view}/_preview${variantSuffix}_${timestamp}.png`;
+  /**
+   * Storage layout: include renderTarget so model previews don't overwrite
+   * flat previews of the same (blank, view, variant) and vice versa. The
+   * legacy `flat_<view>` path stays `…/{view}/…` for backward compat — only
+   * model targets get the extra segment.
+   */
+  const targetSegment = isModelTarget ? `/${renderTarget}` : "";
+  const storagePath = `rp/blank_previews/${blankId}/${view}${targetSegment}/_preview${variantSuffix}_${timestamp}.png`;
   const bucket = storage.bucket();
   const file = bucket.file(storagePath);
   const downloadToken = `${timestamp}_${Math.floor(Math.random() * 1e6).toString(16)}`;
@@ -1077,6 +1170,8 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
     variantSuffix,
     timestamp,
     variant,
+    /** Forward to composeStageB so its storage path stays aligned with Stage A. */
+    renderTarget,
   };
 }
 
@@ -1084,7 +1179,7 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
  * Stage B (AI realism) — runs fal.ai realism pass on Stage A output, saves the result
  * to Storage, returns the persisted `stageB` summary.
  */
-async function composeStageB({ db, storage, sharp, functions, blankId, view, draftBuffer, draftMeta, letterMaskBuffer, designColors, variantSuffix, timestamp, fabricFeel, printStrength }) {
+async function composeStageB({ db, storage, sharp, functions, blankId, view, draftBuffer, draftMeta, letterMaskBuffer, designColors, variantSuffix, timestamp, fabricFeel, printStrength, renderTarget }) {
   const falApiKey = getFalApiKey(functions);
   if (!falApiKey) {
     throw new Error("FAL_API_KEY is not configured — cannot run AI realism pass");
@@ -1109,7 +1204,10 @@ async function composeStageB({ db, storage, sharp, functions, blankId, view, dra
   });
   const realismMeta = await sharp(realism.buffer).metadata();
   const realismToken = `${timestamp}_realism_${Math.floor(Math.random() * 1e6).toString(16)}`;
-  const realismPath = `rp/blank_previews/${blankId}/${view}/_preview${variantSuffix}_${timestamp}_realism.png`;
+  /** Same target-aware layout as Stage A so paired Stage A/B PNGs end up adjacent. */
+  const isModelTarget = renderTarget === "model_front" || renderTarget === "model_back";
+  const targetSegment = isModelTarget ? `/${renderTarget}` : "";
+  const realismPath = `rp/blank_previews/${blankId}/${view}${targetSegment}/_preview${variantSuffix}_${timestamp}_realism.png`;
   const bucket = storage.bucket();
   const realismFile = bucket.file(realismPath);
   await realismFile.save(realism.buffer, {
@@ -1154,6 +1252,9 @@ function buildPreviewBlankRender({ db, storage, functions, sharp, admin }) {
         variantId: input.variantId,
         designId: input.designId,
         view: input.view,
+        /** Per-target render surface (flat_* or model_*); the trigger uses this to pick the
+         *  garment photo + mask doc id when re-running Stage A. */
+        renderTarget: input.renderTarget,
         artworkMode: input.artworkMode,
         placement: input.placement,
         /** Persist the editor's resolved design URL so the trigger composites the same image. */
@@ -1221,6 +1322,12 @@ function buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp })
         variantId: job.variantId || null,
         designId: job.designId,
         view: job.view,
+        /**
+         * Default to flat for legacy job docs created before Phase 2 (they have
+         * no renderTarget field). New jobs always set this; the model_* path
+         * requires it to be present.
+         */
+        renderTarget: job.renderTarget || `flat_${job.view}`,
         artworkMode: job.artworkMode || "light",
         placement: job.placement || {},
         withRealism: job.withRealism === true,
@@ -1254,6 +1361,8 @@ function buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp })
           printStrength: Number.isFinite(Number(input.placement && input.placement.printStrength))
             ? Number(input.placement.printStrength)
             : 0.7,
+          /** Forward so Stage B uses the same target-aware storage layout as Stage A. */
+          renderTarget: input.renderTarget,
         });
         await jobRef.update({ stageB: stageBResult.stageB, updatedAt: tick() });
         console.log(`[onBlankPreviewJobCreated] Job ${jobId} Stage B done`);
