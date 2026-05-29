@@ -528,7 +528,15 @@ function PlacementEditorSection({
   showToast: (m: string, t: "success" | "error") => void;
   masks?: { front: RPBlankMask | null; back: RPBlankMask | null };
   onManageMasks?: (view: "front" | "back") => void;
-  onGenerateAiMask?: (view: "front" | "back") => void;
+  onGenerateAiMask?: (
+    view: "front" | "back",
+    opts?: {
+      /** "flat_<view>" (default for legacy callers) or "model_<view>" for per-pose masks. */
+      renderTarget?: "flat_front" | "flat_back" | "model_front" | "model_back";
+      /** Required when renderTarget is model_*; the variant whose model photo to segment. */
+      variantId?: string | null;
+    }
+  ) => void;
   aiMaskGeneratingForView?: "front" | "back" | null;
 }) {
   const is8394 = String(blank.styleCode || "").trim() === "8394";
@@ -701,8 +709,13 @@ function BlankDetailContent() {
   const [currentMaskUploadView, setCurrentMaskUploadView] = useState<"front" | "back">("front");
   const [autoGenerating, setAutoGenerating] = useState<"front" | "back" | null>(null);
   // AI mask generation state — preview-only until the user clicks Save (see RALLY_BLANK_MASK_AI_AUTOGEN.md §3)
+  type MaskRenderTarget = "flat_front" | "flat_back" | "model_front" | "model_back";
   type AiMaskPreview = {
     view: "front" | "back";
+    /** Surface this preview is for; defaults to flat_<view> for legacy callers. */
+    renderTarget: MaskRenderTarget;
+    /** Required when renderTarget is model_*; null for flat targets. */
+    variantId: string | null;
     previewMaskUrl: string;
     previewMaskStoragePath: string;
     width: number;
@@ -953,7 +966,16 @@ function BlankDetailContent() {
    * Run SAM (fal.ai) to propose a print-zone mask for {blankId, view}. Does not commit;
    * stores into `aiPreview` so the user can Refresh or Save. See RALLY_BLANK_MASK_AI_AUTOGEN.md.
    */
-  const handleAiGenerate = async (view: "front" | "back", opts?: { reroll?: boolean }) => {
+  const handleAiGenerate = async (
+    view: "front" | "back",
+    opts?: {
+      reroll?: boolean;
+      /** Optional target surface — defaults to flat_<view> for backward compat. */
+      renderTarget?: MaskRenderTarget;
+      /** Required when renderTarget is model_*. */
+      variantId?: string | null;
+    }
+  ) => {
     if (!blankId || !firebaseFunctions) {
       showToast("Firebase functions not available", "error");
       return;
@@ -962,19 +984,39 @@ function BlankDetailContent() {
     setAiGenerating(view);
     try {
       const fn = httpsCallable<
-        { blankId: string; view: "front" | "back"; prompt?: string; seed?: number },
+        {
+          blankId: string;
+          view: "front" | "back";
+          renderTarget?: MaskRenderTarget;
+          variantId?: string | null;
+          prompt?: string;
+          seed?: number;
+        },
         AiMaskPreview & { previewMaskUrl: string; previewMaskStoragePath: string }
       >(firebaseFunctions, "generateBlankMaskViaSam");
       const prompt = aiPromptInput.trim();
       /** Reroll = new random seed; non-reroll respects user-supplied seed if we ever add a seed input. */
       const seed = opts?.reroll ? Math.floor(Math.random() * 1e9) : undefined;
+      const renderTarget: MaskRenderTarget = opts?.renderTarget || `flat_${view}`;
+      const variantId = opts?.variantId ?? null;
       const result = await fn({
         blankId,
         view,
+        renderTarget,
+        variantId,
         prompt: prompt.length > 0 ? prompt : undefined,
         seed,
       });
-      setAiPreview({ ...result.data, view });
+      /** Server echoes renderTarget + variantId so we trust those when committing. */
+      setAiPreview({
+        ...result.data,
+        view,
+        renderTarget: (result.data as { renderTarget?: MaskRenderTarget }).renderTarget || renderTarget,
+        variantId:
+          (result.data as { variantId?: string | null }).variantId !== undefined
+            ? (result.data as { variantId?: string | null }).variantId ?? null
+            : variantId,
+      });
     } catch (err: any) {
       console.error("[BlankDetail] AI mask generate failed:", err);
       setAiError(err?.message || "AI mask generation failed");
@@ -990,25 +1032,51 @@ function BlankDetailContent() {
     setAiCommitting(aiPreview.view);
     try {
       const fn = httpsCallable<
-        { blankId: string; view: "front" | "back"; previewMaskStoragePath: string; prompt: string; seed: number },
+        {
+          blankId: string;
+          view: "front" | "back";
+          renderTarget?: MaskRenderTarget;
+          variantId?: string | null;
+          previewMaskStoragePath: string;
+          prompt: string;
+          seed: number;
+        },
         { ok: boolean; maskDocId: string }
       >(firebaseFunctions, "commitBlankMaskFromPreview");
-      await fn({
+      const result = await fn({
         blankId,
         view: aiPreview.view,
+        renderTarget: aiPreview.renderTarget,
+        variantId: aiPreview.variantId,
         previewMaskStoragePath: aiPreview.previewMaskStoragePath,
         prompt: aiPreview.prompt,
         seed: aiPreview.seed,
       });
-      /** Re-fetch the canonical mask doc so status pills, overlays, and the dropdown re-read source/prompt/seed. */
-      const refreshed = await getDoc(doc(db!, "rp_blank_masks", `${blankId}_${aiPreview.view}`));
-      setMasks((prev) => ({
-        ...prev,
-        [aiPreview.view]: refreshed.exists() ? (refreshed.data() as RPBlankMask) : prev[aiPreview.view],
-      }));
+      /**
+       * Doc id depends on (blankId, view, renderTarget, variantId). Use the
+       * id the server returns so client + server stay in lockstep without
+       * duplicating the keying logic.
+       */
+      const maskDocId = result.data.maskDocId;
+      /**
+       * For flat masks, refresh the legacy `masks[view]` slot so the existing
+       * Front/Back status pills and overlays light up. Model masks live at a
+       * different doc id and don't drive the legacy UI today — no refresh
+       * needed; the editor reads them lazily when render target is a model_*.
+       */
+      const isFlatMask =
+        aiPreview.renderTarget === "flat_front" || aiPreview.renderTarget === "flat_back";
+      if (isFlatMask) {
+        const refreshed = await getDoc(doc(db!, "rp_blank_masks", maskDocId));
+        setMasks((prev) => ({
+          ...prev,
+          [aiPreview.view]: refreshed.exists() ? (refreshed.data() as RPBlankMask) : prev[aiPreview.view],
+        }));
+      }
       setAiPreview(null);
       setAiPromptInput("");
-      showToast(`${aiPreview.view} mask saved (AI)`, "success");
+      const targetLabel = aiPreview.renderTarget.replace("_", " ");
+      showToast(`${targetLabel} mask saved (AI)`, "success");
     } catch (err: any) {
       console.error("[BlankDetail] AI mask commit failed:", err);
       setAiError(err?.message || "Saving AI mask failed");
@@ -1663,13 +1731,17 @@ function BlankDetailContent() {
                   setMaskView(view);
                   setActiveTab("rendering");
                 }}
-                onGenerateAiMask={(view) => {
+                onGenerateAiMask={(view, opts) => {
                   /** Hop to the Rendering tab so the AI preview / Save / Refresh card is visible,
                       then kick off the same handler the in-tab button uses. handleAiGenerate
-                      sets aiGenerating + populates aiPreview on success. */
+                      sets aiGenerating + populates aiPreview on success. Threads through the
+                      optional renderTarget + variantId for per-pose model masks. */
                   setMaskView(view);
                   setActiveTab("rendering");
-                  void handleAiGenerate(view);
+                  void handleAiGenerate(view, {
+                    renderTarget: opts?.renderTarget,
+                    variantId: opts?.variantId ?? null,
+                  });
                 }}
                 aiMaskGeneratingForView={aiGenerating}
               />

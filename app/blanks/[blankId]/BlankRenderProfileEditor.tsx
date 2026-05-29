@@ -852,7 +852,15 @@ export function BlankRenderProfileEditor({
    * Parent shows the preview / Save / Refresh UI on the Rendering tab (and switches tabs to it),
    * so designers can keep tuning placement here and only briefly hop over to confirm + save.
    */
-  onGenerateAiMask?: (view: "front" | "back") => void;
+  onGenerateAiMask?: (
+    view: "front" | "back",
+    opts?: {
+      /** "flat_<view>" (default) for shared masks; "model_<view>" for per-pose masks tied to a specific variant. */
+      renderTarget?: "flat_front" | "flat_back" | "model_front" | "model_back";
+      /** Required when renderTarget is model_*; identifies which variant's model photo to mask. */
+      variantId?: string | null;
+    }
+  ) => void;
   /** True while the AI mask callable is in flight for the current view — disables the button. */
   aiMaskGeneratingForView?: "front" | "back" | null;
 }) {
@@ -3618,6 +3626,69 @@ export function BlankRenderProfileEditor({
                       </button>
                     ) : null}
                   </div>
+                  {/**
+                   * Generate AI mask for the CURRENT render target. For flat targets
+                   * (flat_front / flat_back) this writes to the shared blank mask
+                   * `{blankId}_{view}`. For model targets it writes a per-variant
+                   * mask `{blankId}_{variantId}_model_<view>` — exactly what Flux
+                   * Fill on model shots will read in Phase 2.
+                   *
+                   * Disabled when the editor is in "blank baseline" mode and the
+                   * target is a model_* surface, because model masks are inherently
+                   * per-variant and don't make sense without a selected color.
+                   */}
+                  {onGenerateAiMask ? (() => {
+                    const isModelTarget =
+                      selectedRenderTarget === "model_front" ||
+                      selectedRenderTarget === "model_back";
+                    /**
+                     * `variantId` is the editor's state (empty string when "blank baseline"
+                     * is selected; a real variant id when a specific color is). Model masks
+                     * require a real variant id since each color's model photo has its own
+                     * silhouette.
+                     */
+                    const variantIdForCall = variantId && variantId.trim() ? variantId : null;
+                    const canGenerate = !isModelTarget || !!variantIdForCall;
+                    const targetLabel = String(selectedRenderTarget).replace("_", " ");
+                    const generating = aiMaskGeneratingForView === previewSide;
+                    return (
+                      <div className="mt-2">
+                        <button
+                          type="button"
+                          disabled={!canGenerate || generating}
+                          onClick={() =>
+                            onGenerateAiMask(previewSide, {
+                              renderTarget:
+                                selectedRenderTarget === "flat_front" ||
+                                selectedRenderTarget === "flat_back" ||
+                                selectedRenderTarget === "model_front" ||
+                                selectedRenderTarget === "model_back"
+                                  ? (selectedRenderTarget as
+                                      | "flat_front"
+                                      | "flat_back"
+                                      | "model_front"
+                                      | "model_back")
+                                  : `flat_${previewSide}`,
+                              variantId: isModelTarget ? variantIdForCall : null,
+                            })
+                          }
+                          className="px-3 py-1.5 rounded-md text-xs font-semibold bg-pink-600 text-white hover:bg-pink-700 disabled:opacity-50"
+                          title={
+                            isModelTarget && !variantIdForCall
+                              ? "Pick a specific color/variant first — model masks are per-pose"
+                              : `Use AI (SAM) to segment the print area on the ${targetLabel} photo. ~5-10s.`
+                          }
+                        >
+                          {generating ? "Generating mask…" : `✨ Generate AI mask for ${targetLabel}`}
+                        </button>
+                        {isModelTarget && !variantIdForCall ? (
+                          <p className="text-[10px] text-neutral-500 mt-1">
+                            Switch to a specific color to enable — model masks are tied to one pose.
+                          </p>
+                        ) : null}
+                      </div>
+                    );
+                  })() : null}
                 </label>
               </section>
             );
