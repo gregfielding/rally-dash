@@ -3706,6 +3706,33 @@ export interface RPBlankPreviewJob {
   renderTarget?: "flat_front" | "flat_back" | "model_front" | "model_back";
   artworkMode?: "light" | "dark" | "white";
   placement: RPBlankPreviewJobPlacementInput;
+
+  /**
+   * Phase 3: optional product binding. When set, the trigger writes the Stage B
+   * result URL onto the product variant's `flatRenders[officialRole]` slot when
+   * the job completes — so the editor-only preview pipeline doubles as the
+   * production renderer for product assets.
+   *
+   * Editor-only jobs leave all three fields null.
+   */
+  targetProductId?: string | null;
+  targetVariantId?: string | null;
+  /**
+   * Which `enabledOfficialRolesOrdered` slot to fill on the variant.
+   * For Phase 2 model realism this is typically `model_back_designed`
+   * (back-printed garments) or `model_front_designed` (front-printed).
+   * Strings are the official role names from `blankProductImagePlan.js`.
+   */
+  officialRole?:
+    | "flat_back_designed"
+    | "flat_front_designed"
+    | "model_back_designed"
+    | "model_front_designed"
+    | "model_back_clean"
+    | "model_front_clean"
+    | "flat_back_clean"
+    | "flat_front_clean"
+    | null;
   /** When true, the trigger runs Stage A then Stage B; otherwise Stage A only. */
   withRealism: boolean;
 

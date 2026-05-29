@@ -114,6 +114,9 @@ const {
   hexToColorName,
   buildLetterMaskFromDesignRgba,
 } = require("./lib/blankPreviewRender");
+const {
+  buildEnqueueProductModelRealism,
+} = require("./lib/enqueueProductModelRealism");
 
 // Check if placeholder worker mode is enabled (default: true for safety)
 function usePlaceholderWorker() {
@@ -7452,6 +7455,18 @@ exports.onBlankPreviewJobCreated = functions
   .runWith({ memory: "2GB", timeoutSeconds: 540 })
   .firestore.document("rp_blank_preview_jobs/{jobId}")
   .onCreate(buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp: require("sharp") }));
+
+/**
+ * Phase 3: enqueue a model-realism render for a product variant. Wraps the
+ * Phase 2 `rp_blank_preview_jobs` flow with a product binding — when complete,
+ * the trigger writes the realism URL onto the variant's flatRenders slot.
+ *
+ * Input:  { productId, blankVariantId, view: "front" | "back", withRealism?, artworkMode? }
+ * Output: { jobId, status: "queued", officialRole }
+ */
+exports.enqueueProductModelRealism = functions.https.onCall(
+  buildEnqueueProductModelRealism({ db, admin, functions })
+);
 
 /**
  * Create a mock generation job

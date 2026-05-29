@@ -1334,6 +1334,20 @@ function buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp })
         designUrlOverride: typeof job.designUrlOverride === "string" ? job.designUrlOverride : null,
       };
 
+      /**
+       * Phase 3 product binding: when the job was queued by the production
+       * pipeline (`enqueueProductModelRealism` callable), it carries
+       * targetProductId + targetVariantId + officialRole. After Stage B
+       * completes we write the realism URL onto the variant's flatRenders
+       * slot — best-effort, never fails the job.
+       */
+      const targetProductId =
+        typeof job.targetProductId === "string" && job.targetProductId.trim() ? job.targetProductId.trim() : null;
+      const targetVariantId =
+        typeof job.targetVariantId === "string" && job.targetVariantId.trim() ? job.targetVariantId.trim() : null;
+      const officialRole =
+        typeof job.officialRole === "string" && job.officialRole.trim() ? job.officialRole.trim() : null;
+
       const stageAResult = await composeStageA({ db, storage, sharp, functions, input });
       await jobRef.update({ stageA: stageAResult.stageA, updatedAt: tick() });
       console.log(`[onBlankPreviewJobCreated] Job ${jobId} Stage A done`);
@@ -1366,6 +1380,57 @@ function buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp })
         });
         await jobRef.update({ stageB: stageBResult.stageB, updatedAt: tick() });
         console.log(`[onBlankPreviewJobCreated] Job ${jobId} Stage B done`);
+
+        /**
+         * Phase 3: best-effort write to product variant slot. Wrapped in its
+         * own try/catch so a missing product / variant / write conflict
+         * doesn't flip the job to failed — the preview file is still saved
+         * and the operator can manually re-bind if needed.
+         */
+        if (targetProductId && targetVariantId && officialRole && stageBResult.stageB && stageBResult.stageB.previewUrl) {
+          try {
+            const variantRef = db
+              .collection("rp_products")
+              .doc(targetProductId)
+              .collection("variants")
+              .doc(targetVariantId);
+            const variantSnap = await variantRef.get();
+            if (!variantSnap.exists) {
+              console.warn(
+                `[onBlankPreviewJobCreated] Job ${jobId}: product variant ${targetProductId}/${targetVariantId} not found, skipping write`
+              );
+            } else {
+              const existingFlatRenders = (variantSnap.data() || {}).flatRenders || {};
+              const merged = {
+                ...existingFlatRenders,
+                [officialRole]: {
+                  ...(existingFlatRenders[officialRole] || {}),
+                  url: stageBResult.stageB.previewUrl,
+                  storagePath: stageBResult.stageB.storagePath,
+                  width: stageBResult.stageB.width,
+                  height: stageBResult.stageB.height,
+                  bytes: stageBResult.stageB.bytes,
+                  source: "preview_render_realism",
+                  jobId,
+                  updatedAt: tick(),
+                },
+              };
+              await variantRef.update({
+                flatRenders: merged,
+                updatedAt: tick(),
+                updatedBy: "preview_render_trigger",
+              });
+              console.log(
+                `[onBlankPreviewJobCreated] Job ${jobId}: wrote ${officialRole} to ${targetProductId}/${targetVariantId}`
+              );
+            }
+          } catch (writeErr) {
+            console.error(
+              `[onBlankPreviewJobCreated] Job ${jobId}: product variant write failed:`,
+              writeErr && writeErr.message ? writeErr.message : writeErr
+            );
+          }
+        }
       }
 
       await jobRef.update({ status: "completed", updatedAt: tick() });
