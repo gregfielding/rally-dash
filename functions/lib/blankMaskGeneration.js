@@ -24,9 +24,22 @@ const DEFAULT_SAM_ENDPOINT = "fal-ai/evf-sam";
  * SAM-family models segment by concrete nouns, not anatomical region descriptions.
  * "chest panel inside seams" returned empty masks; "chest" / "upper back" land on
  * the garment torso reliably for EVF-SAM. Operators can override per-call.
+ *
+ * Model-pose prompts target the visible garment area on the model body rather
+ * than a generic "chest" because on a model the torso includes skin, hair, and
+ * background that we don't want included.
  */
 const DEFAULT_PROMPT_FRONT = "chest";
 const DEFAULT_PROMPT_BACK = "upper back";
+const DEFAULT_PROMPT_MODEL_FRONT = "shirt front, the visible fabric on the chest";
+const DEFAULT_PROMPT_MODEL_BACK = "shirt back, the visible fabric on the back";
+
+const VALID_RENDER_TARGETS = new Set([
+  "flat_front",
+  "flat_back",
+  "model_front",
+  "model_back",
+]);
 const FAL_QUEUE_BASE = "https://queue.fal.run";
 const MAX_POLL_ATTEMPTS = 30;
 const POLL_INTERVAL_MS = 2000;
@@ -64,7 +77,29 @@ async function assertAdmin(db, functions, uid) {
   }
 }
 
-function pickRefImageUrl(blank, view) {
+/**
+ * Pick the image URL the SAM endpoint will segment.
+ *
+ * - `flat_front` / `flat_back`: shared across colors — try the blank's top-level
+ *   image, then fall back to any variant's flat photo. Same as the legacy behavior.
+ * - `model_front` / `model_back`: per-variant — must read the specific
+ *   `variant.images.modelFront/Back`. variantId is required; no fallback to
+ *   another variant (each model photo has unique geometry).
+ */
+function pickRefImageUrl(blank, view, renderTarget, variantId) {
+  const target = renderTarget || `flat_${view}`;
+  if (target === "model_front" || target === "model_back") {
+    if (!variantId) return null;
+    const variant = Array.isArray(blank && blank.variants)
+      ? blank.variants.find((v) => v && v.variantId === variantId)
+      : null;
+    if (!variant) return null;
+    const im = variant.images || {};
+    const ref = target === "model_front" ? im.modelFront : im.modelBack;
+    return ref && ref.downloadUrl ? String(ref.downloadUrl) : null;
+  }
+
+  /** Flat path (unchanged from legacy). */
   const direct = blank && blank.images && blank.images[view];
   if (direct && direct.downloadUrl) return String(direct.downloadUrl);
   if (Array.isArray(blank && blank.variants)) {
@@ -75,6 +110,40 @@ function pickRefImageUrl(blank, view) {
     }
   }
   return null;
+}
+
+/**
+ * Build the canonical storage prefix + doc id for a (blank, view, renderTarget,
+ * variantId?) tuple. Flat masks keep their legacy `{blankId}/{view}` layout so
+ * existing files and docs continue to resolve; model masks use a richer key.
+ */
+function maskKeyFor(blankId, view, renderTarget, variantId) {
+  const target = renderTarget || `flat_${view}`;
+  if (target === "model_front" || target === "model_back") {
+    if (!variantId) {
+      throw new Error(`maskKeyFor: variantId is required for renderTarget="${target}"`);
+    }
+    return {
+      docId: `${blankId}_${variantId}_${target}`,
+      storageDir: `rp/blank_masks/${blankId}/${variantId}/${target}`,
+    };
+  }
+  return {
+    docId: `${blankId}_${view}`,
+    storageDir: `rp/blank_masks/${blankId}/${view}`,
+  };
+}
+
+/**
+ * Pick the default SAM prompt for a render target. Operators can override per
+ * call but the default matches what EVF-SAM expects to land cleanly.
+ */
+function defaultPromptFor(renderTarget, view) {
+  const target = renderTarget || `flat_${view}`;
+  if (target === "model_front") return DEFAULT_PROMPT_MODEL_FRONT;
+  if (target === "model_back") return DEFAULT_PROMPT_MODEL_BACK;
+  if (target === "flat_back") return DEFAULT_PROMPT_BACK;
+  return DEFAULT_PROMPT_FRONT;
 }
 
 /**
@@ -197,12 +266,39 @@ function buildGenerateBlankMaskViaSam({ db, storage, functions, sharp }) {
   return async (data, context) => {
     await assertAdmin(db, functions, context && context.auth && context.auth.uid);
 
-    const { blankId, view, prompt: promptIn, seed: seedIn } = data || {};
+    const {
+      blankId,
+      view,
+      renderTarget: renderTargetIn,
+      variantId: variantIdIn,
+      prompt: promptIn,
+      seed: seedIn,
+    } = data || {};
     if (!blankId || typeof blankId !== "string") {
       throw new functions.https.HttpsError("invalid-argument", "blankId is required");
     }
     if (view !== "front" && view !== "back") {
       throw new functions.https.HttpsError("invalid-argument", "view must be 'front' or 'back'");
+    }
+
+    /**
+     * `renderTarget` is optional for backward compat — when omitted, default to
+     * the legacy flat path so existing UI callers keep working.
+     */
+    const renderTarget = renderTargetIn || `flat_${view}`;
+    if (!VALID_RENDER_TARGETS.has(renderTarget)) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        `renderTarget must be one of ${[...VALID_RENDER_TARGETS].join(", ")}`
+      );
+    }
+    const isModelTarget = renderTarget === "model_front" || renderTarget === "model_back";
+    const variantId = variantIdIn && typeof variantIdIn === "string" ? variantIdIn.trim() : null;
+    if (isModelTarget && !variantId) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        `variantId is required for renderTarget="${renderTarget}" (each color's model photo gets its own mask)`
+      );
     }
 
     const falApiKey = getFalApiKey(functions);
@@ -216,12 +312,12 @@ function buildGenerateBlankMaskViaSam({ db, storage, functions, sharp }) {
     }
     const blank = blankSnap.data();
 
-    const refImageUrl = pickRefImageUrl(blank, view);
+    const refImageUrl = pickRefImageUrl(blank, view, renderTarget, variantId);
     if (!refImageUrl) {
-      throw new functions.https.HttpsError(
-        "failed-precondition",
-        `Blank has no ${view} reference image — upload one (Identity tab) or add a variant photo first`
-      );
+      const detail = isModelTarget
+        ? `variant ${variantId} has no ${renderTarget === "model_front" ? "modelFront" : "modelBack"} image — upload one on the Identity tab first`
+        : `Blank has no ${view} reference image — upload one (Identity tab) or add a variant photo first`;
+      throw new functions.https.HttpsError("failed-precondition", detail);
     }
 
     const refImageResp = await fetch(refImageUrl);
@@ -236,9 +332,7 @@ function buildGenerateBlankMaskViaSam({ db, storage, functions, sharp }) {
 
     const prompt = typeof promptIn === "string" && promptIn.trim().length > 0
       ? promptIn.trim()
-      : view === "front"
-        ? DEFAULT_PROMPT_FRONT
-        : DEFAULT_PROMPT_BACK;
+      : defaultPromptFor(renderTarget, view);
     const seed = Number.isFinite(Number(seedIn)) ? Number(seedIn) : Math.floor(Math.random() * 1e9);
 
     const endpoint = getSamEndpoint(functions);
@@ -265,7 +359,8 @@ function buildGenerateBlankMaskViaSam({ db, storage, functions, sharp }) {
     }
 
     const timestamp = Date.now();
-    const previewStoragePath = `rp/blank_masks/${blankId}/${view}/_ai_preview_${timestamp}.png`;
+    const { storageDir } = maskKeyFor(blankId, view, renderTarget, variantId);
+    const previewStoragePath = `${storageDir}/_ai_preview_${timestamp}.png`;
     const bucket = storage.bucket();
     const fileRef = bucket.file(previewStoragePath);
     await fileRef.save(normalizedBuffer, {
@@ -293,6 +388,9 @@ function buildGenerateBlankMaskViaSam({ db, storage, functions, sharp }) {
       seed,
       meanGrayscale: Math.round(meanGrayscale),
       endpoint,
+      /** Echoed so the client can pass them straight back to commit without re-deriving. */
+      renderTarget,
+      variantId,
     };
   };
 }
@@ -302,7 +400,15 @@ function buildCommitBlankMaskFromPreview({ db, admin, storage, functions, sharp 
     await assertAdmin(db, functions, context && context.auth && context.auth.uid);
     const uid = context.auth.uid;
 
-    const { blankId, view, previewMaskStoragePath, prompt, seed } = data || {};
+    const {
+      blankId,
+      view,
+      renderTarget: renderTargetIn,
+      variantId: variantIdIn,
+      previewMaskStoragePath,
+      prompt,
+      seed,
+    } = data || {};
     if (!blankId || typeof blankId !== "string") {
       throw new functions.https.HttpsError("invalid-argument", "blankId is required");
     }
@@ -312,16 +418,33 @@ function buildCommitBlankMaskFromPreview({ db, admin, storage, functions, sharp 
     if (!previewMaskStoragePath || typeof previewMaskStoragePath !== "string") {
       throw new functions.https.HttpsError("invalid-argument", "previewMaskStoragePath is required");
     }
-    /**
-     * Guard against a caller passing an unrelated Storage path. The preview must live under
-     * the blank+view's mask directory and use the `_ai_preview_` filename prefix produced by
-     * `generateBlankMaskViaSam`.
-     */
-    const expectedPrefix = `rp/blank_masks/${blankId}/${view}/_ai_preview_`;
-    if (!previewMaskStoragePath.startsWith(expectedPrefix)) {
+    const renderTarget = renderTargetIn || `flat_${view}`;
+    if (!VALID_RENDER_TARGETS.has(renderTarget)) {
       throw new functions.https.HttpsError(
         "invalid-argument",
-        "previewMaskStoragePath does not match this blank/view"
+        `renderTarget must be one of ${[...VALID_RENDER_TARGETS].join(", ")}`
+      );
+    }
+    const isModelTarget = renderTarget === "model_front" || renderTarget === "model_back";
+    const variantId = variantIdIn && typeof variantIdIn === "string" ? variantIdIn.trim() : null;
+    if (isModelTarget && !variantId) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        `variantId is required for renderTarget="${renderTarget}"`
+      );
+    }
+
+    /**
+     * Build the canonical paths + doc id once via the same helper used by the
+     * generator so the preview path guard, canonical save location, and Firestore
+     * doc id all stay in lockstep.
+     */
+    const { docId: maskDocId, storageDir } = maskKeyFor(blankId, view, renderTarget, variantId);
+    const expectedPreviewPrefix = `${storageDir}/_ai_preview_`;
+    if (!previewMaskStoragePath.startsWith(expectedPreviewPrefix)) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        `previewMaskStoragePath does not match expected directory for this (blankId, view, renderTarget, variantId)`
       );
     }
 
@@ -332,7 +455,7 @@ function buildCommitBlankMaskFromPreview({ db, admin, storage, functions, sharp 
       throw new functions.https.HttpsError("not-found", "Preview file not found in Storage");
     }
 
-    const canonicalStoragePath = `rp/blank_masks/${blankId}/${view}/mask.png`;
+    const canonicalStoragePath = `${storageDir}/mask.png`;
     const canonicalFile = bucket.file(canonicalStoragePath);
 
     const [bytes] = await previewFile.download();
@@ -348,7 +471,6 @@ function buildCommitBlankMaskFromPreview({ db, admin, storage, functions, sharp 
     });
     const downloadUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(canonicalStoragePath)}?alt=media&token=${downloadToken}`;
 
-    const maskDocId = `${blankId}_${view}`;
     const maskDocRef = db.collection("rp_blank_masks").doc(maskDocId);
     const existingSnap = await maskDocRef.get();
     const now = admin.firestore.FieldValue.serverTimestamp();
@@ -356,6 +478,8 @@ function buildCommitBlankMaskFromPreview({ db, admin, storage, functions, sharp 
       id: maskDocId,
       blankId,
       view,
+      renderTarget,
+      variantId: isModelTarget ? variantId : null,
       mask: {
         storagePath: canonicalStoragePath,
         downloadUrl,
@@ -389,6 +513,8 @@ function buildCommitBlankMaskFromPreview({ db, admin, storage, functions, sharp 
       source: "ai_sam",
       aiPrompt: docPayload.aiPrompt,
       aiSeed: docPayload.aiSeed,
+      renderTarget,
+      variantId: docPayload.variantId,
     };
   };
 }
@@ -396,7 +522,13 @@ function buildCommitBlankMaskFromPreview({ db, admin, storage, functions, sharp 
 module.exports = {
   buildGenerateBlankMaskViaSam,
   buildCommitBlankMaskFromPreview,
+  pickRefImageUrl,
+  maskKeyFor,
+  defaultPromptFor,
+  VALID_RENDER_TARGETS,
   DEFAULT_SAM_ENDPOINT,
   DEFAULT_PROMPT_FRONT,
   DEFAULT_PROMPT_BACK,
+  DEFAULT_PROMPT_MODEL_FRONT,
+  DEFAULT_PROMPT_MODEL_BACK,
 };

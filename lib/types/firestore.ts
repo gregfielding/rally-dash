@@ -3559,13 +3559,52 @@ export type RPBlankMaskMode = "inpaint" | "control";
  */
 export type RPBlankMaskSource = "manual_upload" | "ai_sam" | "auto_safearea";
 
-// Blank mask document (rp_blank_masks/{blankId}_{view})
-// One document per blank + view combination
+/**
+ * Which rendering surface this mask is for.
+ *
+ * - `flat_front` / `flat_back` — the catalog flat photo of the garment (one mask per
+ *   blank, shared across all colors). Same geometry as the legacy
+ *   `{blankId}_{view}` doc id.
+ * - `model_front` / `model_back` — a specific model photo (different per color +
+ *   pose, because each variant's model shot has a unique silhouette). Requires
+ *   `variantId` so the AI mask generator can read `variant.images.modelFront/Back`.
+ *
+ * Legacy mask docs lack this field; treat as `flat_<view>`.
+ */
+export type RPBlankMaskRenderTarget =
+  | "flat_front"
+  | "flat_back"
+  | "model_front"
+  | "model_back";
+
+// Blank mask document.
+//
+// Doc id patterns:
+//   - Flat mask (one per blank+view, shared across colors):
+//       `{blankId}_{view}`
+//   - Model-pose mask (one per blank+variant+pose, because each color has a
+//     distinct model photo):
+//       `{blankId}_{variantId}_{model_front|model_back}`
+//
+// The flat form is preserved verbatim so existing flat masks keep working.
 export interface RPBlankMask {
-  id: string;                     // e.g. "abc123_front"
+  id: string;                     // e.g. "abc123_front" or "abc123_var-id_model_front"
 
   blankId: string;                // FK to rp_blanks
   view: "front" | "back";
+
+  /**
+   * Surface this mask is for. Optional for backward compat — when omitted, treat
+   * as `flat_<view>`. New writes always set it explicitly.
+   */
+  renderTarget?: RPBlankMaskRenderTarget;
+
+  /**
+   * Required when `renderTarget` starts with `model_`. Identifies which variant
+   * (color) the model photo belongs to so the renderer can pair mask ↔ photo.
+   * Null/missing for flat masks.
+   */
+  variantId?: string | null;
 
   mask: RPImageRef;               // PNG mask file (white = editable, black = protected)
 
