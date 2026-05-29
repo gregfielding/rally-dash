@@ -600,12 +600,7 @@ function filterServerDescriptor(desc) {
   return { ok: true };
 }
 
-/**
- * Style codes whose downstream render/composite pipeline is wired today.
- * Used to flag `pipelineReady` on availableBlanks so the bulk-upload UI can
- * disable the others. Update this as new pipelines land.
- */
-const PIPELINE_READY_STYLE_CODES = new Set(["8394"]);
+const { isPipelineReadyStyleCode } = require("./pipelineReadiness");
 
 /**
  * @param {Array<{originalFilename: string, storagePath: string, ext: string, size: number, contentType?: string}>} descriptors
@@ -629,7 +624,7 @@ function buildPreviewItems(descriptors, designRows, teamRows, masterBlanks, opti
       styleCode,
       name: b.name || b.productName || null,
       category: b.category || null,
-      pipelineReady: PIPELINE_READY_STYLE_CODES.has(styleCode),
+      pipelineReady: isPipelineReadyStyleCode(styleCode),
     };
   });
   const parseFailures = [];

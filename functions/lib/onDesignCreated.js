@@ -1,6 +1,7 @@
 "use strict";
 
 const { launchProductsFromDesign } = require("./launchProductsFromDesign");
+const { isPipelineReadyStyleCode } = require("./pipelineReadiness");
 
 /**
  * Phase 2: auto-launch products on design create / asset-attach.
@@ -126,17 +127,15 @@ function buildOnDesignCreated(deps) {
     // (a) operator's per-design picker selection (`design.targetBlankIds`), if present, and
     // (b) the pipeline-ready safety gate (currently styleCode==="8394" only — see below).
     //
-    // **Pipeline-ready gate:** `startInitialProductAssetBatch` returns
-    // `skipped: not_8394` for any blank whose styleCode is not "8394" (panty). The other
-    // master blanks (8390 thong, TR3008 tank, HF07 crewneck) have catalog entries but no
-    // asset-generation pipeline — auto-launching them would create products stuck at
-    // `launchStatus: generating_assets` forever. When new pipelines land, broaden this set.
+    // **Pipeline-ready gate** — driven by `functions/lib/pipelineReadiness.js`,
+    // the same registry the bulk-upload preview engine + asset-batch starter use.
+    // Until a blank's renderer is wired, this filter keeps it out of auto-launch
+    // so we never spawn products that would stall at `generating_assets` forever.
     //
-    // The picker on the bulk-upload review screen already disables non-pipeline-ready
-    // blanks, so `targetBlankIds` should never include them — but we double-gate here so
-    // a bypassed UI cannot spawn dead stubs.
-    const PIPELINE_READY_STYLE_CODES = new Set(["8394"]);
-
+    // The picker on the bulk-upload review screen also reads this registry and
+    // disables non-pipeline-ready blanks, so `targetBlankIds` should never
+    // include them — but we double-gate here so a bypassed UI cannot spawn
+    // dead stubs.
     const blanksSnap = await db
       .collection("rp_blanks")
       .where("status", "==", "active")
@@ -146,7 +145,7 @@ function buildOnDesignCreated(deps) {
       .filter(
         (b) =>
           Number(b.data.schemaVersion) === MASTER_BLANK_SCHEMA_VERSION &&
-          PIPELINE_READY_STYLE_CODES.has(String(b.data.styleCode || "").trim())
+          isPipelineReadyStyleCode(b.data.styleCode)
       );
 
     const targetBlankIds = Array.isArray(after.targetBlankIds)

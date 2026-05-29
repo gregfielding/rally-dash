@@ -1,6 +1,7 @@
 "use strict";
 
 const { LEGACY_DEFAULT_ASSET_PLAN, resolveBlankProductImagePlan } = require("./defaultAssetPlan");
+const { isPipelineReadyStyleCode } = require("./pipelineReadiness");
 const { resolvePrintSidesForProductBuild } = require("./resolveDefaultPrintSides");
 const { createCreateGenerationJob } = require("./createGenerationJobCore");
 const { resolveModelIdentity } = require("./resolveModelIdentity");
@@ -91,11 +92,18 @@ async function startInitialProductAssetBatch(ctx) {
     return { ok: false, code: "not_found", message: "Blank not found" };
   }
   const blank = blankSnap.data();
-  if (String(blank.styleCode || "").trim() !== "8394") {
+  /**
+   * Pipeline-ready gate (see functions/lib/pipelineReadiness.js).
+   * Only blanks whose downstream renderer is wired today can queue an asset
+   * batch. Until a blank is flipped to `pipelineReady: true` in the registry,
+   * this returns a clear skip reason so the bulk-upload picker (which uses the
+   * same registry) and this trigger agree.
+   */
+  if (!isPipelineReadyStyleCode(blank.styleCode)) {
     return {
       ok: true,
       skipped: true,
-      reason: "not_8394",
+      reason: `pipeline_not_ready_for_styleCode_${String(blank.styleCode || "").trim() || "unknown"}`,
       productId,
       assetsStatus: product.assetsStatus || "idle",
       assetsBatchId: product.assetsBatchId || null,
