@@ -49,12 +49,20 @@ const PIPELINE_CONFIG_BY_STYLE_CODE = {
   "8390": {
     styleCode: "8390",
     displayName: "Thong Panty (LA Apparel)",
-    pipelineReady: false,
+    pipelineReady: true,
     requiresWarp: true,
     requiresMask: true,
     supportedSides: ["front", "back"],
-    blockingGaps:
-      "Mask missing for 8390 variants; warp helper currently 8394-shape-specific; scene presets not configured.",
+    /**
+     * Activated 2026-05-27. The `applyDesignWarp8394` helper is named after
+     * 8394 but the math (affine + scale) is generic and config-driven — it
+     * early-exits when `warp.enabled` is false. Operator should:
+     *   - Generate a mask per variant via the Blanks editor for clean edges
+     *   - Tune per-variant warp values (warpStrength / verticalStretch /
+     *     horizontalWarp) in the Blank Render Profile editor; the thong's
+     *     curved geometry typically wants different values than the panty
+     *   - Configure scene presets for model composites (flat works without)
+     */
   },
   TR3008: {
     styleCode: "TR3008",
@@ -79,12 +87,16 @@ const PIPELINE_CONFIG_BY_STYLE_CODE = {
   HF07: {
     styleCode: "HF07",
     displayName: "Heavy Fleece Crewneck (LA Apparel)",
-    pipelineReady: false,
+    pipelineReady: true,
     requiresWarp: false,
     requiresMask: true,
     supportedSides: ["front", "back"],
-    blockingGaps:
-      "Mask missing for HF07 variants; renderer needs requiresWarp:false branch (skip applyDesignWarp8394); scene presets not configured.",
+    /**
+     * Activated 2026-05-27. Same approach as TR3008 — flat garment, warp
+     * step early-exits via per-render config, generic sharp pipeline runs.
+     * Operator should generate per-variant masks and tune per-color render
+     * params via the editor.
+     */
   },
 };
 
