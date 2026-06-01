@@ -116,6 +116,7 @@ const {
 } = require("./lib/blankPreviewRender");
 const {
   buildEnqueueProductModelRealism,
+  buildEnqueueProductModelRealismBatch,
 } = require("./lib/enqueueProductModelRealism");
 
 // Check if placeholder worker mode is enabled (default: true for safety)
@@ -7467,6 +7468,18 @@ exports.onBlankPreviewJobCreated = functions
 exports.enqueueProductModelRealism = functions.https.onCall(
   buildEnqueueProductModelRealism({ db, admin, functions })
 );
+
+/**
+ * Phase 3e: fan-out — one click on the product page enqueues a model-realism
+ * render per (color, side with a model photo). Returns the list of jobs +
+ * skipped (color, side) combos so the UI can show aggregate progress.
+ *
+ * Input:  { productId, sides?, withRealism?, artworkMode? }
+ * Output: { jobs: [...], skipped: [...] }
+ */
+exports.enqueueProductModelRealismBatch = functions
+  .runWith({ memory: "512MB", timeoutSeconds: 60 })
+  .https.onCall(buildEnqueueProductModelRealismBatch({ db, admin, functions }));
 
 /**
  * Create a mock generation job

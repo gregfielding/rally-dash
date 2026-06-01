@@ -28,6 +28,7 @@ import { useGenerationJobs } from "@/lib/hooks/useRPGenerationJobs";
 import { useScenePresets } from "@/lib/hooks/useRPScenePresets";
 import {
   useEnqueueProductModelRealism,
+  useEnqueueProductModelRealismBatch,
   useGenerateProductAssets,
   useGenerateProductFlatRenders,
   useGenerateProductSceneRender,
@@ -2393,6 +2394,98 @@ function ProductDetailContent() {
   const { generateProductAssets } = useGenerateProductAssets();
   const { generateProductFlatRenders } = useGenerateProductFlatRenders();
   const { enqueueProductModelRealism } = useEnqueueProductModelRealism();
+  const { enqueueProductModelRealismBatch } = useEnqueueProductModelRealismBatch();
+  /**
+   * Phase 3e fan-out state. Tracks all jobs spawned by the batch button so we
+   * can show aggregate progress (X / Y rendered) and a per-job status grid.
+   * Job ids are also pushed into `modelRealismJobs` so the per-color buttons
+   * stay in sync (avoid double-firing).
+   */
+  const [batchState, setBatchState] = useState<{
+    inFlight: boolean;
+    jobs: { jobId: string; productVariantId: string; view: "front" | "back"; status: string; error?: string | null }[];
+    skipped: { productVariantId: string; view: "front" | "back"; reason: string }[];
+    error: string | null;
+  }>({ inFlight: false, jobs: [], skipped: [], error: null });
+  const batchUnsubsRef = useRef<Record<string, () => void>>({});
+  useEffect(() => {
+    return () => {
+      for (const u of Object.values(batchUnsubsRef.current)) {
+        try { u(); } catch { /* ignore */ }
+      }
+      batchUnsubsRef.current = {};
+    };
+  }, []);
+  const handleEnqueueModelRealismBatch = useCallback(
+    async (sides: ("front" | "back")[] = ["front", "back"]) => {
+      if (!product?.id) return;
+      setBatchState((s) => ({ ...s, inFlight: true, error: null }));
+      try {
+        const out = await enqueueProductModelRealismBatch({ productId: product.id, sides });
+        setBatchState({
+          inFlight: false,
+          jobs: out.jobs.map((j) => ({
+            jobId: j.jobId,
+            productVariantId: j.productVariantId,
+            view: j.view,
+            status: "queued",
+          })),
+          skipped: out.skipped,
+          error: null,
+        });
+        /** Mirror into per-color state so per-color buttons reflect in-flight jobs. */
+        setModelRealismJobs((prev) => {
+          const next = { ...prev };
+          for (const j of out.jobs) {
+            next[j.productVariantId] = {
+              ...next[j.productVariantId],
+              [j.view]: { jobId: j.jobId, status: "queued", error: null },
+            };
+          }
+          return next;
+        });
+        /** Subscribe to every job doc; aggregate counters update as they complete. */
+        if (db) {
+          for (const j of out.jobs) {
+            const subKey = `batch:${j.jobId}`;
+            const prev = batchUnsubsRef.current[subKey];
+            if (prev) { try { prev(); } catch { /* ignore */ } }
+            const unsub = onSnapshot(
+              doc(db, "rp_blank_preview_jobs", j.jobId),
+              (snap) => {
+                if (!snap.exists()) return;
+                const jd = snap.data() as { status?: string; error?: string | null };
+                setBatchState((cur) => ({
+                  ...cur,
+                  jobs: cur.jobs.map((x) =>
+                    x.jobId === j.jobId
+                      ? { ...x, status: jd.status || x.status, error: jd.error ?? null }
+                      : x
+                  ),
+                }));
+                setModelRealismJobs((prev) => ({
+                  ...prev,
+                  [j.productVariantId]: {
+                    ...prev[j.productVariantId],
+                    [j.view]: { jobId: j.jobId, status: jd.status || "queued", error: jd.error ?? null },
+                  },
+                }));
+                if (jd.status === "completed" || jd.status === "failed") {
+                  const u = batchUnsubsRef.current[subKey];
+                  if (u) { try { u(); } catch { /* ignore */ } delete batchUnsubsRef.current[subKey]; }
+                }
+              }
+            );
+            batchUnsubsRef.current[subKey] = unsub;
+          }
+        }
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setBatchState({ inFlight: false, jobs: [], skipped: [], error: msg });
+      }
+    },
+    [product?.id, enqueueProductModelRealismBatch]
+  );
   /**
    * Per-color model-realism state: which job is in flight for which side, and
    * the latest doc snapshot for progress display. Map key is the product
@@ -5249,6 +5342,90 @@ function ProductDetailContent() {
                   <p className="text-sm text-gray-500">Loading variants…</p>
                 ) : productVariants.length > 0 ? (
                   <div className="space-y-3 max-w-xl">
+                    {/**
+                     * Phase 3e: batch fan-out for model realism. Single button
+                     * enqueues every (color, side) with a model photo via the
+                     * `enqueueProductModelRealismBatch` callable. Aggregate
+                     * progress (X / Y rendered) updates live via the per-job
+                     * onSnapshot subscriptions.
+                     */}
+                    {(() => {
+                      const total = batchState.jobs.length;
+                      const completed = batchState.jobs.filter((j) => j.status === "completed").length;
+                      const failed = batchState.jobs.filter((j) => j.status === "failed").length;
+                      const running = batchState.jobs.filter(
+                        (j) => j.status === "queued" || j.status === "processing"
+                      ).length;
+                      const allDone = total > 0 && completed + failed === total;
+                      return (
+                        <div className="rounded-md border border-purple-200 bg-purple-50/60 px-3 py-2 text-xs text-purple-950">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <p className="font-medium text-purple-900">Model realism — all colors</p>
+                              <p className="text-purple-800/90 mt-0.5">
+                                One click runs Flux Fill for every color × side with a model photo.
+                                Each render takes ~30s and costs $ per call.
+                              </p>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                disabled={batchState.inFlight || running > 0}
+                                onClick={() => void handleEnqueueModelRealismBatch(["front", "back"])}
+                                className="px-3 py-1.5 text-xs font-semibold rounded-md bg-purple-700 text-white hover:bg-purple-800 disabled:opacity-50"
+                                title="Enqueue model_front + model_back renders for every variant with a model photo"
+                              >
+                                {batchState.inFlight ? "Enqueueing…" : running > 0 ? `Running ${running}…` : "✨ Generate all"}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={batchState.inFlight || running > 0}
+                                onClick={() => void handleEnqueueModelRealismBatch(["back"])}
+                                className="px-3 py-1.5 text-xs font-semibold rounded-md bg-white border border-purple-300 text-purple-900 hover:bg-purple-100 disabled:opacity-50"
+                                title="Back-only: enqueue model_back renders for every variant with a model_back photo"
+                              >
+                                Back only
+                              </button>
+                            </div>
+                          </div>
+                          {total > 0 ? (
+                            <div className="mt-2">
+                              <div className="h-1.5 w-full rounded-full bg-purple-200 overflow-hidden">
+                                <div
+                                  className="h-full bg-purple-700 transition-all"
+                                  style={{ width: `${total > 0 ? Math.round((completed / total) * 100) : 0}%` }}
+                                />
+                              </div>
+                              <p className="text-[11px] text-purple-800 mt-1">
+                                {completed} / {total} rendered
+                                {failed > 0 ? ` · ${failed} failed` : ""}
+                                {running > 0 ? ` · ${running} running` : ""}
+                                {allDone && failed === 0 ? " · all done ✓" : ""}
+                              </p>
+                            </div>
+                          ) : null}
+                          {batchState.skipped.length > 0 ? (
+                            <details className="mt-1.5">
+                              <summary className="cursor-pointer text-[10px] text-purple-800/80">
+                                {batchState.skipped.length} skipped (click to view)
+                              </summary>
+                              <ul className="text-[10px] text-purple-800/80 mt-1 space-y-0.5 max-h-32 overflow-y-auto">
+                                {batchState.skipped.map((s, i) => (
+                                  <li key={i} className="font-mono">
+                                    {s.productVariantId.slice(0, 6)}… {s.view} — {s.reason}
+                                  </li>
+                                ))}
+                              </ul>
+                            </details>
+                          ) : null}
+                          {batchState.error ? (
+                            <p className="text-[10px] text-red-700 mt-1 font-mono break-all">
+                              {batchState.error}
+                            </p>
+                          ) : null}
+                        </div>
+                      );
+                    })()}
                     <div className="flex flex-wrap items-center gap-3">
                       <label className="block flex-1 min-w-[12rem]">
                         <span className="sr-only">Variant</span>

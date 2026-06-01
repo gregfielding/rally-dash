@@ -223,8 +223,174 @@ function buildEnqueueProductModelRealism({ db, admin, functions }) {
   };
 }
 
+/**
+ * Phase 3e: fan-out batch wrapper. Loads the product's variants once and
+ * inspects each variant's blank-variant row to decide which (color, side)
+ * combinations actually have a model photo, then queues one preview job per
+ * eligible combination.
+ *
+ * Skip reasons (returned alongside successful jobs, never throws):
+ *   - "no_blank_variant_id"     product variant doc has no blankVariantId
+ *   - "blank_variant_not_found" the blank's variants[] no longer has this id
+ *   - "no_model_photo"          variant has no modelFront / modelBack for that side
+ *   - "duplicate_color"         already enqueued for that color (dedupes by blankVariantId+side)
+ *
+ * Input:  { productId, sides?: ["front"|"back"], withRealism?, artworkMode? }
+ * Output: { jobs: [{ productVariantId, blankVariantId, view, jobId, officialRole }],
+ *           skipped: [{ productVariantId, view, reason }] }
+ *
+ * Default `sides` = ["front", "back"]. Pass `["back"]` for back-print-only
+ * blanks to avoid queueing front renders.
+ */
+function buildEnqueueProductModelRealismBatch({ db, admin, functions }) {
+  return async (data, context) => {
+    if (!context.auth) {
+      throw new functions.https.HttpsError("unauthenticated", "Sign-in required");
+    }
+    const { productId, sides: sidesIn, withRealism: withRealismIn, artworkMode: artworkModeIn } = data || {};
+    if (!productId || typeof productId !== "string") {
+      throw new functions.https.HttpsError("invalid-argument", "productId is required");
+    }
+    const sides = Array.isArray(sidesIn) && sidesIn.length > 0
+      ? sidesIn.filter((s) => s === "front" || s === "back")
+      : ["front", "back"];
+    if (sides.length === 0) {
+      throw new functions.https.HttpsError("invalid-argument", "sides must include 'front' and/or 'back'");
+    }
+    const withRealism = withRealismIn === false ? false : true;
+    const artworkMode =
+      artworkModeIn === "dark" || artworkModeIn === "white" ? artworkModeIn : "light";
+
+    /** Load product, blank, design once. */
+    const productRef = db.collection("rp_products").doc(productId);
+    const productSnap = await productRef.get();
+    if (!productSnap.exists) {
+      throw new functions.https.HttpsError("not-found", `Product ${productId} not found`);
+    }
+    const product = productSnap.data() || {};
+    const designId =
+      (product.designId && String(product.designId).trim()) ||
+      (product.designIdBack && String(product.designIdBack).trim()) ||
+      (product.designIdFront && String(product.designIdFront).trim()) ||
+      null;
+    const blankId = product.blankId && String(product.blankId).trim();
+    if (!designId || !blankId) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        `Product ${productId} missing designId or blankId`
+      );
+    }
+    const blankSnap = await db.collection("rp_blanks").doc(blankId).get();
+    if (!blankSnap.exists) {
+      throw new functions.https.HttpsError("not-found", `Blank ${blankId} not found`);
+    }
+    const blank = blankSnap.data() || {};
+    const blankVariants = Array.isArray(blank.variants) ? blank.variants : [];
+    const blankVariantById = new Map();
+    for (const v of blankVariants) {
+      if (v && v.variantId) blankVariantById.set(v.variantId, v);
+    }
+
+    /** Load product variants and filter for primary-per-color (avoid 5 size duplicates per color). */
+    const productVariantsSnap = await productRef.collection("variants").get();
+    const variants = productVariantsSnap.docs;
+    /**
+     * Pick one product-variant per blankVariantId — render-once-per-color, the
+     * size variants inherit media. Matches the same primary-per-color choice
+     * startInitialProductAssetBatch makes (M when present, else first sort).
+     */
+    const byColor = new Map();
+    for (const d of variants) {
+      const v = d.data() || {};
+      const bk = v.blankVariantId && String(v.blankVariantId).trim();
+      if (!bk) continue;
+      const sz = v.optionValues && v.optionValues.size ? String(v.optionValues.size) : "";
+      const existing = byColor.get(bk);
+      if (!existing) {
+        byColor.set(bk, { doc: d, size: sz });
+      } else if (sz === "M" && existing.size !== "M") {
+        byColor.set(bk, { doc: d, size: sz });
+      }
+    }
+
+    const jobs = [];
+    const skipped = [];
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    for (const [blankVariantId, entry] of byColor.entries()) {
+      const blankVariant = blankVariantById.get(blankVariantId);
+      if (!blankVariant) {
+        for (const view of sides) {
+          skipped.push({
+            productVariantId: entry.doc.id,
+            blankVariantId,
+            view,
+            reason: "blank_variant_not_found",
+          });
+        }
+        continue;
+      }
+      const im = blankVariant.images || {};
+      for (const view of sides) {
+        const photo = view === "front" ? im.modelFront : im.modelBack;
+        if (!photo || !photo.downloadUrl) {
+          skipped.push({
+            productVariantId: entry.doc.id,
+            blankVariantId,
+            view,
+            reason: "no_model_photo",
+          });
+          continue;
+        }
+        const renderTarget = VIEW_TO_RENDER_TARGET[view];
+        const officialRole = VIEW_TO_OFFICIAL_ROLE[view];
+        const placement = resolvePlacementForVariant(blank, blankVariant, renderTarget);
+        try {
+          const jobRef = await db.collection("rp_blank_preview_jobs").add({
+            blankId,
+            variantId: blankVariantId,
+            designId,
+            view,
+            renderTarget,
+            artworkMode,
+            placement,
+            withRealism,
+            status: "queued",
+            error: null,
+            stageA: null,
+            stageB: null,
+            targetProductId: productId,
+            targetVariantId: entry.doc.id,
+            officialRole,
+            createdAt: now,
+            createdByUid: context.auth.uid,
+            updatedAt: now,
+          });
+          jobs.push({
+            productVariantId: entry.doc.id,
+            blankVariantId,
+            view,
+            jobId: jobRef.id,
+            officialRole,
+          });
+        } catch (writeErr) {
+          skipped.push({
+            productVariantId: entry.doc.id,
+            blankVariantId,
+            view,
+            reason: `enqueue_failed: ${writeErr && writeErr.message ? writeErr.message : String(writeErr)}`,
+          });
+        }
+      }
+    }
+
+    return { jobs, skipped };
+  };
+}
+
 module.exports = {
   buildEnqueueProductModelRealism,
+  buildEnqueueProductModelRealismBatch,
   VIEW_TO_OFFICIAL_ROLE,
   VIEW_TO_RENDER_TARGET,
 };

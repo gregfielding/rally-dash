@@ -385,6 +385,47 @@ export function useEnqueueProductModelRealism() {
   return { enqueueProductModelRealism };
 }
 
+/** Phase 3e: fan-out wrapper. One call enqueues every (color, side) with a model photo. */
+export interface EnqueueProductModelRealismBatchInput {
+  productId: string;
+  sides?: ("front" | "back")[];
+  withRealism?: boolean;
+  artworkMode?: "light" | "dark" | "white";
+}
+
+export interface ModelRealismBatchJob {
+  productVariantId: string;
+  blankVariantId: string;
+  view: "front" | "back";
+  jobId: string;
+  officialRole: string;
+}
+
+export interface ModelRealismBatchSkip {
+  productVariantId: string;
+  blankVariantId: string;
+  view: "front" | "back";
+  reason: string;
+}
+
+export function useEnqueueProductModelRealismBatch() {
+  const enqueueProductModelRealismBatch = useCallback(
+    async (input: EnqueueProductModelRealismBatchInput) => {
+      if (!functions) {
+        throw new Error("Cloud Functions not initialized");
+      }
+      const fn = httpsCallable(functions, "enqueueProductModelRealismBatch");
+      const result = await fn(input);
+      return result.data as {
+        jobs: ModelRealismBatchJob[];
+        skipped: ModelRealismBatchSkip[];
+      };
+    },
+    []
+  );
+  return { enqueueProductModelRealismBatch };
+}
+
 export function useGenerateProductAssets() {
   const { mutate } = useSWRConfig();
 
