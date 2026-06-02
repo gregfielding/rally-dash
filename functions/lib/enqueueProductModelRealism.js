@@ -313,9 +313,20 @@ function buildEnqueueProductModelRealismBatch({ db, admin, functions }) {
       }
     }
 
-    const jobs = [];
+    /**
+     * Phase G (Phase E follow-up): two-pass plan. Pass 1 builds the list of
+     * "to-be-created" jobs + the skipped list WITHOUT writing anything. Pass 2
+     * commits all valid jobs in a single atomic createBatchAtomically call so
+     * a partial fan-out is impossible — either every job lands or none do.
+     *
+     * The previous implementation did a sequential ref.add() loop inside the
+     * for/for loop and caught per-job errors into `skipped`. That worked but
+     * leaked partial state on a callable timeout mid-loop. The new shape
+     * preserves the same return contract (jobs[], skipped[]) so the UI
+     * doesn't need changes.
+     */
     const skipped = [];
-    const now = admin.firestore.FieldValue.serverTimestamp();
+    const plannedJobs = [];
 
     for (const [blankVariantId, entry] of byColor.entries()) {
       const blankVariant = blankVariantById.get(blankVariantId);
@@ -345,8 +356,13 @@ function buildEnqueueProductModelRealismBatch({ db, admin, functions }) {
         const renderTarget = VIEW_TO_RENDER_TARGET[view];
         const officialRole = VIEW_TO_OFFICIAL_ROLE[view];
         const placement = resolvePlacementForVariant(blank, blankVariant, renderTarget);
-        try {
-          const jobRef = await db.collection("rp_blank_preview_jobs").add({
+        plannedJobs.push({
+          productVariantId: entry.doc.id,
+          blankVariantId,
+          view,
+          officialRole,
+          /** Pre-built job-doc payload — committed atomically below. */
+          data: {
             blankId,
             variantId: blankVariantId,
             designId,
@@ -362,29 +378,54 @@ function buildEnqueueProductModelRealismBatch({ db, admin, functions }) {
             targetProductId: productId,
             targetVariantId: entry.doc.id,
             officialRole,
-            createdAt: now,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
             createdByUid: context.auth.uid,
-            updatedAt: now,
-          });
-          jobs.push({
-            productVariantId: entry.doc.id,
-            blankVariantId,
-            view,
-            jobId: jobRef.id,
-            officialRole,
-          });
-        } catch (writeErr) {
-          skipped.push({
-            productVariantId: entry.doc.id,
-            blankVariantId,
-            view,
-            reason: `enqueue_failed: ${writeErr && writeErr.message ? writeErr.message : String(writeErr)}`,
-          });
-        }
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          },
+        });
       }
     }
 
-    return { jobs, skipped };
+    /** Nothing to enqueue (every color × side was skipped). Return cleanly. */
+    if (plannedJobs.length === 0) {
+      return { jobs: [], skipped, batchId: null };
+    }
+
+    /**
+     * Atomic commit: parent rp_batches doc + every child rp_blank_preview_jobs
+     * doc in one Firestore batched write. The Firestore batch limit is 500
+     * writes; we check 499 (one slot for the parent). A product with more
+     * than ~250 color × side combinations would hit it — Rally's catalog
+     * has nothing close. The check inside createBatchAtomically throws
+     * loudly if we ever do.
+     */
+    // eslint-disable-next-line global-require
+    const { createBatchAtomically } = require("./batchHelpers");
+    const { batchId, jobRefs } = await createBatchAtomically({
+      db,
+      admin,
+      kind: "product_realism",
+      createdByUid: context.auth.uid,
+      metadata: {
+        productId,
+        variantId: null, // batch spans multiple variants
+        label: `Product realism (${plannedJobs.length} renders across ${byColor.size} colors)`,
+      },
+      jobs: plannedJobs.map((p) => ({
+        collectionPath: "rp_blank_preview_jobs",
+        data: p.data,
+      })),
+    });
+
+    const jobs = plannedJobs.map((p, i) => ({
+      productVariantId: p.productVariantId,
+      blankVariantId: p.blankVariantId,
+      view: p.view,
+      jobId: jobRefs[i].id,
+      officialRole: p.officialRole,
+    }));
+
+    return { jobs, skipped, batchId };
   };
 }
 

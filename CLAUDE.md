@@ -42,7 +42,7 @@ Per `RALLY_CORE_OBJECT_MODEL_AUDIT.md` (read this if you're touching schema):
 | **Blank** | `rp_blanks` (+ subcollection `rp_blank_masks`) | Garment type, color, placements, render views, masking; planned: Shopify defaults + pricing/weight defaults |
 | **Design** | `designs` | Reusable artwork (lightPng/darkPng/svg/pdf), team+league, design type, print colors, status |
 | **Generated Product** | `rp_products` | A specific design × blank × team × variant; renderSetup, media, taxonomy, Shopify sync state |
-| **Team** | **dual model** — `teams` (Catalog/Leagues/Teams hub) and `design_teams` (Design Library + create-design flow) | League, city, name, colors. The two have different shapes; do **not** assume they're interchangeable. |
+| **Team** | `design_teams` (canonical; legacy `teams` collection merged in Phase F 2026-06-01) | Full name, league/sport codes, CMYK + Pantone colors, productCatalogMatrix (approved blanks per team), generation defaults. Doc id is the canonical slug (e.g. `san_francisco_giants`). |
 | **Taxonomy** | `rp_taxonomy_sports`, `rp_taxonomy_leagues`, `rp_taxonomy_entities`, `rp_taxonomy_themes`, `rp_taxonomy_design_families` | Codes referenced by products for filtering, related-products, and Shopify tags |
 
 Known structural quirks (don't refactor without checking the audit doc first):
@@ -95,7 +95,7 @@ Many older docs were written for Cursor; the conventions in them still apply unl
 
 ## Things to be careful about
 
-- **Don't conflate `teams` and `design_teams`** — they are two collections with different schemas serving different surfaces. Check which one a feature uses.
+- **`teams` is deprecated as of Phase F (2026-06-01)** — it has been merged into `design_teams`. The `/teams` UI now redirects to `/design-teams`; `useTeams` is marked @deprecated. Migration script: `functions/scripts/migrate-teams-into-design-teams.js`. If you find a new caller of the `teams` collection, port it to `design_teams` instead of adding to the legacy surface.
 - **Don't unify placement** between Blank and Design without checking the audit doc; both are referenced by live code paths.
 - **fal.ai key** is never in source — it's read from `process.env.FAL_API_KEY` or `functions.config().fal.key`. Same pattern for Shopify creds.
 - **Firestore `undefined`** is rejected — `functions/index.js` has a `sanitizeForFirestore` helper that strips undefined recursively. Use it when writing arbitrary objects.

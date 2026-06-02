@@ -26,6 +26,9 @@
     "migrate:product-tags:dry": "node scripts/migrate-product-tags.js --dry-run",
     "migrate:design-team-ids": "node scripts/migrate-design-team-ids.js",
     "migrate:design-team-ids:dry": "node scripts/migrate-design-team-ids.js --dry-run",
+    "migrate:teams-into-design-teams:dry": "node scripts/migrate-teams-into-design-teams.js --dry-run",
+    "migrate:teams-into-design-teams": "node scripts/migrate-teams-into-design-teams.js",
+    "migrate:teams-into-design-teams:delete-legacy": "node scripts/migrate-teams-into-design-teams.js --delete-legacy",
     "shopify:ensure-collections": "node scripts/ensure-shopify-smart-collections.js",
     "shopify:verify-collections": "node scripts/verify-shopify-collections.js",
     "validate:launch-batch": "node scripts/validate-launch-batch.js"

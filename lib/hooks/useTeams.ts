@@ -1,5 +1,22 @@
 "use client";
 
+/**
+ * @deprecated Phase F (2026-06-01): the `teams` collection has been merged
+ * into `design_teams`. Use `useDesignTeams` from `@/lib/hooks/useDesignAssets`
+ * instead. This hook is kept exported for one release cycle in case any
+ * legacy code still imports it; it will be removed after the next release.
+ *
+ * Migration:
+ *   - Read: useTeams → useDesignTeams (richer schema, includes CMYK colors)
+ *   - Write: legacy /teams page is gone; team CRUD lives at /design-teams
+ *   - Doc id: design_teams uses canonical slug (san_francisco_giants),
+ *     not kebab-case (sf-giants).
+ *
+ * See: functions/scripts/migrate-teams-into-design-teams.js for the data
+ * migration. The legacy `teams` collection itself may be deleted with
+ * `--delete-legacy` after the migrated rows are verified.
+ */
+
 import { useCallback } from "react";
 import useSWR from "swr";
 import { 

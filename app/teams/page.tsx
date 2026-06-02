@@ -1,274 +1,99 @@
 "use client";
 
-import { useState } from "react";
+/**
+ * Phase F (teams → design_teams merge, 2026-06-01) — this page is now a
+ * deprecation notice that redirects to `/design-teams` (the canonical
+ * team admin surface).
+ *
+ * History: the legacy `teams` collection served `/teams` for early team
+ * CRUD before the canonical `design_teams` collection was established.
+ * Phase F audit confirmed:
+ *   - No cloud functions read `teams`.
+ *   - No designs / products reference `teams` doc ids.
+ *   - The bulk seeder (`npm run seed:design-teams`) writes to design_teams,
+ *     not here — so this page only ever showed rows operators created
+ *     manually via old tooling.
+ *
+ * Migration script: functions/scripts/migrate-teams-into-design-teams.js
+ * (idempotent; dry-run safe). Run that before final removal of the
+ * `teams` collection. After migration the `useTeams` hook stays exported
+ * for one cycle in case anything imports it, then can be removed.
+ */
+
+import { useEffect } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import ProtectedRoute from "@/components/ProtectedRoute";
-import { useTeams } from "@/lib/hooks/useTeams";
-import { useLeagues } from "@/lib/hooks/useLeagues";
-import TeamForm from "@/components/TeamForm";
-import Modal from "@/components/Modal";
-import { TableSkeleton } from "@/components/Skeleton";
-import { Team } from "@/lib/types/firestore";
 
-function TeamsContent() {
-  const { leagues } = useLeagues();
-  const { teams, loading, error, createTeam, updateTeam, deleteTeam } = useTeams();
-  const [selectedLeague, setSelectedLeague] = useState<string>("");
-  const [isModalOpen, setIsModalOpen] = useState(false);
-  const [editingTeam, setEditingTeam] = useState<Team | undefined>();
-  const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
+/** Soft auto-redirect after 5 seconds so the operator sees the deprecation
+ *  notice before being moved. Long enough to read; short enough to not annoy.
+ */
+const AUTO_REDIRECT_MS = 5000;
 
-  const filteredTeams = selectedLeague
-    ? teams.filter((team) => team.leagueId === selectedLeague)
-    : teams;
-
-  const handleCreate = () => {
-    setEditingTeam(undefined);
-    setIsModalOpen(true);
-  };
-
-  const handleEdit = (team: Team) => {
-    setEditingTeam(team);
-    setIsModalOpen(true);
-  };
-
-  const handleSubmit = async (team: Omit<Team, "id" | "createdAt" | "updatedAt">) => {
-    setSaving(true);
-    try {
-      if (editingTeam) {
-        await updateTeam(editingTeam.id!, team);
-      } else {
-        await createTeam(team);
-      }
-      setIsModalOpen(false);
-      setEditingTeam(undefined);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleDelete = async (id: string) => {
-    if (confirm("Are you sure you want to delete this team?")) {
-      setDeletingId(id);
-      try {
-        await deleteTeam(id);
-      } finally {
-        setDeletingId(null);
-      }
-    }
-  };
-
+function TeamsDeprecatedContent() {
+  const router = useRouter();
+  useEffect(() => {
+    const t = setTimeout(() => router.replace("/design-teams"), AUTO_REDIRECT_MS);
+    return () => clearTimeout(t);
+  }, [router]);
 
   return (
-    <>
-        <div className="mb-4 p-4 bg-sky-50 border border-sky-200 rounded-lg text-sm text-sky-950">
-          <p className="font-medium">This page is the legacy <code className="bg-sky-100 px-1 rounded">teams</code> collection</p>
-          <p className="mt-2 text-sky-900/90">
-            Bulk seeds (e.g. <code className="bg-sky-100 px-1 rounded text-xs">npm run seed:design-teams</code> in{" "}
-            <code className="bg-sky-100 px-1 rounded text-xs">functions/</code>) write to{" "}
-            <strong>design_teams</strong>, not here — so you will only see rows you (or old tooling) created in{" "}
-            <code className="bg-sky-100 px-1 rounded">teams</code>. The league filter uses the{" "}
-            <code className="bg-sky-100 px-1 rounded">leagues</code> collection (create leagues on{" "}
-            <Link href="/leagues" className="underline font-medium">
-              /leagues
-            </Link>
-            ).
-          </p>
-          <p className="mt-2 text-sky-900/90">
-            For the full seeded roster, open{" "}
-            <Link href="/designs" className="underline font-medium">
-              Designs
-            </Link>{" "}
-            (team picker reads <code className="bg-sky-100 px-1 rounded">design_teams</code>). Illustrator color libraries live on{" "}
-            <Link href="/design-system" className="underline font-medium">
-              /design-system
-            </Link>{" "}
-            (<code className="bg-sky-100 px-1 rounded">design_system</code>).{" "}
-            <Link href="/docs/design-guide" className="underline font-medium">
-              Design guide →
-            </Link>
-          </p>
-        </div>
-
-        {error && (
-          <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded text-red-700">
-            {error}
-          </div>
-        )}
-
-        <div className="mb-6 flex justify-between items-center">
-          <div className="flex items-center gap-4">
-            <div>
-              <h2 className="text-xl font-semibold">All Teams</h2>
-              <p className="text-xs text-gray-500 mt-0.5">Firestore: <code className="bg-gray-100 px-1 rounded">teams</code></p>
-            </div>
-            <select
-              value={selectedLeague}
-              onChange={(e) => setSelectedLeague(e.target.value)}
-              className="px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-            >
-              <option value="">All Leagues</option>
-              {leagues.map((league) => (
-                <option key={league.id} value={league.id}>
-                  {league.name}
-                </option>
-              ))}
-            </select>
-          </div>
-          <button
-            onClick={handleCreate}
-            disabled={leagues.length === 0}
-            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+    <div className="max-w-2xl mx-auto py-12">
+      <div className="bg-amber-50 border border-amber-200 rounded-lg p-6">
+        <h1 className="text-2xl font-bold text-amber-900 mb-3">
+          /teams is deprecated
+        </h1>
+        <p className="text-amber-900 mb-4">
+          The legacy <code className="bg-amber-100 px-1 rounded">teams</code> collection has
+          been merged into <strong>design_teams</strong>. All team management now lives at{" "}
+          <Link href="/design-teams" className="underline font-semibold">
+            /design-teams
+          </Link>
+          .
+        </p>
+        <p className="text-sm text-amber-800 mb-4">
+          You&rsquo;ll be redirected automatically in a few seconds.
+        </p>
+        <ul className="text-sm text-amber-900 space-y-1 mb-5">
+          <li>
+            <strong>What changed:</strong> the simpler <code>teams</code> schema is now part of
+            the richer <code>design_teams</code> schema (with CMYK colors, product catalog
+            matrix, and team metadata).
+          </li>
+          <li>
+            <strong>Your data:</strong> if you had custom rows in <code>teams</code>, the
+            migration script copies them to <code>design_teams</code> under the canonical
+            team slug. Re-run with <code>--dry-run</code> first to preview.
+          </li>
+          <li>
+            <strong>Doc id:</strong> design_teams uses the canonical slug
+            (<code>san_francisco_giants</code>), not the kebab-case (<code>sf-giants</code>)
+            that <code>teams</code> used.
+          </li>
+        </ul>
+        <div className="flex items-center gap-3">
+          <Link
+            href="/design-teams"
+            className="px-4 py-2 bg-amber-700 text-white rounded font-semibold hover:bg-amber-800"
           >
-            + Add Team
-          </button>
+            Go to /design-teams now
+          </Link>
+          <Link
+            href="/catalog"
+            className="px-4 py-2 border border-amber-300 text-amber-900 rounded hover:bg-amber-100"
+          >
+            Back to catalog
+          </Link>
         </div>
-
-        {leagues.length === 0 && (
-          <div className="mb-4 p-4 bg-yellow-50 border border-yellow-200 rounded text-yellow-800">
-            <p>You need to create at least one league before adding teams.</p>
-            <Link href="/leagues" className="underline mt-2 inline-block">
-              Create a league →
-            </Link>
-          </div>
-        )}
-
-        {loading && teams.length === 0 ? (
-          <TableSkeleton />
-        ) : filteredTeams.length === 0 && leagues.length > 0 ? (
-          <div className="bg-white rounded-lg shadow p-8 text-center">
-            <p className="text-gray-500 mb-4">
-              {selectedLeague ? "No teams found in this league." : "No teams yet. Create your first team!"}
-            </p>
-            <button
-              onClick={handleCreate}
-              className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
-            >
-              Create Team
-            </button>
-          </div>
-        ) : (
-          <div className="bg-white rounded-lg shadow overflow-hidden">
-            <table className="min-w-full divide-y divide-gray-200">
-              <thead className="bg-gray-50">
-                <tr>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Team
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    League
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    City
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Colors
-                  </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Status
-                  </th>
-                  <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    Actions
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="bg-white divide-y divide-gray-200">
-                {filteredTeams.map((team) => {
-                  const league = leagues.find((l) => l.id === team.leagueId);
-                  return (
-                    <tr key={team.id}>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                        {team.name}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                        {league?.name || "Unknown"}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                        {team.city}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <div className="flex gap-1">
-                          <div
-                            className="w-6 h-6 rounded border border-gray-300"
-                            style={{ backgroundColor: team.colors.primary }}
-                            title={`Primary: ${team.colors.primary}`}
-                          />
-                          <div
-                            className="w-6 h-6 rounded border border-gray-300"
-                            style={{ backgroundColor: team.colors.secondary }}
-                            title={`Secondary: ${team.colors.secondary}`}
-                          />
-                          {team.colors.accent && (
-                            <div
-                              className="w-6 h-6 rounded border border-gray-300"
-                              style={{ backgroundColor: team.colors.accent }}
-                              title={`Accent: ${team.colors.accent}`}
-                            />
-                          )}
-                        </div>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <span
-                          className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${
-                            team.active
-                              ? "bg-green-100 text-green-800"
-                              : "bg-gray-100 text-gray-800"
-                          }`}
-                        >
-                          {team.active ? "Active" : "Inactive"}
-                        </span>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-                        <button
-                          onClick={() => handleEdit(team)}
-                          className="text-blue-600 hover:text-blue-900 mr-4"
-                        >
-                          Edit
-                        </button>
-                        <button
-                          onClick={() => handleDelete(team.id!)}
-                          disabled={deletingId === team.id}
-                          className="text-red-600 hover:text-red-900 disabled:opacity-50"
-                        >
-                          {deletingId === team.id ? "Deleting..." : "Delete"}
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-
-        <Modal
-          isOpen={isModalOpen}
-          onClose={() => {
-            setIsModalOpen(false);
-            setEditingTeam(undefined);
-          }}
-          title={editingTeam ? "Edit Team" : "Create New Team"}
-        >
-          <TeamForm
-            team={editingTeam}
-            leagues={leagues}
-            onSubmit={handleSubmit}
-            onCancel={() => {
-              setIsModalOpen(false);
-              setEditingTeam(undefined);
-            }}
-            loading={saving}
-          />
-        </Modal>
-    </>
+      </div>
+    </div>
   );
 }
 
 export default function TeamsPage() {
   return (
-    <ProtectedRoute requiredRole="editor">
-      <TeamsContent />
+    <ProtectedRoute requiredRole="viewer">
+      <TeamsDeprecatedContent />
     </ProtectedRoute>
   );
 }

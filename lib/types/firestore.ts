@@ -2962,6 +2962,28 @@ export interface DesignTeam {
    * Orthogonal to `RPBlank.eligibility` (broad engine rules); bulk generation should require matrix membership.
    */
   productCatalogMatrix?: Record<string, TeamCatalogBlankEntry> | null;
+
+  /**
+   * Phase F (teams → design_teams merge, 2026-06-01): explicit lifecycle flag
+   * for hiding teams from pickers without deleting historical references.
+   * Migrated from the legacy `teams.active` boolean. Missing field = treat
+   * as `true` (legacy design_teams docs predate this field and are all
+   * implicitly active).
+   */
+  active?: boolean;
+  /**
+   * Legacy `teams.keywords` array preserved through the merge. Not used by
+   * any rendering pipeline; available for future search/SEO if useful.
+   */
+  keywords?: string[] | null;
+  /** Legacy `teams.bannedTerms` preserved through the merge. */
+  bannedTerms?: string[] | null;
+  /** Legacy `teams.notes` operator notes. */
+  notes?: string | null;
+  /** Provenance: which legacy doc this row was migrated from (audit trail). */
+  migratedFrom?: string | null;
+  migratedAt?: Timestamp | null;
+
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }

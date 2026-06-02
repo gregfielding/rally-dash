@@ -24,6 +24,7 @@ import {
 } from "firebase/firestore";
 import { db as firebaseDb } from "@/lib/firebase/config";
 import type { RPBatch, RPBatchKind, RPBatchStatus } from "@/lib/types/firestore";
+import BatchDetailDrawer from "@/components/dashboard/BatchDetailDrawer";
 
 const KIND_LABELS: Record<RPBatchKind, string> = {
   vton_ab: "VTON A/B test",
@@ -35,6 +36,14 @@ const KIND_LABELS: Record<RPBatchKind, string> = {
 export default function BatchListWidget() {
   const [batches, setBatches] = useState<Array<RPBatch & { id: string }> | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * Phase H: drawer selection. Clicking a row sets this to the batch object;
+   * clicking the close button / scrim clears it. We keep the WHOLE batch
+   * here (not just an id) so the drawer renders the header instantly
+   * without waiting for a separate fetch — the snapshot subscription
+   * already gave us every field we need.
+   */
+  const [drawerBatch, setDrawerBatch] = useState<(RPBatch & { id: string }) | null>(null);
 
   useEffect(() => {
     if (!firebaseDb) return;
@@ -104,14 +113,21 @@ export default function BatchListWidget() {
       </div>
       <ul className="divide-y divide-gray-100">
         {display.map((b) => (
-          <BatchRow key={b.id} batch={b} />
+          <BatchRow key={b.id} batch={b} onOpen={() => setDrawerBatch(b)} />
         ))}
       </ul>
+      <BatchDetailDrawer batch={drawerBatch} onClose={() => setDrawerBatch(null)} />
     </section>
   );
 }
 
-function BatchRow({ batch }: { batch: RPBatch & { id: string } }) {
+function BatchRow({
+  batch,
+  onOpen,
+}: {
+  batch: RPBatch & { id: string };
+  onOpen: () => void;
+}) {
   const label = KIND_LABELS[batch.kind] || batch.kind;
   const total = batch.total || 0;
   const terminal = (batch.completed || 0) + (batch.failed || 0);
@@ -119,7 +135,18 @@ function BatchRow({ batch }: { batch: RPBatch & { id: string } }) {
   const sub = batch.metadata?.label || "";
   const cost = batch.falCostUsdTotal;
   return (
-    <li className="px-4 py-3 flex items-center gap-4">
+    <li
+      className="px-4 py-3 flex items-center gap-4 cursor-pointer hover:bg-gray-50 transition-colors"
+      onClick={onOpen}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onOpen();
+        }
+      }}
+    >
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
           <span className="font-medium text-sm text-gray-900">{label}</span>
