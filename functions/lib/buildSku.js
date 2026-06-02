@@ -1,6 +1,13 @@
 "use strict";
 
-/** Mirrors lib/products/buildSku.ts */
+/**
+ * Mirrors lib/products/buildSku.ts.
+ *
+ * SKU format: `RP-{LEAGUE}-{TEAM}-{DESIGN}-{BLANK}-{COLOR}-{SIZE}`
+ *
+ * {BLANK} was added 2026-06-01 (Phase A0). Pre-A0 SKUs are 6-part
+ * (no blank); parseSku still accepts them with blankCode=null.
+ */
 
 function normalizeSkuSegment(raw, maxLen) {
   const s = String(raw ?? "")
@@ -72,23 +79,43 @@ function buildSku(p) {
   const league = normalizeSkuSegment(p.leagueCode, 8);
   const team = normalizeSkuSegment(p.teamCode, 6);
   const design = normalizeSkuSegment(p.designCode, 10);
+  const blank = normalizeSkuSegment(p.blankCode, 6);
   const color = normalizeSkuSegment(p.colorCode, 3).padEnd(3, "X").slice(0, 3);
   const size = normalizeSkuSegment(p.size, 4);
-  return `RP-${league}-${team}-${design}-${color}-${size}`;
+  return `RP-${league}-${team}-${design}-${blank}-${color}-${size}`;
 }
 
+/**
+ * Parse a canonical `RP-…` SKU. Accepts both the new 7-part format
+ * (Phase A0+) and the legacy 6-part format (pre-A0, blankCode=null).
+ */
 function parseSku(sku) {
   const s = String(sku ?? "").trim().toUpperCase();
   const parts = s.split("-").filter((x) => x.length > 0);
-  if (parts.length !== 6 || parts[0] !== "RP") return null;
-  return {
-    raw: s,
-    leagueCode: parts[1],
-    teamCode: parts[2],
-    designCode: parts[3],
-    colorCode: parts[4],
-    size: parts[5],
-  };
+  if (parts[0] !== "RP") return null;
+  if (parts.length === 7) {
+    return {
+      raw: s,
+      leagueCode: parts[1],
+      teamCode: parts[2],
+      designCode: parts[3],
+      blankCode: parts[4],
+      colorCode: parts[5],
+      size: parts[6],
+    };
+  }
+  if (parts.length === 6) {
+    return {
+      raw: s,
+      leagueCode: parts[1],
+      teamCode: parts[2],
+      designCode: parts[3],
+      blankCode: null,
+      colorCode: parts[4],
+      size: parts[5],
+    };
+  }
+  return null;
 }
 
 function assertDistinctSkuCandidates(skus) {

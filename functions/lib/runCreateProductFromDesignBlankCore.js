@@ -260,6 +260,13 @@ async function runCreateProductFromDesignBlankCore(ctx) {
 
   const leagueSku = leagueCodeRaw || "XX";
   const teamSku = teamCodeRaw || "XX";
+  /**
+   * Phase A0 (2026-06-01): inject blank styleCode into the SKU so the same
+   * design on different blanks for the same team doesn't collide on the
+   * duplicate-SKU precheck. Falls back to "XX" if the blank somehow has no
+   * styleCode (would only happen on a non-master blank used for tests).
+   */
+  const blankSku = String(blank.styleCode || "").trim() || "XX";
 
   const isV2Master = blank.schemaVersion === MASTER_BLANK_SCHEMA_VERSION;
   const initialRender = buildInitialRenderSetupForProduct({
@@ -417,6 +424,7 @@ async function runCreateProductFromDesignBlankCore(ctx) {
             leagueCode: leagueSku,
             teamCode: teamSku,
             designCode,
+            blankCode: blankSku,
             colorCode,
             size: leadSize,
           });
@@ -443,7 +451,7 @@ async function runCreateProductFromDesignBlankCore(ctx) {
 
   for (const sizeCode of sizesToCreate) {
     skusToRegister.push(
-      buildSku({ leagueCode: leagueSku, teamCode: teamSku, designCode, colorCode, size: sizeCode })
+      buildSku({ leagueCode: leagueSku, teamCode: teamSku, designCode, blankCode: blankSku, colorCode, size: sizeCode })
     );
   }
   if (skusToRegister.length > 0) {
@@ -526,6 +534,7 @@ async function runCreateProductFromDesignBlankCore(ctx) {
         leagueCode: leagueSku,
         teamCode: teamSku,
         designCode,
+        blankCode: blankSku,
         colorCode,
         size: sizeCode,
       });

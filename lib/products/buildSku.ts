@@ -1,6 +1,16 @@
 /**
- * Deterministic Shopify SKUs: RP-{LEAGUE}-{TEAM}-{DESIGN}-{COLOR}-{SIZE}
- * Immutable once written on `rp_products/.../variants/*`.
+ * Deterministic Shopify SKUs: `RP-{LEAGUE}-{TEAM}-{DESIGN}-{BLANK}-{COLOR}-{SIZE}`
+ *
+ * The {BLANK} segment was added 2026-06-01 (Phase A0) so launching the same
+ * design across multiple blanks for one team doesn't collide. Without it,
+ * "SF Giants Pillows Heather Grey XS" produced the same SKU on panty, thong,
+ * tank, and crewneck — and the duplicate-SKU precheck blocked all but the
+ * first blank from spawning variants.
+ *
+ * Immutable once written on `rp_products/.../variants/*`. Legacy 6-part SKUs
+ * (without {BLANK}) are still parseable for backward compat with any
+ * pre-Phase-A0 docs that survived cleanup; `parseSku` returns blankCode=null
+ * for those.
  */
 
 export function normalizeSkuSegment(raw: string | null | undefined, maxLen: number): string {
@@ -89,6 +99,12 @@ export interface BuildSkuParams {
   leagueCode: string;
   teamCode: string;
   designCode: string;
+  /**
+   * Blank style code segment (e.g. "8394", "TR3008", "HF07"). Required as of
+   * Phase A0 (2026-06-01) — disambiguates same-design-across-blanks SKUs that
+   * previously collided on the duplicate-SKU precheck. Source: `blank.styleCode`.
+   */
+  blankCode: string;
   /** Three-letter code from `resolveColorCodeForSku` (or equivalent). */
   colorCode: string;
   size: string;
@@ -98,9 +114,10 @@ export function buildSku(p: BuildSkuParams): string {
   const league = normalizeSkuSegment(p.leagueCode, 8);
   const team = normalizeSkuSegment(p.teamCode, 6);
   const design = normalizeSkuSegment(p.designCode, 10);
+  const blank = normalizeSkuSegment(p.blankCode, 6);
   const color = normalizeSkuSegment(p.colorCode, 3).padEnd(3, "X").slice(0, 3);
   const size = normalizeSkuSegment(p.size, 4);
-  return `RP-${league}-${team}-${design}-${color}-${size}`;
+  return `RP-${league}-${team}-${design}-${blank}-${color}-${size}`;
 }
 
 export interface ParsedSku {
@@ -108,23 +125,45 @@ export interface ParsedSku {
   leagueCode: string;
   teamCode: string;
   designCode: string;
+  /** Null for legacy 6-part SKUs written before Phase A0. */
+  blankCode: string | null;
   colorCode: string;
   size: string;
 }
 
-/** Parse a canonical `RP-…` SKU; returns null if shape is invalid. */
+/**
+ * Parse a canonical `RP-…` SKU; returns null if shape is invalid. Accepts
+ * both the new 7-part format and the legacy 6-part format (no blank code).
+ */
 export function parseSku(sku: string): ParsedSku | null {
   const s = String(sku ?? "").trim().toUpperCase();
   const parts = s.split("-").filter((x) => x.length > 0);
-  if (parts.length !== 6 || parts[0] !== "RP") return null;
-  return {
-    raw: s,
-    leagueCode: parts[1],
-    teamCode: parts[2],
-    designCode: parts[3],
-    colorCode: parts[4],
-    size: parts[5],
-  };
+  if (parts[0] !== "RP") return null;
+  if (parts.length === 7) {
+    return {
+      raw: s,
+      leagueCode: parts[1],
+      teamCode: parts[2],
+      designCode: parts[3],
+      blankCode: parts[4],
+      colorCode: parts[5],
+      size: parts[6],
+    };
+  }
+  if (parts.length === 6) {
+    /** Legacy SKU — pre-Phase-A0. blankCode unknown; downstream callers should
+     *  treat null as "ambiguous which blank this is on." */
+    return {
+      raw: s,
+      leagueCode: parts[1],
+      teamCode: parts[2],
+      designCode: parts[3],
+      blankCode: null,
+      colorCode: parts[4],
+      size: parts[5],
+    };
+  }
+  return null;
 }
 
 /** Throws if the list contains duplicate SKUs (case-insensitive). */
