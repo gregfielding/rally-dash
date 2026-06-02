@@ -3818,3 +3818,92 @@ export interface RPBlankPreviewJob {
   createdByUid: string;
   updatedAt: Timestamp;
 }
+
+
+// --------------------------------------------------------------------
+// Phase C: AI scene generation via Flux Kontext
+// --------------------------------------------------------------------
+
+/**
+ * Curated scene templates the operator can pick from when generating
+ * lifestyle / studio / gameday variations of a product render. The full
+ * list (with prompts) lives in functions/lib/sceneTemplates.js — keep
+ * this string union in sync. Adding one here without registering it
+ * server-side will cause invalid-argument errors at job-creation time.
+ */
+export type RPSceneTemplateId =
+  | "gameday_stadium"
+  | "lifestyle_coffee"
+  | "outdoor_park"
+  | "studio_clean"
+  | "editorial_moody"
+  | "flatlay_table"
+  | "hanging_rack"
+  | "detail_print_crop";
+
+export type RPSceneSourceSlot =
+  | "flat_front_designed"
+  | "flat_back_designed"
+  | "model_front_designed"
+  | "model_back_designed"
+  | "flat_blended"
+  | "custom";
+
+export type RPSceneJobStatus = "queued" | "processing" | "completed" | "failed";
+
+export interface RPSceneJobResult {
+  url: string;
+  storagePath: string;
+  width: number | null;
+  height: number | null;
+  bytes: number;
+  sourceUrl: string;
+  sourceSlot: RPSceneSourceSlot;
+  sceneTemplateId: RPSceneTemplateId;
+  category: string;
+  prompt: string;
+  renderedAt: Timestamp;
+}
+
+export interface RPSceneJob {
+  id: string;
+  productId: string;
+  variantId: string;
+  sourceSlot: RPSceneSourceSlot;
+  /** Set only when sourceSlot="custom". */
+  sourceUrlOverride: string | null;
+  sceneTemplateId: RPSceneTemplateId;
+  /** When part of a batch fan-out (enqueueSceneJobBatch), all sibling jobs share this. */
+  sceneSetId?: string;
+  status: RPSceneJobStatus;
+  error: string | null;
+  result: RPSceneJobResult | null;
+  /** Phase A cost meter — top-level for dashboard aggregation queries. */
+  falCostUsd?: number | null;
+  falLatencyMs?: number | null;
+  falEndpoint?: string | null;
+  falRequestId?: string | null;
+  createdAt: Timestamp;
+  createdByUid: string;
+  updatedAt: Timestamp;
+}
+
+/**
+ * Phase C: per-variant scene render storage. The trigger writes
+ * variant.sceneRenders[templateId] when a scene job completes. The product
+ * page reads from this map to render the scene gallery.
+ */
+export interface RPVariantSceneRender {
+  url: string;
+  storagePath: string;
+  width: number | null;
+  height: number | null;
+  bytes: number;
+  sceneTemplateId: RPSceneTemplateId;
+  category: string;
+  sourceSlot: RPSceneSourceSlot;
+  sourceUrl: string;
+  jobId: string;
+  updatedAt: Timestamp;
+}
+

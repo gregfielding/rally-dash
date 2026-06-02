@@ -116,6 +116,11 @@ const {
   buildLetterMaskFromDesignRgba,
 } = require("./lib/blankPreviewRender");
 const {
+  buildEnqueueSceneJob,
+  buildEnqueueSceneJobBatch,
+  buildOnSceneJobCreated,
+} = require("./lib/sceneJobPipeline");
+const {
   buildEnqueueProductModelRealism,
   buildEnqueueProductModelRealismBatch,
 } = require("./lib/enqueueProductModelRealism");
@@ -7471,6 +7476,45 @@ exports.onBlankPreviewJobCreated = functions
 exports.enqueueVtonAbTest = functions.https.onCall(
   buildEnqueueVtonAbTest({ db, functions, admin })
 );
+
+/**
+ * Phase C: enqueue a single Kontext scene render. Generates a lifestyle /
+ * studio / gameday variation of an existing product render via Flux Kontext.
+ *
+ * Input:  { productId, variantId, sourceSlot, sourceUrlOverride?, sceneTemplateId }
+ * Output: { jobId, status: "queued" }
+ *
+ * The async trigger (onSceneJobCreated) drains the rp_scene_jobs collection
+ * and writes the result to variant.sceneRenders[templateId] plus the job
+ * doc's result field.
+ */
+exports.enqueueSceneJob = functions.https.onCall(
+  buildEnqueueSceneJob({ db, functions, admin })
+);
+
+/**
+ * Phase C: 4-shot PDP batch generator. Fans out N scene jobs (default: 4
+ * curated templates) from one variant + source slot, sharing a sceneSetId
+ * so the UI can subscribe to the whole set with one Firestore query.
+ *
+ * Input:  { productId, variantId, sourceSlot, sourceUrlOverride?, sceneTemplateIds?: string[] }
+ * Output: { sceneSetId, jobIds: { [templateId]: jobId }, templateCount }
+ */
+exports.enqueueSceneJobBatch = functions.https.onCall(
+  buildEnqueueSceneJobBatch({ db, functions, admin })
+);
+
+/**
+ * Phase C trigger: drains rp_scene_jobs. Calls Kontext via runFalInference,
+ * saves the resulting PNG to Storage, writes back to
+ * variant.sceneRenders[templateId], stamps cost telemetry on the job doc.
+ */
+exports.onSceneJobCreated = functions
+  .runWith({ memory: "2GB", timeoutSeconds: 540 })
+  .firestore.document("rp_scene_jobs/{jobId}")
+  .onCreate(
+    buildOnSceneJobCreated({ db, storage, admin, functions, sharp: require("sharp") })
+  );
 
 /**
  * Phase 3: enqueue a model-realism render for a product variant. Wraps the

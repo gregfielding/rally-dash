@@ -255,6 +255,14 @@ service cloud.firestore {
       allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
     }
 
+    // rp_scene_jobs/{jobId} — Phase C: Kontext scene generation pipeline. The
+    // enqueueSceneJob / enqueueSceneJobBatch callables create docs; the
+    // onSceneJobCreated trigger drains them. UI subscribes via onSnapshot.
+    match /rp_scene_jobs/{jobId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
     // rp_product_assets/{assetId}
     match /rp_product_assets/{assetId} {
       allow read: if isAdmin();

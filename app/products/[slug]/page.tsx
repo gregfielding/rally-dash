@@ -19,6 +19,8 @@ import {
 } from "firebase/firestore";
 import { db } from "@/lib/firebase/config";
 import ProtectedRoute from "@/components/ProtectedRoute";
+import SceneGallerySection from "@/components/scenes/SceneGallerySection";
+import type { RPSceneSourceSlot, RPVariantSceneRender } from "@/lib/types/firestore";
 import { useAuth } from "@/lib/providers/AuthProvider";
 import { useProductBySlug, useProducts } from "@/lib/hooks/useRPProducts";
 import { getRelatedProducts } from "@/lib/products/relatedProducts";
@@ -5487,6 +5489,46 @@ function ProductDetailContent() {
                         </ul>
                       </div>
                     )}
+                    {/*
+                      Phase C: scene gallery section. Renders below the variant
+                      picker so the operator sees AI-generated lifestyle / studio
+                      / gameday shots for the currently-selected variant. Only
+                      mounted when there's a variant doc + a product id; without
+                      either, generation can't run.
+                    */}
+                    {product?.id && shopifyPreviewVariantDoc ? (() => {
+                      const flatRenders = (shopifyPreviewVariantDoc.flatRenders || {}) as Record<
+                        string,
+                        unknown
+                      >;
+                      /** Map current flatRenders keys → the canonical sourceSlot enum. */
+                      const candidateSlots: RPSceneSourceSlot[] = [
+                        "model_front_designed",
+                        "model_back_designed",
+                        "flat_front_designed",
+                        "flat_back_designed",
+                      ];
+                      const availableSourceSlots = candidateSlots.filter((slot) => {
+                        const entry = flatRenders[slot] as { url?: string } | undefined;
+                        return entry && typeof entry.url === "string" && entry.url.length > 0;
+                      });
+                      const sceneRenders = ((shopifyPreviewVariantDoc as unknown as {
+                        sceneRenders?: Record<string, RPVariantSceneRender>;
+                      }).sceneRenders ?? {}) as Record<string, RPVariantSceneRender>;
+                      return (
+                        <SceneGallerySection
+                          productId={product.id}
+                          variantId={shopifyPreviewVariantDoc.id}
+                          variantLabel={
+                            shopifyPreviewVariantDoc.colorName ||
+                            shopifyPreviewVariantDoc.blankVariantId ||
+                            shopifyPreviewVariantDoc.id
+                          }
+                          availableSourceSlots={availableSourceSlots}
+                          sceneRenders={sceneRenders}
+                        />
+                      );
+                    })() : null}
                     {is8394ProductContext &&
                     shopifyPreviewVariantDoc &&
                     !isVariantBaseComplete8394(shopifyPreviewVariantDoc, fulfillmentPrintSides, {
