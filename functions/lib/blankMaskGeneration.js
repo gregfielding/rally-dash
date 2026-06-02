@@ -19,6 +19,8 @@
  * Spec: RALLY_BLANK_MASK_AI_AUTOGEN.md
  */
 
+const { runFalInference } = require("./falInference");
+
 const DEFAULT_SAM_ENDPOINT = "fal-ai/evf-sam";
 /**
  * SAM-family models segment by concrete nouns, not anatomical region descriptions.
@@ -147,12 +149,18 @@ function defaultPromptFor(renderTarget, view) {
 }
 
 /**
- * Submit to fal.ai queue, poll until COMPLETED, return the first result image URL.
- * Throws on failure / timeout with a user-readable message.
+ * Submit to fal.ai queue, poll until COMPLETED, return the first result image URL
+ * plus Phase A cost/latency telemetry (so the callable can stamp it on the
+ * preview return value, eventually on the rp_blank_masks doc).
+ *
+ * Endpoint extraction shape (SAM-family) is endpoint-specific — different
+ * SAM variants embed the mask under image.url, images[0].url, mask.url, masks[0],
+ * or output[0]. Probe in a fixed order so an operator can flip
+ * RP_SAM_ENDPOINT to a different SAM-family endpoint without a code change.
+ *
+ * @returns {Promise<{maskUrl: string, costUsd: number|null, latencyMs: number, requestId: string|null}>}
  */
 async function runSam(falApiKey, endpoint, imageUrl, prompt, seed) {
-  const url = `${FAL_QUEUE_BASE}/${endpoint}`;
-
   /**
    * Default endpoint is `fal-ai/evf-sam` which takes `prompt` + `image_url`.
    * `text_prompt` is included for compatibility with grounded-sam-family endpoints if
@@ -166,50 +174,14 @@ async function runSam(falApiKey, endpoint, imageUrl, prompt, seed) {
     seed: seed,
   };
 
-  const submitResp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Key ${falApiKey}` },
-    body: JSON.stringify(body),
+  const inference = await runFalInference({
+    endpoint,
+    payload: body,
+    falApiKey,
+    maxPollAttempts: MAX_POLL_ATTEMPTS,
+    pollIntervalMs: POLL_INTERVAL_MS,
   });
-  if (!submitResp.ok) {
-    const errText = await submitResp.text();
-    throw new Error(`fal.ai submit failed (${submitResp.status}): ${errText}`);
-  }
-  const submitJson = await submitResp.json();
-  const requestId = submitJson.request_id || submitJson.id || null;
-
-  let resultJson = null;
-  if (submitJson.status === "COMPLETED") {
-    resultJson = submitJson;
-  } else if (requestId) {
-    const statusUrl = submitJson.status_url || `${url}/requests/${requestId}/status`;
-    const responseUrl = submitJson.response_url || `${url}/requests/${requestId}`;
-    for (let i = 0; i < MAX_POLL_ATTEMPTS; i++) {
-      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
-      const statusResp = await fetch(statusUrl, {
-        headers: { Authorization: `Key ${falApiKey}` },
-      });
-      if (!statusResp.ok) continue;
-      const statusJson = await statusResp.json();
-      if (statusJson.status === "COMPLETED") {
-        const finalResp = await fetch(responseUrl, {
-          headers: { Authorization: `Key ${falApiKey}` },
-        });
-        if (!finalResp.ok) {
-          throw new Error(`fal.ai result fetch failed (${finalResp.status})`);
-        }
-        resultJson = await finalResp.json();
-        break;
-      }
-      if (statusJson.status === "FAILED") {
-        throw new Error(`fal.ai job failed: ${statusJson.error || "unknown error"}`);
-      }
-    }
-  }
-
-  if (!resultJson) {
-    throw new Error("fal.ai job did not complete within timeout");
-  }
+  const resultJson = inference.result;
 
   /**
    * Different fal.ai SAM-family endpoints return masks under different keys
@@ -228,7 +200,12 @@ async function runSam(falApiKey, endpoint, imageUrl, prompt, seed) {
   if (!maskUrl) {
     throw new Error("fal.ai returned no usable mask URL — endpoint contract may have changed");
   }
-  return maskUrl;
+  return {
+    maskUrl,
+    costUsd: inference.costUsd,
+    latencyMs: inference.latencyMs,
+    requestId: inference.requestId,
+  };
 }
 
 /**
@@ -336,7 +313,11 @@ function buildGenerateBlankMaskViaSam({ db, storage, functions, sharp }) {
     const seed = Number.isFinite(Number(seedIn)) ? Number(seedIn) : Math.floor(Math.random() * 1e9);
 
     const endpoint = getSamEndpoint(functions);
-    const samMaskUrl = await runSam(falApiKey, endpoint, refImageUrl, prompt, seed);
+    const samResult = await runSam(falApiKey, endpoint, refImageUrl, prompt, seed);
+    const samMaskUrl = samResult.maskUrl;
+    console.log(
+      `[sam] cost=$${samResult.costUsd ?? "?"} latency=${samResult.latencyMs}ms request_id=${samResult.requestId || "?"} endpoint=${endpoint}`
+    );
 
     const samResp = await fetch(samMaskUrl);
     if (!samResp.ok) {
@@ -388,6 +369,14 @@ function buildGenerateBlankMaskViaSam({ db, storage, functions, sharp }) {
       seed,
       meanGrayscale: Math.round(meanGrayscale),
       endpoint,
+      /**
+       * Phase A cost telemetry. Client can show "$0.005, 4.2s" inline next to
+       * the preview, and these get persisted onto rp_blank_masks at commit-time
+       * so the dashboard cost-meter widget can sum spend by blank.
+       */
+      falCostUsd: samResult.costUsd,
+      falLatencyMs: samResult.latencyMs,
+      falRequestId: samResult.requestId,
       /** Echoed so the client can pass them straight back to commit without re-deriving. */
       renderTarget,
       variantId,
@@ -408,6 +397,16 @@ function buildCommitBlankMaskFromPreview({ db, admin, storage, functions, sharp 
       previewMaskStoragePath,
       prompt,
       seed,
+      /**
+       * Phase A: client echoes the cost telemetry from the generate response.
+       * These are optional — older clients that haven't been updated still
+       * commit successfully, the doc just lacks the cost fields (the dashboard
+       * widget reads `null` as "unknown" and groups separately).
+       */
+      falCostUsd: falCostUsdIn,
+      falLatencyMs: falLatencyMsIn,
+      falRequestId: falRequestIdIn,
+      falEndpoint: falEndpointIn,
     } = data || {};
     if (!blankId || typeof blankId !== "string") {
       throw new functions.https.HttpsError("invalid-argument", "blankId is required");
@@ -492,6 +491,16 @@ function buildCommitBlankMaskFromPreview({ db, admin, storage, functions, sharp 
       source: "ai_sam",
       aiPrompt: typeof prompt === "string" ? prompt : null,
       aiSeed: Number.isFinite(Number(seed)) ? Number(seed) : null,
+      /**
+       * Phase A telemetry — costs feed the dashboard widget. Fields are null
+       * when the client didn't send them (older callers), which the widget
+       * surfaces as "unknown cost" rather than $0 (a real $0 would be
+       * misleading for spend totals).
+       */
+      falCostUsd: Number.isFinite(Number(falCostUsdIn)) ? Number(falCostUsdIn) : null,
+      falLatencyMs: Number.isFinite(Number(falLatencyMsIn)) ? Number(falLatencyMsIn) : null,
+      falRequestId: typeof falRequestIdIn === "string" ? falRequestIdIn : null,
+      falEndpoint: typeof falEndpointIn === "string" ? falEndpointIn : DEFAULT_SAM_ENDPOINT,
       lockedAt: now,
       updatedAt: now,
       updatedByUid: uid,

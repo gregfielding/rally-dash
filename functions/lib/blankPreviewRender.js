@@ -12,6 +12,7 @@
  */
 
 const { resolveDesignAssetUrls } = require("./designFileMergeCore");
+const { runFalInference } = require("./falInference");
 
 /**
  * Stage B uses fal.ai's Kontext model (`fal-ai/flux-pro/kontext`) for image editing.
@@ -483,7 +484,6 @@ async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, dr
    */
   const falEndpoint = FAL_REALISM_ENDPOINT;
   const useMask = true;
-  const falUrl = `https://queue.fal.run/${falEndpoint}`;
   /**
    * v8.2: deterministic seed so re-running with the same inputs produces the same
    * output. Without a seed, Flux Fill gets a fresh random seed each call and
@@ -522,87 +522,25 @@ async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, dr
     `[realism] v8.2 Flux Fill: endpoint=${falEndpoint} cfg=${falPayload.guidance_scale} steps=${falPayload.num_inference_steps} seed=${stableSeed} draft_bytes=${draftBuffer.length}`
   );
 
-  const submitResp = await fetchFn(falUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Key ${falApiKey}` },
-    body: JSON.stringify(falPayload),
-  });
-  if (!submitResp.ok) {
-    const errText = await submitResp.text();
-    throw new Error(`fal.ai realism submit failed (${submitResp.status}): ${errText}`);
-  }
-  const submitJson = await submitResp.json();
-  const requestId = submitJson.request_id || submitJson.id;
-  const statusUrl = submitJson.status_url;
-  const responseUrl = submitJson.response_url;
-  console.log(
-    `[realism] submit: status=${submitJson.status} request_id=${requestId} status_url=${statusUrl} response_url=${responseUrl} keys=${JSON.stringify(Object.keys(submitJson))}`
-  );
-  if (!statusUrl) {
-    throw new Error(
-      `fal.ai submit returned no status_url (request_id=${requestId || "missing"}). Submit shape: ${JSON.stringify(Object.keys(submitJson))}`
-    );
-  }
-
   /**
-   * Poll status_url until images appear (or status flips to COMPLETED with images
-   * inline). The flux endpoints embed result `images[]` in the status response itself
-   * once inference completes — same pattern onMockJobCreated reads at index.js:8169.
-   * Some status responses include `images` even while status is still "IN_PROGRESS";
-   * treat either signal as completion.
+   * Phase A: every fal.ai call goes through `runFalInference` so cost + latency
+   * land on the job doc. The wrapper encapsulates the submit/poll/response_url
+   * pattern that used to live inline here (and in runSam, and in any future
+   * VTON / Kontext endpoint we add).
    */
-  let resultJson = null;
-  if (submitJson.images || (submitJson.output && submitJson.output.images)) {
-    resultJson = submitJson;
-  } else {
-    let completed = false;
-    /** Pass `?logs=1` so fal.ai includes intermediate fields in the status payload. */
-    const statusUrlWithLogs = statusUrl.includes("?") ? `${statusUrl}&logs=1` : `${statusUrl}?logs=1`;
-    let lastStatusJson = null;
-    for (let i = 0; i < REALISM_MAX_POLL_ATTEMPTS && !completed; i++) {
-      await new Promise((resolve) => setTimeout(resolve, REALISM_POLL_INTERVAL_MS));
-      const statusResp = await fetchFn(statusUrlWithLogs, {
-        headers: { Authorization: `Key ${falApiKey}` },
-      });
-      if (!statusResp.ok) continue;
-      const statusJson = await statusResp.json();
-      lastStatusJson = statusJson;
-      if (statusJson.status === "FAILED") {
-        throw new Error(`fal.ai realism job failed: ${statusJson.error || "unknown"}`);
-      }
-      /** Inline images in status response (some fal endpoints do this). */
-      if (statusJson.images || (statusJson.output && statusJson.output.images)) {
-        resultJson = statusJson;
-        completed = true;
-        break;
-      }
-      /** COMPLETED without inline images → fetch response_url to get the actual result. */
-      if (statusJson.status === "COMPLETED" && responseUrl) {
-        console.log(`[realism] status COMPLETED, fetching response_url: ${responseUrl}`);
-        const finalResp = await fetchFn(responseUrl, {
-          headers: { Authorization: `Key ${falApiKey}` },
-        });
-        const finalText = await finalResp.text();
-        if (!finalResp.ok) {
-          throw new Error(`fal.ai response_url returned HTTP ${finalResp.status} at ${responseUrl}: ${finalText.slice(0, 200)}`);
-        }
-        try {
-          resultJson = JSON.parse(finalText);
-          console.log(`[realism] response_url returned keys=${JSON.stringify(Object.keys(resultJson))}`);
-        } catch (e) {
-          throw new Error(`fal.ai response_url returned non-JSON: ${finalText.slice(0, 200)}`);
-        }
-        completed = true;
-        break;
-      }
-    }
-    if (!completed) {
-      throw new Error(
-        `fal.ai realism job timed out. Last status: ${lastStatusJson ? JSON.stringify({ status: lastStatusJson.status, keys: Object.keys(lastStatusJson) }) : "no successful status response"}`
-      );
-    }
-  }
-
+  const inference = await runFalInference({
+    endpoint: falEndpoint,
+    payload: falPayload,
+    falApiKey,
+    fetchFn,
+    maxPollAttempts: REALISM_MAX_POLL_ATTEMPTS,
+    pollIntervalMs: REALISM_POLL_INTERVAL_MS,
+    withLogs: true,
+  });
+  console.log(
+    `[realism] runFalInference: cost=$${inference.costUsd ?? "?"} latency=${inference.latencyMs}ms request_id=${inference.requestId || "?"}`
+  );
+  const resultJson = inference.result;
   const resultImages = resultJson.images || (resultJson.output && resultJson.output.images) || [];
   if (!Array.isArray(resultImages) || resultImages.length === 0) {
     throw new Error(
@@ -704,6 +642,17 @@ async function runRealismPass({ sharp, db, fetchFn, falApiKey, blankId, view, dr
     /** v8: TRUE inpainting via Flux Fill — letter-shaped mask enforces geometry,
      *  surrounding cotton fabric becomes the prior for what to paint in the mask. */
     useMask,
+    /**
+     * Phase A telemetry from runFalInference. Caller (composeStageB → trigger)
+     * forwards these onto the rp_blank_preview_jobs doc so the dashboard
+     * cost-meter widget can sum them across day / blank / team.
+     */
+    inference: {
+      costUsd: inference.costUsd,
+      latencyMs: inference.latencyMs,
+      endpoint: inference.endpoint,
+      requestId: inference.requestId,
+    },
     params: {
       /** Flux Fill has no strength knob — the mask is the boundary. Kept at 0 for
        *  badge / schema backward compat. */
@@ -1229,6 +1178,13 @@ async function composeStageB({ db, storage, sharp, functions, blankId, view, dra
       falEndpoint: realism.falEndpoint,
       usedMask: realism.useMask,
       params: realism.params,
+      /**
+       * Phase A: telemetry surfaced from runFalInference. The job trigger
+       * (onBlankPreviewJobCreated) stamps these onto the rp_blank_preview_jobs
+       * doc as falCostUsd / falLatencyMs / falRequestId so the dashboard
+       * cost-meter widget can aggregate them.
+       */
+      inference: realism.inference || null,
     },
   };
 }
@@ -1378,8 +1334,34 @@ function buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp })
           /** Forward so Stage B uses the same target-aware storage layout as Stage A. */
           renderTarget: input.renderTarget,
         });
-        await jobRef.update({ stageB: stageBResult.stageB, updatedAt: tick() });
-        console.log(`[onBlankPreviewJobCreated] Job ${jobId} Stage B done`);
+        /**
+         * Phase A cost meter: lift the falCostUsd/falLatencyMs/falEndpoint/
+         * falRequestId fields onto the job doc top-level so the dashboard
+         * widget can aggregate without descending into stageB.inference. The
+         * `inference` block is also kept inside stageB for the per-render
+         * audit trail (one job can re-run; the top-level fields reflect the
+         * latest successful realism pass).
+         */
+        const inferenceTelemetry = stageBResult.stageB && stageBResult.stageB.inference
+          ? stageBResult.stageB.inference
+          : null;
+        const jobUpdate = {
+          stageB: stageBResult.stageB,
+          updatedAt: tick(),
+        };
+        if (inferenceTelemetry) {
+          jobUpdate.falCostUsd = inferenceTelemetry.costUsd;
+          jobUpdate.falLatencyMs = inferenceTelemetry.latencyMs;
+          jobUpdate.falEndpoint = inferenceTelemetry.endpoint;
+          jobUpdate.falRequestId = inferenceTelemetry.requestId;
+        }
+        await jobRef.update(jobUpdate);
+        console.log(
+          `[onBlankPreviewJobCreated] Job ${jobId} Stage B done` +
+            (inferenceTelemetry
+              ? ` — cost=$${inferenceTelemetry.costUsd ?? "?"} latency=${inferenceTelemetry.latencyMs}ms`
+              : "")
+        );
 
         /**
          * Phase 3: best-effort write to product variant slot. Wrapped in its

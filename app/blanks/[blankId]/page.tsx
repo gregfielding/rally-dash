@@ -725,6 +725,15 @@ function BlankDetailContent() {
     seed: number;
     meanGrayscale: number;
     endpoint: string;
+    /**
+     * Phase A cost telemetry — server returns these from runFalInference so
+     * the UI can show "$0.005 · 4.2s" inline and commit can persist them on
+     * the rp_blank_masks doc for the dashboard cost-meter widget. Both can
+     * be null if the price table doesn't know the endpoint (or older server).
+     */
+    falCostUsd: number | null;
+    falLatencyMs: number | null;
+    falRequestId: string | null;
   };
   const [aiGenerating, setAiGenerating] = useState<"front" | "back" | null>(null);
   const [aiCommitting, setAiCommitting] = useState<"front" | "back" | null>(null);
@@ -1040,6 +1049,11 @@ function BlankDetailContent() {
           previewMaskStoragePath: string;
           prompt: string;
           seed: number;
+          /** Phase A: cost telemetry from the preview, persisted onto rp_blank_masks. */
+          falCostUsd?: number | null;
+          falLatencyMs?: number | null;
+          falRequestId?: string | null;
+          falEndpoint?: string;
         },
         { ok: boolean; maskDocId: string }
       >(firebaseFunctions, "commitBlankMaskFromPreview");
@@ -1051,6 +1065,10 @@ function BlankDetailContent() {
         previewMaskStoragePath: aiPreview.previewMaskStoragePath,
         prompt: aiPreview.prompt,
         seed: aiPreview.seed,
+        falCostUsd: aiPreview.falCostUsd,
+        falLatencyMs: aiPreview.falLatencyMs,
+        falRequestId: aiPreview.falRequestId,
+        falEndpoint: aiPreview.endpoint,
       });
       /**
        * Doc id depends on (blankId, view, renderTarget, variantId). Use the
