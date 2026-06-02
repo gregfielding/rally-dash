@@ -668,6 +668,11 @@ function validatePreviewInput(functions, data) {
     renderTarget: renderTargetIn,
     /** Phase B: optional provider override for single-job callers. */
     providerId: providerIdIn,
+    /** Phase I: optional identity attachment. When set, the trigger pulls
+     *  referenceImages from the identity doc and threads them into the
+     *  VTON provider (Flux 2 multi-ref) along with the identity's
+     *  preferredProviderId override. */
+    identityId: identityIdIn,
   } = data || {};
   const artworkMode = artworkModeIn === "dark" || artworkModeIn === "white" ? artworkModeIn : "light";
   if (!blankId || typeof blankId !== "string") {
@@ -723,6 +728,21 @@ function validatePreviewInput(functions, data) {
     }
     providerId = providerIdIn;
   }
+  /**
+   * Phase I identity validation. We don't verify the identity exists here
+   * (saves a Firestore read on every callable) — the trigger will surface a
+   * clean log when an attached identity is missing. Format validation only.
+   */
+  let identityId = null;
+  if (identityIdIn != null) {
+    if (typeof identityIdIn !== "string" || identityIdIn.length === 0) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "identityId must be a non-empty string when provided"
+      );
+    }
+    identityId = identityIdIn;
+  }
   return {
     blankId,
     variantId: variantId || null,
@@ -735,6 +755,7 @@ function validatePreviewInput(functions, data) {
       typeof designUrlOverrideIn === "string" && designUrlOverrideIn.length > 0 ? designUrlOverrideIn : null,
     renderTarget,
     providerId,
+    identityId,
   };
 }
 
@@ -1153,6 +1174,10 @@ async function composeStageB({
   providerId,
   /** Phase B: variant model photo URL — required by providers like Kolors VTO. */
   modelImageUrl,
+  /** Phase I: identity reference photo URLs — required by flux_2_multireference. */
+  referenceImageUrls,
+  /** Phase I: identity doc id, surfaced for telemetry + future provider needs. */
+  identityId,
 }) {
   const falApiKey = getFalApiKey(functions);
   if (!falApiKey) {
@@ -1177,6 +1202,12 @@ async function composeStageB({
     letterMaskBuffer,
     /** Model photo URL: required by Kolors VTO; null for Flux Fill (which composites upstream). */
     modelImageUrl: modelImageUrl || null,
+    /**
+     * Phase I: identity reference photo URLs. Required by flux_2_multireference;
+     * ignored by Flux Fill / Kolors VTO. Empty array when no identity attached.
+     */
+    referenceImageUrls: Array.isArray(referenceImageUrls) ? referenceImageUrls : [],
+    identityId: identityId || null,
     designColors,
     fabricFeel: Number.isFinite(Number(fabricFeel)) ? Number(fabricFeel) : 0.5,
     printStrength: Number.isFinite(Number(printStrength)) ? Number(printStrength) : 0.7,
@@ -1261,6 +1292,13 @@ function buildPreviewBlankRender({ db, storage, functions, sharp, admin }) {
          * trigger defaults to DEFAULT_VTON_PROVIDER_ID (flux_fill).
          */
         providerId: input.providerId,
+        /**
+         * Phase I: identity attachment. When set, the trigger pulls reference
+         * photos from rp_identities/{identityId}.referenceImages and routes
+         * the realism call through the identity's preferredProviderId
+         * (typically flux_2_multireference).
+         */
+        identityId: input.identityId,
         status: "queued",
         error: null,
         stageA: null,
@@ -1355,15 +1393,64 @@ function buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp })
 
       if (input.withRealism) {
         /**
+         * Phase I: resolve identity FIRST (if attached to this job). An identity
+         * with mode="reference_images" or "hybrid" can override the job-level
+         * providerId — its preferredProviderId wins because the identity owns
+         * the reference photos that the chosen provider needs. We also pass
+         * the reference URLs through to composeStageB so the provider can
+         * thread them into the inference call.
+         *
+         * Resolution order for the providerId:
+         *   1. Explicit job.providerId (A/B harness sets this) — highest priority
+         *   2. identity.preferredProviderId (when identity has mode=reference_images/hybrid)
+         *   3. DEFAULT_VTON_PROVIDER_ID (flux_fill) — fallback
+         */
+        let identityDoc = null;
+        let identityReferenceUrls = [];
+        const identityId = typeof job.identityId === "string" && job.identityId ? job.identityId : null;
+        if (identityId) {
+          try {
+            const idSnap = await db.collection("rp_identities").doc(identityId).get();
+            if (idSnap.exists) {
+              identityDoc = idSnap.data();
+              if (Array.isArray(identityDoc.referenceImages)) {
+                identityReferenceUrls = identityDoc.referenceImages
+                  .map((r) => (r && typeof r.url === "string" ? r.url : null))
+                  .filter(Boolean);
+              }
+            } else {
+              console.warn(`[trigger] identity ${identityId} on job ${jobId} not found, skipping identity resolution`);
+            }
+          } catch (idErr) {
+            console.warn(`[trigger] identity lookup failed for ${identityId}: ${idErr && idErr.message}`);
+          }
+        }
+
+        /**
          * Phase B: providerId picks which VTON pipeline runs. Legacy job docs
          * (pre-registry) had no field — default to `flux_fill` so they keep
          * working byte-identical to pre-refactor. The A/B harness sets this
          * explicitly when fanning out N jobs across providers.
          */
-        const providerId =
-          typeof job.providerId === "string" && job.providerId.length > 0
-            ? job.providerId
-            : DEFAULT_VTON_PROVIDER_ID;
+        let providerId;
+        if (typeof job.providerId === "string" && job.providerId.length > 0) {
+          /** Explicit job override (A/B harness, manual operator selection) — wins. */
+          providerId = job.providerId;
+        } else if (
+          identityDoc &&
+          (identityDoc.mode === "reference_images" || identityDoc.mode === "hybrid") &&
+          typeof identityDoc.preferredProviderId === "string" &&
+          identityDoc.preferredProviderId.length > 0 &&
+          identityReferenceUrls.length > 0
+        ) {
+          /** Identity declares its preferred provider AND has reference photos. */
+          providerId = identityDoc.preferredProviderId;
+          console.log(
+            `[trigger] identity ${identityId} (mode=${identityDoc.mode}) routes to provider ${providerId} with ${identityReferenceUrls.length} refs`
+          );
+        } else {
+          providerId = DEFAULT_VTON_PROVIDER_ID;
+        }
         /**
          * Phase B: Kolors VTO needs the variant's model photo URL as a
          * separate input (it doesn't read from draftBuffer). Resolve it here
@@ -1401,6 +1488,9 @@ function buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp })
             modelImageUrl && typeof modelImageUrl.downloadUrl === "string"
               ? modelImageUrl.downloadUrl
               : null,
+          /** Phase I: identity reference URLs threaded into the provider's ctx. */
+          referenceImageUrls: identityReferenceUrls,
+          identityId,
         });
         /**
          * Phase A cost meter: lift the falCostUsd/falLatencyMs/falEndpoint/
@@ -1592,6 +1682,14 @@ function buildEnqueueVtonAbTest({ db, functions, admin }) {
         designUrlOverride: baseInput.designUrlOverride,
         withRealism: true,
         providerId,
+        /**
+         * Phase I: every job in an A/B fan-out shares the same identityId
+         * so the comparison is "this identity rendered by 3 different
+         * providers" rather than "3 different identities." If one of the
+         * providers in the set doesn't use identity refs (e.g. flux_fill),
+         * the trigger just ignores the field for that provider.
+         */
+        identityId: baseInput.identityId,
         abTestGroupId,
         status: "queued",
         error: null,

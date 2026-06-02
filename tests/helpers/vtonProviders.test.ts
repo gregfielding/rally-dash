@@ -83,6 +83,43 @@ describe("VTON registry — Flux Fill provider", () => {
   });
 });
 
+describe("VTON registry — Flux 2 multi-reference provider (Phase I)", () => {
+  it("is registered", () => {
+    const p = providers.getVtonProvider("flux_2_multireference");
+    expect(p).toBeDefined();
+  });
+
+  it("requires identity references, NOT a mask, NOT a prompt, NOT a model photo", () => {
+    const p = providers.getVtonProvider("flux_2_multireference");
+    /** This is the differentiator vs Flux Fill (mask+prompt) and Kolors VTO (model photo). */
+    expect(p.capabilities.requiresMask).toBe(false);
+    expect(p.capabilities.requiresPrompt).toBe(false);
+    expect(p.capabilities.requiresModelPhoto).toBe(false);
+    // requiresIdentityReferences is a Phase I capability flag — guarded explicitly so
+    // a future provider stripping it would fail this test.
+    expect(
+      (p.capabilities as { requiresIdentityReferences?: boolean }).requiresIdentityReferences
+    ).toBe(true);
+  });
+
+  it("is flagged experimental until A/B-validated", () => {
+    const p = providers.getVtonProvider("flux_2_multireference");
+    expect(p.capabilities.experimental).toBe(true);
+  });
+
+  it("points at the Flux 2 Pro edit endpoint", () => {
+    const p = providers.getVtonProvider("flux_2_multireference");
+    expect(p.endpoint).toBe("fal-ai/flux-2-pro/edit");
+  });
+
+  it("endpoint has a price-table entry (cost meter coverage)", () => {
+    const p = providers.getVtonProvider("flux_2_multireference");
+    expect(falInference.FAL_ENDPOINT_PRICING[p.endpoint]).toBeDefined();
+    expect(falInference.FAL_ENDPOINT_PRICING[p.endpoint].costUsd).toBeGreaterThan(0);
+    expect(falInference.FAL_ENDPOINT_PRICING[p.endpoint].costUsd).toBeLessThan(0.5);
+  });
+});
+
 describe("VTON registry — Kolors VTO provider", () => {
   it("is registered", () => {
     const p = providers.getVtonProvider("kolors_vto");

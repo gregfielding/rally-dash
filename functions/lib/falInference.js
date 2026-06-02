@@ -57,6 +57,18 @@ const FAL_ENDPOINT_PRICING = {
     costUsd: 0.04,
     notes: "FLUX.1 Kontext [pro] — iterative image editing",
   },
+  /**
+   * Phase I target: Flux 2 Pro edit (multi-reference). Vendor positions this
+   * as the identity-preservation replacement for per-character LoRA training
+   * — accepts up to 9-10 reference images per generation natively. Rally
+   * uses it as the primary path for "Amber wearing X" via her referenceImages
+   * stack. Pricing estimate is mid-range between Flux Pro and Kontext;
+   * verify against an actual successful call and update.
+   */
+  "fal-ai/flux-2-pro/edit": {
+    costUsd: 0.06,
+    notes: "Flux 2 Pro edit — multi-reference identity + edit (Phase I primary)",
+  },
   /** Legacy Flux endpoints kept for historical job-doc readers. */
   "fal-ai/flux-lora": {
     costUsd: 0.035,

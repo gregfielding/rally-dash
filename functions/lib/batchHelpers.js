@@ -248,6 +248,7 @@ const FAL_ENDPOINT_LIMITERS = {
   "fal-ai/evf-sam": createConcurrencyLimiter(8),
   "fal-ai/flux-pro/v1/fill": createConcurrencyLimiter(4),
   "fal-ai/flux-pro/kontext": createConcurrencyLimiter(4),
+  "fal-ai/flux-2-pro/edit": createConcurrencyLimiter(4),
   "fal-ai/kling/v1-5/kolors-virtual-try-on": createConcurrencyLimiter(4),
   "fal-ai/flux-2-lora-gallery/virtual-tryon": createConcurrencyLimiter(4),
   "fal-ai/flux-lora": createConcurrencyLimiter(4),

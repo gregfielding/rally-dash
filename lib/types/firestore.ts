@@ -382,6 +382,58 @@ export interface TrainingJob {
 // Source-of-truth for identity-level LoRA linkage.
 export type RPIdentityStatus = "draft" | "ready" | "trained";
 
+/**
+ * Identity-source mode (Phase I, 2026-06-01 — post deep-research recalibration).
+ *
+ *   - "reference_images": identity is preserved at inference time via N
+ *     reference photos fed to a multi-reference model (Flux 2 multi-ref or
+ *     equivalent). NO training step. Fast iteration, no overfitting risk.
+ *     The recommended default for new identities — Zalando's analog production
+ *     workflow and FASHN AI's fashion-vertical SaaS both use this pattern.
+ *   - "lora": legacy training-based identity. Identity lives in trained
+ *     LoRA weights (`activeLoraArtifactId`). Use only when reference-image
+ *     mode disappoints quality-wise, OR when the identity is highly stylized
+ *     and needs the per-character fine-tune.
+ *   - "hybrid": both modes available. Inference picks LoRA when available
+ *     AND a reference set when supported by the chosen VTON provider.
+ *
+ * Legacy docs (pre-Phase-I) lack this field — `resolveIdentityMode()` in
+ * lib/identity treats missing as "lora" if `activeLoraArtifactId` is set,
+ * otherwise "reference_images" so the field is fully optional.
+ */
+export type RPIdentityMode = "reference_images" | "lora" | "hybrid";
+
+/**
+ * One reference photo of the identity, used for Flux 2 multi-reference and
+ * other reference-conditioned VTON providers. Role is the angle/coverage tag
+ * — UI groups photos by role so the operator can see "do I have a face front
+ * + face 3-quarter + body full?" at a glance.
+ */
+export type RPIdentityReferenceRole =
+  | "face_front"
+  | "face_3q"
+  | "face_profile"
+  | "body_full"
+  | "body_3q"
+  | "body_side"
+  | "detail_hands"
+  | "detail_hair";
+
+export interface RPIdentityReferenceImage {
+  /** Auto-generated id (random); used as the deletion key. */
+  refId: string;
+  url: string;
+  storagePath: string;
+  role: RPIdentityReferenceRole;
+  /** Optional operator label ("hero shot", "casual wave", etc.). Free-form. */
+  label?: string | null;
+  width?: number | null;
+  height?: number | null;
+  bytes?: number | null;
+  uploadedAt: Timestamp;
+  uploadedByUid: string;
+}
+
 export interface RPIdentity {
   id?: string;
   name: string; // "Amber"
@@ -394,6 +446,27 @@ export interface RPIdentity {
   defaultTriggerPhrase: string;
 
   status: RPIdentityStatus;
+
+  /**
+   * Phase I: how this identity is applied at inference time. See RPIdentityMode.
+   * Missing = legacy behavior (LoRA if activeLoraArtifactId set, else reference_images).
+   */
+  mode?: RPIdentityMode;
+
+  /**
+   * Phase I: reference photos used by Flux 2 multi-reference (and future
+   * reference-conditioned providers like FASHN Face Reference). Capped at ~10
+   * client-side to match Flux 2's max input (4-9 per generation; we keep a
+   * buffer for the inference layer to pick the best subset).
+   */
+  referenceImages?: RPIdentityReferenceImage[] | null;
+
+  /**
+   * Phase I: which registered VTON provider this identity prefers. If unset,
+   * `composeStageB` falls back to the global default. Setting this enables
+   * "Amber always uses Flux 2 multi-ref" without operator intervention per render.
+   */
+  preferredProviderId?: string | null;
 
   // Currently active LoRA artifact for this identity.
   activeLoraArtifactId?: string;
@@ -414,6 +487,8 @@ export interface RPIdentity {
   faceImageCount?: number;
   upperBodyCount?: number;
   fullBodyCount?: number;
+  /** Phase I: total count of reference images currently uploaded. Mirror of referenceImages.length. */
+  referenceImageCount?: number;
 
   // Audit
   createdAt: Timestamp;
@@ -3808,6 +3883,15 @@ export interface RPBlankPreviewJob {
    * providers from the same Stage A input.
    */
   providerId?: RPVtonProviderId;
+
+  /**
+   * Phase I (2026-06-01): identity attachment. When set, the trigger pulls
+   * referenceImages from `rp_identities/{identityId}` and threads them into
+   * the VTON provider's context. The identity's `preferredProviderId` also
+   * overrides the job-level `providerId` UNLESS the job explicitly set one
+   * (A/B harness use case). Legacy jobs without this field route as before.
+   */
+  identityId?: string | null;
 
   /**
    * Phase B: when this job is part of an A/B fan-out, every job in the same

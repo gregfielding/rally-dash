@@ -189,3 +189,6 @@ require("./vtonProviderFluxFill");
 // Phase B3: Kolors VTO provider. Comment out to disable in production until
 // it's been A/B-validated for Rally's specific use case.
 require("./vtonProviderKolorsVto");
+// Phase I: Flux 2 multi-reference (identity-preserving via reference photos).
+// Vendor-positioned as the LoRA-replacement for character consistency.
+require("./vtonProviderFlux2MultiReference");

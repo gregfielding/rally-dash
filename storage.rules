@@ -29,6 +29,16 @@ service firebase.storage {
       allow write: if isAdmin();
     }
 
+    // Phase I: identity reference images for Flux 2 multi-reference + future
+    // reference-conditioned VTON providers. Operator uploads here via the
+    // /lora/identities/{id}/references page; callable registers the file on
+    // the identity doc (see addIdentityReferenceImage). Path is enforced
+    // server-side to start with rp/identity_references/{identityId}/.
+    match /rp/identity_references/{identityId}/{fileName} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
     // LoRA Ops: Training dataset zips (any file under packId)
     match /training_zips/{packId}/{datasetFile} {
       allow read: if isAuthenticated();

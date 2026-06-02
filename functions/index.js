@@ -122,6 +122,11 @@ const {
 } = require("./lib/sceneJobPipeline");
 const { buildOnJobBatchProgress } = require("./lib/batchProgressTriggers");
 const {
+  buildAddIdentityReferenceImage,
+  buildRemoveIdentityReferenceImage,
+  buildSetIdentityMode,
+} = require("./lib/identityReferenceImages");
+const {
   buildEnqueueProductModelRealism,
   buildEnqueueProductModelRealismBatch,
 } = require("./lib/enqueueProductModelRealism");
@@ -7534,6 +7539,26 @@ exports.onSceneJobBatchProgress = functions.firestore
 exports.onBlankPreviewJobBatchProgress = functions.firestore
   .document("rp_blank_preview_jobs/{jobId}")
   .onWrite(buildOnJobBatchProgress({ db, admin, label: "preview_job" }));
+
+/**
+ * Phase I: identity reference-image management. Client uploads the image to
+ * Cloud Storage at rp/identity_references/{identityId}/... via the client SDK,
+ * then calls these to register the reference on the rp_identities doc.
+ *
+ *   addIdentityReferenceImage    → append { refId, url, role, ... }
+ *   removeIdentityReferenceImage → remove by refId + best-effort Storage delete
+ *   setIdentityMode              → switch lora/reference_images/hybrid +
+ *                                  optional preferredProviderId
+ */
+exports.addIdentityReferenceImage = functions.https.onCall(
+  buildAddIdentityReferenceImage({ db, admin, functions, storage })
+);
+exports.removeIdentityReferenceImage = functions.https.onCall(
+  buildRemoveIdentityReferenceImage({ db, admin, functions, storage })
+);
+exports.setIdentityMode = functions.https.onCall(
+  buildSetIdentityMode({ db, admin, functions })
+);
 
 /**
  * Phase 3: enqueue a model-realism render for a product variant. Wraps the
