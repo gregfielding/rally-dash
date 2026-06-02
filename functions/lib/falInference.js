@@ -128,6 +128,45 @@ async function runFalInference(params) {
   if (!falApiKey) {
     throw new Error("runFalInference: falApiKey is required (set FAL_API_KEY)");
   }
+  /**
+   * Phase E: per-endpoint concurrency limiting. Wraps the actual HTTP work
+   * in a semaphore so a 50-template fan-out from a single function instance
+   * doesn't fire 50 parallel fal.ai calls. Per-endpoint caps live in
+   * batchHelpers.js (FAL_ENDPOINT_LIMITERS). Unknown endpoints pass through
+   * unbounded — same behavior as pre-E4.
+   *
+   * Lazy-require to avoid circular dep risk between falInference and
+   * batchHelpers (batchHelpers doesn't import falInference today, but the
+   * lazy require keeps it safe for future additions).
+   */
+  // eslint-disable-next-line global-require
+  const { withEndpointLimit } = require("./batchHelpers");
+  return withEndpointLimit(endpoint, () =>
+    runFalInferenceUnlimited({
+      endpoint,
+      payload,
+      falApiKey,
+      fetchFn,
+      maxPollAttempts,
+      pollIntervalMs,
+      withLogs,
+      signal,
+    })
+  );
+}
+
+/** Inner implementation — separated so the limiter wrapper is one tight indirection. */
+async function runFalInferenceUnlimited(params) {
+  const {
+    endpoint,
+    payload,
+    falApiKey,
+    fetchFn,
+    maxPollAttempts,
+    pollIntervalMs,
+    withLogs,
+    signal,
+  } = params;
   const _fetch = fetchFn || fetch;
   const startedAtMs = Date.now();
   const url = `${FAL_QUEUE_BASE}/${endpoint}`;

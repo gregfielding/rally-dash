@@ -29,6 +29,7 @@
 
 const { runFalInference } = require("./falInference");
 const { getSceneTemplate, getDefault4ShotTemplateIds } = require("./sceneTemplates");
+const { createBatchAtomically, incrementBatchCounters } = require("./batchHelpers");
 
 const KONTEXT_ENDPOINT = "fal-ai/flux-pro/kontext";
 /** 60 attempts × 1500ms = 90s. Kontext usually completes in 15-30s. */
@@ -226,12 +227,19 @@ function buildEnqueueSceneJobBatch({ db, functions, admin }) {
     });
     const uniqueIds = [...new Set(templateIds)];
 
+    /**
+     * Phase E: atomic fan-out. The parent batch doc + every child job doc
+     * land in a single Firestore commit, so a half-fan-out (some jobs
+     * created, batch never written) is impossible — either every doc is in
+     * Firestore or none are. Without atomic fan-out, a callable timeout
+     * after writing N-1 jobs would leak partial work.
+     */
     const sceneSetId = `set_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e9).toString(36)}`;
     const now = admin.firestore.FieldValue.serverTimestamp();
-    const collRef = db.collection("rp_scene_jobs");
-    const jobIds = {};
-    for (const sceneTemplateId of uniqueIds) {
-      const jobData = {
+
+    const jobs = uniqueIds.map((sceneTemplateId) => ({
+      collectionPath: "rp_scene_jobs",
+      data: {
         productId,
         variantId,
         sourceSlot,
@@ -244,12 +252,29 @@ function buildEnqueueSceneJobBatch({ db, functions, admin }) {
         createdAt: now,
         createdByUid: uid,
         updatedAt: now,
-      };
-      const ref = await collRef.add(jobData);
-      jobIds[sceneTemplateId] = ref.id;
-    }
+      },
+    }));
 
-    return { sceneSetId, jobIds, templateCount: uniqueIds.length };
+    const { batchId, jobRefs } = await createBatchAtomically({
+      db,
+      admin,
+      kind: "scene_set",
+      createdByUid: uid,
+      metadata: {
+        productId,
+        variantId,
+        sceneTemplateIds: uniqueIds,
+        label: `${uniqueIds.length}-shot scene set`,
+      },
+      jobs,
+    });
+
+    /** Build the {templateId → jobId} map in input order so the UI can subscribe. */
+    const jobIds = Object.fromEntries(
+      uniqueIds.map((id, i) => [id, jobRefs[i].id])
+    );
+
+    return { sceneSetId, batchId, jobIds, templateCount: uniqueIds.length };
   };
 }
 

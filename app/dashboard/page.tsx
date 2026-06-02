@@ -5,6 +5,7 @@ import { useMemo } from "react";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import { TableSkeleton } from "@/components/Skeleton";
 import FalCostMeterWidget from "@/components/dashboard/FalCostMeterWidget";
+import BatchListWidget from "@/components/dashboard/BatchListWidget";
 import { useProducts } from "@/lib/hooks/useRPProducts";
 import {
   productAttentionReasons,
@@ -117,6 +118,8 @@ function DashboardContent() {
           ))}
         </div>
       </div>
+
+      <BatchListWidget />
 
       <FalCostMeterWidget />
 

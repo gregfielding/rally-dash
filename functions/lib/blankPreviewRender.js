@@ -18,6 +18,7 @@ const {
   getVtonProvider,
   DEFAULT_VTON_PROVIDER_ID,
 } = require("./vtonProviders");
+const { createBatchAtomically } = require("./batchHelpers");
 
 /**
  * Stage B uses fal.ai's Kontext model (`fal-ai/flux-pro/kontext`) for image editing.
@@ -1567,19 +1568,20 @@ function buildEnqueueVtonAbTest({ db, functions, admin }) {
     }
 
     /**
-     * Shared group id so the UI can query all jobs in this A/B run with one
-     * Firestore where("abTestGroupId", "==", X) call. The id is built from
-     * the job docs' add() results — but we need it BEFORE add() since it
-     * goes into each doc. Generate with the same random + timestamp pattern
-     * Rally already uses elsewhere.
+     * Phase E atomic fan-out. The parent rp_batches doc + every
+     * rp_blank_preview_jobs doc land in a single Firestore commit so a
+     * mid-fan-out timeout can't leave us with N-1 jobs and no batch row.
+     *
+     * abTestGroupId is preserved on every child for back-compat with the
+     * existing comparison UI (which queries by abTestGroupId). The new
+     * batchId is the rp_batches doc id — orthogonal to abTestGroupId but
+     * authoritative for batch-level state.
      */
     const abTestGroupId = `ab_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e9).toString(36)}`;
     const now = admin.firestore.FieldValue.serverTimestamp();
-    const collRef = db.collection("rp_blank_preview_jobs");
-
-    const jobIds = {};
-    for (const providerId of uniqueIds) {
-      const jobData = {
+    const jobs = uniqueIds.map((providerId) => ({
+      collectionPath: "rp_blank_preview_jobs",
+      data: {
         blankId: baseInput.blankId,
         variantId: baseInput.variantId,
         designId: baseInput.designId,
@@ -1598,13 +1600,30 @@ function buildEnqueueVtonAbTest({ db, functions, admin }) {
         createdAt: now,
         createdByUid: uid,
         updatedAt: now,
-      };
-      const ref = await collRef.add(jobData);
-      jobIds[providerId] = ref.id;
-    }
+      },
+    }));
+
+    const { batchId, jobRefs } = await createBatchAtomically({
+      db,
+      admin,
+      kind: "vton_ab",
+      createdByUid: uid,
+      metadata: {
+        productId: null,
+        variantId: baseInput.variantId,
+        providerIds: uniqueIds,
+        label: `VTON A/B (${uniqueIds.length} providers)`,
+      },
+      jobs,
+    });
+
+    const jobIds = Object.fromEntries(
+      uniqueIds.map((id, i) => [id, jobRefs[i].id])
+    );
 
     return {
       abTestGroupId,
+      batchId,
       jobIds,
       providerCount: uniqueIds.length,
     };

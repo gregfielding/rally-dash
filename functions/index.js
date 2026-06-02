@@ -120,6 +120,7 @@ const {
   buildEnqueueSceneJobBatch,
   buildOnSceneJobCreated,
 } = require("./lib/sceneJobPipeline");
+const { buildOnJobBatchProgress } = require("./lib/batchProgressTriggers");
 const {
   buildEnqueueProductModelRealism,
   buildEnqueueProductModelRealismBatch,
@@ -7515,6 +7516,24 @@ exports.onSceneJobCreated = functions
   .onCreate(
     buildOnSceneJobCreated({ db, storage, admin, functions, sharp: require("sharp") })
   );
+
+/**
+ * Phase E: per-job progress triggers that update the parent rp_batches doc
+ * when a child job's status changes. Two onWrite triggers (one per child
+ * collection) share the same factory — same status-rollup semantics for
+ * scene_set and vton_ab batches.
+ *
+ * onWrite (not onUpdate): we need to see the initial status==="queued"
+ * create event to ignore it (the parent batch's `queued` counter was
+ * already set at fan-out time). The factory short-circuits the no-op case.
+ */
+exports.onSceneJobBatchProgress = functions.firestore
+  .document("rp_scene_jobs/{jobId}")
+  .onWrite(buildOnJobBatchProgress({ db, admin, label: "scene_job" }));
+
+exports.onBlankPreviewJobBatchProgress = functions.firestore
+  .document("rp_blank_preview_jobs/{jobId}")
+  .onWrite(buildOnJobBatchProgress({ db, admin, label: "preview_job" }));
 
 /**
  * Phase 3: enqueue a model-realism render for a product variant. Wraps the

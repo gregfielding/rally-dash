@@ -263,6 +263,16 @@ service cloud.firestore {
       allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
     }
 
+    // rp_batches/{batchId} — Phase E: durable batch-level state for fan-out
+    // callables (enqueueSceneJobBatch, enqueueVtonAbTest, etc). The parent
+    // batch doc + N child job docs are created in a single atomic Firestore
+    // write so partial fan-outs are impossible. Progress triggers on the
+    // child collections increment counters here. UI subscribes via onSnapshot.
+    match /rp_batches/{batchId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin() && (hasRole('admin') || hasRole('ops'));
+    }
+
     // rp_product_assets/{assetId}
     match /rp_product_assets/{assetId} {
       allow read: if isAdmin();

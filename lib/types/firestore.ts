@@ -3907,3 +3907,77 @@ export interface RPVariantSceneRender {
   updatedAt: Timestamp;
 }
 
+
+
+// --------------------------------------------------------------------
+// Phase E: durable batch fan-out tracking (rp_batches)
+// --------------------------------------------------------------------
+
+/**
+ * Stable identifiers for the kinds of batches Rally can fan out. Each kind
+ * corresponds to a specific batch callable + child-job collection:
+ *
+ *   - vton_ab            → enqueueVtonAbTest          → rp_blank_preview_jobs
+ *   - scene_set          → enqueueSceneJobBatch       → rp_scene_jobs
+ *   - product_realism    → enqueueProductModelRealismBatch → rp_blank_preview_jobs
+ *   - shopify_collections → syncShopifySmartCollectionsFromTaxonomy (no child docs;
+ *                            tracks N taxonomy upserts in summary[])
+ */
+export type RPBatchKind =
+  | "vton_ab"
+  | "scene_set"
+  | "product_realism"
+  | "shopify_collections";
+
+export type RPBatchStatus =
+  | "queued"        // batch doc + child docs created, no triggers fired yet
+  | "running"       // at least one child job in_progress / completed / failed
+  | "completed"     // every child reached a terminal state, ALL succeeded
+  | "partial"       // every child terminal, but ≥1 failed (NOT a fatal batch error)
+  | "failed";       // the fan-out callable itself errored before/while creating child docs
+
+/**
+ * One row per fan-out. The batch doc is the ATOMIC anchor — created in the same
+ * Firestore batched write as its child job docs so a half-fan-out is impossible
+ * (either all docs land or none do). Progress triggers on the child collections
+ * update the counter fields via FieldValue.increment.
+ */
+export interface RPBatch {
+  id: string;
+  kind: RPBatchKind;
+  status: RPBatchStatus;
+
+  /**
+   * Counts. `total` is set at fan-out time; the others increment from 0 as
+   * child jobs transition. `total = completed + failed + (queued + processing)`
+   * is the loop invariant.
+   */
+  total: number;
+  queued: number;
+  processing: number;
+  completed: number;
+  failed: number;
+
+  /** Free-form bag for kind-specific metadata that helps the UI render the batch. */
+  metadata?: {
+    /** Product context for product-scoped batches. */
+    productId?: string | null;
+    variantId?: string | null;
+    /** For vton_ab: which providers were in the fan-out. */
+    providerIds?: string[];
+    /** For scene_set: which templates were in the fan-out. */
+    sceneTemplateIds?: string[];
+    /** Free-form label for the dashboard batch list. */
+    label?: string | null;
+  };
+
+  /** Top-level cost mirror, summed from child jobs by the progress trigger. */
+  falCostUsdTotal?: number | null;
+
+  /** Populated when the fan-out callable itself errored before completing. */
+  error?: string | null;
+
+  createdAt: Timestamp;
+  createdByUid: string;
+  updatedAt: Timestamp;
+}
