@@ -8531,6 +8531,55 @@ exports.onMockJobCreated = functions
   });
 
 /**
+ * Phase D: proactive taxonomy → Shopify smart collections sync. Iterates the
+ * active rp_taxonomy_sports/leagues/entities/themes docs and ensures a
+ * Shopify smart collection exists for each. Idempotent — safe to call
+ * repeatedly. Writes sync state back onto each taxonomy doc.
+ *
+ * Input:  { collections?: string[], dryRun?: boolean }
+ * Output: { summary: Array<{family, code, handle, status, shopifyId?, error?}> }
+ */
+exports.syncShopifySmartCollectionsFromTaxonomy = functions
+  .runWith({ memory: "512MB", timeoutSeconds: 540 })
+  .https.onCall(async (data, context) => {
+    const uid = context && context.auth && context.auth.uid;
+    if (!uid) throw new functions.https.HttpsError("unauthenticated", "Sign-in required");
+    const adminSnap = await db.collection("admins").doc(uid).get();
+    if (!adminSnap.exists) {
+      throw new functions.https.HttpsError("permission-denied", "Admins only");
+    }
+    const { collections, dryRun } = data || {};
+    const { store, accessToken } = shopifySync.getShopifyConfig();
+    return await shopifySmartCollections.syncSmartCollectionsFromTaxonomy({
+      db,
+      store,
+      accessToken,
+      collections,
+      dryRun: dryRun === true,
+      admin,
+    });
+  });
+
+/**
+ * Phase D: read-only status report — which taxonomy entries have synced
+ * smart collections vs which are missing. Cheap (Firestore-only, no
+ * Shopify call). Drives the catalog page status grid.
+ *
+ * Input:  { collections?: string[] }
+ * Output: { rows: Array<{collection, family, docId, code, expectedHandle, status, shopifyId?, syncedAt?}> }
+ */
+exports.getShopifySmartCollectionsStatus = functions.https.onCall(async (data, context) => {
+  const uid = context && context.auth && context.auth.uid;
+  if (!uid) throw new functions.https.HttpsError("unauthenticated", "Sign-in required");
+  const adminSnap = await db.collection("admins").doc(uid).get();
+  if (!adminSnap.exists) {
+    throw new functions.https.HttpsError("permission-denied", "Admins only");
+  }
+  const { collections } = data || {};
+  return await shopifySmartCollections.getShopifySmartCollectionsStatus({ db, collections });
+});
+
+/**
  * Shopify catalog sync worker. Processes shopifySyncJobs (entityType: product, action: create_or_update).
  * Loads Rally product, validates readiness, runs productSet (media + single variant + metafields), updates Rally and job.
  */

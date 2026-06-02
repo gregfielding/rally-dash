@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import ProtectedRoute from "@/components/ProtectedRoute";
+import ShopifySmartCollectionsSection from "@/components/catalog/ShopifySmartCollectionsSection";
 
 const sections = [
   {
@@ -67,6 +68,14 @@ function CatalogContent() {
           </div>
         ))}
       </div>
+
+      {/*
+        Phase D — Shopify smart-collection sync. Sits below the existing
+        navigation cards so it's discoverable but doesn't dominate the
+        catalog landing experience. Read-only on mount; sync requires
+        an explicit button click + admin/ops role.
+      */}
+      <ShopifySmartCollectionsSection />
     </div>
   );
 }
