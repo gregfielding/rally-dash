@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useMemo } from "react";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import { TableSkeleton } from "@/components/Skeleton";
+import FalCostMeterWidget from "@/components/dashboard/FalCostMeterWidget";
 import { useProducts } from "@/lib/hooks/useRPProducts";
 import {
   productAttentionReasons,
@@ -116,6 +117,8 @@ function DashboardContent() {
           ))}
         </div>
       </div>
+
+      <FalCostMeterWidget />
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
         <section className="bg-white rounded-lg shadow border border-gray-100 overflow-hidden">
