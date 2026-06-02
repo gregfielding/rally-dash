@@ -8,6 +8,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui",
     "firebase": "firebase",
     "deploy:functions": "firebase deploy --only functions",
     "deploy:firestore:rules": "firebase deploy --only firestore:rules",
@@ -29,12 +32,14 @@
     "@types/node": "^20.14.0",
     "@types/react": "^18.3.0",
     "@types/react-dom": "^18.3.0",
+    "@vitest/ui": "^4.1.8",
     "autoprefixer": "^10.4.22",
     "eslint": "^8.57.0",
     "eslint-config-next": "^14.2.0",
     "firebase-tools": "^15.11.0",
     "postcss": "^8.5.6",
     "tailwindcss": "^3.4.19",
-    "typescript": "^5.5.0"
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.8"
   }
 }

@@ -81,18 +81,34 @@ export interface BuildDesignCodeParams {
 
 /**
  * Stable design segment from taxonomy + design fields (hyphen-free, ≤10 chars).
- * Prefers explicit `themeCode` when usable; else `designFamily` + `designSeries`; else `designType`; else `designId`.
+ * Prefers explicit `themeCode` when usable; else `designFamily` + `designSeries`;
+ * else `designType`; else `designId`. Final fallback `"XX"` if literally nothing
+ * is set (loud signal that taxonomy is broken upstream).
+ *
+ * Bug history (2026-06-01, Phase A0 tests): the original used
+ * `normalizeSkuSegment` which forces a `"X"` fallback for empty inputs, making
+ * the combined `${fam}${ser}` always ≥ 2 chars ("XX") and short-circuiting the
+ * designType/designId branches. Fixed to skip the "X" fallback in the chain so
+ * downstream fallbacks actually execute.
  */
 export function buildDesignCodeForSku(p: BuildDesignCodeParams): string {
-  const tc = normalizeSkuSegment(p.themeCode, 10);
+  /** Like normalizeSkuSegment but returns "" for empty/missing inputs (no "X" fallback). */
+  const tryNormalize = (raw: string | null | undefined, maxLen: number): string => {
+    if (raw == null) return "";
+    const s = String(raw).trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+    return s.slice(0, Math.max(1, maxLen));
+  };
+  const tc = tryNormalize(p.themeCode, 10);
   if (tc.length >= 2) return tc;
-  const fam = normalizeSkuSegment(p.designFamily, 8);
-  const ser = normalizeSkuSegment(p.designSeries, 6);
-  const combined = `${fam}${ser}`.replace(/[^A-Z0-9]/g, "").slice(0, 10);
+  const fam = tryNormalize(p.designFamily, 8);
+  const ser = tryNormalize(p.designSeries, 6);
+  const combined = `${fam}${ser}`.slice(0, 10);
   if (combined.length >= 2) return combined;
-  const dt = normalizeSkuSegment(p.designType, 10);
+  const dt = tryNormalize(p.designType, 10);
   if (dt.length >= 2) return dt;
-  return normalizeSkuSegment(p.designId, 8);
+  const id = tryNormalize(p.designId, 8);
+  if (id.length >= 2) return id;
+  return "XX";
 }
 
 export interface BuildSkuParams {

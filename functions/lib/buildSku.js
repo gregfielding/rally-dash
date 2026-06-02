@@ -63,16 +63,30 @@ function resolveColorCodeForSku(colorName) {
   return compact.slice(0, 3);
 }
 
+/**
+ * Stable design segment. Bug history (2026-06-01, Phase A0 tests):
+ * the original used `normalizeSkuSegment` which "X"-pads empty inputs,
+ * so the combined fam+ser was always ≥ 2 chars ("XX") and short-circuited
+ * the designType/designId branches. Fixed below to skip the "X" fallback
+ * in the chain so downstream fallbacks actually execute.
+ */
 function buildDesignCodeForSku(p) {
-  const tc = normalizeSkuSegment(p.themeCode, 10);
+  const tryNormalize = (raw, maxLen) => {
+    if (raw == null) return "";
+    const s = String(raw).trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+    return s.slice(0, Math.max(1, maxLen));
+  };
+  const tc = tryNormalize(p.themeCode, 10);
   if (tc.length >= 2) return tc;
-  const fam = normalizeSkuSegment(p.designFamily, 8);
-  const ser = normalizeSkuSegment(p.designSeries, 6);
-  const combined = `${fam}${ser}`.replace(/[^A-Z0-9]/g, "").slice(0, 10);
+  const fam = tryNormalize(p.designFamily, 8);
+  const ser = tryNormalize(p.designSeries, 6);
+  const combined = `${fam}${ser}`.slice(0, 10);
   if (combined.length >= 2) return combined;
-  const dt = normalizeSkuSegment(p.designType, 10);
+  const dt = tryNormalize(p.designType, 10);
   if (dt.length >= 2) return dt;
-  return normalizeSkuSegment(p.designId, 8);
+  const id = tryNormalize(p.designId, 8);
+  if (id.length >= 2) return id;
+  return "XX";
 }
 
 function buildSku(p) {
