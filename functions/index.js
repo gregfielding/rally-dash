@@ -110,6 +110,7 @@ const {
 const {
   buildPreviewBlankRender,
   buildOnBlankPreviewJobCreated,
+  buildEnqueueVtonAbTest,
   runRealismPass,
   hexToColorName,
   buildLetterMaskFromDesignRgba,
@@ -7456,6 +7457,20 @@ exports.onBlankPreviewJobCreated = functions
   .runWith({ memory: "2GB", timeoutSeconds: 540 })
   .firestore.document("rp_blank_preview_jobs/{jobId}")
   .onCreate(buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp: require("sharp") }));
+
+/**
+ * Phase B A/B harness: fan out N rp_blank_preview_jobs from one input, one
+ * per VTON provider, all sharing an `abTestGroupId`. Used by the
+ * compare-providers UI to render side-by-side realism outputs for the same
+ * design + blank + variant.
+ *
+ * Input:  { blankId, variantId, designId, view, renderTarget, placement,
+ *           artworkMode?, designUrlOverride?, providerIds: string[] }
+ * Output: { abTestGroupId, jobIds: { [providerId]: jobId }, providerCount }
+ */
+exports.enqueueVtonAbTest = functions.https.onCall(
+  buildEnqueueVtonAbTest({ db, functions, admin })
+);
 
 /**
  * Phase 3: enqueue a model-realism render for a product variant. Wraps the

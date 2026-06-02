@@ -3704,6 +3704,13 @@ export interface RPBlankPreviewJobInferenceTelemetry {
   requestId: string | null;
 }
 
+/**
+ * Phase B: stable identifiers for the registered VTON providers. New
+ * providers added to functions/lib/vtonProviders.js should also be added
+ * here so the type system catches typos at job-creation time.
+ */
+export type RPVtonProviderId = "flux_fill" | "kolors_vto" | "flux2_vto";
+
 export interface RPBlankPreviewJobStageB {
   previewUrl: string;
   storagePath: string;
@@ -3711,9 +3718,20 @@ export interface RPBlankPreviewJobStageB {
   height: number;
   bytes: number;
   falEndpoint: string;
-  usedMask: boolean;
-  params: { strength: number; num_inference_steps: number; guidance_scale: number };
-  /** Phase A: cost meter telemetry from the Flux Fill call. */
+  /**
+   * Phase B: which VTON provider produced this realism PNG. Legacy
+   * pre-Phase-B docs lack this field; consumers should treat missing as
+   * `"flux_fill"` (the historical default).
+   */
+  providerId?: RPVtonProviderId;
+  /**
+   * Provider-specific params bag — shape depends on `providerId`. Flux Fill:
+   * { strength, num_inference_steps, guidance_scale, seed, fabric_feel, ... }.
+   * Kolors VTO: { modelImageUrl, garmentDraftBytes }. Don't rely on specific
+   * fields — use `providerId` to discriminate.
+   */
+  params: Record<string, unknown>;
+  /** Phase A: cost meter telemetry from runFalInference. */
   inference?: RPBlankPreviewJobInferenceTelemetry | null;
 }
 
@@ -3760,6 +3778,22 @@ export interface RPBlankPreviewJob {
     | null;
   /** When true, the trigger runs Stage A then Stage B; otherwise Stage A only. */
   withRealism: boolean;
+
+  /**
+   * Phase B: which VTON provider to dispatch through for Stage B. Pre-Phase-B
+   * docs lack this field; the trigger defaults to `"flux_fill"` for back-compat.
+   * The A/B harness sets this explicitly when fanning out N jobs across
+   * providers from the same Stage A input.
+   */
+  providerId?: RPVtonProviderId;
+
+  /**
+   * Phase B: when this job is part of an A/B fan-out, every job in the same
+   * fan-out shares this id. The comparison UI queries
+   * `where("abTestGroupId", "==", groupId)` to render all attempts side-by-side.
+   * Single-job (non-A/B) callables leave this field unset.
+   */
+  abTestGroupId?: string | null;
 
   status: RPBlankPreviewJobStatus;
   /** Populated when `status === "failed"`. */

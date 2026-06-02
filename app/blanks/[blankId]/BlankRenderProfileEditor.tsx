@@ -84,6 +84,7 @@ import { httpsCallable } from "firebase/functions";
 import { functions as firebaseFunctions, db as firebaseDb } from "@/lib/firebase/config";
 import { doc as firestoreDoc, onSnapshot, updateDoc as firestoreUpdateDoc } from "firebase/firestore";
 import type { RPBlankPreviewJob } from "@/lib/types/firestore";
+import VtonAbCompareModal from "@/components/vton/VtonAbCompareModal";
 
 /**
  * AI realism preview uses async pipeline (rp_blank_preview_jobs + onSnapshot) so the
@@ -941,6 +942,11 @@ export function BlankRenderProfileEditor({
   const [realPreview, setRealPreview] = useState<RealPreviewResult | null>(null);
   /** Loading state — "A" = Stage A only (fast), "B" = Stage A + AI realism (slow, $). */
   const [realPreviewLoading, setRealPreviewLoading] = useState<"A" | "B" | null>(null);
+  /**
+   * Phase B: A/B compare modal open state. The modal owns its own fan-out
+   * logic + onSnapshot subscription; this state just controls visibility.
+   */
+  const [abCompareOpen, setAbCompareOpen] = useState(false);
   const [realPreviewError, setRealPreviewError] = useState<string | null>(null);
   /** Active onSnapshot unsubscribe for the realism job — kept in a ref so re-renders don't leak listeners. */
   const realPreviewJobUnsubRef = useRef<(() => void) | null>(null);
@@ -4221,6 +4227,24 @@ export function BlankRenderProfileEditor({
                   </button>
                 );
               })() : null}
+              {/*
+                Phase B: A/B compare button. Opens a modal that fans out the
+                same Stage A input to multiple VTON providers (Flux Fill +
+                Kolors VTO today, FLUX 2 VTO when registered) and renders the
+                results side-by-side. Disabled when there's no design selected
+                — A/B against nothing isn't meaningful.
+              */}
+              {previewDesignId && firebaseFunctions ? (
+                <button
+                  type="button"
+                  onClick={() => setAbCompareOpen(true)}
+                  disabled={realPreviewLoading !== null}
+                  className="ml-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+                  title="Run multiple VTON providers (Flux Fill, Kolors VTO) on the same inputs and compare results side-by-side."
+                >
+                  🆚 Compare providers
+                </button>
+              ) : null}
             </div>
             {/*
               DISABLED v10.2 (2026-05-25): original preview header button row.
@@ -4794,6 +4818,47 @@ export function BlankRenderProfileEditor({
             </button>
           </div>
         </div>
+      ) : null}
+      {/*
+        Phase B: A/B compare modal mount. Only mounted when open so the
+        inputs computation doesn't run on every render of the editor. The
+        modal owns its own job-doc subscription and tears it down on close.
+        Inputs mirror what handleRealRenderPreview sends to previewBlankRender —
+        kept in sync below so a successful A/B run produces visually-identical
+        Stage A to a single-job run with the same provider.
+      */}
+      {abCompareOpen && previewDesignId ? (
+        <VtonAbCompareModal
+          open={abCompareOpen}
+          onClose={() => setAbCompareOpen(false)}
+          inputs={{
+            blankId: blank.blankId,
+            variantId: previewVariant?.variantId ?? null,
+            designId: previewDesignId,
+            view: previewSide,
+            renderTarget:
+              selectedRenderTarget === "flat_front" ||
+              selectedRenderTarget === "flat_back" ||
+              selectedRenderTarget === "model_front" ||
+              selectedRenderTarget === "model_back"
+                ? (selectedRenderTarget as "flat_front" | "flat_back" | "model_front" | "model_back")
+                : (`flat_${previewSide}` as "flat_front" | "flat_back"),
+            artworkMode: previewArtworkMode,
+            designUrlOverride: effectiveOverlayArtUrl || null,
+            placement: {
+              x: tuning.placement.x,
+              y: tuning.placement.y,
+              scale: tuning.placement.scale,
+              width: selected?.safeArea?.w,
+              height: selected?.safeArea?.h,
+              blendMode: selected ? undefined : undefined, // resolved server-side via blank+variant
+              blendOpacity: undefined,
+              fabricFeel: tuning.blend.fabricFeel,
+              printStrength: tuning.blend.printStrength,
+              maskConfig: selected?.maskConfig ?? null,
+            },
+          }}
+        />
       ) : null}
     </div>
   );

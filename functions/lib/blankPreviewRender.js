@@ -13,6 +13,11 @@
 
 const { resolveDesignAssetUrls } = require("./designFileMergeCore");
 const { runFalInference } = require("./falInference");
+const { hexToColorName } = require("./hexToColorName");
+const {
+  getVtonProvider,
+  DEFAULT_VTON_PROVIDER_ID,
+} = require("./vtonProviders");
 
 /**
  * Stage B uses fal.ai's Kontext model (`fal-ai/flux-pro/kontext`) for image editing.
@@ -254,42 +259,10 @@ async function assertAdmin(db, functions, uid) {
  * Costs $ per call (fal.ai) and takes ~20-60s. Only run when explicitly requested.
  */
 /**
- * Hex → coarse color name. Flux Fill responds better to color names than raw hex.
- * Buckets keyed on dominant HSV region — close enough for the model to paint the
- * right hue, not a precision color match. The hex is still appended after the
- * name for fine-tuning ("orange (#FF6B00)").
+ * `hexToColorName` is now in functions/lib/hexToColorName.js so VTON providers
+ * can import it without a circular dependency on this module. Re-exported below
+ * for backward compat with any external caller that imports it from here.
  */
-function hexToColorName(hex) {
-  if (typeof hex !== "string" || !hex.startsWith("#")) return null;
-  const h = hex.replace("#", "").toLowerCase();
-  if (h.length !== 6) return null;
-  const r = parseInt(h.slice(0, 2), 16);
-  const g = parseInt(h.slice(2, 4), 16);
-  const b = parseInt(h.slice(4, 6), 16);
-  const max = Math.max(r, g, b);
-  const min = Math.min(r, g, b);
-  const delta = max - min;
-  if (max < 32) return "black";
-  if (min > 220) return "white";
-  if (delta < 25 && max > 100 && max < 200) return "gray";
-  // Hue calc
-  let hue = 0;
-  if (delta > 0) {
-    if (max === r) hue = ((g - b) / delta) % 6;
-    else if (max === g) hue = (b - r) / delta + 2;
-    else hue = (r - g) / delta + 4;
-    hue *= 60;
-    if (hue < 0) hue += 360;
-  }
-  if (hue < 15 || hue >= 345) return "red";
-  if (hue < 40) return "orange";
-  if (hue < 70) return "yellow";
-  if (hue < 165) return "green";
-  if (hue < 200) return "cyan";
-  if (hue < 255) return "blue";
-  if (hue < 290) return "purple";
-  return "magenta";
-}
 
 /**
  * Build a letter-shaped grayscale mask for Stage B inpainting from a design RGBA buffer.
@@ -692,6 +665,8 @@ function validatePreviewInput(functions, data) {
     withRealism: withRealismIn,
     designUrlOverride: designUrlOverrideIn,
     renderTarget: renderTargetIn,
+    /** Phase B: optional provider override for single-job callers. */
+    providerId: providerIdIn,
   } = data || {};
   const artworkMode = artworkModeIn === "dark" || artworkModeIn === "white" ? artworkModeIn : "light";
   if (!blankId || typeof blankId !== "string") {
@@ -724,6 +699,29 @@ function validatePreviewInput(functions, data) {
       `variantId is required for renderTarget="${renderTarget}" — each color has its own model photo`
     );
   }
+  /**
+   * Phase B providerId validation. We validate against the registered list at
+   * the trigger boundary too, but doing it here returns a friendly callable
+   * error code (invalid-argument) instead of a server-error 500.
+   */
+  let providerId = null;
+  if (providerIdIn != null) {
+    if (typeof providerIdIn !== "string" || providerIdIn.length === 0) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "providerId must be a non-empty string when provided"
+      );
+    }
+    try {
+      // Touch the registry — throws if id is unknown.
+      // eslint-disable-next-line global-require
+      const { getVtonProvider } = require("./vtonProviders");
+      getVtonProvider(providerIdIn);
+    } catch (e) {
+      throw new functions.https.HttpsError("invalid-argument", e.message);
+    }
+    providerId = providerIdIn;
+  }
   return {
     blankId,
     variantId: variantId || null,
@@ -735,6 +733,7 @@ function validatePreviewInput(functions, data) {
     designUrlOverride:
       typeof designUrlOverrideIn === "string" && designUrlOverrideIn.length > 0 ? designUrlOverrideIn : null,
     renderTarget,
+    providerId,
   };
 }
 
@@ -1125,29 +1124,59 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
 }
 
 /**
- * Stage B (AI realism) — runs fal.ai realism pass on Stage A output, saves the result
- * to Storage, returns the persisted `stageB` summary.
+ * Stage B (AI realism) — runs the configured VTON provider on Stage A output,
+ * saves the result to Storage, returns the persisted `stageB` summary.
+ *
+ * Phase B: provider is dispatched through `vtonProviders` registry. `providerId`
+ * defaults to `flux_fill` for back-compat with legacy jobs (which were created
+ * before the registry existed). Kolors VTO and future providers slot in by
+ * registering themselves and being chosen by the operator at job-creation time.
  */
-async function composeStageB({ db, storage, sharp, functions, blankId, view, draftBuffer, draftMeta, letterMaskBuffer, designColors, variantSuffix, timestamp, fabricFeel, printStrength, renderTarget }) {
+async function composeStageB({
+  db,
+  storage,
+  sharp,
+  functions,
+  blankId,
+  view,
+  draftBuffer,
+  draftMeta,
+  letterMaskBuffer,
+  designColors,
+  variantSuffix,
+  timestamp,
+  fabricFeel,
+  printStrength,
+  renderTarget,
+  /** Phase B: id of the registered VTON provider to dispatch through. */
+  providerId,
+  /** Phase B: variant model photo URL — required by providers like Kolors VTO. */
+  modelImageUrl,
+}) {
   const falApiKey = getFalApiKey(functions);
   if (!falApiKey) {
     throw new Error("FAL_API_KEY is not configured — cannot run AI realism pass");
   }
-  const realism = await runRealismPass({
+  const resolvedProviderId =
+    typeof providerId === "string" && providerId.length > 0 ? providerId : DEFAULT_VTON_PROVIDER_ID;
+  const provider = getVtonProvider(resolvedProviderId);
+  console.log(
+    `[stageB] provider=${provider.id} endpoint=${provider.endpoint} renderTarget=${renderTarget || `flat_${view}`}`
+  );
+
+  const realism = await provider.runVtonPass({
     sharp,
-    db,
     fetchFn: fetch,
     falApiKey,
     blankId,
     view,
     draftBuffer,
     draftMeta,
-    /** v8: letter mask drives Flux Fill inpaint. Only ink pixels regenerate. */
+    /** Mask: Flux Fill needs it; Kolors VTO ignores it; future providers may use it. */
     letterMaskBuffer,
-    /** v8.1: ink colors injected into the Flux Fill prompt. */
+    /** Model photo URL: required by Kolors VTO; null for Flux Fill (which composites upstream). */
+    modelImageUrl: modelImageUrl || null,
     designColors,
-    /** Operator-set sliders (0–1). Stage B prompt + pre-blur scale with these so they're
-     *  no longer Stage-A-only knobs that AI realism silently ignores. */
     fabricFeel: Number.isFinite(Number(fabricFeel)) ? Number(fabricFeel) : 0.5,
     printStrength: Number.isFinite(Number(printStrength)) ? Number(printStrength) : 0.7,
   });
@@ -1176,7 +1205,12 @@ async function composeStageB({ db, storage, sharp, functions, blankId, view, dra
       width: realismMeta.width || draftMeta.width,
       height: realismMeta.height || draftMeta.height,
       falEndpoint: realism.falEndpoint,
-      usedMask: realism.useMask,
+      /**
+       * Phase B: which provider produced this realism PNG. Surfaced on the
+       * stageB summary so the A/B comparison UI can label each result and
+       * the job doc carries the provenance for later inspection.
+       */
+      providerId: provider.id,
       params: realism.params,
       /**
        * Phase A: telemetry surfaced from runFalInference. The job trigger
@@ -1184,7 +1218,12 @@ async function composeStageB({ db, storage, sharp, functions, blankId, view, dra
        * doc as falCostUsd / falLatencyMs / falRequestId so the dashboard
        * cost-meter widget can aggregate them.
        */
-      inference: realism.inference || null,
+      inference: {
+        costUsd: realism.falCostUsd,
+        latencyMs: realism.falLatencyMs,
+        endpoint: realism.falEndpoint,
+        requestId: realism.falRequestId,
+      },
     },
   };
 }
@@ -1216,6 +1255,11 @@ function buildPreviewBlankRender({ db, storage, functions, sharp, admin }) {
         /** Persist the editor's resolved design URL so the trigger composites the same image. */
         designUrlOverride: input.designUrlOverride,
         withRealism: true,
+        /**
+         * Phase B: persist the VTON provider choice on the job doc. Null →
+         * trigger defaults to DEFAULT_VTON_PROVIDER_ID (flux_fill).
+         */
+        providerId: input.providerId,
         status: "queued",
         error: null,
         stageA: null,
@@ -1309,6 +1353,28 @@ function buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp })
       console.log(`[onBlankPreviewJobCreated] Job ${jobId} Stage A done`);
 
       if (input.withRealism) {
+        /**
+         * Phase B: providerId picks which VTON pipeline runs. Legacy job docs
+         * (pre-registry) had no field — default to `flux_fill` so they keep
+         * working byte-identical to pre-refactor. The A/B harness sets this
+         * explicitly when fanning out N jobs across providers.
+         */
+        const providerId =
+          typeof job.providerId === "string" && job.providerId.length > 0
+            ? job.providerId
+            : DEFAULT_VTON_PROVIDER_ID;
+        /**
+         * Phase B: Kolors VTO needs the variant's model photo URL as a
+         * separate input (it doesn't read from draftBuffer). Resolve it here
+         * from the same variant we used for Stage A so the URL stays in
+         * lockstep with the model image driving the composite.
+         */
+        const modelImageUrl =
+          stageAResult.variant && stageAResult.variant.images
+            ? (input.renderTarget === "model_back"
+                ? stageAResult.variant.images.modelBack
+                : stageAResult.variant.images.modelFront) || null
+            : null;
         const stageBResult = await composeStageB({
           db,
           storage,
@@ -1318,21 +1384,22 @@ function buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp })
           view: input.view,
           draftBuffer: stageAResult.draftBuffer,
           draftMeta: stageAResult.draftMeta,
-          /** v8: letter-mask threads from Stage A → Flux Fill. */
           letterMaskBuffer: stageAResult.letterMaskBuffer,
-          /** v8.1: ink colors threaded from design doc → Flux Fill prompt. */
           designColors: stageAResult.designColors,
           variantSuffix: stageAResult.variantSuffix,
           timestamp: stageAResult.timestamp,
-          /** Slider values reach the prompt + pre-blur via this path. */
           fabricFeel: Number.isFinite(Number(input.placement && input.placement.fabricFeel))
             ? Number(input.placement.fabricFeel)
             : 0.5,
           printStrength: Number.isFinite(Number(input.placement && input.placement.printStrength))
             ? Number(input.placement.printStrength)
             : 0.7,
-          /** Forward so Stage B uses the same target-aware storage layout as Stage A. */
           renderTarget: input.renderTarget,
+          providerId,
+          modelImageUrl:
+            modelImageUrl && typeof modelImageUrl.downloadUrl === "string"
+              ? modelImageUrl.downloadUrl
+              : null,
         });
         /**
          * Phase A cost meter: lift the falCostUsd/falLatencyMs/falEndpoint/
@@ -1432,9 +1499,122 @@ function buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp })
   };
 }
 
+/**
+ * Phase B A/B harness — fan out N rp_blank_preview_jobs from one set of
+ * inputs, one per VTON provider. All jobs share an `abTestGroupId` so the
+ * comparison UI can query them as a set.
+ *
+ * Each job runs Stage A independently (Stage A is cheap — deterministic Sharp
+ * composite, no fal.ai). That's intentional: we accept the small cost of
+ * re-running Stage A 2-3 times in exchange for keeping the trigger pipeline
+ * uniform (one job = one Stage A + Stage B, no special "shared Stage A" path).
+ *
+ * The trigger already handles per-provider Stage B dispatch via the
+ * providerId field on each job doc, so fan-out is just "create N docs."
+ */
+function buildEnqueueVtonAbTest({ db, functions, admin }) {
+  return async (data, context) => {
+    const uid = context && context.auth && context.auth.uid;
+    await assertAdmin(db, functions, uid);
+
+    /**
+     * Re-use validatePreviewInput so the inputs match the single-job callable
+     * exactly. The only delta is `providerIds: string[]` (which providers to
+     * fan out across); the single-job `providerId` field on data is ignored
+     * here — the array is authoritative for A/B mode.
+     */
+    const baseInput = validatePreviewInput(functions, { ...data, providerId: null, withRealism: true });
+    if (!baseInput.withRealism) {
+      throw new functions.https.HttpsError(
+        "failed-precondition",
+        "A/B test requires withRealism=true (single-stage A/B is meaningless — all providers run Stage B)"
+      );
+    }
+
+    const { providerIds: providerIdsIn } = data || {};
+    if (!Array.isArray(providerIdsIn) || providerIdsIn.length < 2) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "providerIds must be an array of 2+ provider ids — A/B with one provider isn't an A/B test"
+      );
+    }
+    if (providerIdsIn.length > 5) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "providerIds is capped at 5 — each provider costs $$ + ~30s; fan-out larger than this is rarely useful"
+      );
+    }
+    // Validate every provider id BEFORE we create any docs — partial fan-out is worse than total failure.
+    // eslint-disable-next-line global-require
+    const { getVtonProvider } = require("./vtonProviders");
+    const validated = providerIdsIn.map((id) => {
+      if (typeof id !== "string" || id.length === 0) {
+        throw new functions.https.HttpsError("invalid-argument", `Invalid providerId: ${JSON.stringify(id)}`);
+      }
+      try {
+        getVtonProvider(id);
+      } catch (e) {
+        throw new functions.https.HttpsError("invalid-argument", e.message);
+      }
+      return id;
+    });
+    const uniqueIds = [...new Set(validated)];
+    if (uniqueIds.length !== validated.length) {
+      throw new functions.https.HttpsError(
+        "invalid-argument",
+        "providerIds contains duplicates — each provider should appear once in an A/B set"
+      );
+    }
+
+    /**
+     * Shared group id so the UI can query all jobs in this A/B run with one
+     * Firestore where("abTestGroupId", "==", X) call. The id is built from
+     * the job docs' add() results — but we need it BEFORE add() since it
+     * goes into each doc. Generate with the same random + timestamp pattern
+     * Rally already uses elsewhere.
+     */
+    const abTestGroupId = `ab_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e9).toString(36)}`;
+    const now = admin.firestore.FieldValue.serverTimestamp();
+    const collRef = db.collection("rp_blank_preview_jobs");
+
+    const jobIds = {};
+    for (const providerId of uniqueIds) {
+      const jobData = {
+        blankId: baseInput.blankId,
+        variantId: baseInput.variantId,
+        designId: baseInput.designId,
+        view: baseInput.view,
+        renderTarget: baseInput.renderTarget,
+        artworkMode: baseInput.artworkMode,
+        placement: baseInput.placement,
+        designUrlOverride: baseInput.designUrlOverride,
+        withRealism: true,
+        providerId,
+        abTestGroupId,
+        status: "queued",
+        error: null,
+        stageA: null,
+        stageB: null,
+        createdAt: now,
+        createdByUid: uid,
+        updatedAt: now,
+      };
+      const ref = await collRef.add(jobData);
+      jobIds[providerId] = ref.id;
+    }
+
+    return {
+      abTestGroupId,
+      jobIds,
+      providerCount: uniqueIds.length,
+    };
+  };
+}
+
 module.exports = {
   buildPreviewBlankRender,
   buildOnBlankPreviewJobCreated,
+  buildEnqueueVtonAbTest,
   runRealismPass,
   hexToColorName,
   buildLetterMaskFromDesignRgba,
