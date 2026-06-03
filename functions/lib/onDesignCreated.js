@@ -2,6 +2,7 @@
 
 const { launchProductsFromDesign } = require("./launchProductsFromDesign");
 const { isPipelineReadyStyleCode } = require("./pipelineReadiness");
+const { resolveSpawnBlankIds } = require("./resolveSpawnBlanks");
 
 /**
  * Phase 2: auto-launch products on design create / asset-attach.
@@ -151,30 +152,73 @@ function buildOnDesignCreated(deps) {
     const targetBlankIds = Array.isArray(after.targetBlankIds)
       ? after.targetBlankIds.map((x) => String(x || "").trim()).filter(Boolean)
       : [];
-    if (targetBlankIds.length > 0) {
-      const allow = new Set(targetBlankIds);
-      const before = masterBlanks.length;
+
+    /**
+     * Phase K8: load the team's approved-blank catalog so the spawn set honors
+     * it. The matrix is configured in /design-teams but was previously never
+     * read here — every design fanned out to ALL pipeline-ready blanks
+     * regardless of team catalog. Best-effort: a read failure logs + falls
+     * through to the all-blanks default (a bad team doc must not halt
+     * auto-launch across the catalog).
+     */
+    let productCatalogMatrix = null;
+    if (targetBlankIds.length === 0) {
+      try {
+        const teamSnap = await db.collection("design_teams").doc(teamId).get();
+        if (teamSnap.exists && teamSnap.data() && teamSnap.data().productCatalogMatrix) {
+          productCatalogMatrix = teamSnap.data().productCatalogMatrix;
+        }
+      } catch (matrixErr) {
+        console.warn(
+          "[ON_DESIGN_CREATED:MATRIX_READ_ERROR]",
+          JSON.stringify({
+            designId,
+            teamId,
+            message: matrixErr && matrixErr.message ? matrixErr.message : String(matrixErr),
+          })
+        );
+      }
+    }
+
+    {
+      // Pure precedence resolution (targetBlankIds > productCatalogMatrix >
+      // all-pipeline-ready). Unit-tested in resolveSpawnBlanks.test.ts.
+      const beforeCount = masterBlanks.length;
+      const { blankIds: allowedIds, reason: filterReason } = resolveSpawnBlankIds(
+        masterBlanks.map((b) => b.id),
+        { targetBlankIds, productCatalogMatrix }
+      );
+      const allow = new Set(allowedIds);
       masterBlanks = masterBlanks.filter((b) => allow.has(b.id));
       console.log(
         JSON.stringify({
           tag: "[ON_DESIGN_CREATED:FILTER]",
           designId,
-          filterReason: "targetBlankIds",
-          requested: targetBlankIds,
-          eligibleAfterPipelineGate: before,
+          teamId,
+          filterReason,
+          requested: targetBlankIds.length > 0 ? targetBlankIds : undefined,
+          eligibleAfterPipelineGate: beforeCount,
           spawning: masterBlanks.map((b) => b.id),
         })
       );
     }
 
     if (masterBlanks.length === 0) {
+      // Distinguish the empty-result causes: explicit picker, team-matrix
+      // restriction, or simply no pipeline-ready blanks at all. The matrix
+      // case is the new Phase K8 path — surfaced explicitly so an operator
+      // seeing "no products spawned" can tell it's the team catalog, not a
+      // missing renderer.
+      const noopReason =
+        targetBlankIds.length > 0
+          ? "no_pipeline_ready_blanks_in_targetBlankIds"
+          : "no_pipeline_ready_or_team_approved_blanks";
       console.log(
         JSON.stringify({
           tag: "[ON_DESIGN_CREATED:NOOP]",
-          reason: targetBlankIds.length > 0
-            ? "no_pipeline_ready_blanks_in_targetBlankIds"
-            : "no_pipeline_ready_master_blanks",
+          reason: noopReason,
           designId,
+          teamId,
           targetBlankIds,
         })
       );
