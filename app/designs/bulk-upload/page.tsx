@@ -6,6 +6,7 @@ import { ref, uploadBytes } from "firebase/storage";
 import { addDoc, collection, serverTimestamp } from "firebase/firestore";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import { filterBulkDesignFiles } from "@/lib/bulkDesignUpload";
+import { parseDesignFilename } from "@/lib/batchImport/parseDesignFilename";
 import {
   useDesigns,
   useParseBulkDesignUploadPreview,
@@ -127,13 +128,53 @@ export default function BulkDesignUploadPage() {
     Array<{ itemId: string; resultStatus: string; resultDesignId?: string | null; resultError?: string | null }>
   >([]);
 
+  /**
+   * Phase K6: shared file intake. Runs the existing extension/dotfile filter,
+   * THEN a client-side filename-parse pass so structurally-broken names (missing
+   * league/team/side tokens, bad garment tone) are rejected at drop time with a
+   * clear reason — instead of riding through upload → server parse → review
+   * screen before failing. Team-resolution ambiguity still defers to the server
+   * (it needs the design_teams registry the client doesn't have), so we ONLY
+   * demote on hard structural parse failures, never on team-matching.
+   */
+  const splitFiles = useCallback((list: File[]) => {
+    const { accepted: acc, ignored: ign } = filterBulkDesignFiles(list);
+    const STRUCTURAL_FAIL = new Set([
+      "invalid_format",
+      "unsupported_extension",
+      "missing_token",
+      "unknown_garment_tone",
+    ]);
+    const stillAccepted: typeof acc = [];
+    const parseRejected: { name: string; reason: string; detail?: string }[] = [];
+    for (const entry of acc) {
+      const fname = entry.file.name;
+      let res: { status?: string; message?: string };
+      try {
+        res = parseDesignFilename(fname);
+      } catch (err) {
+        res = { status: "invalid_format", message: err instanceof Error ? err.message : "parse error" };
+      }
+      if (res.status && STRUCTURAL_FAIL.has(res.status)) {
+        parseRejected.push({ name: fname, reason: res.status, detail: res.message });
+      } else {
+        stillAccepted.push(entry);
+      }
+    }
+    const ignoredAll = [
+      ...ign.map((x) => ({ name: x.name, reason: x.reason, detail: x.detail })),
+      ...parseRejected,
+    ];
+    return { accepted: stillAccepted, ignored: ignoredAll };
+  }, []);
+
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     const list = Array.from(e.dataTransfer.files);
     setRawFiles(list);
-    const { accepted: acc, ignored: ign } = filterBulkDesignFiles(list);
+    const { accepted: acc, ignored: ign } = splitFiles(list);
     setAccepted(acc);
-    setIgnoredClient(ign.map((x) => ({ name: x.name, reason: x.reason, detail: x.detail })));
+    setIgnoredClient(ign);
     setNameOverrides({});
     setActionOverrides({});
     setOverwriteByItem({});
@@ -142,14 +183,14 @@ export default function BulkDesignUploadPage() {
     setParseFailures([]);
     setIgnoredServer([]);
     setStep("upload");
-  }, []);
+  }, [splitFiles]);
 
   const onFileInput = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const list = Array.from(e.target.files ?? []);
     setRawFiles(list);
-    const { accepted: acc, ignored: ign } = filterBulkDesignFiles(list);
+    const { accepted: acc, ignored: ign } = splitFiles(list);
     setAccepted(acc);
-    setIgnoredClient(ign.map((x) => ({ name: x.name, reason: x.reason, detail: x.detail })));
+    setIgnoredClient(ign);
     setNameOverrides({});
     setActionOverrides({});
     setOverwriteByItem({});
@@ -306,6 +347,37 @@ export default function BulkDesignUploadPage() {
     return { perItem, totalCollisionGroups };
   }, [effectiveItems, targetBlanksByItem]);
 
+  /**
+   * Phase K5: pre-commit product-count preview. Pure client computation over
+   * the in-memory items — gives the operator a "this will create N products"
+   * number BEFORE clicking commit, so the bulk fan-out is never a surprise.
+   *
+   * Counts ONLY pipeline-ready blanks (onDesignCreated skips non-ready ones),
+   * and only items whose action will actually create/update. A product is one
+   * (design × pipeline-ready blank).
+   */
+  const commitPreview = useMemo(() => {
+    let designs = 0;
+    let products = 0;
+    let nonReadySelected = 0;
+    for (const it of effectiveItems) {
+      if (it.confirmedAction !== "create" && it.confirmedAction !== "update") continue;
+      const selected = targetBlanksByItem[it.itemId] ?? it.defaultTargetBlankIds ?? [];
+      if (selected.length === 0) continue;
+      const readyById = new Map((it.availableBlanks || []).map((b) => [b.blankId, b.pipelineReady]));
+      let readyForItem = 0;
+      for (const blankId of selected) {
+        if (readyById.get(blankId) === true) readyForItem += 1;
+        else if (readyById.has(blankId)) nonReadySelected += 1;
+      }
+      if (readyForItem > 0) {
+        designs += 1;
+        products += readyForItem;
+      }
+    }
+    return { designs, products, nonReadySelected };
+  }, [effectiveItems, targetBlanksByItem]);
+
   const runCommit = useCallback(async (commitMode: "with_products" | "library" = "with_products") => {
     if (!jobId) return;
     setImporting(true);
@@ -453,25 +525,49 @@ export default function BulkDesignUploadPage() {
               >
                 Start over
               </button>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => runCommit("library")}
-                  disabled={effectiveItems.length === 0 || importing}
-                  title="Save the design files to the library only. No products are spawned. You can launch products later from the design page."
-                  className="px-4 py-2 bg-white border border-gray-300 text-gray-800 rounded-lg text-sm font-medium hover:bg-gray-50 disabled:opacity-50"
-                >
-                  Commit to library
-                </button>
-                <button
-                  type="button"
-                  onClick={() => runCommit("with_products")}
-                  disabled={effectiveItems.length === 0 || importing}
-                  title="Save the design files AND auto-launch a product for each blank checked in the Apply to blanks column."
-                  className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
-                >
-                  Commit + create products
-                </button>
+              <div className="flex flex-col items-end gap-2">
+                {/* Phase K5: live product-count preview so the fan-out is never a surprise. */}
+                <div className="text-xs text-gray-600">
+                  {commitPreview.products > 0 ? (
+                    <span>
+                      Will create <strong className="text-gray-900">{commitPreview.products}</strong> product
+                      {commitPreview.products === 1 ? "" : "s"} across{" "}
+                      <strong className="text-gray-900">{commitPreview.designs}</strong> design
+                      {commitPreview.designs === 1 ? "" : "s"}.
+                      {commitPreview.nonReadySelected > 0 ? (
+                        <span className="text-amber-700">
+                          {" "}
+                          {commitPreview.nonReadySelected} selected blank
+                          {commitPreview.nonReadySelected === 1 ? "" : "s"} not pipeline-ready — skipped.
+                        </span>
+                      ) : null}
+                    </span>
+                  ) : (
+                    <span className="text-gray-400">No products will spawn (no pipeline-ready blanks selected).</span>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => runCommit("library")}
+                    disabled={effectiveItems.length === 0 || importing}
+                    title="Save the design files to the library only. No products are spawned. You can launch products later from the design page."
+                    className="px-4 py-2 bg-white border border-gray-300 text-gray-800 rounded-lg text-sm font-medium hover:bg-gray-50 disabled:opacity-50"
+                  >
+                    Commit to library
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => runCommit("with_products")}
+                    disabled={effectiveItems.length === 0 || importing}
+                    title="Save the design files AND auto-launch a product for each blank checked in the Apply to blanks column."
+                    className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
+                  >
+                    {commitPreview.products > 0
+                      ? `Commit + create ${commitPreview.products} product${commitPreview.products === 1 ? "" : "s"}`
+                      : "Commit + create products"}
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -519,7 +615,7 @@ export default function BulkDesignUploadPage() {
                     : `${duplicateTeamWarnings.totalCollisionGroups} groups of rows below`}{" "}
                   target the same team + blank slot. Committing them all would
                   create separate products with different importKeys instead of
-                  one product. If they're really the same design under different
+                  one product. If they&rsquo;re really the same design under different
                   filenames, set all-but-one to <span className="font-mono">skip</span> in
                   the Action column. Affected rows are highlighted in amber below.
                 </p>
@@ -796,35 +892,71 @@ export default function BulkDesignUploadPage() {
                   {commitSummary.failed}.
                 </p>
                 {commitSummary.created > 0 && (
-                  <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-blue-900 text-sm">
-                    <strong>Auto-launch:</strong> Products are being created in the background for each new design ×
-                    active master blank. Watch the <Link href="/products" className="underline">Products</Link> page —
-                    rows will appear shortly and renders will queue automatically.
+                  <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-blue-900 text-sm space-y-2">
+                    <p>
+                      <strong>Auto-launch:</strong> Products are being created in the background for each new design ×
+                      active master blank. Renders queue automatically — watch them on the{" "}
+                      <Link href="/dashboard" className="underline">dashboard</Link> &ldquo;Recent batches&rdquo;.
+                    </p>
+                    {(() => {
+                      /** Phase K3: deep link to exactly the products this import spawned,
+                       *  filtered by the design ids that committed OK. */
+                      const okDesignIds = commitResults
+                        .filter((r) => r.resultStatus === "ok" && r.resultDesignId)
+                        .map((r) => r.resultDesignId as string);
+                      if (okDesignIds.length === 0) return null;
+                      const href = `/products?designImportIds=${encodeURIComponent(okDesignIds.join(","))}`;
+                      return (
+                        <Link
+                          href={href}
+                          className="inline-block px-3 py-1.5 bg-blue-600 text-white rounded text-sm font-medium hover:bg-blue-700"
+                        >
+                          View created products ({okDesignIds.length} design{okDesignIds.length === 1 ? "" : "s"}) →
+                        </Link>
+                      );
+                    })()}
                   </div>
                 )}
                 <ul className="space-y-2 text-sm">
-                  {commitResults.map((r) => (
-                    <li key={r.itemId} className="flex flex-wrap gap-2 items-baseline">
-                      <span className="font-mono text-xs">{r.itemId}</span>
-                      <span
-                        className={
-                          r.resultStatus === "ok"
-                            ? "text-green-700"
-                            : r.resultStatus === "failed"
-                              ? "text-red-700"
-                              : "text-gray-600"
-                        }
-                      >
-                        {r.resultStatus}
-                      </span>
-                      {r.resultDesignId && (
-                        <Link href={`/designs/${r.resultDesignId}`} className="text-blue-600 text-xs">
-                          Open design
-                        </Link>
-                      )}
-                      {r.resultError && <span className="text-xs text-red-600">{r.resultError}</span>}
-                    </li>
-                  ))}
+                  {commitResults.map((r) => {
+                    /** Phase K7: join back to the reviewed item so the operator
+                     *  sees the friendly design name + team that committed —
+                     *  verifies the filename parse + naming convention fired
+                     *  without opening any product page. */
+                    const item = items.find((it) => it.itemId === r.itemId);
+                    const friendly = item
+                      ? [item.teamName, item.themeName || item.designName].filter(Boolean).join(" · ")
+                      : null;
+                    return (
+                      <li key={r.itemId} className="flex flex-wrap gap-2 items-baseline">
+                        <span
+                          className={
+                            r.resultStatus === "ok"
+                              ? "text-green-700"
+                              : r.resultStatus === "failed"
+                                ? "text-red-700"
+                                : "text-gray-600"
+                          }
+                        >
+                          {r.resultStatus}
+                        </span>
+                        {friendly ? (
+                          <span className="font-medium text-gray-900">{friendly}</span>
+                        ) : (
+                          <span className="font-mono text-xs">{r.itemId}</span>
+                        )}
+                        {item?.slug ? (
+                          <span className="font-mono text-[11px] text-gray-400">{item.slug}</span>
+                        ) : null}
+                        {r.resultDesignId && (
+                          <Link href={`/designs/${r.resultDesignId}`} className="text-blue-600 text-xs">
+                            Open design
+                          </Link>
+                        )}
+                        {r.resultError && <span className="text-xs text-red-600">{r.resultError}</span>}
+                      </li>
+                    );
+                  })}
                 </ul>
                 <Link
                   href="/designs"

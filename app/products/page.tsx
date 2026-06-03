@@ -1,7 +1,8 @@
 "use client";
 
-import { useMemo, useState, useEffect, FormEvent } from "react";
+import { useMemo, useState, useEffect, FormEvent, Suspense } from "react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import ProtectedRoute from "@/components/ProtectedRoute";
 import { TableSkeleton } from "@/components/Skeleton";
 import Modal from "@/components/Modal";
@@ -112,6 +113,7 @@ function BoolChip({ ok, label }: { ok: boolean | undefined; label: string }) {
 }
 
 function ProductsContent() {
+  const searchParams = useSearchParams();
   const [statusFilter, setStatusFilter] = useState<RpProductStatus | "all">("all");
   const [categoryFilter, setCategoryFilter] = useState<RpProductCategory | "all">("all");
   const [searchQuery, setSearchQuery] = useState("");
@@ -228,7 +230,33 @@ function ProductsContent() {
     return f;
   }, [statusFilter, categoryFilter, searchQuery, showLegacyTopLevel, launchOpsFilter]);
 
-  const { products, loading, error, refetch } = useProducts(filters);
+  const { products: rawProducts, loading, error, refetch } = useProducts(filters);
+
+  /**
+   * Phase K3: "View created products" deep link from a bulk-upload commit.
+   * The bulk-upload results screen links here with ?designImportIds=<csv of
+   * design ids that were just created>. We filter client-side to products
+   * whose designId / designIdFront / designIdBack is in that set, so the
+   * operator lands on exactly the products their import spawned (which arrive
+   * asynchronously a moment after commit). When the param is absent, the
+   * full list shows as before.
+   */
+  const importDesignIdSet = useMemo(() => {
+    const raw = searchParams?.get("designImportIds") || "";
+    const ids = raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    return ids.length > 0 ? new Set(ids) : null;
+  }, [searchParams]);
+
+  const products = useMemo(() => {
+    if (!importDesignIdSet) return rawProducts;
+    return rawProducts.filter((p) => {
+      const ids = [p.designId, p.designIdFront, p.designIdBack].filter(Boolean) as string[];
+      return ids.some((id) => importDesignIdSet.has(id));
+    });
+  }, [rawProducts, importDesignIdSet]);
 
   useEffect(() => {
     if (loading) return;
@@ -1029,13 +1057,31 @@ function ProductsContent() {
         </div>
       )}
 
+      {/* Phase K3: import-filter banner — shown when arriving via the
+          bulk-upload "View created products" deep link. */}
+      {importDesignIdSet ? (
+        <div className="mb-4 flex items-center justify-between gap-3 rounded-lg border border-blue-200 bg-blue-50 px-4 py-2.5 text-sm text-blue-900">
+          <span>
+            Showing <strong>{products.length}</strong> product
+            {products.length === 1 ? "" : "s"} from your recent import
+            ({importDesignIdSet.size} design{importDesignIdSet.size === 1 ? "" : "s"}).
+            {loading ? " Still loading — newly-spawned products may take a moment to appear." : ""}
+          </span>
+          <Link href="/products" className="shrink-0 font-medium underline whitespace-nowrap">
+            Clear filter
+          </Link>
+        </div>
+      ) : null}
+
       {/* Products Table */}
       <div className="bg-white rounded-lg shadow overflow-hidden">
         {products.length === 0 ? (
           <div className="p-12 text-center">
             <p className="text-gray-500">No products found.</p>
             <p className="text-sm text-gray-400 mt-2">
-              {searchQuery || statusFilter !== "all" || categoryFilter !== "all" || launchOpsFilter !== "all"
+              {importDesignIdSet
+                ? "Your imported products haven't spawned yet — they're created in the background a moment after commit. Refresh in a few seconds, or clear the filter to see all products."
+                : searchQuery || statusFilter !== "all" || categoryFilter !== "all" || launchOpsFilter !== "all"
                 ? "Try adjusting your filters."
                 : "Use Generate Team Products for standard creation or Create One-off Product for QA/advanced cases. Legacy-only view is off — enable it above if you need old per-color rows."}
             </p>
@@ -1623,7 +1669,10 @@ export default function ProductsPage() {
   return (
     <ProtectedRoute requiredRole="ops">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <ProductsContent />
+        {/* Suspense boundary required by useSearchParams (Phase K3 deep link). */}
+        <Suspense fallback={<TableSkeleton />}>
+          <ProductsContent />
+        </Suspense>
       </div>
     </ProtectedRoute>
   );
