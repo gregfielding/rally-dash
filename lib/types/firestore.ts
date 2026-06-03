@@ -2605,6 +2605,39 @@ export interface RPBlankVariant {
   productImageTargets?: Partial<Record<RpBlankProductImageGenerationKey, RPBlankProductImageTarget>> | null;
   sortOrder?: number | null;
   eligibilityOverride?: RPBlankVariantEligibilityOverride | null;
+  /**
+   * Phase L (2026-06-02): deterministic chest-print perspective quad for the
+   * model photos. Each model shot is a fixed pose at an angle; the operator
+   * sets a 4-corner quad ONCE per photo (front/back) that captures the chest
+   * plane's perspective. The renderer warps every design through a homography
+   * onto this quad so the print follows the body angle + fabric drape — same
+   * geometry every render. Absent → Stage A falls back to the legacy flat
+   * rectangle paste. See functions/lib/perspectiveWarp.js.
+   */
+  modelPrintQuad?: {
+    front?: RPModelPrintQuad | null;
+    back?: RPModelPrintQuad | null;
+  } | null;
+}
+
+/**
+ * Phase L: 4 normalized corners (0..1 fractions of the model photo) describing
+ * the chest-print plane. Order is conventional: topLeft, topRight, bottomRight,
+ * bottomLeft (clockwise from top-left). The design's rectangle maps
+ * (0,0)→topLeft, (W,0)→topRight, (W,H)→bottomRight, (0,H)→bottomLeft.
+ */
+export interface RPModelPrintQuadCorner {
+  x: number;
+  y: number;
+}
+export interface RPModelPrintQuad {
+  topLeft: RPModelPrintQuadCorner;
+  topRight: RPModelPrintQuadCorner;
+  bottomRight: RPModelPrintQuadCorner;
+  bottomLeft: RPModelPrintQuadCorner;
+  /** Audit. */
+  updatedAt?: Timestamp | null;
+  updatedByUid?: string | null;
 }
 
 // Image reference

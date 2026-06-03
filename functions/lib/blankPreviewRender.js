@@ -14,6 +14,7 @@
 const { resolveDesignAssetUrls } = require("./designFileMergeCore");
 const { runFalInference } = require("./falInference");
 const { hexToColorName } = require("./hexToColorName");
+const { warpDesignToQuad, isValidNormalizedQuad } = require("./perspectiveWarp");
 const {
   getVtonProvider,
   DEFAULT_VTON_PROVIDER_ID,
@@ -1040,6 +1041,69 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
   }
 
   /**
+   * Phase L (2026-06-02): deterministic chest-print perspective warp for model
+   * targets. When the variant has a `modelPrintQuad` for this side, warp the
+   * (mask-multiplied) design through a homography onto the 4-corner chest quad
+   * so it follows the body's angle + fabric plane — instead of pasting a flat
+   * rectangle that Flux Fill then faithfully keeps flat. The warp is done in
+   * the oversampled canvas space; the result is a FULL-CANVAS RGBA buffer, so
+   * we reset the placement vars to (0,0, full size) and the existing letter-
+   * mask + composite code below works unchanged (it's parameterized on these).
+   *
+   * Absent quad → composeDesign* stay the flat values (legacy behavior, byte-
+   * identical to pre-Phase-L). Any warp failure logs + falls back to flat.
+   */
+  let composeDesignRaw = resizedDesignRaw;
+  let composeW = actualW;
+  let composeH = actualH;
+  let composeLeft = designLeft;
+  let composeTop = designTop;
+  let quadWarpApplied = false;
+
+  const printQuad =
+    isModelTarget && variant && variant.modelPrintQuad
+      ? view === "back"
+        ? variant.modelPrintQuad.back
+        : variant.modelPrintQuad.front
+      : null;
+  if (printQuad && isValidNormalizedQuad(printQuad)) {
+    try {
+      // The masked design at placement size → PNG → warp onto the quad in
+      // oversampled canvas space → full-canvas RGBA.
+      const designPlacedPng = await sharp(resizedDesignRaw, {
+        raw: { width: actualW, height: actualH, channels: 4 },
+      })
+        .png()
+        .toBuffer();
+      const warpedCanvasPng = await warpDesignToQuad({
+        sharp,
+        designBuffer: designPlacedPng,
+        quad: printQuad,
+        outputWidth: blankWidth,
+        outputHeight: blankHeight,
+      });
+      const warpedRaw = await sharp(warpedCanvasPng)
+        .ensureAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      composeDesignRaw = warpedRaw.data;
+      composeW = warpedRaw.info.width;
+      composeH = warpedRaw.info.height;
+      composeLeft = 0;
+      composeTop = 0;
+      quadWarpApplied = true;
+      console.log(
+        `[composeStageA] Phase L quad warp applied (${renderTarget}, variant ${variantId}) → ${composeW}x${composeH} canvas`
+      );
+    } catch (warpErr) {
+      console.warn(
+        "[composeStageA] quad warp failed, falling back to flat paste:",
+        warpErr && warpErr.message ? warpErr.message : warpErr
+      );
+    }
+  }
+
+  /**
    * v8 LETTER MASK FOR INPAINTING (2026-05-25): build a binary mask that's white
    * exactly where the design's ink is and black everywhere else. Stage B (Flux Fill)
    * uses this mask to regenerate ONLY the ink pixels — leaving the entire garment,
@@ -1049,33 +1113,35 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
    * those exact pixels from scratch using the surrounding cotton fabric as context,
    * so it must produce cotton-textured ink instead of preserving the sticker.
    *
-   * Mask is built BEFORE we mutate `resizedDesignRaw` with opacity/premultiply so
-   * the alpha values still reflect the design's natural shape. Slight blur applied
-   * for feathered edges (gives the inpaint model room to soften letter boundaries).
+   * Mask is built BEFORE we mutate the design with opacity/premultiply so the
+   * alpha values still reflect the design's natural shape. For the Phase L quad
+   * path the design is already on the full canvas (composeLeft/Top = 0), so the
+   * letter mask traces the WARPED ink — keeping Flux Fill aligned to the angled
+   * print, not the flat rectangle.
    */
   const letterMaskBuffer = await buildLetterMaskFromDesignRgba({
     sharp,
-    resizedDesignRaw,
-    actualW,
-    actualH,
-    designLeft,
-    designTop,
+    resizedDesignRaw: composeDesignRaw,
+    actualW: composeW,
+    actualH: composeH,
+    designLeft: composeLeft,
+    designTop: composeTop,
     nativeBlankW,
     nativeBlankH,
     OVERSAMPLE,
   });
 
-  const designWithOpacity = applyOpacityToRgbaBuffer(resizedDesignRaw, effectiveOpacity);
+  const designWithOpacity = applyOpacityToRgbaBuffer(composeDesignRaw, effectiveOpacity);
   const designPremultiplied = premultiplyRgbaBuffer(designWithOpacity);
   const designForComposite = await sharp(designPremultiplied, {
-    raw: { width: actualW, height: actualH, channels: 4, premultiplied: true },
+    raw: { width: composeW, height: composeH, channels: 4, premultiplied: true },
   })
     .png()
     .toBuffer();
 
-  /** Composite at the same designLeft/designTop the mask extract used — keeps mask + design aligned. */
+  /** Composite at composeLeft/composeTop the mask used — keeps mask + design aligned. */
   const oversampledComposite = await sharp(blankBuffer)
-    .composite([{ input: designForComposite, left: designLeft, top: designTop, blend: blendMode, premultiplied: true }])
+    .composite([{ input: designForComposite, left: composeLeft, top: composeTop, blend: blendMode, premultiplied: true }])
     .png()
     .toBuffer();
 
@@ -1124,6 +1190,9 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
       maskApplied,
       maskMean: maskMean != null ? Math.round(maskMean) : null,
       maskMode,
+      /** Phase L: true when the design was perspective-warped onto the model
+       *  print quad (deterministic angled placement) vs the legacy flat paste. */
+      quadWarpApplied,
       placementUsed: { x, y, scale: effectiveScale, blendMode: blendModeRequested, blendOpacity: effectiveOpacity },
     },
     /** Chained handoff for Stage B — kept in memory so we don't re-fetch. */
