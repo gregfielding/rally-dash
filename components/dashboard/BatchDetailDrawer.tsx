@@ -17,6 +17,7 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import {
   collection,
   onSnapshot,
@@ -24,11 +25,14 @@ import {
   where,
 } from "firebase/firestore";
 import { db as firebaseDb } from "@/lib/firebase/config";
-import type { RPBatch, RPBatchKind, RPBatchStatus } from "@/lib/types/firestore";
+import type { RPBatchKind, RPBatchStatus } from "@/lib/types/firestore";
+import type { DisplayBatch } from "@/components/dashboard/BatchListWidget";
 
 /**
- * Mapping from batch.kind → the child collection where its jobs live.
- * Kept in this file so the drawer is self-contained.
+ * Mapping from rp_batches kind → the child collection where its jobs live.
+ * Kept in this file so the drawer is self-contained. Asset batches
+ * (source="asset_batch") have no child collection — their roles are
+ * embedded in the doc and rendered inline.
  */
 const KIND_TO_CHILD_COLLECTION: Record<RPBatchKind, string | null> = {
   vton_ab: "rp_blank_preview_jobs",
@@ -55,12 +59,16 @@ interface ChildJob {
 }
 
 interface BatchDetailDrawerProps {
-  batch: (RPBatch & { id: string }) | null;
+  batch: DisplayBatch | null;
   onClose: () => void;
 }
 
 export default function BatchDetailDrawer({ batch, onClose }: BatchDetailDrawerProps) {
-  const childCollection = batch ? KIND_TO_CHILD_COLLECTION[batch.kind] : null;
+  /** Only rp_batches have a child collection; asset batches render inline. */
+  const childCollection =
+    batch && batch.source === "rp_batch" && batch.rpBatchKind
+      ? KIND_TO_CHILD_COLLECTION[batch.rpBatchKind]
+      : null;
   const [children, setChildren] = useState<ChildJob[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -129,13 +137,11 @@ export default function BatchDetailDrawer({ batch, onClose }: BatchDetailDrawerP
         <div className="px-6 py-4 border-b border-gray-200 flex items-start justify-between gap-4">
           <div>
             <div className="flex items-center gap-2">
-              <h2 className="text-xl font-semibold text-gray-900">
-                {kindLabel(batch.kind)}
-              </h2>
+              <h2 className="text-xl font-semibold text-gray-900">{batch.kindLabel}</h2>
               <StatusPill status={batch.status} />
             </div>
             <p className="text-sm text-gray-500 mt-0.5">
-              {batch.metadata?.label || `Batch ${batch.id.slice(0, 8)}`}
+              {batch.subLabel || `Batch ${batch.id.slice(0, 8)}`}
             </p>
           </div>
           <button
@@ -149,40 +155,58 @@ export default function BatchDetailDrawer({ batch, onClose }: BatchDetailDrawerP
 
         <BatchSummary batch={batch} />
 
-        <div className="px-6 py-4 border-t border-gray-200">
-          <h3 className="text-sm font-semibold uppercase tracking-wide text-gray-500 mb-3">
-            Jobs ({batch.total})
-          </h3>
-          {!childCollection ? (
-            <p className="text-sm text-gray-500">
-              This batch kind doesn&rsquo;t have child docs — see the summary above.
-            </p>
-          ) : error ? (
-            <p className="text-sm text-red-700">{error}</p>
-          ) : children === null ? (
-            <p className="text-sm text-gray-500">Loading jobs…</p>
-          ) : children.length === 0 ? (
-            <p className="text-sm text-gray-500">No matching jobs found.</p>
-          ) : (
-            <JobTable jobs={children} kind={batch.kind} />
-          )}
-        </div>
+        {/* Asset batch: render the embedded colors→roles map + a product link. */}
+        {batch.source === "asset_batch" ? (
+          <div className="px-6 py-4 border-t border-gray-200 space-y-3">
+            {batch.productId ? (
+              <Link
+                href={`/products/${encodeURIComponent(batch.productId)}`}
+                className="inline-flex items-center gap-1 text-sm text-blue-600 hover:underline"
+              >
+                View product →
+              </Link>
+            ) : null}
+            <h3 className="text-sm font-semibold uppercase tracking-wide text-gray-500">
+              Image roles by color
+            </h3>
+            <AssetRolesTable colors={batch.assetColors || {}} />
+          </div>
+        ) : (
+          <div className="px-6 py-4 border-t border-gray-200">
+            <h3 className="text-sm font-semibold uppercase tracking-wide text-gray-500 mb-3">
+              Jobs ({batch.total})
+            </h3>
+            {!childCollection ? (
+              <p className="text-sm text-gray-500">
+                This batch kind doesn&rsquo;t have child docs — see the summary above.
+              </p>
+            ) : error ? (
+              <p className="text-sm text-red-700">{error}</p>
+            ) : children === null ? (
+              <p className="text-sm text-gray-500">Loading jobs…</p>
+            ) : children.length === 0 ? (
+              <p className="text-sm text-gray-500">No matching jobs found.</p>
+            ) : (
+              <JobTable jobs={children} kind={batch.rpBatchKind} />
+            )}
+          </div>
+        )}
       </aside>
     </div>
   );
 }
 
-function BatchSummary({ batch }: { batch: RPBatch & { id: string } }) {
+function BatchSummary({ batch }: { batch: DisplayBatch }) {
   const total = batch.total || 0;
-  const terminal = (batch.completed || 0) + (batch.failed || 0);
+  const terminal = batch.completed + batch.failed;
   const pct = total > 0 ? Math.round((terminal / total) * 100) : 0;
-  const cost = batch.falCostUsdTotal;
+  const cost = batch.costUsd;
   return (
     <div className="px-6 py-4 space-y-3">
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
         <SummaryStat label="Total" value={String(total)} />
-        <SummaryStat label="Completed" value={String(batch.completed || 0)} className="text-emerald-700" />
-        <SummaryStat label="Failed" value={String(batch.failed || 0)} className={(batch.failed || 0) > 0 ? "text-red-700" : ""} />
+        <SummaryStat label="Completed" value={String(batch.completed)} className="text-emerald-700" />
+        <SummaryStat label="Failed" value={String(batch.failed)} className={batch.failed > 0 ? "text-red-700" : ""} />
         <SummaryStat label="Cost" value={cost != null && cost > 0 ? `$${cost.toFixed(2)}` : "—"} />
       </div>
       <div className="h-2 bg-gray-100 rounded overflow-hidden">
@@ -199,6 +223,63 @@ function BatchSummary({ batch }: { batch: RPBatch & { id: string } }) {
   );
 }
 
+/**
+ * Asset-batch role detail. Renders one row per (color, role) so the operator
+ * can see exactly which image is queued / running / done / failed for each
+ * color. Sourced from the batch doc's embedded `colors` map — no child query.
+ */
+function AssetRolesTable({
+  colors,
+}: {
+  colors: Record<string, { colorName?: string | null; roles?: Record<string, { status?: string; reason?: string }> }>;
+}) {
+  const rows: Array<{ color: string; role: string; status: string; reason?: string }> = [];
+  for (const block of Object.values(colors)) {
+    const colorName = block.colorName || "—";
+    for (const [role, r] of Object.entries(block.roles || {})) {
+      rows.push({ color: colorName, role, status: String(r.status || "queued"), reason: r.reason });
+    }
+  }
+  rows.sort((a, b) => statusSortRank(a.status) - statusSortRank(b.status));
+  if (rows.length === 0) {
+    return <p className="text-sm text-gray-500">No roles on this batch.</p>;
+  }
+  return (
+    <div className="border border-gray-200 rounded overflow-hidden">
+      <table className="w-full text-sm">
+        <thead className="bg-gray-50 text-xs uppercase tracking-wide text-gray-500">
+          <tr>
+            <th className="text-left px-3 py-2 font-medium">Color</th>
+            <th className="text-left px-3 py-2 font-medium">Role</th>
+            <th className="text-left px-3 py-2 font-medium">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={`${r.color}-${r.role}-${i}`} className="border-t border-gray-100">
+              <td className="px-3 py-2 text-gray-800">{r.color}</td>
+              <td className="px-3 py-2 font-mono text-[11px] text-gray-600">{r.role}</td>
+              <td className="px-3 py-2">
+                <JobStatusBadge status={normalizeRoleStatus(r.status)} error={r.reason} />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** Map raw asset-role status into the JobStatusBadge's vocabulary. */
+function normalizeRoleStatus(status: string): string {
+  if (status === "succeeded" || status === "done" || status === "complete") return "completed";
+  if (status === "failed") return "failed";
+  if (status === "running" || status === "processing") return "processing";
+  /** optional_failed + skipped_no_identity are non-blocking — show muted, not red. */
+  if (status === "optional_failed" || status.startsWith("skipped")) return "skipped";
+  return "queued";
+}
+
 function SummaryStat({ label, value, className }: { label: string; value: string; className?: string }) {
   return (
     <div>
@@ -208,7 +289,7 @@ function SummaryStat({ label, value, className }: { label: string; value: string
   );
 }
 
-function JobTable({ jobs, kind }: { jobs: ChildJob[]; kind: RPBatchKind }) {
+function JobTable({ jobs, kind }: { jobs: ChildJob[]; kind: RPBatchKind | undefined }) {
   /** Per-kind label override for the per-job axis (provider / template / variant+view). */
   const labelHeader = useMemo(() => {
     switch (kind) {
@@ -294,25 +375,20 @@ function JobStatusBadge({ status, error }: { status: string; error: string | nul
       ? "bg-red-100 text-red-700 cursor-help"
       : status === "processing"
       ? "bg-blue-100 text-blue-700"
+      : status === "skipped"
+      ? "bg-gray-100 text-gray-500 cursor-help"
       : "bg-gray-100 text-gray-600";
   return (
-    <span className={`text-xs px-2 py-0.5 rounded ${cls}`} title={status === "failed" && error ? error : undefined}>
+    <span
+      className={`text-xs px-2 py-0.5 rounded ${cls}`}
+      title={(status === "failed" || status === "skipped") && error ? error : undefined}
+    >
       {status}
     </span>
   );
 }
 
 /* ---------- helpers ---------- */
-
-function kindLabel(kind: RPBatchKind): string {
-  const m: Record<RPBatchKind, string> = {
-    vton_ab: "VTON A/B test",
-    scene_set: "Scene set",
-    product_realism: "Product realism",
-    shopify_collections: "Shopify collections sync",
-  };
-  return m[kind] || kind;
-}
 
 function progressBarClass(status: RPBatchStatus): string {
   if (status === "completed") return "bg-emerald-500";
@@ -336,7 +412,7 @@ function statusSortRank(status: string): number {
   }
 }
 
-function jobAxisLabel(j: ChildJob, kind: RPBatchKind): string {
+function jobAxisLabel(j: ChildJob, kind: RPBatchKind | undefined): string {
   if (kind === "vton_ab") return j.providerId || j.id.slice(0, 8);
   if (kind === "scene_set") return j.sceneTemplateId || j.id.slice(0, 8);
   if (kind === "product_realism") {

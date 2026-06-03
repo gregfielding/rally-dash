@@ -4008,7 +4008,31 @@ exports.onRpGenerationJobStatusChanged = functions.firestore
     }
 
     try {
-      const { handleOfficialGenerationJobTerminal } = require("./lib/officialProductImageJobs");
+      const {
+        handleOfficialGenerationJobTerminal,
+        handleOfficialGenerationJobRunning,
+      } = require("./lib/officialProductImageJobs");
+      /**
+       * Phase K2: surface the queued→running transition to the batch UI so
+       * the dashboard drawer shows live motion during the 30–60s render.
+       * Best-effort + separate try so a running-mark hiccup never blocks the
+       * terminal handler (which writes the actual image result).
+       */
+      try {
+        await handleOfficialGenerationJobRunning({
+          db,
+          admin,
+          sanitizeForFirestore,
+          before,
+          after,
+          jobId,
+        });
+      } catch (runErr) {
+        console.warn(
+          "[onRpGenerationJobStatusChanged] running-mark hook:",
+          runErr && runErr.message ? runErr.message : runErr
+        );
+      }
       await handleOfficialGenerationJobTerminal({
         db,
         admin,

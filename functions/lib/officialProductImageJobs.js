@@ -9,6 +9,7 @@ const {
 const {
   launchBatchLog,
   markOfficialAssetRoleTerminal,
+  markOfficialAssetRoleRunning,
   markOfficialAssetRoleSkippedNoIdentity,
   applyPrimaryVariantMediaInheritance,
 } = require("./productAssetBatchHelpers");
@@ -860,6 +861,39 @@ async function enqueueOfficialProductImages(ctx) {
 /**
  * Firestore trigger: `rp_generation_jobs` terminal state for `initialAssetRole` jobs.
  */
+/**
+ * Phase K2: propagate the queued→running transition to the asset-batch role
+ * so the dashboard drawer shows live motion during the fal.ai render. Mirrors
+ * the terminal handler's batch/role lookup but for the running edge only.
+ *
+ * Only model roles go through rp_generation_jobs (flat roles complete via
+ * deterministic compose at enqueue), so this only fires for model-role jobs —
+ * which are exactly the slow ones (30–60s) where the frozen chip was worst.
+ */
+async function handleOfficialGenerationJobRunning({ db, admin, sanitizeForFirestore, before, after, jobId }) {
+  if (!after.initialAssetRole || !after.productAssetBatchId || !after.productAssetColorKey) return;
+  if (before.status === after.status) return;
+
+  /** Accept the common "now working" status names defensively. */
+  const RUNNING_STATES = new Set(["running", "processing", "in_progress", "started"]);
+  if (!RUNNING_STATES.has(String(after.status))) return;
+
+  const role = String(after.initialAssetRole).trim();
+  if (!ALL_OFFICIAL_CATALOG_ROLES.has(role)) return;
+  /** Flat roles never hit rp_generation_jobs; nothing to mark running. */
+  if (isOfficialFlatRoleName(role)) return;
+
+  await markOfficialAssetRoleRunning({
+    db,
+    admin,
+    sanitizeForFirestore,
+    batchId: String(after.productAssetBatchId).trim(),
+    colorKey: String(after.productAssetColorKey).trim(),
+    role,
+    jobId,
+  });
+}
+
 async function handleOfficialGenerationJobTerminal({ db, admin, sanitizeForFirestore, before, after, jobId }) {
   if (!after.initialAssetRole || !after.productAssetBatchId || !after.productAssetColorKey) return;
   if (before.status === after.status) return;
@@ -986,6 +1020,7 @@ async function handleOfficialGenerationJobTerminal({ db, admin, sanitizeForFires
 module.exports = {
   enqueueOfficialProductImages,
   handleOfficialGenerationJobTerminal,
+  handleOfficialGenerationJobRunning,
   resolveOfficialScenePresetId,
   resolveOfficialScenePresetIdForEnqueue,
   DEFAULT_OFFICIAL_8394_SCENE_PRESET_SLUG,

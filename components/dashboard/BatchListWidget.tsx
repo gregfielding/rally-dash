@@ -2,16 +2,21 @@
 
 /**
  * Phase E — recent-batches widget for the dashboard.
+ * Phase K1 (2026-06-02) — now ALSO shows auto-launched product-asset batches.
  *
- * Subscribes to rp_batches (last 14 days) and renders a compact list of
- * batch fan-outs: kind, total/completed/failed counters, progress bar,
- * cost so far, status badge. Operator can see at a glance whether a
- * batch they kicked off is still running, partially failed, or done.
+ * Two sources, one list:
+ *   - rp_batches            → explicit operator fan-outs (VTON A/B, 4-shot
+ *     scene sets, multi-variant product realism). Created by Phase B/C/E
+ *     callables. Shape: RPBatch.
+ *   - rp_product_asset_batches → the auto-launch generation that fires when a
+ *     design is committed with products (startInitialProductAssetBatch).
+ *     This is the work Greg's bulk-commit kicks off — previously INVISIBLE
+ *     here because the widget only queried rp_batches. Different doc shape
+ *     (colors→roles map, not flat counters), normalized below.
  *
- * Single-job operations (single previewBlankRender, single Kontext scene)
- * don't create batch docs — they only show up in the cost meter widget.
- * The batch widget is for FAN-OUTS specifically: 4-shot PDPs, A/B tests,
- * multi-variant product realism.
+ * Both normalize into `DisplayBatch` so the row + drawer render one mental
+ * model. The drawer branches on `source` to render asset-batch role detail
+ * (which lives embedded in the doc, not in a child collection).
  */
 
 import { useEffect, useState } from "react";
@@ -33,35 +38,160 @@ const KIND_LABELS: Record<RPBatchKind, string> = {
   shopify_collections: "Shopify collections sync",
 };
 
+/**
+ * One asset-batch color block: a map of officialRole → { status }. The batch
+ * doc holds `colors: { [blankVariantKey]: { colorName, roles: {...} } }`.
+ */
+interface AssetBatchColorBlock {
+  colorName?: string | null;
+  roles?: Record<string, { status?: string; reason?: string }>;
+}
+
+interface RpProductAssetBatch {
+  productId?: string;
+  blankId?: string;
+  designId?: string;
+  teamId?: string;
+  status?: string; // "running" | "complete" | "failed" | "partial"
+  colors?: Record<string, AssetBatchColorBlock>;
+  assetsProgress?: { completed?: number; total?: number };
+  createdAt?: unknown;
+}
+
+/**
+ * Normalized display shape both sources map into. `source` discriminates so
+ * the drawer knows whether to query a child collection (rp_batch) or render
+ * the embedded colors→roles map (asset_batch).
+ */
+export interface DisplayBatch {
+  id: string;
+  source: "rp_batch" | "asset_batch";
+  kindLabel: string;
+  status: RPBatchStatus;
+  total: number;
+  completed: number;
+  failed: number;
+  subLabel: string;
+  costUsd: number | null;
+  createdAt: unknown;
+  /** rp_batch only: the original kind, for the drawer's child-collection routing. */
+  rpBatchKind?: RPBatchKind;
+  /** asset_batch only: product context + raw colors map for the drawer. */
+  productId?: string | null;
+  assetColors?: Record<string, AssetBatchColorBlock> | null;
+}
+
+/** Map an asset-batch's status string into the shared RPBatchStatus enum. */
+function normalizeAssetStatus(status: string | undefined): RPBatchStatus {
+  switch (status) {
+    case "complete":
+    case "completed":
+      return "completed";
+    case "failed":
+      return "failed";
+    case "partial":
+      return "partial";
+    case "running":
+      return "running";
+    default:
+      return "queued";
+  }
+}
+
+/** Count failed roles across all colors (asset batches don't store a flat `failed`). */
+function countAssetRoles(colors: Record<string, AssetBatchColorBlock> | undefined): {
+  failed: number;
+  completed: number;
+  total: number;
+} {
+  let failed = 0;
+  let completed = 0;
+  let total = 0;
+  for (const block of Object.values(colors || {})) {
+    for (const role of Object.values(block.roles || {})) {
+      total += 1;
+      const st = String(role.status || "queued");
+      if (st === "failed") failed += 1;
+      else if (st === "succeeded" || st === "completed" || st === "done") completed += 1;
+    }
+  }
+  return { failed, completed, total };
+}
+
+function rpBatchToDisplay(b: RPBatch & { id: string }): DisplayBatch {
+  return {
+    id: b.id,
+    source: "rp_batch",
+    kindLabel: KIND_LABELS[b.kind] || b.kind,
+    status: b.status,
+    total: b.total || 0,
+    completed: b.completed || 0,
+    failed: b.failed || 0,
+    subLabel: b.metadata?.label || "",
+    costUsd: b.falCostUsdTotal ?? null,
+    createdAt: b.createdAt,
+    rpBatchKind: b.kind,
+  };
+}
+
+function assetBatchToDisplay(id: string, b: RpProductAssetBatch): DisplayBatch {
+  const counts = countAssetRoles(b.colors);
+  /** Prefer the doc's assetsProgress for completed/total (authoritative), fall
+   *  back to the role-count derivation when it's absent. */
+  const total = b.assetsProgress?.total ?? counts.total;
+  const completed = b.assetsProgress?.completed ?? counts.completed;
+  const colorCount = Object.keys(b.colors || {}).length;
+  return {
+    id,
+    source: "asset_batch",
+    kindLabel: "Product images (auto)",
+    status: normalizeAssetStatus(b.status),
+    total,
+    completed,
+    failed: counts.failed,
+    subLabel: `${colorCount} color${colorCount === 1 ? "" : "s"}${b.blankId ? ` · ${b.blankId}` : ""}`,
+    costUsd: null,
+    createdAt: b.createdAt,
+    productId: b.productId || null,
+    assetColors: b.colors || null,
+  };
+}
+
 export default function BatchListWidget() {
-  const [batches, setBatches] = useState<Array<RPBatch & { id: string }> | null>(null);
+  const [rpBatches, setRpBatches] = useState<DisplayBatch[] | null>(null);
+  const [assetBatches, setAssetBatches] = useState<DisplayBatch[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  /**
-   * Phase H: drawer selection. Clicking a row sets this to the batch object;
-   * clicking the close button / scrim clears it. We keep the WHOLE batch
-   * here (not just an id) so the drawer renders the header instantly
-   * without waiting for a separate fetch — the snapshot subscription
-   * already gave us every field we need.
-   */
-  const [drawerBatch, setDrawerBatch] = useState<(RPBatch & { id: string }) | null>(null);
+  const [drawerBatch, setDrawerBatch] = useState<DisplayBatch | null>(null);
 
   useEffect(() => {
     if (!firebaseDb) return;
     const fourteenDaysAgo = Timestamp.fromMillis(Date.now() - 14 * 24 * 60 * 60 * 1000);
-    const q = query(
-      collection(firebaseDb, "rp_batches"),
-      where("createdAt", ">=", fourteenDaysAgo)
-    );
-    const unsub = onSnapshot(
-      q,
+
+    const unsubRp = onSnapshot(
+      query(collection(firebaseDb, "rp_batches"), where("createdAt", ">=", fourteenDaysAgo)),
       (snap) => {
-        const rows = snap.docs.map((d) => ({ id: d.id, ...(d.data() as RPBatch) }));
-        rows.sort((a, b) => tsMs(b.createdAt) - tsMs(a.createdAt));
-        setBatches(rows);
+        setRpBatches(snap.docs.map((d) => rpBatchToDisplay({ ...(d.data() as RPBatch), id: d.id })));
       },
-      (err) => setError(err.message)
+      (err) => setError(`rp_batches: ${err.message}`)
     );
-    return () => unsub();
+
+    const unsubAssets = onSnapshot(
+      query(
+        collection(firebaseDb, "rp_product_asset_batches"),
+        where("createdAt", ">=", fourteenDaysAgo)
+      ),
+      (snap) => {
+        setAssetBatches(
+          snap.docs.map((d) => assetBatchToDisplay(d.id, d.data() as RpProductAssetBatch))
+        );
+      },
+      (err) => setError(`rp_product_asset_batches: ${err.message}`)
+    );
+
+    return () => {
+      unsubRp();
+      unsubAssets();
+    };
   }, []);
 
   if (error) {
@@ -74,7 +204,9 @@ export default function BatchListWidget() {
       </section>
     );
   }
-  if (batches === null) {
+
+  const loading = rpBatches === null && assetBatches === null;
+  if (loading) {
     return (
       <section className="bg-white rounded-lg shadow border border-gray-100 overflow-hidden">
         <div className="px-4 py-3 border-b border-gray-200">
@@ -84,23 +216,29 @@ export default function BatchListWidget() {
       </section>
     );
   }
-  if (batches.length === 0) {
+
+  const merged = [...(rpBatches || []), ...(assetBatches || [])].sort(
+    (a, b) => tsMs(b.createdAt) - tsMs(a.createdAt)
+  );
+
+  if (merged.length === 0) {
     return (
       <section className="bg-white rounded-lg shadow border border-gray-100 overflow-hidden">
         <div className="px-4 py-3 border-b border-gray-200">
           <h3 className="text-lg font-semibold text-gray-900">Recent batches</h3>
         </div>
         <div className="p-4 text-sm text-gray-500">
-          No batch fan-outs in the last 14 days. Batches appear here after running an A/B
-          comparison, 4-shot PDP scene set, or multi-variant product realism.
+          No batch activity in the last 14 days. Batches appear here when you commit a
+          bulk design upload (auto-launch generation) or run an A/B comparison, 4-shot PDP,
+          or multi-variant realism fan-out.
         </div>
       </section>
     );
   }
 
-  /** Top 8 — operator wants to see recent activity, not full history. */
-  const display = batches.slice(0, 8);
-  const running = batches.filter((b) => b.status === "running" || b.status === "queued").length;
+  /** Top 10 — show a touch more now that auto-launch batches share the list. */
+  const display = merged.slice(0, 10);
+  const running = merged.filter((b) => b.status === "running" || b.status === "queued").length;
 
   return (
     <section className="bg-white rounded-lg shadow border border-gray-100 overflow-hidden">
@@ -108,12 +246,12 @@ export default function BatchListWidget() {
         <h3 className="text-lg font-semibold text-gray-900">Recent batches</h3>
         <span className="text-xs text-gray-500">
           {running > 0 ? `${running} running · ` : ""}
-          {batches.length} in last 14 days
+          {merged.length} in last 14 days
         </span>
       </div>
       <ul className="divide-y divide-gray-100">
         {display.map((b) => (
-          <BatchRow key={b.id} batch={b} onOpen={() => setDrawerBatch(b)} />
+          <BatchRow key={`${b.source}-${b.id}`} batch={b} onOpen={() => setDrawerBatch(b)} />
         ))}
       </ul>
       <BatchDetailDrawer batch={drawerBatch} onClose={() => setDrawerBatch(null)} />
@@ -121,19 +259,11 @@ export default function BatchListWidget() {
   );
 }
 
-function BatchRow({
-  batch,
-  onOpen,
-}: {
-  batch: RPBatch & { id: string };
-  onOpen: () => void;
-}) {
-  const label = KIND_LABELS[batch.kind] || batch.kind;
+function BatchRow({ batch, onOpen }: { batch: DisplayBatch; onOpen: () => void }) {
   const total = batch.total || 0;
-  const terminal = (batch.completed || 0) + (batch.failed || 0);
+  const terminal = batch.completed + batch.failed;
   const pct = total > 0 ? Math.round((terminal / total) * 100) : 0;
-  const sub = batch.metadata?.label || "";
-  const cost = batch.falCostUsdTotal;
+  const cost = batch.costUsd;
   return (
     <li
       className="px-4 py-3 flex items-center gap-4 cursor-pointer hover:bg-gray-50 transition-colors"
@@ -149,10 +279,12 @@ function BatchRow({
     >
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
-          <span className="font-medium text-sm text-gray-900">{label}</span>
+          <span className="font-medium text-sm text-gray-900">{batch.kindLabel}</span>
           <StatusBadge status={batch.status} />
         </div>
-        {sub ? <p className="text-xs text-gray-500 mt-0.5 truncate">{sub}</p> : null}
+        {batch.subLabel ? (
+          <p className="text-xs text-gray-500 mt-0.5 truncate">{batch.subLabel}</p>
+        ) : null}
         <div className="mt-2 flex items-center gap-3">
           <div className="flex-1 h-1.5 bg-gray-100 rounded overflow-hidden">
             <div

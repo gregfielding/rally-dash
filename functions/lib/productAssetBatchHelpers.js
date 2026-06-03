@@ -515,6 +515,64 @@ async function markOfficialAssetRoleTerminal({
 }
 
 /**
+ * Phase K2 (2026-06-02): promote a role from `queued` → `running` the moment
+ * the fal.ai job is accepted, so the dashboard batch drawer shows live motion
+ * during the 30–60s render instead of a frozen `queued` chip.
+ *
+ * Guarded: only writes when the current role status is exactly `queued`. This
+ * makes the function a no-op if the role already reached a terminal state
+ * (succeeded/failed/skipped) — protects against an out-of-order
+ * running-event arriving after a fast terminal event (rare but possible with
+ * Firestore trigger retries).
+ *
+ * Deliberately does NOT call recomputeAndSyncParent — the parent product is
+ * already `assetsStatus: "running"` from batch creation, and the running
+ * transition is purely a role-level UI signal. Skipping the recompute avoids
+ * doubling the parent-sync write volume across a multi-role batch.
+ */
+async function markOfficialAssetRoleRunning({
+  db,
+  admin,
+  sanitizeForFirestore,
+  batchId,
+  colorKey,
+  role,
+  jobId,
+}) {
+  if (!batchId || !colorKey || !role) return;
+  const batchRef = db.collection("rp_product_asset_batches").doc(batchId);
+  const batchSnap = await batchRef.get();
+  if (!batchSnap.exists) return;
+
+  const b = batchSnap.data() || {};
+  const colors = { ...(b.colors || {}) };
+  const colorBlock = { ...(colors[colorKey] || {}) };
+  const roles = { ...(colorBlock.roles || {}) };
+  const current = roles[role];
+
+  /** Only promote a still-queued role; never clobber a terminal/skipped state. */
+  if (!current || String(current.status) !== "queued") return;
+
+  roles[role] = {
+    ...current,
+    status: "running",
+    generationJobId: jobId || current.generationJobId || null,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+  colorBlock.roles = roles;
+  colors[colorKey] = colorBlock;
+
+  await batchRef.update(
+    sanitizeForFirestore({
+      colors,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    })
+  );
+
+  launchBatchLog("ROLE_RUNNING", { batchId, blankVariantId: colorKey, role, generationJobId: jobId || null });
+}
+
+/**
  * Model role skipped in official enqueue (no AI path) — must not leave batch role stuck `queued`.
  */
 async function markOfficialAssetRoleSkippedNoIdentity({
@@ -604,6 +662,7 @@ module.exports = {
   applyPrimaryVariantMediaInheritance,
   recomputeAndSyncParent,
   markOfficialAssetRoleTerminal,
+  markOfficialAssetRoleRunning,
   markOfficialAssetRoleSkippedNoIdentity,
   on8394SecondaryPipelineMediaInheritance,
   supersedeOpenBatchesForProduct,
