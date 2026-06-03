@@ -6715,7 +6715,40 @@ function ProductDetailContent() {
                     {product.shopify?.lastSyncError && (
                       <div className="md:col-span-2">
                         <dt className="text-gray-500">Last sync error</dt>
-                        <dd className="text-red-600 text-xs mt-1">{product.shopify.lastSyncError}</dd>
+                        <dd className="text-red-600 text-xs mt-1 flex items-start justify-between gap-3">
+                          <span className="flex-1">{product.shopify.lastSyncError}</span>
+                          {/* Phase K4: one-click retry next to the error. A previous
+                              sync means the product was ready, so a transient Shopify
+                              hiccup (rate limit, timeout) just needs a re-queue — no
+                              need to scroll to the main button or re-check readiness.
+                              Re-uses the existing onShopifySyncJobCreated trigger. */}
+                          <button
+                            type="button"
+                            disabled={syncingToShopify}
+                            onClick={async () => {
+                              if (!db || !product?.id) return;
+                              setSyncingToShopify(true);
+                              try {
+                                await addDoc(collection(db, "shopifySyncJobs"), {
+                                  entityType: "product",
+                                  entityId: product.id,
+                                  action: "create_or_update",
+                                  status: "queued",
+                                  createdAt: serverTimestamp(),
+                                });
+                                showToast("Retry queued. The worker will re-attempt the sync shortly.", "success");
+                              } catch (err) {
+                                console.error("[Shopify retry] Failed to queue job:", err);
+                                showToast("Failed to queue retry", "error");
+                              } finally {
+                                setSyncingToShopify(false);
+                              }
+                            }}
+                            className="shrink-0 px-2.5 py-1 text-xs font-medium bg-red-600 text-white rounded hover:bg-red-700 disabled:opacity-50"
+                          >
+                            {syncingToShopify ? "Queuing…" : "Retry sync"}
+                          </button>
+                        </dd>
                       </div>
                     )}
                   </dl>
