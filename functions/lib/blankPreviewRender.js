@@ -1394,6 +1394,8 @@ function buildPreviewBlankRender({ db, storage, functions, sharp, admin }) {
       maskApplied: stageA.maskApplied,
       maskMean: stageA.maskMean,
       maskMode: stageA.maskMode,
+      /** Phase L: surface the chest-quad-warp flag on the sync path too. */
+      quadWarpApplied: stageA.quadWarpApplied,
       artworkMode: input.artworkMode,
       placementUsed: stageA.placementUsed,
       variantId: variant ? variant.variantId : null,

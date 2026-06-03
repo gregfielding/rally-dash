@@ -936,6 +936,8 @@ export function BlankRenderProfileEditor({
     } | null;
     maskApplied: boolean;
     maskMean: number | null;
+    /** Phase L: true when the design was perspective-warped onto the model chest quad. */
+    quadWarpApplied?: boolean;
     placementUsed: { x: number; y: number; scale: number; blendMode: string; blendOpacity: number };
     variantId: string | null;
     artworkMode?: "light" | "dark" | "white";
@@ -1979,6 +1981,9 @@ export function BlankRenderProfileEditor({
                 : null,
               maskApplied: stageAPresent ? job.stageA!.maskApplied : false,
               maskMean: stageAPresent ? job.stageA!.maskMean ?? null : null,
+              quadWarpApplied: stageAPresent
+                ? !!(job.stageA as { quadWarpApplied?: boolean }).quadWarpApplied
+                : false,
               placementUsed:
                 stageAPresent && job.stageA!.placementUsed
                   ? job.stageA!.placementUsed
@@ -4737,10 +4742,28 @@ export function BlankRenderProfileEditor({
       {realPreview ? (
         <div className={`mt-4 border rounded-lg overflow-hidden ${realPreview.stage === "B" ? "border-purple-300 bg-purple-50" : "border-indigo-200 bg-indigo-50"}`}>
           <div className={`px-4 py-2 border-b flex items-center justify-between text-xs ${realPreview.stage === "B" ? "border-purple-200 bg-purple-100" : "border-indigo-200 bg-indigo-100"}`}>
-            <h4 className={`font-semibold ${realPreview.stage === "B" ? "text-purple-900" : "text-indigo-900"}`}>
+            <h4 className={`font-semibold flex items-center gap-2 ${realPreview.stage === "B" ? "text-purple-900" : "text-indigo-900"}`}>
               {realPreview.stage === "B"
                 ? "✨ Product Preview"
                 : "🖼️ Real render — Stage A (deterministic)"}
+              {/* Phase L: chest-quad warp indicator, only meaningful for model targets. */}
+              {(selectedRenderTarget === "model_front" || selectedRenderTarget === "model_back") ? (
+                realPreview.quadWarpApplied ? (
+                  <span
+                    className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-teal-100 text-teal-800"
+                    title="Design was perspective-warped onto the saved chest quad — follows the body angle."
+                  >
+                    📐 warp: on
+                  </span>
+                ) : (
+                  <span
+                    className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-100 text-amber-800"
+                    title="No chest quad saved for this color — design pasted flat. Click 'Set chest quad' to fix the body angle."
+                  >
+                    ⚠ flat (no quad)
+                  </span>
+                )
+              ) : null}
             </h4>
             <div className={`flex items-center gap-3 font-mono ${realPreview.stage === "B" ? "text-purple-800" : "text-indigo-800"}`}>
               {realPreview.stage === "B" && realPreview.stageB ? (
