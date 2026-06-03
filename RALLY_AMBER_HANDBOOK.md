@@ -294,5 +294,7 @@ UI (live):
 Tests: 231/231 passing.
 
 What's NOT yet wired:
-- **Auto-resolution from `design_teams.generationDefaults.defaultIdentityId` → job.identityId** in the existing product-launch pipeline. The Phase I backend accepts `identityId` on `previewBlankRender` and `enqueueVtonAbTest`, but the older `enqueueProductModelRealism*` callables don't yet auto-attach the team's default identity. Until that's wired, **set `identityId` explicitly** when calling the previewBlankRender callable from the UI, OR add it to the variant-realism callable's input when needed. This is a 1-hour follow-up to wire when you're ready.
 - **FASHN AI** as an alternate provider (separate vendor with its own API, not on fal.ai). Worth piloting after Flux 2 multi-ref has a real-world track record.
+
+What IS wired (as of Phase I7, post-handbook v1):
+- **Auto-resolution `design_teams.generationDefaults.defaultIdentityId` → job.identityId** in both `enqueueProductModelRealism` (single) AND `enqueueProductModelRealismBatch` (fan-out). Set `defaultIdentityId: "amber"` on any team's `generationDefaults` and every realism enqueue for products under that team automatically routes through Amber's reference photos + her preferred provider. Optional `identityId` callable input still overrides for ad-hoc testing.

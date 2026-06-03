@@ -82,6 +82,54 @@ function resolvePlacementForVariant(blank, blankVariant, renderTarget) {
   return placement;
 }
 
+/**
+ * Phase I7: resolve the identity attached to a product via its team.
+ *
+ * Chain:
+ *   product.teamId → design_teams/{teamId}.generationDefaults.defaultIdentityId
+ *
+ * The trigger (onBlankPreviewJobCreated) reads this `identityId` off the job
+ * doc, pulls the identity's referenceImages, and routes through the
+ * identity's preferredProviderId (e.g. flux_2_multireference for Amber). When
+ * the team has no identity attached the resolver returns null and the
+ * trigger falls back to DEFAULT_VTON_PROVIDER_ID — back-compat with every
+ * existing job flow.
+ *
+ * Best-effort: any Firestore read failure logs a warning and returns null.
+ * We never fail the realism enqueue because identity resolution couldn't
+ * read a team doc — the catalog would grind to a halt if a single bad
+ * design_teams doc broke product launches.
+ *
+ * @returns {Promise<string|null>}
+ */
+async function resolveIdentityIdForProduct(db, product, { explicitOverride } = {}) {
+  if (typeof explicitOverride === "string" && explicitOverride.length > 0) {
+    return explicitOverride;
+  }
+  const teamId = product && typeof product.teamId === "string" ? product.teamId.trim() : null;
+  if (!teamId) return null;
+  try {
+    const snap = await db.collection("design_teams").doc(teamId).get();
+    if (!snap.exists) {
+      console.warn(`[resolveIdentityIdForProduct] design_teams/${teamId} not found`);
+      return null;
+    }
+    const team = snap.data() || {};
+    const id =
+      team.generationDefaults &&
+      typeof team.generationDefaults.defaultIdentityId === "string" &&
+      team.generationDefaults.defaultIdentityId.trim().length > 0
+        ? team.generationDefaults.defaultIdentityId.trim()
+        : null;
+    return id;
+  } catch (e) {
+    console.warn(
+      `[resolveIdentityIdForProduct] team lookup failed for ${teamId}: ${e && e.message}`
+    );
+    return null;
+  }
+}
+
 function buildEnqueueProductModelRealism({ db, admin, functions }) {
   return async (data, context) => {
     if (!context.auth) {
@@ -94,6 +142,10 @@ function buildEnqueueProductModelRealism({ db, admin, functions }) {
       view: viewIn,
       withRealism: withRealismIn,
       artworkMode: artworkModeIn,
+      /** Phase I7: optional identityId override — bypass the team→identity
+       *  resolution chain. Used when the operator wants to test a different
+       *  identity than the team's configured default. */
+      identityId: identityIdIn,
     } = data || {};
     if (!productId || typeof productId !== "string") {
       throw new functions.https.HttpsError("invalid-argument", "productId is required");
@@ -191,6 +243,16 @@ function buildEnqueueProductModelRealism({ db, admin, functions }) {
     const placement = resolvePlacementForVariant(blank, blankVariant, renderTarget);
 
     /**
+     * Phase I7: resolve identity through the product's team. When set, the
+     * trigger uses identity.referenceImages + identity.preferredProviderId
+     * to route the realism call (typically Flux 2 multi-reference for the
+     * Amber brand face). When null, falls back to the default VTON provider.
+     */
+    const identityId = await resolveIdentityIdForProduct(db, product, {
+      explicitOverride: identityIdIn,
+    });
+
+    /**
      * Enqueue the preview job with the product binding. The Phase 2 trigger
      * will pick it up, render Stage A + B, and the Phase 3 binding-write
      * branch will land the URL in the variant's flatRenders[officialRole]
@@ -214,12 +276,14 @@ function buildEnqueueProductModelRealism({ db, admin, functions }) {
       targetProductId: productId,
       targetVariantId,
       officialRole,
+      /** Phase I7: identity from product.teamId → design_teams default. Null when unattached. */
+      identityId,
       createdAt: now,
       createdByUid: context.auth.uid,
       updatedAt: now,
     });
 
-    return { jobId: jobRef.id, status: "queued", officialRole };
+    return { jobId: jobRef.id, status: "queued", officialRole, identityId };
   };
 }
 
@@ -247,7 +311,14 @@ function buildEnqueueProductModelRealismBatch({ db, admin, functions }) {
     if (!context.auth) {
       throw new functions.https.HttpsError("unauthenticated", "Sign-in required");
     }
-    const { productId, sides: sidesIn, withRealism: withRealismIn, artworkMode: artworkModeIn } = data || {};
+    const {
+      productId,
+      sides: sidesIn,
+      withRealism: withRealismIn,
+      artworkMode: artworkModeIn,
+      /** Phase I7: optional identityId override across the entire fan-out. */
+      identityId: identityIdIn,
+    } = data || {};
     if (!productId || typeof productId !== "string") {
       throw new functions.https.HttpsError("invalid-argument", "productId is required");
     }
@@ -328,6 +399,18 @@ function buildEnqueueProductModelRealismBatch({ db, admin, functions }) {
     const skipped = [];
     const plannedJobs = [];
 
+    /**
+     * Phase I7: resolve identity ONCE up front and stamp it on every child
+     * job. Every job in this fan-out targets the same product, so they all
+     * inherit the same team → identity. The trigger reads job.identityId and
+     * routes through the identity's preferredProviderId (Flux 2 multi-ref
+     * when Amber's mode=reference_images). Null = no identity attached,
+     * trigger falls back to the default VTON provider.
+     */
+    const identityId = await resolveIdentityIdForProduct(db, product, {
+      explicitOverride: identityIdIn,
+    });
+
     for (const [blankVariantId, entry] of byColor.entries()) {
       const blankVariant = blankVariantById.get(blankVariantId);
       if (!blankVariant) {
@@ -378,6 +461,9 @@ function buildEnqueueProductModelRealismBatch({ db, admin, functions }) {
             targetProductId: productId,
             targetVariantId: entry.doc.id,
             officialRole,
+            /** Phase I7: identity stamped on every child so the trigger
+             *  routes consistently across the fan-out. */
+            identityId,
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             createdByUid: context.auth.uid,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -388,7 +474,7 @@ function buildEnqueueProductModelRealismBatch({ db, admin, functions }) {
 
     /** Nothing to enqueue (every color × side was skipped). Return cleanly. */
     if (plannedJobs.length === 0) {
-      return { jobs: [], skipped, batchId: null };
+      return { jobs: [], skipped, batchId: null, identityId };
     }
 
     /**
@@ -409,7 +495,10 @@ function buildEnqueueProductModelRealismBatch({ db, admin, functions }) {
       metadata: {
         productId,
         variantId: null, // batch spans multiple variants
-        label: `Product realism (${plannedJobs.length} renders across ${byColor.size} colors)`,
+        /** Phase I7: surfaced on the batch metadata so the dashboard drawer
+         *  can show "this batch ran as Amber" without descending into child jobs. */
+        identityId: identityId || null,
+        label: `Product realism (${plannedJobs.length} renders across ${byColor.size} colors${identityId ? ` · identity ${identityId}` : ""})`,
       },
       jobs: plannedJobs.map((p) => ({
         collectionPath: "rp_blank_preview_jobs",
@@ -425,11 +514,12 @@ function buildEnqueueProductModelRealismBatch({ db, admin, functions }) {
       officialRole: p.officialRole,
     }));
 
-    return { jobs, skipped, batchId };
+    return { jobs, skipped, batchId, identityId };
   };
 }
 
 module.exports = {
+  resolveIdentityIdForProduct,
   buildEnqueueProductModelRealism,
   buildEnqueueProductModelRealismBatch,
   VIEW_TO_OFFICIAL_ROLE,
