@@ -85,6 +85,7 @@ import { functions as firebaseFunctions, db as firebaseDb } from "@/lib/firebase
 import { doc as firestoreDoc, onSnapshot, updateDoc as firestoreUpdateDoc } from "firebase/firestore";
 import type { RPBlankPreviewJob } from "@/lib/types/firestore";
 import VtonAbCompareModal from "@/components/vton/VtonAbCompareModal";
+import ModelPrintQuadEditor from "@/components/blanks/ModelPrintQuadEditor";
 
 /**
  * AI realism preview uses async pipeline (rp_blank_preview_jobs + onSnapshot) so the
@@ -947,6 +948,8 @@ export function BlankRenderProfileEditor({
    * logic + onSnapshot subscription; this state just controls visibility.
    */
   const [abCompareOpen, setAbCompareOpen] = useState(false);
+  /** Phase L: chest-quad editor modal (model targets only). */
+  const [quadEditorOpen, setQuadEditorOpen] = useState(false);
   const [realPreviewError, setRealPreviewError] = useState<string | null>(null);
   /** Active onSnapshot unsubscribe for the realism job — kept in a ref so re-renders don't leak listeners. */
   const realPreviewJobUnsubRef = useRef<(() => void) | null>(null);
@@ -4245,6 +4248,24 @@ export function BlankRenderProfileEditor({
                   🆚 Compare providers
                 </button>
               ) : null}
+              {/*
+                Phase L: chest-quad editor. Only for model targets with a
+                variant picked (each color's model photo is a distinct pose).
+                Sets the 4-corner perspective quad so the design warps to the
+                body angle deterministically on every render.
+              */}
+              {(selectedRenderTarget === "model_front" || selectedRenderTarget === "model_back") &&
+              previewVariant &&
+              firebaseFunctions ? (
+                <button
+                  type="button"
+                  onClick={() => setQuadEditorOpen(true)}
+                  className="ml-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-teal-600 text-white hover:bg-teal-700"
+                  title="Set the 4-corner chest print quad so designs follow the body angle. One-time per model photo."
+                >
+                  📐 Set chest quad
+                </button>
+              ) : null}
             </div>
             {/*
               DISABLED v10.2 (2026-05-25): original preview header button row.
@@ -4858,6 +4879,32 @@ export function BlankRenderProfileEditor({
               maskConfig: selected?.maskConfig ?? null,
             },
           }}
+        />
+      ) : null}
+
+      {/* Phase L: chest-quad editor (model targets). Reads the selected
+          variant's model photo + current quad; the live preview warps the
+          chosen design so corners are easy to align. */}
+      {quadEditorOpen &&
+      previewVariant &&
+      (selectedRenderTarget === "model_front" || selectedRenderTarget === "model_back") ? (
+        <ModelPrintQuadEditor
+          open={quadEditorOpen}
+          onClose={() => setQuadEditorOpen(false)}
+          blankId={blank.blankId}
+          variantId={previewVariant.variantId}
+          side={selectedRenderTarget === "model_back" ? "back" : "front"}
+          modelPhotoUrl={
+            (selectedRenderTarget === "model_back"
+              ? previewVariant.images?.modelBack?.downloadUrl
+              : previewVariant.images?.modelFront?.downloadUrl) || ""
+          }
+          designPreviewUrl={effectiveOverlayArtUrl || null}
+          initialQuad={
+            (selectedRenderTarget === "model_back"
+              ? previewVariant.modelPrintQuad?.back
+              : previewVariant.modelPrintQuad?.front) ?? null
+          }
         />
       ) : null}
     </div>

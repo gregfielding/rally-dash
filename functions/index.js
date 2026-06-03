@@ -126,6 +126,7 @@ const {
   buildRemoveIdentityReferenceImage,
   buildSetIdentityMode,
 } = require("./lib/identityReferenceImages");
+const { buildSaveModelPrintQuad } = require("./lib/modelPrintQuad");
 const {
   buildEnqueueProductModelRealism,
   buildEnqueueProductModelRealismBatch,
@@ -7582,6 +7583,16 @@ exports.removeIdentityReferenceImage = functions.https.onCall(
 );
 exports.setIdentityMode = functions.https.onCall(
   buildSetIdentityMode({ db, admin, functions })
+);
+
+/**
+ * Phase L: persist the model print quad (4 chest-plane corners) on a blank
+ * variant so composeStageA can perspective-warp designs onto the angled
+ * model photo deterministically. Input: { blankId, variantId, side, quad } or
+ * { blankId, variantId, side, clear: true }.
+ */
+exports.saveModelPrintQuad = functions.https.onCall(
+  buildSaveModelPrintQuad({ db, admin, functions })
 );
 
 /**
