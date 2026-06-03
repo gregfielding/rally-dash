@@ -11,6 +11,20 @@ import { functions } from "@/lib/firebase/config";
 import { httpsCallable } from "firebase/functions";
 import { ArtifactsPanel } from "./components/ArtifactsPanel";
 
+/**
+ * Trainer presets. Step defaults match fal.ai's documented values as of
+ * mid-2026 (verified via Phase I deep-research workflow against the model
+ * pages at fal.ai/models/fal-ai/flux-lora-* — see RALLY_DEEP_RESEARCH_AMBER_2026
+ * findings). Operators can still override per-job; these are just the
+ * sensible starting points.
+ *
+ *   - portrait_v1 → 2000 steps. Portrait LoRAs benefit from longer training
+ *     for face capture; the operator can dial back if overfitting shows up.
+ *   - fast_v1     → 1000 steps. Matches fal.ai's documented default for
+ *     flux-lora-fast-training (was 1200 here; fal.ai docs say 1000). The
+ *     small divergence cost ~$0.40 of extra spend per training run for no
+ *     documented quality benefit.
+ */
 const TRAINER_PRESETS = [
   {
     key: "portrait_v1",
@@ -22,7 +36,7 @@ const TRAINER_PRESETS = [
     key: "fast_v1",
     label: "Fast Trainer",
     endpoint: "fal-ai/flux-lora-fast-training",
-    defaults: { steps: 1200, learningRate: 0.0003 },
+    defaults: { steps: 1000, learningRate: 0.0003 },
   },
 ] as const;
 

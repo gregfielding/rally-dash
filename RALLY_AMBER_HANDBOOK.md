@@ -213,7 +213,7 @@ The LoRA training pipeline is **fully built and untouched** — `flux-lora-portr
 
 1. **Reuse the same reference photos** from the references admin page. Don't re-shoot.
 2. Visit `/lora/training`
-3. Pick the Amber identity, create a dataset from her reference images, pick `flux-lora-portrait-trainer` preset (1000 steps default per fal.ai docs, NOT 2000 — your current schema mis-documents this)
+3. Pick the Amber identity, create a dataset from her reference images, pick `flux-lora-portrait-trainer` preset (defaults to 2000 steps — fine for portraits; dial down to 1000-1500 if overfitting appears). The `flux-lora-fast-training` preset defaults to 1000 steps as of Phase J2 (was 1200; fal.ai's documented default is 1000)
 4. Submit. Wait ~25 min for completion.
 5. Once done, an `rp_lora_artifacts` doc auto-creates with the `.safetensors` weights URL.
 6. Go back to `/lora/identities/amber/references` → switch mode to `hybrid` (both LoRA AND reference photos available) OR `lora` (LoRA only).

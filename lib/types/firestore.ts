@@ -9,24 +9,13 @@ export interface League {
   updatedAt?: Timestamp;
 }
 
-export interface Team {
-  id?: string;
-  leagueId: string;
-  name: string;
-  slug: string;
-  city: string;
-  colors: {
-    primary: string;
-    secondary: string;
-    accent?: string;
-  };
-  keywords: string[];
-  bannedTerms: string[];
-  notes?: string;
-  active: boolean;
-  createdAt?: Timestamp;
-  updatedAt?: Timestamp;
-}
+/**
+ * The legacy `Team` interface (for the deprecated `teams` collection)
+ * was removed in Phase J1 (2026-06-02). Its data was merged into
+ * `design_teams` via functions/scripts/migrate-teams-into-design-teams.js
+ * during Phase F (executed 2026-06-01). Use `DesignTeam` instead — see
+ * canonical definition below.
+ */
 
 /**
  * Design System / color library (Illustrator workflow, future bulk import).
