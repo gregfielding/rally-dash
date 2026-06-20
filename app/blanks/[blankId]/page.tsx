@@ -1108,6 +1108,96 @@ function BlankDetailContent() {
     setAiError(null);
   };
 
+  /**
+   * One-shot "generate + save" used by the Render profile tab's model-mask
+   * button. Unlike handleAiGenerate (which stops at a preview the operator must
+   * review + Save on the Rendering tab), this commits immediately and stays on
+   * the current tab — so generating a model-front mask doesn't yank the operator
+   * off their Light Blue / Model Front setup. Model masks are inherently
+   * per-pose silhouettes; there's nothing to fine-tune by hand, so the
+   * preview→Save gate just added friction. Falls back gracefully on error.
+   */
+  const handleAiGenerateAndCommit = async (
+    view: "front" | "back",
+    opts?: { renderTarget?: MaskRenderTarget; variantId?: string | null }
+  ): Promise<void> => {
+    if (!blankId || !firebaseFunctions || !db) {
+      showToast("Firebase functions not available", "error");
+      return;
+    }
+    setAiError(null);
+    setAiGenerating(view);
+    try {
+      const renderTarget: MaskRenderTarget = opts?.renderTarget || `flat_${view}`;
+      const variantId = opts?.variantId ?? null;
+      const genFn = httpsCallable<
+        {
+          blankId: string;
+          view: "front" | "back";
+          renderTarget?: MaskRenderTarget;
+          variantId?: string | null;
+        },
+        AiMaskPreview & { previewMaskUrl: string; previewMaskStoragePath: string }
+      >(firebaseFunctions, "generateBlankMaskViaSam");
+      const gen = await genFn({ blankId, view, renderTarget, variantId });
+      const d = gen.data;
+      const resolvedTarget =
+        (d as { renderTarget?: MaskRenderTarget }).renderTarget || renderTarget;
+      const resolvedVariantId =
+        (d as { variantId?: string | null }).variantId !== undefined
+          ? (d as { variantId?: string | null }).variantId ?? null
+          : variantId;
+
+      const commitFn = httpsCallable<
+        {
+          blankId: string;
+          view: "front" | "back";
+          renderTarget?: MaskRenderTarget;
+          variantId?: string | null;
+          previewMaskStoragePath: string;
+          prompt: string;
+          seed: number;
+          falCostUsd?: number | null;
+          falLatencyMs?: number | null;
+          falRequestId?: string | null;
+          falEndpoint?: string;
+        },
+        { ok: boolean; maskDocId: string }
+      >(firebaseFunctions, "commitBlankMaskFromPreview");
+      const commit = await commitFn({
+        blankId,
+        view,
+        renderTarget: resolvedTarget,
+        variantId: resolvedVariantId,
+        previewMaskStoragePath: d.previewMaskStoragePath,
+        prompt: d.prompt,
+        seed: d.seed,
+        falCostUsd: d.falCostUsd,
+        falLatencyMs: d.falLatencyMs,
+        falRequestId: d.falRequestId,
+        falEndpoint: d.endpoint,
+      });
+
+      /** Flat masks drive the legacy masks[view] pills — refresh that slot.
+          Model masks live at a per-variant doc the editor watches live. */
+      if (resolvedTarget === "flat_front" || resolvedTarget === "flat_back") {
+        const refreshed = await getDoc(doc(db, "rp_blank_masks", commit.data.maskDocId));
+        setMasks((prev) => ({
+          ...prev,
+          [view]: refreshed.exists() ? (refreshed.data() as RPBlankMask) : prev[view],
+        }));
+      }
+      const label = resolvedTarget.replace("_", " ");
+      showToast(`${label} mask generated + saved ✓`, "success");
+    } catch (err: any) {
+      console.error("[BlankDetail] AI mask generate+commit failed:", err);
+      setAiError(err?.message || "Mask generate/save failed");
+      showToast("Mask generate/save failed", "error");
+    } finally {
+      setAiGenerating(null);
+    }
+  };
+
   const handleStatusChange = async (newStatus: "draft" | "active" | "archived") => {
     if (!blank?.blankId) return;
 
@@ -1750,13 +1840,13 @@ function BlankDetailContent() {
                   setActiveTab("rendering");
                 }}
                 onGenerateAiMask={(view, opts) => {
-                  /** Hop to the Rendering tab so the AI preview / Save / Refresh card is visible,
-                      then kick off the same handler the in-tab button uses. handleAiGenerate
-                      sets aiGenerating + populates aiPreview on success. Threads through the
-                      optional renderTarget + variantId for per-pose model masks. */
-                  setMaskView(view);
-                  setActiveTab("rendering");
-                  void handleAiGenerate(view, {
+                  /** Generate AND save in one shot, staying on the Render profile tab.
+                      Previously this hopped to the Rendering tab for a manual preview→Save,
+                      which yanked the operator off their color/target setup (and lost the
+                      live model preview). Model masks are per-pose silhouettes with nothing
+                      to hand-tune, so we commit immediately; the editor watches the saved
+                      doc live and flips the badge. Threads renderTarget + variantId through. */
+                  void handleAiGenerateAndCommit(view, {
                     renderTarget: opts?.renderTarget,
                     variantId: opts?.variantId ?? null,
                   });

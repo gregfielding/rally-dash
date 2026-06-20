@@ -1426,6 +1426,46 @@ export function BlankRenderProfileEditor({
   const currentBlankMaskDoc: RPBlankMask | null =
     (previewSide === "front" ? masks?.front : masks?.back) ?? null;
   const currentBlankMaskUrl = currentBlankMaskDoc?.mask?.downloadUrl ?? null;
+
+  /**
+   * Phase L: model targets clip to a PER-POSE silhouette stored at a different
+   * doc id (`{blankId}_{variantId}_model_<view>`) than the flat letter mask
+   * (`{blankId}_<view>`). The legacy `masks` prop only carries the flat slots,
+   * so the mask-status badge would wrongly read "No mask uploaded" on a model
+   * target even after one was generated. Watch the model mask doc live so the
+   * badge reflects reality the instant "Generate AI mask for model front"
+   * commits it (no refetch wiring needed). Null off model targets.
+   */
+  const [modelMaskDoc, setModelMaskDoc] = useState<RPBlankMask | null>(null);
+  useEffect(() => {
+    const isModel =
+      selectedRenderTarget === "model_front" || selectedRenderTarget === "model_back";
+    if (!isModel || !firebaseDb || !previewVariant?.variantId) {
+      setModelMaskDoc(null);
+      return;
+    }
+    const docId = `${blank.blankId}_${previewVariant.variantId}_${selectedRenderTarget}`;
+    const ref = firestoreDoc(firebaseDb, "rp_blank_masks", docId);
+    const unsub = onSnapshot(
+      ref,
+      (snap) => setModelMaskDoc(snap.exists() ? (snap.data() as RPBlankMask) : null),
+      () => setModelMaskDoc(null)
+    );
+    return () => unsub();
+  }, [selectedRenderTarget, previewVariant?.variantId, blank.blankId]);
+
+  /**
+   * Target-aware mask presence for the status badge: model targets read the
+   * per-pose model mask; flat targets read the shared flat mask. (The garment
+   * OVERLAY still uses the flat letter mask — `currentBlankMaskUrl` — since the
+   * model silhouette isn't a print-area overlay.)
+   */
+  const isModelTargetForMask =
+    selectedRenderTarget === "model_front" || selectedRenderTarget === "model_back";
+  const maskDocForTargetBadge: RPBlankMask | null = isModelTargetForMask
+    ? modelMaskDoc
+    : currentBlankMaskDoc;
+  const maskUrlForTargetBadge = maskDocForTargetBadge?.mask?.downloadUrl ?? null;
   /**
    * If the operator has not yet picked a clip strategy for this zone, default to
    * `blank_mask_doc` when an `rp_blank_masks/{blankId}_{view}` doc exists, otherwise
@@ -3752,16 +3792,18 @@ export function BlankRenderProfileEditor({
                     </option>
                   </select>
                   <div className="flex flex-wrap items-center gap-2 text-[11px] mt-1">
-                    {currentBlankMaskDoc && currentBlankMaskUrl ? (
+                    {maskDocForTargetBadge && maskUrlForTargetBadge ? (
                       <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-900 font-medium">
-                        Mask uploaded
-                        {currentBlankMaskDoc.mask?.width && currentBlankMaskDoc.mask?.height
-                          ? ` · ${currentBlankMaskDoc.mask.width}×${currentBlankMaskDoc.mask.height}`
+                        {isModelTargetForMask ? "Model mask saved" : "Mask uploaded"}
+                        {maskDocForTargetBadge.mask?.width && maskDocForTargetBadge.mask?.height
+                          ? ` · ${maskDocForTargetBadge.mask.width}×${maskDocForTargetBadge.mask.height}`
                           : ""}
                       </span>
                     ) : (
                       <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-neutral-100 border border-neutral-200 text-neutral-700">
-                        No mask uploaded for {previewSide}
+                        {isModelTargetForMask
+                          ? `No mask for this ${previewSide} pose`
+                          : `No mask uploaded for ${previewSide}`}
                       </span>
                     )}
                     {isAutoDefault ? (
