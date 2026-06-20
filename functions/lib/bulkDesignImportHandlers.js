@@ -544,6 +544,13 @@ function parseBulkDesignUploadPreviewImpl(db, storage) {
       league: d.data().league,
       leagueCode: d.data().leagueCode || d.data().leagueId,
       leagueId: d.data().leagueId,
+      /**
+       * The team's approved-blank catalog. Needed so the preview can default the
+       * blank picker to each team's matrix (e.g. thong only for teams that allow
+       * it) instead of always pre-checking all pipeline-ready blanks. Mirrors the
+       * server spawn precedence (resolveSpawnBlankIds).
+       */
+      productCatalogMatrix: d.data().productCatalogMatrix || null,
     }));
     /** Active **master** blanks only (schemaVersion=2); the picker shouldn't expose drafts. */
     const masterBlanks = blanksSnap.docs

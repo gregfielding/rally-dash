@@ -601,6 +601,7 @@ function filterServerDescriptor(desc) {
 }
 
 const { isPipelineReadyStyleCode } = require("./pipelineReadiness");
+const { resolveSpawnBlankIds } = require("./resolveSpawnBlanks");
 
 /**
  * @param {Array<{originalFilename: string, storagePath: string, ext: string, size: number, contentType?: string}>} descriptors
@@ -807,13 +808,30 @@ function buildPreviewItems(descriptors, designRows, teamRows, masterBlanks, opti
     const itemId = groupKey.replace(/[/\\]/g, "_").slice(0, 1400);
 
     /**
-     * Default the operator's blank selection to all pipeline-ready blanks. They
-     * can uncheck on the review screen; the disabled non-pipeline-ready ones
-     * cannot be selected today.
+     * Default the operator's blank selection from the matched team's product
+     * matrix — so per-team setup (e.g. thong only for approved teams) actually
+     * drives uploads instead of always pre-checking every pipeline-ready blank.
+     * Uses the SAME precedence as the server spawn (resolveSpawnBlankIds), so
+     * the preview default and the eventual auto-launch agree:
+     *   team matrix (enabled blanks ∩ pipeline-ready) → else all pipeline-ready.
+     * The operator can still check/uncheck on the review screen to override.
      */
-    const defaultTargetBlankIds = availableBlanks
+    const pipelineReadyBlankIds = availableBlanks
       .filter((b) => b.pipelineReady)
       .map((b) => b.blankId);
+    const spawnResolution = resolveSpawnBlankIds(pipelineReadyBlankIds, {
+      productCatalogMatrix:
+        team && team.productCatalogMatrix ? team.productCatalogMatrix : null,
+    });
+    const defaultTargetBlankIds = spawnResolution.blankIds;
+    if (
+      spawnResolution.reason === "productCatalogMatrix" &&
+      defaultTargetBlankIds.length < pipelineReadyBlankIds.length
+    ) {
+      warnings.push(
+        `Blanks defaulted to ${teamDisplay || "the team"}'s product matrix (${defaultTargetBlankIds.length} of ${pipelineReadyBlankIds.length} pipeline-ready blanks). Check/uncheck to override.`
+      );
+    }
 
     items.push({
       itemId,
