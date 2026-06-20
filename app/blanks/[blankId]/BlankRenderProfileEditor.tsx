@@ -4928,6 +4928,19 @@ export function BlankRenderProfileEditor({
               ? previewVariant.modelPrintQuad?.back
               : previewVariant.modelPrintQuad?.front) ?? null
           }
+          /**
+           * Phase L8: refresh the blank after save so the new quad is reflected
+           * immediately — otherwise `previewVariant.modelPrintQuad` stays stale,
+           * the badge never flips off "flat", and re-opening the editor resets
+           * the corners to default (looked like it never saved).
+           */
+          onSaved={() => {
+            refetchBlank();
+            showToast(
+              selectedRenderTarget === "model_back" ? "Back chest quad saved" : "Chest quad saved",
+              "success"
+            );
+          }}
         />
       ) : null}
     </div>
