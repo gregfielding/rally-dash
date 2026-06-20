@@ -614,7 +614,16 @@ function buildResolvedMerchandisingBundleForParent({
   resolvedBlankDescription,
 }) {
   const teamNameFull = buildTeamDisplayName(team, design);
-  const designShortName = designTypeToStorefrontShort(design.designType);
+  /**
+   * Prefer the operator-set `design.productLabel` over the designType-derived
+   * default — same as the variant bundle (buildResolvedMerchandisingBundle).
+   * The PARENT title drives the product name shown everywhere, so without this
+   * a custom_one_off design titled with its label ("Pillows") still came out as
+   * "Custom" on the parent (the variant fix alone wasn't enough).
+   */
+  const designLabelOverride =
+    design && typeof design.productLabel === "string" ? design.productLabel.trim() : "";
+  const designShortName = designLabelOverride || designTypeToStorefrontShort(design.designType);
   const productTypeWord = buildStorefrontProductTypeWord(blank);
 
   const apparel = isApparelBlank(blank);
