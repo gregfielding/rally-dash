@@ -48,6 +48,14 @@ const POLL_INTERVAL_MS = 2000;
 /** Reject masks outside this grayscale-mean range (catches inverted / near-empty results). */
 const MEAN_MIN = 30;
 const MEAN_MAX = 230;
+/**
+ * Model targets segment a small region (the chest/garment fabric) of a FULL-BODY
+ * photo, so a legitimate mask is only ~3-10% white → mean ~8-25, well under the
+ * flat MEAN_MIN=30. Use a much lower floor for model targets: still rejects a
+ * truly-empty all-black mask (mean ~0) but accepts a real small chest silhouette.
+ * Inversion is still caught by MEAN_MAX (an inverted model mask is mostly white).
+ */
+const MEAN_MIN_MODEL = 3;
 
 function getFalApiKey(functions) {
   try {
@@ -332,7 +340,8 @@ function buildGenerateBlankMaskViaSam({ db, storage, functions, sharp }) {
       refMeta.height
     );
 
-    if (meanGrayscale < MEAN_MIN || meanGrayscale > MEAN_MAX) {
+    const meanMin = isModelTarget ? MEAN_MIN_MODEL : MEAN_MIN;
+    if (meanGrayscale < meanMin || meanGrayscale > MEAN_MAX) {
       throw new functions.https.HttpsError(
         "internal",
         `SAM returned a near-empty or inverted mask (mean=${Math.round(meanGrayscale)}). Try a different prompt or refresh.`

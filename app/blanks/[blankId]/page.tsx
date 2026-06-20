@@ -1191,8 +1191,9 @@ function BlankDetailContent() {
       showToast(`${label} mask generated + saved ✓`, "success");
     } catch (err: any) {
       console.error("[BlankDetail] AI mask generate+commit failed:", err);
-      setAiError(err?.message || "Mask generate/save failed");
-      showToast("Mask generate/save failed", "error");
+      const msg = err?.message ? String(err.message) : "Mask generate/save failed";
+      setAiError(msg);
+      showToast(`Mask failed: ${msg}`, "error");
     } finally {
       setAiGenerating(null);
     }
