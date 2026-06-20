@@ -154,30 +154,32 @@ function buildOnDesignCreated(deps) {
       : [];
 
     /**
-     * Phase K8: load the team's approved-blank catalog so the spawn set honors
-     * it. The matrix is configured in /design-teams but was previously never
-     * read here — every design fanned out to ALL pipeline-ready blanks
-     * regardless of team catalog. Best-effort: a read failure logs + falls
-     * through to the all-blanks default (a bad team doc must not halt
+     * Phase K8 / L13: load the team's product catalog matrix. It gates BOTH:
+     *  - which BLANKS spawn (K8, via resolveSpawnBlankIds — only consulted when
+     *    there's no per-design targetBlankIds override), AND
+     *  - which COLORS each spawned product gets (L13 — approvedVariantIds per
+     *    blank; applied regardless of how the blank was selected).
+     * Loaded unconditionally now (was gated on an empty targetBlankIds) because
+     * the color gate is needed even when the picker set targetBlankIds — and the
+     * L12 picker always sets it. Best-effort: a read failure logs + falls through
+     * to all-blanks / all-colors defaults (a bad team doc must not halt
      * auto-launch across the catalog).
      */
     let productCatalogMatrix = null;
-    if (targetBlankIds.length === 0) {
-      try {
-        const teamSnap = await db.collection("design_teams").doc(teamId).get();
-        if (teamSnap.exists && teamSnap.data() && teamSnap.data().productCatalogMatrix) {
-          productCatalogMatrix = teamSnap.data().productCatalogMatrix;
-        }
-      } catch (matrixErr) {
-        console.warn(
-          "[ON_DESIGN_CREATED:MATRIX_READ_ERROR]",
-          JSON.stringify({
-            designId,
-            teamId,
-            message: matrixErr && matrixErr.message ? matrixErr.message : String(matrixErr),
-          })
-        );
+    try {
+      const teamSnap = await db.collection("design_teams").doc(teamId).get();
+      if (teamSnap.exists && teamSnap.data() && teamSnap.data().productCatalogMatrix) {
+        productCatalogMatrix = teamSnap.data().productCatalogMatrix;
       }
+    } catch (matrixErr) {
+      console.warn(
+        "[ON_DESIGN_CREATED:MATRIX_READ_ERROR]",
+        JSON.stringify({
+          designId,
+          teamId,
+          message: matrixErr && matrixErr.message ? matrixErr.message : String(matrixErr),
+        })
+      );
     }
 
     {
@@ -260,18 +262,48 @@ function buildOnDesignCreated(deps) {
       const activeVariants = Array.isArray(blankData.variants)
         ? blankData.variants.filter((v) => v && v.isActive !== false).map((v) => v.variantId).filter(Boolean)
         : [];
-      if (activeVariants.length === 0) {
+
+      /**
+       * Phase L13: honor the team's per-blank approved COLORS. The matrix entry's
+       * `approvedVariantIds` is the operator's curated color set for this blank
+       * (e.g. neutrals only, team-color garment excluded). Restrict the product's
+       * variants to it. No matrix entry for this blank, or an empty list → all
+       * active colors (back-compat; e.g. a blank added via the picker override
+       * that isn't in the team catalog).
+       */
+      const matrixEntry =
+        productCatalogMatrix && productCatalogMatrix[blankId] ? productCatalogMatrix[blankId] : null;
+      const approvedColorIds =
+        matrixEntry && Array.isArray(matrixEntry.approvedVariantIds)
+          ? matrixEntry.approvedVariantIds.map((x) => String(x || "").trim()).filter(Boolean)
+          : [];
+      let scopedVariants = activeVariants;
+      if (approvedColorIds.length > 0) {
+        const approvedSet = new Set(approvedColorIds);
+        scopedVariants = activeVariants.filter((id) => approvedSet.has(String(id || "").trim()));
+        console.log(
+          JSON.stringify({
+            tag: "[ON_DESIGN_CREATED:COLOR_FILTER]",
+            designId,
+            blankId,
+            activeColors: activeVariants.length,
+            approvedColors: scopedVariants.length,
+          })
+        );
+      }
+
+      if (scopedVariants.length === 0) {
         console.log(
           JSON.stringify({
             tag: "[ON_DESIGN_CREATED:BLANK_SKIP]",
-            reason: "no_active_variants",
+            reason: approvedColorIds.length > 0 ? "no_team_approved_colors_active" : "no_active_variants",
             designId,
             blankId,
           })
         );
         continue;
       }
-      const uniqueIds = [...new Set(activeVariants.map((x) => String(x || "").trim()).filter(Boolean))];
+      const uniqueIds = [...new Set(scopedVariants.map((x) => String(x || "").trim()).filter(Boolean))];
 
       try {
         const out = await launchProductsFromDesign({
