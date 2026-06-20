@@ -79,6 +79,7 @@ import {
   DESIGN_ARTBOARD_HEIGHT_PX,
   DESIGN_ARTBOARD_WIDTH_PX,
 } from "@/lib/render/designArtboardSpec";
+import { quadToMatrix3d, type NormalizedQuad } from "@/lib/render/cssQuadWarp";
 import { proxiedImageUrlForCanvas } from "@/lib/storageImageProxyUrl";
 import { httpsCallable } from "firebase/functions";
 import { functions as firebaseFunctions, db as firebaseDb } from "@/lib/firebase/config";
@@ -216,6 +217,14 @@ type GarmentPreviewCanvasProps = {
   overlayWarpTransform?: string;
   /** 8394 preview: soft edge mask on the artwork layer. */
   overlayMaskStyle?: CSSProperties;
+  /**
+   * Phase L: when set, the design (`overlayArtUrl`) is perspective-warped onto
+   * this saved chest quad via CSS matrix3d — exactly what the server renders for
+   * model targets — instead of the flat px/py/scale paste. The flat overlay and
+   * the safe-area box are suppressed so the live preview matches the real output.
+   * Only passed for model_front / model_back when a quad has been saved.
+   */
+  modelQuad?: NormalizedQuad | null;
   overlayArtUrl: string;
   onPointerDownOverlay: (e: React.PointerEvent) => void;
   maxHeightClass: string;
@@ -279,6 +288,7 @@ function GarmentPreviewCanvas({
   overlayImgClassName = "w-full h-full object-contain drop-shadow-md pointer-events-none select-none",
   overlayWarpTransform,
   overlayMaskStyle,
+  modelQuad,
   overlayArtUrl,
   onPointerDownOverlay,
   maxHeightClass,
@@ -303,6 +313,12 @@ function GarmentPreviewCanvas({
   const last8394TelemetryRef = useRef<Preview8394ParityTelemetry | null>(null);
   const [naturalComposeError, setNaturalComposeError] = useState<string | null>(null);
   const showArt = Boolean(overlayArtUrl);
+  /**
+   * Phase L: a saved chest quad takes over placement for model targets — the
+   * design is perspective-warped onto the quad (matching the server) instead of
+   * the flat px/py/scale paste, so we suppress the flat overlay + safe-area box.
+   */
+  const modelQuadActive = Boolean(modelQuad) && showArt;
   const useNatural8394Canvas = Boolean(pixelFaithful8394 && showArt);
   const overlayTransform =
     overlayWarpTransform && overlayWarpTransform.trim() !== ""
@@ -478,7 +494,7 @@ function GarmentPreviewCanvas({
         />
       )}
       <div className="absolute inset-0 pointer-events-none">
-        {showSafeArea && (
+        {showSafeArea && !modelQuadActive && (
           <div
             className={`absolute border-2 border-dashed border-amber-500/90 bg-amber-500/5 pointer-events-none ${
               showClipHint ? "ring-2 ring-red-400/50 ring-inset" : ""
@@ -568,7 +584,7 @@ function GarmentPreviewCanvas({
           </div>
           );
         })() : null}
-        {!useNatural8394Canvas && showArt ? (
+        {!useNatural8394Canvas && showArt && !modelQuadActive ? (
           <div
             className="absolute pointer-events-auto touch-none cursor-grab active:cursor-grabbing will-change-transform [transform-style:preserve-3d]"
             style={{
@@ -595,7 +611,89 @@ function GarmentPreviewCanvas({
             </div>
           </div>
         ) : null}
+        {modelQuadActive && modelQuad ? (
+          <ModelQuadWarpOverlay wrapRef={wrapRef} designUrl={overlayArtUrl} quad={modelQuad} />
+        ) : null}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Phase L: live perspective-warp of the design onto a saved chest quad, for the
+ * model-target preview. Measures the rendered garment <img> rect inside the
+ * preview wrapper and applies the SAME homography (CSS matrix3d) the server
+ * uses — so the operator sees the warp the instant a quad is saved, with no
+ * server round-trip and no drift from the "Set chest quad" editor.
+ *
+ * The garment img is shown at its natural aspect (no crop), so its rect equals
+ * the full model-photo box — the exact basis the normalized quad is defined in.
+ */
+function ModelQuadWarpOverlay({
+  wrapRef,
+  designUrl,
+  quad,
+}: {
+  wrapRef: React.RefObject<HTMLDivElement>;
+  designUrl: string;
+  quad: NormalizedQuad;
+}) {
+  const [rect, setRect] = useState<{ left: number; top: number; width: number; height: number } | null>(
+    null
+  );
+
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const measure = () => {
+      const w = wrapRef.current;
+      if (!w) return;
+      const img = w.querySelector("img[alt^='Garment']") as HTMLImageElement | null;
+      if (!img) return;
+      const ir = img.getBoundingClientRect();
+      const wr = w.getBoundingClientRect();
+      if (!ir.width || !ir.height) return;
+      setRect({ left: ir.left - wr.left, top: ir.top - wr.top, width: ir.width, height: ir.height });
+    };
+    measure();
+    const img = wrap.querySelector("img[alt^='Garment']") as HTMLImageElement | null;
+    img?.addEventListener("load", measure);
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(measure) : null;
+    if (ro) {
+      ro.observe(wrap);
+      if (img) ro.observe(img);
+    }
+    return () => {
+      img?.removeEventListener("load", measure);
+      ro?.disconnect();
+    };
+  }, [wrapRef, designUrl, quad]);
+
+  const matrix = useMemo(
+    () => (rect ? quadToMatrix3d(quad, rect.width, rect.height) : null),
+    [rect, quad]
+  );
+
+  if (!rect || !matrix) return null;
+  return (
+    <div
+      className="absolute pointer-events-none"
+      style={{ left: rect.left, top: rect.top, width: rect.width, height: rect.height }}
+    >
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={designUrl}
+        alt="Quad-warped design preview"
+        className="absolute top-0 left-0 select-none"
+        style={{
+          width: "1px",
+          height: "1px",
+          transformOrigin: "0 0",
+          transform: matrix,
+          opacity: 0.92,
+        }}
+        draggable={false}
+      />
     </div>
   );
 }
@@ -1251,6 +1349,22 @@ export function BlankRenderProfileEditor({
     if (variantId) return getVariantById(blank, variantId) ?? firstActiveVariant(blank) ?? null;
     return firstActiveVariant(blank) ?? null;
   }, [blank, variantId]);
+
+  /**
+   * Phase L: the saved chest quad for the active model target (front/back) on
+   * the preview variant, if any. When present, the live preview perspective-
+   * warps the design onto it — matching the server — so what the operator
+   * aligns in "Set chest quad" is reflected immediately. Null for flat targets
+   * or when no quad is saved (preview falls back to the flat paste).
+   */
+  const activeModelQuad = useMemo<NormalizedQuad | null>(() => {
+    if (selectedRenderTarget !== "model_front" && selectedRenderTarget !== "model_back") return null;
+    const q =
+      selectedRenderTarget === "model_back"
+        ? previewVariant?.modelPrintQuad?.back
+        : previewVariant?.modelPrintQuad?.front;
+    return q ?? null;
+  }, [selectedRenderTarget, previewVariant]);
 
   /** When garment color or artwork override changes on the variant, resync preview tone (not on unrelated blank edits). */
   const variantPreviewArtKey = useMemo(() => {
@@ -4708,6 +4822,7 @@ export function BlankRenderProfileEditor({
               }
               overlayWarpTransform={canvas8394Warp}
               overlayMaskStyle={canvas8394Mask}
+              modelQuad={activeModelQuad}
               overlayArtUrl={effectiveOverlayArtUrl}
               onPointerDownOverlay={handlePointerDownOverlay}
               maxHeightClass="max-h-[min(72vh,720px)]"

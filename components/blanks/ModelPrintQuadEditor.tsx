@@ -19,16 +19,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { httpsCallable } from "firebase/functions";
 import { functions as firebaseFunctions } from "@/lib/firebase/config";
 import type { RPModelPrintQuad } from "@/lib/types/firestore";
-
-type CornerKey = "topLeft" | "topRight" | "bottomRight" | "bottomLeft";
-const CORNER_ORDER: CornerKey[] = ["topLeft", "topRight", "bottomRight", "bottomLeft"];
-
-interface NormQuad {
-  topLeft: { x: number; y: number };
-  topRight: { x: number; y: number };
-  bottomRight: { x: number; y: number };
-  bottomLeft: { x: number; y: number };
-}
+import {
+  QUAD_CORNER_ORDER as CORNER_ORDER,
+  quadToMatrix3d,
+  type QuadCornerKey as CornerKey,
+  type NormalizedQuad as NormQuad,
+} from "@/lib/render/cssQuadWarp";
 
 /** Sensible default quad — a centered upright rectangle over the upper torso. */
 const DEFAULT_QUAD: NormQuad = {
@@ -67,7 +63,35 @@ export default function ModelPrintQuadEditor({
   const [dragging, setDragging] = useState<CornerKey | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * Natural aspect ratio (w/h) of the model photo. The stage is sized to this
+   * so `object-contain` fills it with NO letterboxing — which makes the stage
+   * box identical to the photo box. That keeps the dragged corners (normalized
+   * to the stage) identical to the server's basis (normalized to the photo),
+   * so what you align here is exactly what renders. Falls back to a portrait
+   * 2:3 until the image loads.
+   */
+  const [imgAspect, setImgAspect] = useState<number | null>(null);
   const stageRef = useRef<HTMLDivElement>(null);
+
+  /** Measure the model photo's natural aspect so the stage matches it exactly. */
+  useEffect(() => {
+    if (!open || !modelPhotoUrl) {
+      setImgAspect(null);
+      return;
+    }
+    let cancelled = false;
+    const im = new window.Image();
+    im.onload = () => {
+      if (!cancelled && im.naturalWidth > 0 && im.naturalHeight > 0) {
+        setImgAspect(im.naturalWidth / im.naturalHeight);
+      }
+    };
+    im.src = modelPhotoUrl;
+    return () => {
+      cancelled = true;
+    };
+  }, [open, modelPhotoUrl]);
 
   /** Seed from the saved quad when the modal opens. */
   useEffect(() => {
@@ -109,16 +133,12 @@ export default function ModelPrintQuadEditor({
   const designMatrix = useMemo(() => {
     const stage = stageRef.current;
     if (!stage || !designPreviewUrl) return null;
-    const w = stage.clientWidth;
-    const h = stage.clientHeight;
-    const dst: Array<[number, number]> = CORNER_ORDER.map((k) => [quad[k].x * w, quad[k].y * h]);
-    // Unit square (1×1) → dst corners. The preview <img> is sized 1×1px then
-    // transformed; matrix3d maps it onto the quad.
-    const m = matrix3dForQuad(dst);
-    return m;
-    // Recompute when corners change or the stage resizes (open).
+    // Unit square (1×1) → quad corners. The preview <img> is sized 1×1px then
+    // transformed; matrix3d maps it onto the quad over the stage box.
+    return quadToMatrix3d(quad, stage.clientWidth, stage.clientHeight);
+    // Recompute when corners change or the stage resizes (open / aspect).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [quad, designPreviewUrl, open]);
+  }, [quad, designPreviewUrl, open, imgAspect]);
 
   const handleSave = async () => {
     if (!firebaseFunctions) {
@@ -186,7 +206,7 @@ export default function ModelPrintQuadEditor({
           <div
             ref={stageRef}
             className="relative w-full bg-gray-100 rounded overflow-hidden select-none"
-            style={{ aspectRatio: "2 / 3" }}
+            style={{ aspectRatio: imgAspect ? String(imgAspect) : "2 / 3" }}
           >
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
@@ -284,90 +304,4 @@ export default function ModelPrintQuadEditor({
 
 function clamp(v: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, v));
-}
-
-/**
- * Compute a CSS matrix3d string that maps the unit square (0,0)-(1,1) onto the
- * 4 destination corners (in container px, order TL,TR,BR,BL). Standard
- * "general 2D projection" technique: solve the source→dest homography, emit
- * the 4×4 column-major matrix CSS expects (z row identity).
- */
-function matrix3dForQuad(dst: Array<[number, number]>): string | null {
-  const src: Array<[number, number]> = [
-    [0, 0],
-    [1, 0],
-    [1, 1],
-    [0, 1],
-  ];
-  const H = general2DProjection(src, dst);
-  if (!H) return null;
-  // Normalize so H[8] = 1.
-  for (let i = 0; i < 9; i++) H[i] /= H[8];
-  // CSS matrix3d is column-major 4×4. Map the 3×3 homography
-  // [a b c; d e f; g h i] into the 4×4 (x,y,1) projective form.
-  const m = [
-    H[0], H[3], 0, H[6],
-    H[1], H[4], 0, H[7],
-    0, 0, 1, 0,
-    H[2], H[5], 0, H[8],
-  ];
-  return `matrix3d(${m.map((v) => round(v)).join(",")})`;
-}
-
-function round(v: number) {
-  return Math.abs(v) < 1e-6 ? 0 : Number(v.toFixed(8));
-}
-
-/** Solve the 3×3 projective transform mapping 4 src → 4 dst points. */
-function general2DProjection(
-  src: Array<[number, number]>,
-  dst: Array<[number, number]>
-): number[] | null {
-  // Build the basis-to-quad transforms for src and dst, then compose:
-  // H = dstBasis · inverse(srcBasis).
-  const s = basisToPoints(src);
-  const d = basisToPoints(dst);
-  if (!s || !d) return null;
-  const sInv = adj3(s);
-  return multmm(d, sInv);
-}
-
-function basisToPoints(p: Array<[number, number]>): number[] | null {
-  const m = [p[0][0], p[1][0], p[2][0], p[0][1], p[1][1], p[2][1], 1, 1, 1];
-  const v = multmv(adj3(m), [p[3][0], p[3][1], 1]);
-  return multmm(m, [v[0], 0, 0, 0, v[1], 0, 0, 0, v[2]]);
-}
-
-function multmm(a: number[], b: number[]): number[] {
-  const r = new Array(9).fill(0);
-  for (let i = 0; i < 3; i++) {
-    for (let j = 0; j < 3; j++) {
-      let sum = 0;
-      for (let k = 0; k < 3; k++) sum += a[3 * i + k] * b[3 * k + j];
-      r[3 * i + j] = sum;
-    }
-  }
-  return r;
-}
-
-function multmv(m: number[], v: number[]): number[] {
-  return [
-    m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
-    m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
-    m[6] * v[0] + m[7] * v[1] + m[8] * v[2],
-  ];
-}
-
-function adj3(m: number[]): number[] {
-  return [
-    m[4] * m[8] - m[5] * m[7],
-    m[2] * m[7] - m[1] * m[8],
-    m[1] * m[5] - m[2] * m[4],
-    m[5] * m[6] - m[3] * m[8],
-    m[0] * m[8] - m[2] * m[6],
-    m[2] * m[3] - m[0] * m[5],
-    m[3] * m[7] - m[4] * m[6],
-    m[1] * m[6] - m[0] * m[7],
-    m[0] * m[4] - m[1] * m[3],
-  ];
 }
