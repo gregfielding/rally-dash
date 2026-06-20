@@ -166,6 +166,26 @@ function listVtonProviders() {
 const DEFAULT_VTON_PROVIDER_ID = "flux_fill";
 
 /**
+ * Phase M (2026-06-02): target-aware default provider.
+ *
+ * Flat targets keep flux_fill — its v10 hybrid color composite is tuned for
+ * flat screen-print on a plain garment. MODEL targets default to Kolors VTO:
+ * it's a true garment-on-body model (warps the print to the angled torso),
+ * and in Greg's A/B it held color better AND ran ~3x faster than Flux Fill on
+ * the angled tank shot. This makes every product's model render auto-use the
+ * right tool with zero per-render clicks; still overridable via an explicit
+ * job.providerId (A/B harness) or an identity's preferredProviderId.
+ */
+const MODEL_TARGET_DEFAULT_PROVIDER_ID = "kolors_vto";
+
+function defaultProviderForRenderTarget(renderTarget) {
+  if (renderTarget === "model_front" || renderTarget === "model_back") {
+    return MODEL_TARGET_DEFAULT_PROVIDER_ID;
+  }
+  return DEFAULT_VTON_PROVIDER_ID;
+}
+
+/**
  * Export the registry surface BEFORE eager-loading providers, otherwise the
  * provider files (which do `require("./vtonProviders")` to get
  * `registerVtonProvider`) hit a circular-dependency partial-export and see
@@ -178,6 +198,8 @@ module.exports = {
   getVtonProvider,
   listVtonProviders,
   DEFAULT_VTON_PROVIDER_ID,
+  MODEL_TARGET_DEFAULT_PROVIDER_ID,
+  defaultProviderForRenderTarget,
 };
 
 /**

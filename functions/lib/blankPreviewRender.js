@@ -18,6 +18,7 @@ const { warpDesignToQuad, isValidNormalizedQuad } = require("./perspectiveWarp")
 const {
   getVtonProvider,
   DEFAULT_VTON_PROVIDER_ID,
+  defaultProviderForRenderTarget,
 } = require("./vtonProviders");
 const { createBatchAtomically } = require("./batchHelpers");
 
@@ -1333,8 +1334,11 @@ async function composeStageB({
   if (!falApiKey) {
     throw new Error("FAL_API_KEY is not configured — cannot run AI realism pass");
   }
+  /** Phase M: fall back to the target-aware default (model → kolors_vto). */
   const resolvedProviderId =
-    typeof providerId === "string" && providerId.length > 0 ? providerId : DEFAULT_VTON_PROVIDER_ID;
+    typeof providerId === "string" && providerId.length > 0
+      ? providerId
+      : defaultProviderForRenderTarget(renderTarget);
   const provider = getVtonProvider(resolvedProviderId);
   console.log(
     `[stageB] provider=${provider.id} endpoint=${provider.endpoint} renderTarget=${renderTarget || `flat_${view}`}`
@@ -1477,6 +1481,8 @@ function buildPreviewBlankRender({ db, storage, functions, sharp, admin }) {
       maskMode: stageA.maskMode,
       /** Phase L: surface the chest-quad-warp flag on the sync path too. */
       quadWarpApplied: stageA.quadWarpApplied,
+      /** Phase L7: surface the garment-silhouette clip flag on the sync path. */
+      garmentClipApplied: stageA.garmentClipApplied,
       artworkMode: input.artworkMode,
       placementUsed: stageA.placementUsed,
       variantId: variant ? variant.variantId : null,
@@ -1601,7 +1607,13 @@ function buildOnBlankPreviewJobCreated({ db, storage, admin, functions, sharp })
             `[trigger] identity ${identityId} (mode=${identityDoc.mode}) routes to provider ${providerId} with ${identityReferenceUrls.length} refs`
           );
         } else {
-          providerId = DEFAULT_VTON_PROVIDER_ID;
+          /**
+           * Phase M: target-aware default. Model targets → Kolors VTO (body-
+           * aware warp + better color on angled shots); flat targets → Flux Fill.
+           */
+          // eslint-disable-next-line global-require
+          const { defaultProviderForRenderTarget } = require("./vtonProviders");
+          providerId = defaultProviderForRenderTarget(input.renderTarget);
         }
         /**
          * Phase B: Kolors VTO needs the variant's model photo URL as a

@@ -3809,6 +3809,10 @@ export interface RPBlankPreviewJobStageA {
   maskApplied: boolean;
   maskMean?: number | null;
   maskMode?: string | null;
+  /** Phase L: design was perspective-warped onto the saved chest quad (model targets). */
+  quadWarpApplied?: boolean;
+  /** Phase L7: print was clipped to the garment silhouette (curves out of sight at the fabric edge). */
+  garmentClipApplied?: boolean;
   placementUsed?: { x: number; y: number; scale: number; blendMode: string; blendOpacity: number };
 }
 

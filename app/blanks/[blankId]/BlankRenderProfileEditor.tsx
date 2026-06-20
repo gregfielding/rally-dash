@@ -938,6 +938,8 @@ export function BlankRenderProfileEditor({
     maskMean: number | null;
     /** Phase L: true when the design was perspective-warped onto the model chest quad. */
     quadWarpApplied?: boolean;
+    /** Phase L7: true when the print was clipped to the garment silhouette. */
+    garmentClipApplied?: boolean;
     placementUsed: { x: number; y: number; scale: number; blendMode: string; blendOpacity: number };
     variantId: string | null;
     artworkMode?: "light" | "dark" | "white";
@@ -1983,6 +1985,9 @@ export function BlankRenderProfileEditor({
               maskMean: stageAPresent ? job.stageA!.maskMean ?? null : null,
               quadWarpApplied: stageAPresent
                 ? !!(job.stageA as { quadWarpApplied?: boolean }).quadWarpApplied
+                : false,
+              garmentClipApplied: stageAPresent
+                ? !!(job.stageA as { garmentClipApplied?: boolean }).garmentClipApplied
                 : false,
               placementUsed:
                 stageAPresent && job.stageA!.placementUsed
@@ -4761,6 +4766,24 @@ export function BlankRenderProfileEditor({
                     title="No chest quad saved for this color — design pasted flat. Click 'Set chest quad' to fix the body angle."
                   >
                     ⚠ flat (no quad)
+                  </span>
+                )
+              ) : null}
+              {/* Phase L7: garment-silhouette clip indicator (model targets). */}
+              {(selectedRenderTarget === "model_front" || selectedRenderTarget === "model_back") ? (
+                realPreview.garmentClipApplied ? (
+                  <span
+                    className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-teal-100 text-teal-800"
+                    title="Print is clipped to the garment silhouette — curves out of sight at the fabric edge instead of painting on skin."
+                  >
+                    ✂ clipped
+                  </span>
+                ) : (
+                  <span
+                    className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-100 text-amber-800"
+                    title="No garment clip — print can bleed past the fabric edge onto skin. Click 'Generate AI mask for model front' to enable edge clipping."
+                  >
+                    ⚠ no clip (gen mask)
                   </span>
                 )
               ) : null}
