@@ -3100,6 +3100,7 @@ export type DesignDesignType =
   | "number"
   | "wordplay"
   | "badge_crest"
+  | "pillows"
   | "custom_one_off";
 
 /** Older documents may still store these; UI and functions accept them on read/update */

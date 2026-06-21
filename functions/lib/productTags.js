@@ -14,6 +14,7 @@ const DESIGN_TYPE_LABELS = {
   number: "Number",
   wordplay: "Wordplay",
   badge_crest: "Badge / Crest",
+  pillows: "Pillows",
   custom_one_off: "Custom / One-off",
   wordmark: "Wordmark (legacy)",
   script: "Script (legacy)",

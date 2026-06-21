@@ -58,6 +58,7 @@ const DESIGN_THEME_CANONICAL = new Set([
   "number",
   "wordplay",
   "badge_crest",
+  "pillows",
   "custom_one_off",
 ]);
 const DESIGN_THEME_LEGACY = new Set(["wordmark", "script", "other", "badge"]);

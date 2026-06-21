@@ -14,6 +14,7 @@ export const DESIGN_THEME_OPTIONS: { value: DesignDesignType; label: string }[] 
   { value: "number", label: "Number" },
   { value: "wordplay", label: "Wordplay" },
   { value: "badge_crest", label: "Badge / Crest" },
+  { value: "pillows", label: "Pillows" },
   { value: "custom_one_off", label: "Custom / One-off" },
 ];
 
@@ -25,6 +26,7 @@ const LABELS: Record<string, string> = {
   number: "Number",
   wordplay: "Wordplay",
   badge_crest: "Badge / Crest",
+  pillows: "Pillows",
   custom_one_off: "Custom / One-off",
   // Legacy `designType` values still in Firestore
   wordmark: "Wordmark (legacy)",

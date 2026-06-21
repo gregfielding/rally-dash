@@ -277,6 +277,36 @@ function inferIdentityFromDesignKey(designKey) {
   };
 }
 
+/**
+ * Curated theme values that can be AUTO-ADOPTED from a filename's design-family
+ * token (`mlb_<family>_<team>_<tone>` → `designType = <family>`). Mirrors the
+ * canonical designType set MINUS `city_69` (positionally special-cased above)
+ * and `custom_one_off` (the fallback). To make a new campaign auto-classify from
+ * its filename: add the value here AND to the DesignDesignType union AND to the
+ * label/short maps (designThemes.ts, merchandisingAtCreate.js, productTags.js).
+ */
+const FAMILY_ADOPTABLE_THEMES = new Set([
+  "slogan",
+  "stadium",
+  "rivalry",
+  "number",
+  "wordplay",
+  "badge_crest",
+  "pillows",
+]);
+
+/**
+ * Map a parsed design-family token to a canonical `designType` when it names a
+ * known theme, else null. Lets the importer classify `mlb_pillows_sf_giants` as
+ * the "pillows" theme instead of the generic `custom_one_off` fallback — which
+ * then drives the theme dropdown, storefront collections, and the `theme:` tag.
+ */
+function designTypeFromFamilyToken(familyToken) {
+  if (!familyToken) return null;
+  const norm = String(familyToken).trim().toLowerCase().replace(/[\s-]+/g, "_");
+  return FAMILY_ADOPTABLE_THEMES.has(norm) ? norm : null;
+}
+
 function identityKeyToSlug(identityKey) {
   return identityKey
     .toLowerCase()
@@ -833,6 +863,20 @@ function buildPreviewItems(descriptors, designRows, teamRows, masterBlanks, opti
       );
     }
 
+    /**
+     * Auto-adopt the theme from the filename's design-family token when the
+     * positional inference only produced the generic custom_one_off fallback —
+     * e.g. mlb_pillows_sf_giants → designType "pillows". The city_69 path
+     * (inferred.designType === "city_69") is left untouched. Stored on the item,
+     * so the commit (which reads the item back) persists it to the design doc;
+     * the design editor's Theme dropdown remains the manual override.
+     */
+    const familyThemeType = designTypeFromFamilyToken(parsed.designFamily);
+    const resolvedDesignType =
+      inferred.designType === "custom_one_off" && familyThemeType
+        ? familyThemeType
+        : inferred.designType;
+
     items.push({
       itemId,
       groupKey,
@@ -845,7 +889,7 @@ function buildPreviewItems(descriptors, designRows, teamRows, masterBlanks, opti
       themeCode,
       themeName: themeName || null,
       designSeries,
-      designType: inferred.designType,
+      designType: resolvedDesignType,
       files: filesOut,
       assetCoverage: coverage,
       warnings,

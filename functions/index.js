@@ -6347,6 +6347,7 @@ const DESIGN_THEME_CANONICAL = new Set([
   "number",
   "wordplay",
   "badge_crest",
+  "pillows",
   "custom_one_off",
 ]);
 const DESIGN_THEME_LEGACY = new Set(["wordmark", "script", "other", "badge"]);
@@ -6844,7 +6845,7 @@ exports.createDesignAsset = functions.https.onCall(async (data, context) => {
   if (!designType || typeof designType !== "string" || !isAllowedDesignTheme(designType)) {
     throw new functions.https.HttpsError(
       "invalid-argument",
-      "designType (design theme) is required and must be a canonical theme: city_69, slogan, stadium, rivalry, number, wordplay, badge_crest, custom_one_off (or a legacy value: wordmark, script, badge, other)"
+      "designType (design theme) is required and must be a canonical theme: city_69, slogan, stadium, rivalry, number, wordplay, badge_crest, pillows, custom_one_off (or a legacy value: wordmark, script, badge, other)"
     );
   }
 
