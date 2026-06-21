@@ -45,6 +45,9 @@ const PIPELINE_CONFIG_BY_STYLE_CODE = {
     requiresWarp: true,
     requiresMask: true,
     supportedSides: ["front", "back"],
+    /** Side(s) the DESIGN is printed on (drives the official "designed" flat role).
+        Panty prints on the back; the front is a clean garment shot. */
+    designPrintSides: ["back"],
   },
   "8390": {
     styleCode: "8390",
@@ -53,6 +56,7 @@ const PIPELINE_CONFIG_BY_STYLE_CODE = {
     requiresWarp: true,
     requiresMask: true,
     supportedSides: ["front", "back"],
+    designPrintSides: ["back"],
     /**
      * Activated 2026-05-27. The `applyDesignWarp8394` helper is named after
      * 8394 but the math (affine + scale) is generic and config-driven — it
@@ -71,6 +75,8 @@ const PIPELINE_CONFIG_BY_STYLE_CODE = {
     requiresWarp: false,
     requiresMask: true,
     supportedSides: ["front", "back"],
+    /** Apparel prints on the chest (front); design composites onto the front. */
+    designPrintSides: ["front"],
     /**
      * Activated 2026-05-27. Generic sharp pipeline runs (placement, blend);
      * warp + mask early-exit when their per-render `enabled` flags are false.
@@ -91,6 +97,8 @@ const PIPELINE_CONFIG_BY_STYLE_CODE = {
     requiresWarp: false,
     requiresMask: true,
     supportedSides: ["front", "back"],
+    /** Crewneck prints on the chest (front); design composites onto the front. */
+    designPrintSides: ["front"],
     /**
      * Activated 2026-05-27. Same approach as TR3008 — flat garment, warp
      * step early-exits via per-render config, generic sharp pipeline runs.
@@ -136,6 +144,19 @@ function styleCodeRequiresWarp(styleCode) {
   return !!(cfg && cfg.requiresWarp === true);
 }
 
+/**
+ * Side(s) the DESIGN is printed on for this blank — drives which official flat
+ * role is "designed" vs a clean garment shot. Back-print blanks (panty/thong)
+ * get flat_back_designed; front-print apparel (tank/crewneck) gets
+ * flat_front_designed. Defaults to ["back"] for unknown codes (legacy 8394
+ * behavior) so nothing regresses.
+ */
+function designPrintSidesForStyleCode(styleCode) {
+  const cfg = pipelineConfigForStyleCode(styleCode);
+  const sides = cfg && Array.isArray(cfg.designPrintSides) ? cfg.designPrintSides : null;
+  return sides && sides.length ? sides : ["back"];
+}
+
 module.exports = {
   PIPELINE_CONFIG_BY_STYLE_CODE,
   pipelineConfigForStyleCode,
@@ -143,4 +164,5 @@ module.exports = {
   pipelineReadyStyleCodes,
   allRegisteredStyleCodes,
   styleCodeRequiresWarp,
+  designPrintSidesForStyleCode,
 };

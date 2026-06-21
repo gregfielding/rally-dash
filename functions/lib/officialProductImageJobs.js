@@ -38,6 +38,15 @@ function enabledRolesActuallyEnqueuedForColor(blank, blankVariantId, enabledOffi
 
 /** Saved blank master has on-model URLs for this color — deterministic compose (no identity / scene preset). */
 function roleUsesDeterministic8394ModelCompose(blank, blankVariantId, role) {
+  /**
+   * The deterministic model compositor (officialProductModelCompose) only
+   * supports 8394 — it throws for any other styleCode. For non-8394 blanks the
+   * on-model shots come from the VTON product-realism path
+   * (enqueueProductModelRealism / "Compare providers"), NOT auto-launch. Return
+   * false here so non-8394 model roles route to the graceful skip path instead
+   * of the 8394-only throw (which used to fail the whole launch — tank/thong).
+   */
+  if (String((blank && blank.styleCode) || "").trim() !== "8394") return false;
   const vr = blankVariantRowFromMaster(blank, blankVariantId);
   if (!vr) return false;
   if (role === "model_back_designed") return !!getVariantModelBackUrl(blank, vr);
@@ -584,6 +593,36 @@ async function enqueueOfficialProductImages(ctx) {
       const isModelRole = isOfficialModelRoleName(role);
 
       if (isModelRole) {
+        /**
+         * Phase N4: at auto-launch, only 8394 has a working official model
+         * pipeline (deterministic compose). For every other blank the on-model
+         * shots are produced by the VTON product-realism path
+         * (enqueueProductModelRealism / "Compare providers"), so skip model roles
+         * here gracefully — never fail the launch over them. Flat (incl. the
+         * designed-front role) still generates.
+         */
+        if (String((blank && blank.styleCode) || "").trim() !== "8394") {
+          officialEnqueuePayload("OFFICIAL_ENQUEUE:SKIP_MODEL_ROLE", {
+            productId,
+            batchId,
+            blankVariantId,
+            role,
+            reason: "non_8394_model_via_vton_path",
+          });
+          await markOfficialAssetRoleSkippedNoIdentity({
+            db,
+            admin,
+            sanitizeForFirestore,
+            productId,
+            batchId,
+            colorKey: blankVariantId,
+            role,
+            reason:
+              "Model assets for non-8394 blanks come from the VTON product-realism path (Compare providers), not auto-launch.",
+          });
+          continue;
+        }
+
         const useDeterministicModel = roleUsesDeterministic8394ModelCompose(blank, blankVariantId, role);
 
         if (useDeterministicModel) {

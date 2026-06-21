@@ -10,9 +10,11 @@ const {
   getVariantModelBackUrl,
   getVariantModelFrontUrl,
 } = require("./variantRenderSources");
+const { designPrintSidesForStyleCode } = require("./pipelineReadiness");
 
 const BLANK_PRODUCT_IMAGE_GENERATION_KEYS = Object.freeze([
   "model_blended_back",
+  "flat_blended_front",
   "flat_clean_front",
   "flat_blended_back",
   "model_clean_front",
@@ -20,6 +22,7 @@ const BLANK_PRODUCT_IMAGE_GENERATION_KEYS = Object.freeze([
 
 const DEFAULT_GALLERY_ORDER = Object.freeze({
   model_blended_back: 10,
+  flat_blended_front: 15,
   flat_clean_front: 20,
   flat_blended_back: 30,
   model_clean_front: 40,
@@ -35,6 +38,7 @@ function resolveSourcePhotoUrlForGenerationKey(blank, variant, key, override) {
   switch (key) {
     case "flat_blended_back":
       return trimU(getVariantFlatBackUrl(blank, variant)) || null;
+    case "flat_blended_front":
     case "flat_clean_front":
       return trimU(getVariantFlatFrontUrl(blank, variant)) || null;
     case "model_blended_back":
@@ -47,10 +51,25 @@ function resolveSourcePhotoUrlForGenerationKey(blank, variant, key, override) {
 }
 
 function inferEnabledGenerationKeys8394(blank, variant) {
+  /**
+   * Print-side-aware role inference. The blank's `designPrintSides` (from the
+   * pipeline-readiness registry) decides which flat side carries the DESIGN vs a
+   * clean garment shot:
+   *   - back-print (panty/thong): flat back is designed, flat front is clean → unchanged legacy behavior.
+   *   - front-print (tank/crewneck): flat front is DESIGNED (flat_blended_front).
+   * Model keys stay image-driven (non-8394 model roles are skipped downstream by
+   * the official model compositor; the VTON product-realism path renders those).
+   */
+  const printSides = designPrintSidesForStyleCode(blank && blank.styleCode);
+  const printsFront = printSides.includes("front");
+  const printsBack = printSides.includes("back");
+
   const out = [];
   if (trimU(getVariantModelBackUrl(blank, variant))) out.push("model_blended_back");
-  if (trimU(getVariantFlatFrontUrl(blank, variant))) out.push("flat_clean_front");
-  if (trimU(getVariantFlatBackUrl(blank, variant))) out.push("flat_blended_back");
+  if (trimU(getVariantFlatFrontUrl(blank, variant))) {
+    out.push(printsFront ? "flat_blended_front" : "flat_clean_front");
+  }
+  if (printsBack && trimU(getVariantFlatBackUrl(blank, variant))) out.push("flat_blended_back");
   if (trimU(getVariantModelFrontUrl(blank, variant))) out.push("model_clean_front");
   return out;
 }
@@ -77,8 +96,9 @@ function resolve8394ProductImagePlan(blank, variant) {
     const effectiveGalleryOrder =
       go != null && Number.isFinite(Number(go)) ? Number(go) : DEFAULT_GALLERY_ORDER[key];
 
-    const isBackComposite = key === "flat_blended_back" || key === "model_blended_back";
-    const expectsArtwork = isBackComposite ? explicit.expectsArtwork !== false : false;
+    const isDesignedComposite =
+      key === "flat_blended_back" || key === "model_blended_back" || key === "flat_blended_front";
+    const expectsArtwork = isDesignedComposite ? explicit.expectsArtwork !== false : false;
 
     out[key] = {
       ...explicit,
@@ -107,12 +127,13 @@ function expectsArtworkForPlanKey(plan, key) {
 const GENERATION_KEY_TO_OFFICIAL_ROLE = Object.freeze({
   model_blended_back: "model_back_designed",
   model_clean_front: "model_front_clean",
+  flat_blended_front: "flat_front_designed",
   flat_clean_front: "flat_front_clean",
   flat_blended_back: "flat_back_designed",
 });
 
 const OFFICIAL_MODEL_ROLES = Object.freeze(["model_back_designed", "model_front_clean"]);
-const OFFICIAL_FLAT_ROLES = Object.freeze(["flat_front_clean", "flat_back_designed"]);
+const OFFICIAL_FLAT_ROLES = Object.freeze(["flat_front_clean", "flat_front_designed", "flat_back_designed"]);
 
 function officialRoleForGenerationKey(key) {
   return GENERATION_KEY_TO_OFFICIAL_ROLE[key] || null;
@@ -146,7 +167,7 @@ function resolveBlankProductImagePlan(blank, variant) {
       .filter(Boolean);
   } else {
     requiredLaunchOfficialRoles = enabledKeys
-      .filter((k) => k === "flat_clean_front" || k === "flat_blended_back")
+      .filter((k) => k === "flat_clean_front" || k === "flat_blended_back" || k === "flat_blended_front")
       .map(officialRoleForGenerationKey)
       .filter(Boolean);
   }

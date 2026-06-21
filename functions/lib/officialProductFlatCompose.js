@@ -62,12 +62,23 @@ async function composeOfficial8394FlatRole(ctx) {
 
   const sharp = require("sharp");
 
-  if (role !== "flat_front_clean" && role !== "flat_back_designed") {
+  /**
+   * Role → (render target, designed?). flat_front_designed (front-print apparel)
+   * runs the SAME designed compose path as flat_back_designed, just side=front.
+   * flat_front_clean stays garment-only.
+   */
+  const ROLE_CFG = {
+    flat_front_clean: { renderTarget: "flat_front", designed: false },
+    flat_front_designed: { renderTarget: "flat_front", designed: true },
+    flat_back_designed: { renderTarget: "flat_back", designed: true },
+  };
+  const roleCfg = ROLE_CFG[role];
+  if (!roleCfg) {
     throw new Error(`composeOfficial8394FlatRole: unsupported role ${role}`);
   }
-
-  const renderTarget = role === "flat_front_clean" ? "flat_front" : "flat_back";
+  const renderTarget = roleCfg.renderTarget;
   const side = renderTarget === "flat_front" ? "front" : "back";
+  const isDesignedRole = roleCfg.designed;
 
   const productRef = db.collection("rp_products").doc(productId);
   const productSnap = await productRef.get();
@@ -131,19 +142,23 @@ async function composeOfficial8394FlatRole(ctx) {
   if (!savedProfile) {
     throw new Error("resolveSavedBlankRenderProfile: blank color row missing");
   }
-  if (role === "flat_back_designed" && !savedProfile.printSides.effectiveBack) {
-    throw new Error(
-      `Saved blank profile + design do not allow back artwork (effectiveBack=false). Adjust blank/design or supportedRenderViews.`
-    );
+  if (isDesignedRole) {
+    const sideEffective =
+      side === "front" ? savedProfile.printSides.effectiveFront : savedProfile.printSides.effectiveBack;
+    if (!sideEffective) {
+      throw new Error(
+        `Saved blank profile + design do not allow ${side} artwork (effective${side === "front" ? "Front" : "Back"}=false). Adjust blank/design or supportedRenderViews.`
+      );
+    }
+    if (!savedProfile.placement) {
+      throw new Error(`resolveSavedBlankRenderProfile: missing effective placement for ${renderTarget} (${side})`);
+    }
   }
   /** `flat_front_clean` is garment-only; allowed even when commerce print is back-only (supplemental PDP asset). */
   if (role === "flat_front_clean" && !savedProfile.printSides.effectiveFront && !savedProfile.garmentImageUrl) {
     throw new Error(
       `No saved front garment image for this color: add variants[].images.flatFront on ${savedProfile.source.blankDocPath} (or legacy front slot).`
     );
-  }
-  if (role === "flat_back_designed" && !savedProfile.placement) {
-    throw new Error(`resolveSavedBlankRenderProfile: missing effective placement for ${renderTarget} (${side})`);
   }
 
   flatRenderLog("RESOLVED_SAVED_BLANK_RENDER_PROFILE", {

@@ -20,10 +20,31 @@ import { RP_BLANK_PRODUCT_IMAGE_DEFAULT_GALLERY_ORDER } from "@/lib/types/firest
 
 export const BLANK_PRODUCT_IMAGE_GENERATION_KEYS: readonly RpBlankProductImageGenerationKey[] = [
   "model_blended_back",
+  "flat_blended_front",
   "flat_clean_front",
   "flat_blended_back",
   "model_clean_front",
 ] as const;
+
+/**
+ * Side(s) the design prints on per blank — mirrors `designPrintSides` in
+ * functions/lib/pipelineReadiness.js. Front-print apparel gets a designed FRONT
+ * flat; back-print panty/thong keep the designed BACK. No client readiness
+ * registry exists, so this small curated map mirrors the server config. Unknown
+ * codes default to ["back"] (legacy 8394 behavior).
+ */
+const DESIGN_PRINT_SIDES_BY_STYLE_CODE: Record<string, ("front" | "back")[]> = {
+  "8394": ["back"],
+  "8390": ["back"],
+  TR3008: ["front"],
+  HF07: ["front"],
+};
+
+function designPrintSidesForBlank(blank: RPBlank): ("front" | "back")[] {
+  const code = String((blank && blank.styleCode) || "").trim();
+  const sides = DESIGN_PRINT_SIDES_BY_STYLE_CODE[code] || DESIGN_PRINT_SIDES_BY_STYLE_CODE[code.toUpperCase()];
+  return sides && sides.length ? sides : ["back"];
+}
 
 export type Resolved8394ProductImageTarget = RPBlankProductImageTarget & {
   key: RpBlankProductImageGenerationKey;
@@ -49,6 +70,7 @@ export function resolveSourcePhotoUrlForGenerationKey(
   switch (key) {
     case "flat_blended_back":
       return trimU(getVariantFlatBackUrl(blank, variant)) || null;
+    case "flat_blended_front":
     case "flat_clean_front":
       return trimU(getVariantFlatFrontUrl(blank, variant)) || null;
     case "model_blended_back":
@@ -62,10 +84,16 @@ export function resolveSourcePhotoUrlForGenerationKey(
 
 /** Infers which MVP slots have a source photo from master blank URLs (legacy behavior). */
 export function inferEnabledGenerationKeys8394(blank: RPBlank, variant: RPBlankVariant): RpBlankProductImageGenerationKey[] {
+  const printSides = designPrintSidesForBlank(blank);
+  const printsFront = printSides.includes("front");
+  const printsBack = printSides.includes("back");
+
   const out: RpBlankProductImageGenerationKey[] = [];
   if (trimU(getVariantModelBackUrl(blank, variant))) out.push("model_blended_back");
-  if (trimU(getVariantFlatFrontUrl(blank, variant))) out.push("flat_clean_front");
-  if (trimU(getVariantFlatBackUrl(blank, variant))) out.push("flat_blended_back");
+  if (trimU(getVariantFlatFrontUrl(blank, variant))) {
+    out.push(printsFront ? "flat_blended_front" : "flat_clean_front");
+  }
+  if (printsBack && trimU(getVariantFlatBackUrl(blank, variant))) out.push("flat_blended_back");
   if (trimU(getVariantModelFrontUrl(blank, variant))) out.push("model_clean_front");
   return out;
 }
@@ -98,8 +126,9 @@ export function resolve8394ProductImagePlan(
     const effectiveGalleryOrder =
       go != null && Number.isFinite(Number(go)) ? Number(go) : RP_BLANK_PRODUCT_IMAGE_DEFAULT_GALLERY_ORDER[key];
 
-    const isBackComposite = key === "flat_blended_back" || key === "model_blended_back";
-    const expectsArtwork = isBackComposite ? explicit.expectsArtwork !== false : false;
+    const isDesignedComposite =
+      key === "flat_blended_back" || key === "model_blended_back" || key === "flat_blended_front";
+    const expectsArtwork = isDesignedComposite ? explicit.expectsArtwork !== false : false;
 
     out[key] = {
       ...explicit,
@@ -140,6 +169,7 @@ export function expectsArtworkForPlanKey(
 export const GENERATION_KEY_TO_OFFICIAL_ROLE: Record<RpBlankProductImageGenerationKey, Rp8394InitialAssetRole> = {
   model_blended_back: "model_back_designed",
   model_clean_front: "model_front_clean",
+  flat_blended_front: "flat_front_designed",
   flat_clean_front: "flat_front_clean",
   flat_blended_back: "flat_back_designed",
 };
@@ -189,7 +219,7 @@ export function resolveBlankProductImagePlan(blank: RPBlank, variant: RPBlankVar
       .filter((r): r is Rp8394InitialAssetRole => !!r);
   } else {
     requiredLaunchOfficialRoles = enabledKeys
-      .filter((k) => k === "flat_clean_front" || k === "flat_blended_back")
+      .filter((k) => k === "flat_clean_front" || k === "flat_blended_back" || k === "flat_blended_front")
       .map((k) => officialRoleForGenerationKey(k))
       .filter((r): r is Rp8394InitialAssetRole => !!r);
   }
