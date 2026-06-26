@@ -44,7 +44,6 @@ import {
   build8394PreviewWarpTransform,
   fabricFeelToSaturatePercent,
   mapInkStrengthToFactorsPreview,
-  mapRealismToBlendPreview,
 } from "@/lib/blanks/preview8394";
 import { computePlacement8394Layout } from "@/lib/blanks/placement8394Layout";
 import {
@@ -108,7 +107,6 @@ import {
 import {
   RENDER_TARGETS,
   RENDER_TARGET_LABELS,
-  blendSettingsToPreviewCss,
   buildRenderTargetSettingsMap,
   cloneRenderTargetSettings,
   defaultRenderTargetForZoneView,
@@ -1689,14 +1687,19 @@ export function BlankRenderProfileEditor({
    * Other styles: unified fabric/print curve for preview CSS.
    */
   const zoneBlend = useMemo(() => {
-    if (tuning && is8394) {
-      const r = Math.round(clamp(tuning.blend.fabricFeel * 100, 0, 100));
-      return mapRealismToBlendPreview(r);
-    }
-    if (tuning) return blendSettingsToPreviewCss(tuning.blend);
+    /**
+     * RenderCore R4: drive the live canvas from the SAME blend the product engine
+     * resolves (`engineBlendResolved` = resolveEngineBlendForRenderTarget, the server's
+     * function), instead of a preview-only formula. This makes the canvas blend mode +
+     * opacity match what ships (the legibility adjustment in
+     * zoneBlendFor8394BlendedPreview still applies on top — the product applies the same
+     * resolveBlendedPreviewBlend8394). The canvas is still a CSS approximation (mix-blend
+     * ≠ Sharp composite); the byte-exact render is the "Product Preview" button.
+     */
+    if (tuning) return { blendMode: engineBlendResolved.blendMode, blendOpacity: engineBlendResolved.blendOpacity };
     if (!selected) return { blendMode: "multiply", blendOpacity: 1 };
     return effectiveZoneBlend(blank, selected.view, selected);
-  }, [blank, is8394, selected, tuning]);
+  }, [blank, selected, tuning, engineBlendResolved]);
 
   /** Browser-only: multiply preview is illegible for several garment × artwork pairs; see resolveBlendedPreviewBlend8394. */
   const zoneBlendFor8394BlendedPreview = useMemo(() => {
