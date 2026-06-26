@@ -1476,15 +1476,24 @@ function buildPreviewBlankRender({ db, storage, functions, sharp, admin }) {
      * composeStageA (CSS-canvas-matching, model targets, Stage B input) stays the
      * fallback for non-flat targets, missing color, or any parity-render error.
      */
-    const isFlatTarget = input.renderTarget === "flat_front" || input.renderTarget === "flat_back";
+    /**
+     * RenderCore R3: route ALL deterministic targets (flat AND model) through the
+     * product engine so the editor "Product Preview" equals the shipped image by
+     * construction — including the chest-quad warp for model targets (R2). composeStageA
+     * stays the fallback (parity error) and the path for AI realism (withRealism=true,
+     * handled on the async branch above), which needs a clean Stage A as Flux input.
+     */
+    const isDeterministicTarget = ["flat_front", "flat_back", "model_front", "model_back"].includes(
+      input.renderTarget
+    );
     let stageA;
     let variant;
-    if (isFlatTarget && input.variantId) {
+    if (isDeterministicTarget && input.variantId) {
       try {
         ({ stageA, variant } = await composeFlatPreviewParity({ db, storage, sharp, functions, input }));
       } catch (parityErr) {
         console.warn(
-          `[previewBlankRender] flat parity render failed (${parityErr && parityErr.message}); falling back to composeStageA`
+          `[previewBlankRender] parity render failed (${parityErr && parityErr.message}); falling back to composeStageA`
         );
         ({ stageA, variant } = await composeStageA({ db, storage, sharp, functions, input }));
       }

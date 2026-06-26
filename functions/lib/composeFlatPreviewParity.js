@@ -55,10 +55,11 @@ async function composeFlatPreviewParity({ db, storage, sharp, functions, input }
   const { blankId, variantId, designId, renderTarget } = input;
   const side = renderTargetToSide(renderTarget);
 
-  if (renderTarget !== "flat_front" && renderTarget !== "flat_back") {
+  const VALID_TARGETS = new Set(["flat_front", "flat_back", "model_front", "model_back"]);
+  if (!VALID_TARGETS.has(renderTarget)) {
     throw new functions.https.HttpsError(
       "invalid-argument",
-      `composeFlatPreviewParity only handles flat targets (got ${renderTarget})`
+      `composePreviewParity: unsupported renderTarget ${renderTarget}`
     );
   }
   if (!variantId) {
