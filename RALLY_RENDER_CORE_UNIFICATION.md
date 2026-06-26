@@ -14,8 +14,10 @@ flat and on-body.** Today it isn't, because rendering logic is forked across ~5 
   yet visible. Set a quad on a model photo and it ships.
 - ✅ **R3** — editor **model** preview now runs the product engine too → on-body editor preview ==
   shipped on-body image by construction. Verified on panty model_back (scale 1.0875).
-- ⬜ **R4** — kill the client CSS-canvas blend math (the live drag-canvas still uses its own formula).
-- ⬜ **R5** — Flux VTON realism consumes resolved placement.
+- ✅ **R4** — live CSS drag-canvas now uses the engine-resolved blend (`engineBlendResolved`)
+  instead of its own preview formula, so canvas blend params match the product. (Canvas is still
+  a CSS approximation — mix-blend ≠ Sharp; the byte-exact preview is the Product Preview button.)
+- ⬜ **R5** — Flux VTON realism consumes resolved placement (optional AI-layer polish).
 - ⚠️ **Apparel on-body not set up:** HF07 crewneck has **no model photos** (renders flat-lay only);
   TR3008 tank + 8390 thong have **0 variants**. Only the 8394 panty has on-body renders today.
 
