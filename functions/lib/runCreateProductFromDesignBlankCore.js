@@ -35,6 +35,7 @@ const {
   assertDistinctSkuCandidates,
 } = require("./buildSku");
 const { assertSkusUnusedInDatastore } = require("./skuUniqueness");
+const { parentProductDocId } = require("./parentProductDocId");
 
 function deriveColorFamilyFromName(colorName) {
   const dark = new Set(["black", "midnight navy", "navy", "indigo"]);
@@ -280,8 +281,10 @@ async function runCreateProductFromDesignBlankCore(ctx) {
   let parentRef = null;
   let parentSlug = null;
   let parentId = null;
-  /** Firestore payload for a brand-new parent; `.add()` runs only after assertSkusUnusedInDatastore succeeds. */
+  /** Firestore payload for a brand-new parent; the create runs only after assertSkusUnusedInDatastore succeeds. */
   let pendingNewParentPayload = null;
+  /** True when our deterministic-id `.create()` lost the race to a concurrent launch and we reused its parent. */
+  let parentCreateRaceLost = false;
 
   if (parentDocExisting) {
     parentRef = parentDocExisting.ref;
@@ -495,9 +498,47 @@ async function runCreateProductFromDesignBlankCore(ctx) {
   }
 
   if (pendingNewParentPayload && !parentRef) {
-    parentRef = await db.collection("rp_products").add(sanitizeForFirestore(pendingNewParentPayload));
-    parentId = parentRef.id;
-    console.log("[createProductFromDesignBlank] Created parent product:", parentId, parentSlug);
+    /**
+     * Concurrency-safe parent create. Derive a DETERMINISTIC doc id from
+     * parentProductIdentityKey and `.create()` it (atomic; fails if the doc exists)
+     * instead of `.add()`-ing a random id. Two auto-launches racing on the same
+     * (league, team, design, blank) — e.g. two at-least-once `onDesignCreated`
+     * deliveries — compute the SAME id, so the loser's create fails with
+     * ALREADY_EXISTS and reuses the winner's parent rather than writing a duplicate.
+     * This closes the read-then-write window in the parentProductIdentityKey query
+     * above (which can't see a parent a concurrent run hasn't committed yet).
+     */
+    const deterministicParentRef = db
+      .collection("rp_products")
+      .doc(parentProductDocId(parentProductIdentityKey));
+    try {
+      await deterministicParentRef.create(sanitizeForFirestore(pendingNewParentPayload));
+      parentRef = deterministicParentRef;
+      parentId = parentRef.id;
+      console.log("[createProductFromDesignBlank] Created parent product:", parentId, parentSlug);
+    } catch (createErr) {
+      const code = createErr && createErr.code;
+      const msg = createErr && createErr.message ? String(createErr.message) : "";
+      // gRPC ALREADY_EXISTS is code 6; admin SDK may surface the string code too.
+      const alreadyExists = code === 6 || code === "already-exists" || /ALREADY_EXISTS/i.test(msg);
+      if (!alreadyExists) throw createErr;
+      // Lost the create race — a concurrent launch already created this parent. Reuse it.
+      parentCreateRaceLost = true;
+      parentRef = deterministicParentRef;
+      parentId = parentRef.id;
+      const winnerSnap = await deterministicParentRef.get();
+      const winnerData = winnerSnap.exists ? winnerSnap.data() : null;
+      if (winnerData && winnerData.slug) parentSlug = winnerData.slug;
+      console.log(
+        JSON.stringify({
+          tag: "[TEAM_PRODUCT_GEN:SERVER:PARENT_CREATE_RACE]",
+          note: "create_lost_reusing_existing_parent",
+          parentProductId: parentId,
+          parentProductIdentityKey,
+          parentSlug: parentSlug || null,
+        })
+      );
+    }
   }
 
   if (legacyLeadPatch) {
@@ -711,8 +752,12 @@ async function runCreateProductFromDesignBlankCore(ctx) {
     slug: parentSlug,
     variantId: returnVariantId,
     variantIds: variantIdsThisColor,
-    /** True if parent `rp_products` doc already existed before this run (team gen / multi-color). */
-    parentExisted: !!parentDocExisting,
+    /**
+     * True if parent `rp_products` doc already existed before this run (team gen /
+     * multi-color), OR we lost the deterministic-id create race and reused a concurrent
+     * launch's parent — either way this run did not author a fresh parent.
+     */
+    parentExisted: !!parentDocExisting || parentCreateRaceLost,
   };
 }
 
