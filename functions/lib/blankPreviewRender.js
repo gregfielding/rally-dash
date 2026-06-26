@@ -21,6 +21,7 @@ const {
   defaultProviderForRenderTarget,
 } = require("./vtonProviders");
 const { createBatchAtomically } = require("./batchHelpers");
+const { composeFlatPreviewParity } = require("./composeFlatPreviewParity");
 
 /**
  * Stage B uses fal.ai's Kontext model (`fal-ai/flux-pro/kontext`) for image editing.
@@ -1465,8 +1466,31 @@ function buildPreviewBlankRender({ db, storage, functions, sharp, admin }) {
       return { jobId: jobRef.id, status: "queued" };
     }
 
-    /** Sync path: Stage A only — fast enough to finish well within the gateway window. */
-    const { stageA, variant } = await composeStageA({ db, storage, sharp, functions, input });
+    /**
+     * Sync path: Stage A only — fast enough to finish well within the gateway window.
+     *
+     * For FLAT targets we render through the *actual product compositor*
+     * (`composeFlatPreviewParity` → `render8394DesignOnGarmentSharp`) so the
+     * "Product Preview" is byte-identical to the generated product: same crop,
+     * box base, blend, mask, and warp resolved from the saved blank render profile.
+     * composeStageA (CSS-canvas-matching, model targets, Stage B input) stays the
+     * fallback for non-flat targets, missing color, or any parity-render error.
+     */
+    const isFlatTarget = input.renderTarget === "flat_front" || input.renderTarget === "flat_back";
+    let stageA;
+    let variant;
+    if (isFlatTarget && input.variantId) {
+      try {
+        ({ stageA, variant } = await composeFlatPreviewParity({ db, storage, sharp, functions, input }));
+      } catch (parityErr) {
+        console.warn(
+          `[previewBlankRender] flat parity render failed (${parityErr && parityErr.message}); falling back to composeStageA`
+        );
+        ({ stageA, variant } = await composeStageA({ db, storage, sharp, functions, input }));
+      }
+    } else {
+      ({ stageA, variant } = await composeStageA({ db, storage, sharp, functions, input }));
+    }
     return {
       previewUrl: stageA.previewUrl,
       storagePath: stageA.storagePath,
