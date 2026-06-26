@@ -32,4 +32,31 @@ function parentProductDocId(parentProductIdentityKey) {
   return `p_${hash}`;
 }
 
-module.exports = { parentProductDocId };
+/**
+ * Deterministic Firestore doc id for a `rp_products/{parent}/variants/{variant}` doc,
+ * derived from its `variantIdentityKey` (league_team_design_blank_color_size).
+ *
+ * Why: same race as the parent, one level down. Variant creation in
+ * `runCreateProductFromDesignBlankCore` looped `sizesToCreate` and wrote each with a
+ * random-id `.doc()`, deduping only against the legacy top-level collection — never
+ * against the parent's own `variants` subcollection. Two at-least-once auto-launch
+ * deliveries (or a retried run after the parent already exists) both compute
+ * `sizesToCreate = all` before either writes, then both write a fresh per-(color,size)
+ * doc → duplicate variants (observed: crewneck Off White ×2 per size). Routing variant
+ * creates through this deterministic id makes the write an atomic `.create()`: racing
+ * runs collide on `ALREADY_EXISTS` and skip instead of duplicating, and existing
+ * renders are never clobbered.
+ *
+ * @param {string} variantIdentityKey
+ * @returns {string} Firestore-safe doc id (e.g. "v_<sha256hex>").
+ */
+function variantProductDocId(variantIdentityKey) {
+  const key = String(variantIdentityKey == null ? "" : variantIdentityKey).trim();
+  if (!key) {
+    throw new Error("variantProductDocId: variantIdentityKey is required (got empty)");
+  }
+  const hash = crypto.createHash("sha256").update(key).digest("hex");
+  return `v_${hash}`;
+}
+
+module.exports = { parentProductDocId, variantProductDocId };

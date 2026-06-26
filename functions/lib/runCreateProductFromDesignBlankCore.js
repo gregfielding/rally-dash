@@ -35,7 +35,7 @@ const {
   assertDistinctSkuCandidates,
 } = require("./buildSku");
 const { assertSkusUnusedInDatastore } = require("./skuUniqueness");
-const { parentProductDocId } = require("./parentProductDocId");
+const { parentProductDocId, variantProductDocId } = require("./parentProductDocId");
 
 function deriveColorFamilyFromName(colorName) {
   const dark = new Set(["black", "midnight navy", "navy", "indigo"]);
@@ -580,7 +580,7 @@ async function runCreateProductFromDesignBlankCore(ctx) {
         size: sizeCode,
       });
 
-      const vRef = parentRef.collection("variants").doc();
+      const vRef = parentRef.collection("variants").doc(variantProductDocId(variantIdentityKey));
       const variantData = {
         productKind: "variant",
         schemaVersion: 1,
@@ -627,8 +627,23 @@ async function runCreateProductFromDesignBlankCore(ctx) {
         updatedBy: userId,
       };
 
-      await vRef.set(sanitizeForFirestore(variantData));
-      wroteAnyVariant = true;
+      /**
+       * Deterministic id + atomic create: racing at-least-once auto-launch deliveries
+       * collide on ALREADY_EXISTS instead of duplicating per-(color,size). On collision
+       * we skip — the existing doc (and any renders already written to it) wins.
+       */
+      try {
+        await vRef.create(sanitizeForFirestore(variantData));
+        wroteAnyVariant = true;
+      } catch (e) {
+        if (e && e.code === 6 /* ALREADY_EXISTS */) {
+          console.log(
+            `[runCreateProductFromDesignBlankCore] variant ${vRef.id} already exists (identityKey=${variantIdentityKey}); skipping duplicate create`
+          );
+        } else {
+          throw e;
+        }
+      }
     }
   } else if (existingBySize.size === 0) {
     throw new functions.https.HttpsError(
