@@ -65,6 +65,7 @@ const { mergeRenderTargetSettings } = require("./renderTargetTuning");
 const MASTER_BLANK_SCHEMA_VERSION = 2;
 const MVP_STYLE_CODE = "8394";
 const { isPipelineReadyStyleCode } = require("./pipelineReadiness");
+const { warpDesignToQuad, isValidNormalizedQuad } = require("./perspectiveWarp");
 const ART_BASE = 0.5;
 function stableStringify(value) {
   if (value === null || typeof value !== "object") {
@@ -558,7 +559,7 @@ async function render8394DesignOnGarmentSharp(options) {
     h: designHeight,
   };
 
-  const { left: left0, top: top0, resizedWidth, resizedHeight } = computeLayout8394(
+  let { left: left0, top: top0, resizedWidth, resizedHeight } = computeLayout8394(
     blankWidth,
     blankHeight,
     layoutPlacement,
@@ -580,8 +581,64 @@ async function render8394DesignOnGarmentSharp(options) {
     h: metaResizedBeforeWarp.height || resizedHeight,
   };
 
-  const wm = await pipeWarpMaskForDesignLayer(resizedBasePng, sharp, tuning.settings);
+  /**
+   * RenderCore R2: chest-quad perspective warp for model targets. The realistic
+   * 4-corner homography lives on the blank variant (`modelPrintQuad.{front,back}`).
+   * When present for this model side it IS the warp — so we run mask-only here
+   * (disable the `tuning.warp` stretch to avoid double-warping) and apply the quad
+   * below. This is the SAME `warpDesignToQuad` homography the editor preview
+   * (`composeStageA`) uses, so once R3 routes the editor model preview through this
+   * engine, editor preview and shipped on-body image are identical by construction.
+   * No quad (or any flat target) → unchanged legacy mask + stretch path.
+   */
+  const isModelTargetR2 = target === "model_front" || target === "model_back";
+  const quadView = String(target).includes("back") ? "back" : "front";
+  const modelPrintQuad =
+    isModelTargetR2 && variant && variant.modelPrintQuad
+      ? quadView === "back"
+        ? variant.modelPrintQuad.back
+        : variant.modelPrintQuad.front
+      : null;
+  const useQuadWarp = !!(modelPrintQuad && isValidNormalizedQuad(modelPrintQuad));
+
+  const maskWarpSettings = useQuadWarp
+    ? { ...tuning.settings, warp: { ...(tuning.settings && tuning.settings.warp), enabled: false } }
+    : tuning.settings;
+  const wm = await pipeWarpMaskForDesignLayer(resizedBasePng, sharp, maskWarpSettings);
   resizedBasePng = wm.buffer;
+
+  let quadWarpApplied = false;
+  if (useQuadWarp) {
+    try {
+      const designPlacedPng = await sharp(resizedBasePng).png().toBuffer();
+      const warpedCanvasPng = await warpDesignToQuad({
+        sharp,
+        designBuffer: designPlacedPng,
+        quad: modelPrintQuad,
+        outputWidth: blankWidth,
+        outputHeight: blankHeight,
+      });
+      resizedBasePng = await sharp(warpedCanvasPng).ensureAlpha().png().toBuffer();
+      /**
+       * The warped design is now a full-canvas RGBA at (0,0). Reset the placement
+       * vars so the existing composite + metrics code (parameterized on these)
+       * pastes it at the origin, full size — mirroring composeStageA's reset.
+       */
+      left0 = 0;
+      top0 = 0;
+      resizedWidth = blankWidth;
+      resizedHeight = blankHeight;
+      quadWarpApplied = true;
+      console.log(
+        `[render8394] RenderCore R2 chest-quad warp applied (${target}) → ${blankWidth}x${blankHeight} canvas`
+      );
+    } catch (warpErr) {
+      console.warn(
+        `[render8394] chest-quad warp failed (${target}), falling back to flat paste:`,
+        warpErr && warpErr.message ? warpErr.message : warpErr
+      );
+    }
+  }
   const pngPostWarp = Buffer.from(resizedBasePng);
 
   const metaAfterWarpMask = await sharp(resizedBasePng).metadata();
