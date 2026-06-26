@@ -44,42 +44,42 @@ function resolvePlacementForVariant(blank, blankVariant, renderTarget) {
   const defaults = { x: 0.5, y: 0.5, scale: 0.5 };
 
   /**
-   * Look up the per-variant render-target settings. Blank schema v2 stores
-   * these on `variant.renderTargets[renderTarget]`; fall back to the blank's
-   * top-level defaults when missing.
+   * RenderCore R5: resolve placement + blend from the CANONICAL render profile
+   * (`resolveEffectiveRenderTargetSettings` → reads `renderProfile.renderTargetsByColor`
+   * / placement baseline / variant slices) — the SAME source the deterministic engine
+   * (`render8394` via `resolveSavedBlankRenderProfile`) and the blank editor use.
+   *
+   * Previously this read the legacy `blankVariant.renderTargets` + `generationDefaults`,
+   * so the Flux VTON realism layer positioned/sized the design differently than every
+   * other surface. Now the AI realism input is placed per the same per-(color,view)
+   * settings, so on-body realism honors the blank profile. fabricFeel/printStrength still
+   * feed the Flux prompt + pre-blur. No safeArea/width passthrough — the engine sizes via
+   * artboardBase (0.5 × scale), and composeStageA's no-width fallback matches it.
    */
-  const variantRenderTargets = (blankVariant && blankVariant.renderTargets) || {};
-  const targetSettings = variantRenderTargets[renderTarget] || {};
-  const blankDefaults = (blank && blank.generationDefaults && blank.generationDefaults.placement) || {};
+  let resolved = null;
+  try {
+    // eslint-disable-next-line global-require
+    const { resolveEffectiveRenderTargetSettings } = require("./resolveProductRenderProfile");
+    resolved = resolveEffectiveRenderTargetSettings(null, blank, blankVariant || undefined, renderTarget);
+  } catch (e) {
+    console.warn(
+      `[enqueueProductModelRealism] resolveEffectiveRenderTargetSettings failed (${e && e.message}); using centered defaults`
+    );
+    resolved = null;
+  }
+  const p = (resolved && resolved.settings && resolved.settings.placement) || {};
+  const blend = (resolved && resolved.settings && resolved.settings.blend) || {};
 
-  const placement = {
-    x:
-      Number.isFinite(Number(targetSettings.x)) ? Number(targetSettings.x)
-      : Number.isFinite(Number(blankDefaults.x)) ? Number(blankDefaults.x)
-      : defaults.x,
-    y:
-      Number.isFinite(Number(targetSettings.y)) ? Number(targetSettings.y)
-      : Number.isFinite(Number(blankDefaults.y)) ? Number(blankDefaults.y)
-      : defaults.y,
-    scale:
-      Number.isFinite(Number(targetSettings.scale)) ? Number(targetSettings.scale)
-      : Number.isFinite(Number(blankDefaults.scale)) ? Number(blankDefaults.scale)
-      : defaults.scale,
-    /** Slider knobs that drive Flux Fill prompt + pre-blur. */
-    fabricFeel:
-      Number.isFinite(Number(targetSettings.fabricFeel)) ? Number(targetSettings.fabricFeel) : 0.5,
-    printStrength:
-      Number.isFinite(Number(targetSettings.printStrength)) ? Number(targetSettings.printStrength) : 0.85,
-    /** Mask strategy. "blank_mask_doc" auto-loads the per-target mask if it exists; "none" skips. */
-    maskConfig: { mode: targetSettings.maskMode || "blank_mask_doc" },
+  return {
+    x: Number.isFinite(Number(p.x)) ? Number(p.x) : defaults.x,
+    y: Number.isFinite(Number(p.y)) ? Number(p.y) : defaults.y,
+    scale: Number.isFinite(Number(p.scale)) ? Number(p.scale) : defaults.scale,
+    /** Slider knobs that drive Flux Fill prompt + pre-blur (0–1). */
+    fabricFeel: Number.isFinite(Number(blend.fabricFeel)) ? Number(blend.fabricFeel) : 0.5,
+    printStrength: Number.isFinite(Number(blend.printStrength)) ? Number(blend.printStrength) : 0.85,
+    /** Garment-silhouette clip: auto-load the per-target mask doc if it exists (preserves prior default). */
+    maskConfig: { mode: "blank_mask_doc" },
   };
-
-  /** Optional safeArea passthrough (Option A safeArea-based sizing). */
-  const sa = targetSettings.safeArea || blankDefaults.safeArea || null;
-  if (sa && Number.isFinite(Number(sa.w))) placement.width = Number(sa.w);
-  if (sa && Number.isFinite(Number(sa.h))) placement.height = Number(sa.h);
-
-  return placement;
 }
 
 /**
