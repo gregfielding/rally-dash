@@ -17,7 +17,15 @@ flat and on-body.** Today it isn't, because rendering logic is forked across ~5 
 - ✅ **R4** — live CSS drag-canvas now uses the engine-resolved blend (`engineBlendResolved`)
   instead of its own preview formula, so canvas blend params match the product. (Canvas is still
   a CSS approximation — mix-blend ≠ Sharp; the byte-exact preview is the Product Preview button.)
-- ⬜ **R5** — Flux VTON realism consumes resolved placement (optional AI-layer polish).
+- ✅ **R5** — Flux VTON realism placement now resolves from `resolveEffectiveRenderTargetSettings`
+  (was legacy `blankVariant.renderTargets`, which fell back to centered scale-0.5). The AI realism
+  layer now positions/sizes the design per the same per-(color,view) profile. Verified panty HG
+  model_back → scale 1.0875.
+
+**RenderCore complete (P1–R5).** Every surface — blank editor (canvas + exact Product Preview),
+Shopify preview, final flat + on-body image, and the Flux realism layer — reads ONE engine's
+per-(color, view) settings. Remaining work is data/assets, not rendering: apparel model photos +
+persisting a chest-quad (see warning above).
 - ⚠️ **Apparel on-body not set up:** HF07 crewneck has **no model photos** (renders flat-lay only);
   TR3008 tank + 8390 thong have **0 variants**. Only the 8394 panty has on-body renders today.
 
