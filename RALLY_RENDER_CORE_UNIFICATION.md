@@ -7,6 +7,18 @@ Shopify preview, and the final store image."
 The contract: **what you tune on the blank render profile IS what ships — on every surface,
 flat and on-body.** Today it isn't, because rendering logic is forked across ~5 paths.
 
+## STATUS (live)
+- ✅ **P1** — flat editor "Product Preview" runs the product engine (byte-parity).
+- ✅ **R2** — chest-quad warp folded into the product engine (`render8394`). *Dormant:* no blank
+  has a persisted `modelPrintQuad` yet (audited 8394/HF07/TR3008/8390), so it's quad-READY, not
+  yet visible. Set a quad on a model photo and it ships.
+- ✅ **R3** — editor **model** preview now runs the product engine too → on-body editor preview ==
+  shipped on-body image by construction. Verified on panty model_back (scale 1.0875).
+- ⬜ **R4** — kill the client CSS-canvas blend math (the live drag-canvas still uses its own formula).
+- ⬜ **R5** — Flux VTON realism consumes resolved placement.
+- ⚠️ **Apparel on-body not set up:** HF07 crewneck has **no model photos** (renders flat-lay only);
+  TR3008 tank + 8390 thong have **0 variants**. Only the 8394 panty has on-body renders today.
+
 ---
 
 ## 1. Audit — the current paths
