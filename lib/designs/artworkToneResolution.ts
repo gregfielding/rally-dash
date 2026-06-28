@@ -146,9 +146,17 @@ export function resolveBlendedPreviewBlend8394(
     if (t === "light" || t === "white") {
       return { blendMode: "normal", blendOpacity: Math.min(1, op), previewAdjusted: true };
     }
+    /**
+     * Colored ink on a dark/colored garment. Screen-print ink is OPAQUE → use "normal".
+     * "screen" blended the GARMENT's color INTO the ink — orange on a blue garment came out
+     * pink (orange red + garment blue = magenta); it only looked right on near-black because
+     * screen-with-black ≈ identity. Normal keeps the ink's true color on any dark/colored
+     * garment (the design PNG is transparent around the artwork). Near-opaque floor so a
+     * saturated garment doesn't bleed through. Mirrors functions/lib/artworkToneResolution.js.
+     */
     return {
-      blendMode: "screen",
-      blendOpacity: Math.min(1, op * 1.08),
+      blendMode: "normal",
+      blendOpacity: Math.min(1, Math.max(op * 1.08, 0.9)),
       previewAdjusted: true,
     };
   }

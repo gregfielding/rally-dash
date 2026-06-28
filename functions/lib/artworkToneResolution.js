@@ -72,9 +72,18 @@ function resolveBlendedPreviewBlend8394(garmentFamily, previewArtworkMode, baseZ
     if (t === "light" || t === "white") {
       return { blendMode: "normal", blendOpacity: Math.min(1, op), previewAdjusted: true };
     }
+    /**
+     * Colored ink on a dark/colored garment. Screen-print ink is OPAQUE, so use "normal".
+     * "screen" blended the GARMENT's color INTO the ink — orange on a blue garment came out
+     * pink (orange's red + garment blue = magenta). It only looked right on near-black because
+     * screen-with-black ≈ identity. Normal keeps the ink's true color on ANY dark/colored
+     * garment; the design PNG is transparent around the artwork so opaque paste shows just the
+     * letters. Floor opacity near-opaque so a saturated garment doesn't bleed through and
+     * desaturate the ink (fabric realism is the Flux pass's job, not a hue-shifting blend).
+     */
     return {
-      blendMode: "screen",
-      blendOpacity: Math.min(1, op * 1.08),
+      blendMode: "normal",
+      blendOpacity: Math.min(1, Math.max(op * 1.08, 0.9)),
       previewAdjusted: true,
     };
   }
