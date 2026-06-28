@@ -151,12 +151,13 @@ export function resolveBlendedPreviewBlend8394(
      * "screen" blended the GARMENT's color INTO the ink — orange on a blue garment came out
      * pink (orange red + garment blue = magenta); it only looked right on near-black because
      * screen-with-black ≈ identity. Normal keeps the ink's true color on any dark/colored
-     * garment (the design PNG is transparent around the artwork). Near-opaque floor so a
-     * saturated garment doesn't bleed through. Mirrors functions/lib/artworkToneResolution.js.
+     * garment (the design PNG is transparent around the artwork). FULLY opaque (1.0) — any
+     * bleed-through desaturates the ink (10% of a black garment muted the orange). Mirrors
+     * functions/lib/artworkToneResolution.js.
      */
     return {
       blendMode: "normal",
-      blendOpacity: Math.min(1, Math.max(op * 1.08, 0.9)),
+      blendOpacity: 1,
       previewAdjusted: true,
     };
   }

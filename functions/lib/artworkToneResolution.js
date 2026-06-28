@@ -78,12 +78,13 @@ function resolveBlendedPreviewBlend8394(garmentFamily, previewArtworkMode, baseZ
      * pink (orange's red + garment blue = magenta). It only looked right on near-black because
      * screen-with-black ≈ identity. Normal keeps the ink's true color on ANY dark/colored
      * garment; the design PNG is transparent around the artwork so opaque paste shows just the
-     * letters. Floor opacity near-opaque so a saturated garment doesn't bleed through and
-     * desaturate the ink (fabric realism is the Flux pass's job, not a hue-shifting blend).
+     * letters. FULLY opaque (1.0) — any bleed-through desaturates the ink (e.g. 10% of a black
+     * garment muted the orange). Fabric realism is the Flux pass's job, not a hue/saturation
+     * shifting blend.
      */
     return {
       blendMode: "normal",
-      blendOpacity: Math.min(1, Math.max(op * 1.08, 0.9)),
+      blendOpacity: 1,
       previewAdjusted: true,
     };
   }
