@@ -91,11 +91,19 @@ const DARK = new Set([
 ]);
 
 function getEffectiveColorFamily(colorFamily, colorName) {
-  if (colorFamily === "light" || colorFamily === "dark") return colorFamily;
   const n = String(colorName || "")
     .trim()
     .toLowerCase();
-  return DARK.has(n) ? "dark" : "light";
+  /**
+   * A known-dark garment NAME (black/navy/indigo/blue/…) is ALWAYS the dark family for
+   * render purposes — it overrides a mis-set `colorFamily`. The tank's "Black" variant was
+   * saved as colorFamily="light", which routed the blend to the light-garment path
+   * (multiply) → multiply(orange ink × black garment) ≈ muddy/maroon. Name wins for
+   * known-dark colors; otherwise trust the explicit family, then default light.
+   */
+  if (DARK.has(n)) return "dark";
+  if (colorFamily === "light" || colorFamily === "dark") return colorFamily;
+  return "light";
 }
 
 /**
