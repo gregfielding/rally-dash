@@ -19,6 +19,7 @@ const { pipelineFailurePatch, PIPELINE_STAGE } = require("./pipelineReporting");
 const { composeOfficial8394FlatRole } = require("./officialProductFlatCompose");
 const { composeOfficial8394ModelRole } = require("./officialProductModelCompose");
 const { getVariantModelBackUrl, getVariantModelFrontUrl } = require("./variantRenderSources");
+const { isPipelineReadyStyleCode } = require("./pipelineReadiness");
 
 function blankVariantRowFromMaster(blank, blankVariantId) {
   const list = blank && blank.variants;
@@ -39,17 +40,17 @@ function enabledRolesActuallyEnqueuedForColor(blank, blankVariantId, enabledOffi
 /** Saved blank master has on-model URLs for this color — deterministic compose (no identity / scene preset). */
 function roleUsesDeterministic8394ModelCompose(blank, blankVariantId, role) {
   /**
-   * The deterministic model compositor (officialProductModelCompose) only
-   * supports 8394 — it throws for any other styleCode. For non-8394 blanks the
-   * on-model shots come from the VTON product-realism path
-   * (enqueueProductModelRealism / "Compare providers"), NOT auto-launch. Return
-   * false here so non-8394 model roles route to the graceful skip path instead
-   * of the 8394-only throw (which used to fail the whole launch — tank/thong).
+   * Route a model role to the deterministic compositor (officialProductModelCompose)
+   * when the blank is pipelineReady AND the variant has the model photo for the role's
+   * side. The compositor is now generic across pipelineReady blanks (the 8394-only throw
+   * was lifted), and render8394 applies the chest-quad warp when set. Photo-less sides
+   * return false → graceful skip (no failed launch — crewneck has no model photos yet).
    */
-  if (String((blank && blank.styleCode) || "").trim() !== "8394") return false;
+  if (!isPipelineReadyStyleCode(blank && blank.styleCode)) return false;
   const vr = blankVariantRowFromMaster(blank, blankVariantId);
   if (!vr) return false;
   if (role === "model_back_designed") return !!getVariantModelBackUrl(blank, vr);
+  if (role === "model_front_designed") return !!getVariantModelFrontUrl(blank, vr);
   if (role === "model_front_clean") return !!getVariantModelFrontUrl(blank, vr);
   return false;
 }
@@ -594,20 +595,26 @@ async function enqueueOfficialProductImages(ctx) {
 
       if (isModelRole) {
         /**
-         * Phase N4: at auto-launch, only 8394 has a working official model
-         * pipeline (deterministic compose). For every other blank the on-model
-         * shots are produced by the VTON product-realism path
-         * (enqueueProductModelRealism / "Compare providers"), so skip model roles
-         * here gracefully — never fail the launch over them. Flat (incl. the
-         * designed-front role) still generates.
+         * Deterministic on-model compose runs for ANY pipelineReady blank that has a
+         * model photo for this role's side (8394 panty back, tank front, …) —
+         * render8394 applies the chest-quad warp when the variant has one. Computed
+         * first so apparel with model photos renders on-body at auto-launch.
          */
-        if (String((blank && blank.styleCode) || "").trim() !== "8394") {
+        const useDeterministicModel = roleUsesDeterministic8394ModelCompose(blank, blankVariantId, role);
+
+        /**
+         * Non-8394 with NO deterministic model source (e.g. crewneck has no model
+         * photos): on-model shots come from the VTON product-realism path
+         * ("Compare providers"), not auto-launch. Skip gracefully — never fail the
+         * launch. (8394 falls through to its identity/AI path below as before.)
+         */
+        if (!useDeterministicModel && String((blank && blank.styleCode) || "").trim() !== "8394") {
           officialEnqueuePayload("OFFICIAL_ENQUEUE:SKIP_MODEL_ROLE", {
             productId,
             batchId,
             blankVariantId,
             role,
-            reason: "non_8394_model_via_vton_path",
+            reason: "non_8394_model_no_deterministic_source_via_vton_path",
           });
           await markOfficialAssetRoleSkippedNoIdentity({
             db,
@@ -618,12 +625,10 @@ async function enqueueOfficialProductImages(ctx) {
             colorKey: blankVariantId,
             role,
             reason:
-              "Model assets for non-8394 blanks come from the VTON product-realism path (Compare providers), not auto-launch.",
+              "Model assets for non-8394 blanks without a deterministic model source come from the VTON product-realism path (Compare providers), not auto-launch.",
           });
           continue;
         }
-
-        const useDeterministicModel = roleUsesDeterministic8394ModelCompose(blank, blankVariantId, role);
 
         if (useDeterministicModel) {
           let imageUrl;

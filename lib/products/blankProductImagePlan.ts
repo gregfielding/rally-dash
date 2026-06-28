@@ -20,6 +20,7 @@ import { RP_BLANK_PRODUCT_IMAGE_DEFAULT_GALLERY_ORDER } from "@/lib/types/firest
 
 export const BLANK_PRODUCT_IMAGE_GENERATION_KEYS: readonly RpBlankProductImageGenerationKey[] = [
   "model_blended_back",
+  "model_blended_front",
   "flat_blended_front",
   "flat_clean_front",
   "flat_blended_back",
@@ -75,6 +76,7 @@ export function resolveSourcePhotoUrlForGenerationKey(
       return trimU(getVariantFlatFrontUrl(blank, variant)) || null;
     case "model_blended_back":
       return trimU(getVariantModelBackUrl(blank, variant)) || null;
+    case "model_blended_front":
     case "model_clean_front":
       return trimU(getVariantModelFrontUrl(blank, variant)) || null;
     default:
@@ -89,12 +91,16 @@ export function inferEnabledGenerationKeys8394(blank: RPBlank, variant: RPBlankV
   const printsBack = printSides.includes("back");
 
   const out: RpBlankProductImageGenerationKey[] = [];
-  if (trimU(getVariantModelBackUrl(blank, variant))) out.push("model_blended_back");
+  // Model keys are print-side-aware (mirrors the flat side + functions/lib): the DESIGNED
+  // model shot goes on whichever side the blank prints (front-print tank → model_blended_front).
+  if (printsBack && trimU(getVariantModelBackUrl(blank, variant))) out.push("model_blended_back");
   if (trimU(getVariantFlatFrontUrl(blank, variant))) {
     out.push(printsFront ? "flat_blended_front" : "flat_clean_front");
   }
   if (printsBack && trimU(getVariantFlatBackUrl(blank, variant))) out.push("flat_blended_back");
-  if (trimU(getVariantModelFrontUrl(blank, variant))) out.push("model_clean_front");
+  if (trimU(getVariantModelFrontUrl(blank, variant))) {
+    out.push(printsFront ? "model_blended_front" : "model_clean_front");
+  }
   return out;
 }
 
@@ -127,7 +133,10 @@ export function resolve8394ProductImagePlan(
       go != null && Number.isFinite(Number(go)) ? Number(go) : RP_BLANK_PRODUCT_IMAGE_DEFAULT_GALLERY_ORDER[key];
 
     const isDesignedComposite =
-      key === "flat_blended_back" || key === "model_blended_back" || key === "flat_blended_front";
+      key === "flat_blended_back" ||
+      key === "model_blended_back" ||
+      key === "flat_blended_front" ||
+      key === "model_blended_front";
     const expectsArtwork = isDesignedComposite ? explicit.expectsArtwork !== false : false;
 
     out[key] = {
@@ -168,6 +177,7 @@ export function expectsArtworkForPlanKey(
 /** MVP generation key → `rp_generation_jobs.initialAssetRole` / batch role id (matches `blankProductImagePlan.js`). */
 export const GENERATION_KEY_TO_OFFICIAL_ROLE: Record<RpBlankProductImageGenerationKey, Rp8394InitialAssetRole> = {
   model_blended_back: "model_back_designed",
+  model_blended_front: "model_front_designed",
   model_clean_front: "model_front_clean",
   flat_blended_front: "flat_front_designed",
   flat_clean_front: "flat_front_clean",

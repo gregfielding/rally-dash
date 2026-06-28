@@ -1142,6 +1142,7 @@ export interface RpProductVariantSummary {
 /** Initial 8394 team-product asset roles (orchestrator + batch doc). Canonical display order. */
 export type Rp8394InitialAssetRole =
   | "model_back_designed"
+  | "model_front_designed"
   | "flat_front_clean"
   | "flat_front_designed"
   | "flat_back_designed"
@@ -2478,6 +2479,7 @@ export interface RpRenderTargetSettings {
  */
 export type RpBlankProductImageGenerationKey =
   | "model_blended_back"
+  | "model_blended_front"
   | "flat_blended_front"
   | "flat_clean_front"
   | "flat_blended_back"
@@ -2508,6 +2510,7 @@ export interface RPBlankProductImageTarget {
 /** Default `galleryOrder` when a target omits it (lower = earlier). */
 export const RP_BLANK_PRODUCT_IMAGE_DEFAULT_GALLERY_ORDER: Record<RpBlankProductImageGenerationKey, number> = {
   model_blended_back: 10,
+  model_blended_front: 12,
   flat_blended_front: 15,
   flat_clean_front: 20,
   flat_blended_back: 30,

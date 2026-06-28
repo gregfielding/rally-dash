@@ -12,6 +12,7 @@ const { getPlacementRowForSide } = require("./resolveProductRenderProfile");
 const { resolveSavedBlankRenderProfile } = require("./resolveSavedBlankRenderProfile");
 const { getEffectiveColorFamilyForBlankPreview } = require("./designPickForBlankPreview");
 const { mergePlacementSource } = require("./officialProductFlatCompose");
+const { isPipelineReadyStyleCode } = require("./pipelineReadiness");
 
 function modelRenderLog(tag, payload) {
   try {
@@ -35,12 +36,25 @@ async function composeOfficial8394ModelRole(ctx) {
 
   const sharp = require("sharp");
 
-  if (role !== "model_back_designed" && role !== "model_front_clean") {
+  /**
+   * Role → (render target, designed?). model_front_designed (front-print apparel on-body)
+   * runs the SAME designed compose path as model_back_designed, just side=front — and
+   * render8394 applies the chest-quad warp when the variant has one (R2). Mirrors
+   * officialProductFlatCompose's ROLE_CFG.
+   */
+  const ROLE_CFG = {
+    model_back_designed: { renderTarget: "model_back", designed: true },
+    model_front_designed: { renderTarget: "model_front", designed: true },
+    model_front_clean: { renderTarget: "model_front", designed: false },
+    model_back_clean: { renderTarget: "model_back", designed: false },
+  };
+  const roleCfg = ROLE_CFG[role];
+  if (!roleCfg) {
     throw new Error(`composeOfficial8394ModelRole: unsupported role ${role}`);
   }
-
-  const renderTarget = role === "model_back_designed" ? "model_back" : "model_front";
+  const renderTarget = roleCfg.renderTarget;
   const side = renderTarget === "model_front" ? "front" : "back";
+  const isDesignedRole = roleCfg.designed;
 
   const productRef = db.collection("rp_products").doc(productId);
   const productSnap = await productRef.get();
@@ -59,8 +73,10 @@ async function composeOfficial8394ModelRole(ctx) {
   if (!blankSnap.exists) throw new Error("Blank not found");
   const blank = blankSnap.data();
 
-  if (String(blank.styleCode || "").trim() !== "8394") {
-    throw new Error("Official model composition supports 8394 blanks only");
+  if (!isPipelineReadyStyleCode(blank.styleCode)) {
+    throw new Error(
+      `Official model composition: blank styleCode "${blank.styleCode || "unknown"}" is not pipelineReady (see functions/lib/pipelineReadiness.js)`
+    );
   }
 
   const variantRow = (blank.variants || []).find((v) => v.variantId === blankVariantId);
@@ -138,9 +154,11 @@ async function composeOfficial8394ModelRole(ctx) {
   }
 
   /**
-   * `model_front_clean` garment-only when commerce/blank recipe does not place front artwork on the model.
+   * Clean model roles (model_front_clean / model_back_clean) are garment-only — the
+   * on-model garment photo passed through with no artwork. Designed roles fall through
+   * to the composite below.
    */
-  if (role === "model_front_clean" && !savedProfile.sideAllowedForDesign) {
+  if (!isDesignedRole) {
     const blankResp = await fetchFn(blankImageUrl);
     if (!blankResp.ok) {
       throw new Error(`Failed to fetch model image: HTTP ${blankResp.status}`);
@@ -174,15 +192,16 @@ async function composeOfficial8394ModelRole(ctx) {
     return { imageUrl, storagePath, resolvedToneRef: null, provenance };
   }
 
-  if (role === "model_back_designed" && !savedProfile.printSides.effectiveBack) {
+  /** Designed roles (model_front_designed / model_back_designed): the print side must be
+   *  effective and a placement must resolve. Clean roles already returned (garment-only). */
+  const sideEffectiveForDesign =
+    side === "front" ? savedProfile.printSides.effectiveFront : savedProfile.printSides.effectiveBack;
+  if (!sideEffectiveForDesign) {
     throw new Error(
-      `Saved blank profile + design do not allow back artwork (effectiveBack=false). Adjust blank/design or supportedRenderViews.`
+      `Saved blank profile + design do not allow ${side} artwork (effective${side === "front" ? "Front" : "Back"}=false). Adjust blank/design or supportedRenderViews.`
     );
   }
-  if (role === "model_front_clean" && savedProfile.sideAllowedForDesign && !savedProfile.placement) {
-    throw new Error(`resolveSavedBlankRenderProfile: missing effective placement for ${renderTarget} (${side})`);
-  }
-  if (role === "model_back_designed" && !savedProfile.placement) {
+  if (!savedProfile.placement) {
     throw new Error(`resolveSavedBlankRenderProfile: missing effective placement for ${renderTarget} (${side})`);
   }
 

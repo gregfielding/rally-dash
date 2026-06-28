@@ -14,6 +14,7 @@ const { designPrintSidesForStyleCode } = require("./pipelineReadiness");
 
 const BLANK_PRODUCT_IMAGE_GENERATION_KEYS = Object.freeze([
   "model_blended_back",
+  "model_blended_front",
   "flat_blended_front",
   "flat_clean_front",
   "flat_blended_back",
@@ -22,6 +23,7 @@ const BLANK_PRODUCT_IMAGE_GENERATION_KEYS = Object.freeze([
 
 const DEFAULT_GALLERY_ORDER = Object.freeze({
   model_blended_back: 10,
+  model_blended_front: 12,
   flat_blended_front: 15,
   flat_clean_front: 20,
   flat_blended_back: 30,
@@ -43,6 +45,7 @@ function resolveSourcePhotoUrlForGenerationKey(blank, variant, key, override) {
       return trimU(getVariantFlatFrontUrl(blank, variant)) || null;
     case "model_blended_back":
       return trimU(getVariantModelBackUrl(blank, variant)) || null;
+    case "model_blended_front":
     case "model_clean_front":
       return trimU(getVariantModelFrontUrl(blank, variant)) || null;
     default:
@@ -65,12 +68,21 @@ function inferEnabledGenerationKeys8394(blank, variant) {
   const printsBack = printSides.includes("back");
 
   const out = [];
-  if (trimU(getVariantModelBackUrl(blank, variant))) out.push("model_blended_back");
+  /**
+   * Model keys are now print-side-aware too (mirrors the flat side): the DESIGNED
+   * model shot goes on whichever side the blank prints. Back-print (panty/thong):
+   * model_blended_back + a clean model_clean_front. Front-print (tank): model_blended_front
+   * (the design on the front, on the body — uses the chest-quad when set). A front-print
+   * blank no longer emits a designed-back model shot.
+   */
+  if (printsBack && trimU(getVariantModelBackUrl(blank, variant))) out.push("model_blended_back");
   if (trimU(getVariantFlatFrontUrl(blank, variant))) {
     out.push(printsFront ? "flat_blended_front" : "flat_clean_front");
   }
   if (printsBack && trimU(getVariantFlatBackUrl(blank, variant))) out.push("flat_blended_back");
-  if (trimU(getVariantModelFrontUrl(blank, variant))) out.push("model_clean_front");
+  if (trimU(getVariantModelFrontUrl(blank, variant))) {
+    out.push(printsFront ? "model_blended_front" : "model_clean_front");
+  }
   return out;
 }
 
@@ -97,7 +109,10 @@ function resolve8394ProductImagePlan(blank, variant) {
       go != null && Number.isFinite(Number(go)) ? Number(go) : DEFAULT_GALLERY_ORDER[key];
 
     const isDesignedComposite =
-      key === "flat_blended_back" || key === "model_blended_back" || key === "flat_blended_front";
+      key === "flat_blended_back" ||
+      key === "model_blended_back" ||
+      key === "flat_blended_front" ||
+      key === "model_blended_front";
     const expectsArtwork = isDesignedComposite ? explicit.expectsArtwork !== false : false;
 
     out[key] = {
@@ -126,13 +141,18 @@ function expectsArtworkForPlanKey(plan, key) {
 /** MVP generation key → rp_generation_jobs `initialAssetRole` / batch role id */
 const GENERATION_KEY_TO_OFFICIAL_ROLE = Object.freeze({
   model_blended_back: "model_back_designed",
+  model_blended_front: "model_front_designed",
   model_clean_front: "model_front_clean",
   flat_blended_front: "flat_front_designed",
   flat_clean_front: "flat_front_clean",
   flat_blended_back: "flat_back_designed",
 });
 
-const OFFICIAL_MODEL_ROLES = Object.freeze(["model_back_designed", "model_front_clean"]);
+const OFFICIAL_MODEL_ROLES = Object.freeze([
+  "model_back_designed",
+  "model_front_designed",
+  "model_front_clean",
+]);
 const OFFICIAL_FLAT_ROLES = Object.freeze(["flat_front_clean", "flat_front_designed", "flat_back_designed"]);
 
 function officialRoleForGenerationKey(key) {
