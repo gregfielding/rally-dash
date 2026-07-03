@@ -112,6 +112,12 @@ export default function BulkDesignUploadPage() {
    * in product naming ("Custom" for custom_one_off).
    */
   const [productLabelByItem, setProductLabelByItem] = useState<Record<string, string>>({});
+  /**
+   * Per-item ink/brand accent color (e.g. "orange") — independent of garment fabric
+   * colors. Flows to design.accentColor → product.accentColor → `color:` Shopify tag
+   * + "Color: X" smart collection. Empty = no color tag.
+   */
+  const [accentColorByItem, setAccentColorByItem] = useState<Record<string, string>>({});
   const [importing, setImporting] = useState(false);
   const [parsing, setParsing] = useState(false);
   const [prepareError, setPrepareError] = useState<string | null>(null);
@@ -398,6 +404,7 @@ export default function BulkDesignUploadPage() {
         slug: undefined,
         targetBlankIds: targetBlanksByItem[it.itemId] ?? it.defaultTargetBlankIds ?? [],
         productLabel: productLabelByItem[it.itemId] ?? "",
+        accentColor: accentColorByItem[it.itemId] ?? "",
       }));
 
       const out = await commitBulkImport({ jobId, items: decisions, commitMode });
@@ -424,6 +431,7 @@ export default function BulkDesignUploadPage() {
     nameOverrides,
     targetBlanksByItem,
     productLabelByItem,
+    accentColorByItem,
     commitBulkImport,
     mutateDesigns,
   ]);
@@ -636,6 +644,12 @@ export default function BulkDesignUploadPage() {
                     >
                       Label
                     </th>
+                    <th
+                      className="text-left py-2 px-3"
+                      title="Ink/brand accent color of the artwork (e.g. 'orange') — NOT the garment fabric color. Adds a color: tag to spawned products, which auto-creates a 'Color: X' Shopify collection for shop-by-color. Leave blank for no color tag."
+                    >
+                      Ink&nbsp;color
+                    </th>
                     <th className="text-left py-2 px-3">Apply to blanks</th>
                     <th className="text-left py-2 px-3">Series</th>
                     <th className="text-left py-2 px-3">Match</th>
@@ -712,6 +726,20 @@ export default function BulkDesignUploadPage() {
                             }))
                           }
                           title="Goes in product title between team name and blank type. Leave blank to use the designType default."
+                        />
+                      </td>
+                      <td className="py-2 px-3 align-top text-xs">
+                        <input
+                          className="w-full min-w-[80px] border border-gray-200 rounded px-2 py-1 text-xs text-gray-900"
+                          placeholder="e.g. orange"
+                          value={accentColorByItem[it.itemId] ?? ""}
+                          onChange={(e) =>
+                            setAccentColorByItem((o) => ({
+                              ...o,
+                              [it.itemId]: e.target.value,
+                            }))
+                          }
+                          title="Ink/brand color of the artwork itself (not the garment). Adds a color: tag → auto 'Color: X' Shopify collection. Leave blank for none."
                         />
                       </td>
                       <td className="py-2 px-3 align-top text-xs">

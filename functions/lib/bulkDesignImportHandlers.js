@@ -329,6 +329,7 @@ async function createDesignDocument(db, userId, payload) {
     targetBlankIds,
     skipAutoLaunch,
     productLabel,
+    accentColor,
   } = payload;
 
   const teamSnap = await db.collection("design_teams").doc(teamId).get();
@@ -461,6 +462,14 @@ async function createDesignDocument(db, userId, payload) {
    */
   if (typeof productLabel === "string" && productLabel.trim()) {
     designData.productLabel = productLabel.trim();
+  }
+  /**
+   * Ink/brand accent color (e.g. "ORANGE") — flows to product.accentColor and the
+   * `color:` Shopify tag / smart collection. Uppercased for code convention; omitted
+   * when empty so no null stomps downstream merges.
+   */
+  if (typeof accentColor === "string" && accentColor.trim()) {
+    designData.accentColor = accentColor.trim().toUpperCase();
   }
 
   const designRef = await db.collection("designs").add(designData);
@@ -725,6 +734,8 @@ function commitBulkDesignUploadImpl(db, storage) {
         : null;
       /** Operator-set storefront short label. Empty/whitespace = leave unset → fallback chain wins. */
       const productLabelOverride = typeof dec.productLabel === "string" ? dec.productLabel.trim() : null;
+      /** Operator-set ink/brand accent color (e.g. "orange"). Empty = no color tag. */
+      const accentColorOverride = typeof dec.accentColor === "string" ? dec.accentColor.trim() : null;
 
       let designName = nameOverride || item.designName;
       let teamId = teamIdOverride || item.teamId || BATCH_IMPORT_TEAM_ID;
@@ -859,6 +870,8 @@ function commitBulkDesignUploadImpl(db, storage) {
             skipAutoLaunch: skipAutoLaunchForNewDesigns,
             /** Storefront label override (empty = use designType fallback). */
             productLabel: productLabelOverride,
+            /** Ink/brand accent color → color: tag on spawned products. */
+            accentColor: accentColorOverride,
           });
           designId = createdRes.designId;
           created++;

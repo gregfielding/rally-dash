@@ -383,6 +383,12 @@ export interface CommitBulkDesignUploadItemDecision {
    * designType-derived default ("Custom" for custom_one_off).
    */
   productLabel?: string;
+  /**
+   * Ink/brand accent color of the artwork (e.g. "orange") — independent of
+   * garment fabric colors. Flows to product.accentColor → `color:` Shopify
+   * tag + "Color: X" smart collection. Empty/undefined = no color tag.
+   */
+  accentColor?: string;
 }
 
 export interface CommitBulkDesignUploadInput {
