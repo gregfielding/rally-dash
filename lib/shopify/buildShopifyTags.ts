@@ -16,6 +16,8 @@ export interface ProductForShopifyTags {
   modelCodes?: string[] | null;
   /** Ink/brand accent color (e.g. "ORANGE") — independent of garment fabric color. */
   accentColor?: string | null;
+  /** Garment fabric colors the product is offered in (unique variant colorNames). */
+  garmentColors?: string[] | null;
 }
 
 /**
@@ -58,6 +60,13 @@ export function buildShopifyTags(product: ProductForShopifyTags | null | undefin
   }
   if (hasValue(product.accentColor)) {
     out.push(`${SHOPIFY_TAG_FIELD_MAP.accentColor}:${toTagValue(product.accentColor!)}`);
+  }
+  if (Array.isArray(product.garmentColors)) {
+    for (const c of product.garmentColors) {
+      if (hasValue(c)) {
+        out.push(`garment:${toTagValue(c!)}`);
+      }
+    }
   }
   if (Array.isArray(product.modelCodes)) {
     for (const code of product.modelCodes) {

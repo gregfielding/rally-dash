@@ -53,6 +53,13 @@ function buildShopifyTags(product) {
   if (hasValue(product.accentColor)) {
     out.push(`${TAG_PREFIX.accentColor}:${toTagValue(product.accentColor)}`);
   }
+  if (Array.isArray(product.garmentColors)) {
+    for (const c of product.garmentColors) {
+      if (hasValue(c)) {
+        out.push(`garment:${toTagValue(c)}`);
+      }
+    }
+  }
   if (Array.isArray(product.modelCodes)) {
     for (const code of product.modelCodes) {
       if (hasValue(code)) {

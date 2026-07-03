@@ -70,6 +70,17 @@ function buildProductTags(product) {
       : null;
   const accentColorSlug = accentColorName ? slugifyUnderscore(accentColorName) : null;
 
+  /**
+   * Garment fabric colors the product is actually offered in (unique variant colorNames,
+   * maintained on the parent by runCreateProductFromDesignBlankCore). Structured tags only
+   * (`garment:heather_grey`) — descriptive color facts for color-pair merchandising; not
+   * human tags, and deliberately NOT a smart-collection family (garment:black would match
+   * nearly the whole catalog).
+   */
+  const garmentColorSlugs = Array.isArray(product.garmentColors)
+    ? [...new Set(product.garmentColors.map((c) => slugifyUnderscore(String(c || ""))).filter(Boolean))]
+    : [];
+
   const productTypeName =
     t.productTypeName != null && String(t.productTypeName).trim() ? String(t.productTypeName).trim() : null;
   const productTypeSlug =
@@ -92,6 +103,7 @@ function buildProductTags(product) {
     themePart ? `theme:${themePart}` : null,
     productTypeSlug ? `product_type:${productTypeSlug}` : null,
     accentColorSlug ? `color:${accentColorSlug}` : null,
+    ...garmentColorSlugs.map((s) => `garment:${s}`),
   ].filter(Boolean);
 
   const out = [];

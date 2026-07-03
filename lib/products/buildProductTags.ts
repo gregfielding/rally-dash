@@ -38,6 +38,8 @@ export interface ProductLikeForTags {
   themeCode?: string | null;
   /** Ink/brand accent color (e.g. "ORANGE") — independent of garment fabric color. */
   accentColor?: string | null;
+  /** Garment fabric colors the product is offered in (unique variant colorNames). */
+  garmentColors?: string[] | null;
 }
 
 /**
@@ -79,6 +81,16 @@ export function buildProductTags(product: ProductLikeForTags | null | undefined)
       : null;
   const accentColorSlug = accentColorName ? slugifyUnderscore(accentColorName) : null;
 
+  /**
+   * Garment fabric colors the product is actually offered in (unique variant colorNames,
+   * maintained on the parent by runCreateProductFromDesignBlankCore). Structured tags only
+   * (`garment:heather_grey`) — descriptive color facts for color-pair merchandising; not
+   * human tags, and deliberately NOT a smart-collection family.
+   */
+  const garmentColorSlugs = Array.isArray(product.garmentColors)
+    ? [...new Set(product.garmentColors.map((c) => slugifyUnderscore(String(c || ""))).filter(Boolean))]
+    : [];
+
   const productTypeName =
     t.productTypeName != null && String(t.productTypeName).trim() ? String(t.productTypeName).trim() : null;
   const productTypeSlug =
@@ -101,6 +113,7 @@ export function buildProductTags(product: ProductLikeForTags | null | undefined)
     themePart ? `theme:${themePart}` : null,
     productTypeSlug ? `product_type:${productTypeSlug}` : null,
     accentColorSlug ? `color:${accentColorSlug}` : null,
+    ...garmentColorSlugs.map((s) => `garment:${s}`),
   ].filter(Boolean);
 
   const out: string[] = [];
@@ -131,6 +144,7 @@ export function buildProductTagsFromRpProduct(product: RpProduct, blank?: RPBlan
     leagueCode: product.leagueCode ?? null,
     themeCode: product.themeCode ?? null,
     accentColor: product.accentColor ?? null,
+    garmentColors: product.garmentColors ?? null,
   });
 }
 

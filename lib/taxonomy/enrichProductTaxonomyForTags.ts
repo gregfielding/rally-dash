@@ -101,6 +101,9 @@ export function enrichTaxonomyAndTagsForSave(
     sportCode: form.taxSportCode ?? product.sportCode ?? null,
     leagueCode: form.taxLeagueCode ?? product.leagueCode ?? null,
     themeCode: form.taxThemeCode ?? product.themeCode ?? null,
+    /** Preserve color/garment tags on taxonomy re-save — these aren't in the form; sourced from the doc. */
+    accentColor: product.accentColor ?? null,
+    garmentColors: product.garmentColors ?? null,
   });
   const tagsNormalized = tagsNormalizedFromTags(tags);
 

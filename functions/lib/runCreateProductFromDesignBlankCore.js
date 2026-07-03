@@ -36,6 +36,7 @@ const {
 } = require("./buildSku");
 const { assertSkusUnusedInDatastore } = require("./skuUniqueness");
 const { parentProductDocId, variantProductDocId } = require("./parentProductDocId");
+const { slugifyUnderscore: tagsSlugifyUnderscore } = require("./buildProductTags");
 
 function deriveColorFamilyFromName(colorName) {
   const dark = new Set(["black", "midnight navy", "navy", "indigo"]);
@@ -690,10 +691,26 @@ async function runCreateProductFromDesignBlankCore(ctx) {
   const stillExists = prevDefaultId && allVariantsSnap.docs.some((d) => d.id === prevDefaultId);
   const nextDefaultId = stillExists ? prevDefaultId : variantSummary[0] ? variantSummary[0].variantId : null;
 
+  /**
+   * Garment-color rollup: unique fabric colorNames across ALL variants (this runs after
+   * every color lands, so it converges as colors accumulate). Persisted as
+   * `garmentColors` and reflected into structured `garment:` tags for color-pair
+   * merchandising ("blue garment + white ink"). We rewrite ONLY the garment: entries in
+   * the tag list — operator-added and taxonomy tags are preserved untouched.
+   */
+  const garmentColors = [...new Set(sortRows.map((r) => String(r.colorName || "").trim()).filter(Boolean))];
+  const garmentTags = garmentColors.map((c) => `garment:${tagsSlugifyUnderscore(c)}`).filter((t) => t !== "garment:");
+  const prevTags = Array.isArray(parentAfter.tags) ? parentAfter.tags : [];
+  const nonGarmentTags = prevTags.filter((t) => !String(t).toLowerCase().startsWith("garment:"));
+  const nextTags = [...new Set([...nonGarmentTags, ...garmentTags])];
+
   const parentUpdate = {
     variantSummary,
     variantCount: variantSummary.length,
     colorVariantCount,
+    garmentColors,
+    tags: nextTags,
+    tagsNormalized: nextTags.map((t) => String(t).toLowerCase()),
     updatedAt: now,
     updatedBy: userId,
     availableSizes: deriveSizesForProductMatrix(blank),

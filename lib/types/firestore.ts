@@ -1420,6 +1420,12 @@ export interface RpProduct {
   themeCode?: string | null;
   /** Ink/brand accent color (e.g. "ORANGE") — independent of garment fabric color. */
   accentColor?: string | null;
+  /**
+   * Unique garment fabric colorNames across this product's variants (e.g. ["Black",
+   * "Heather Grey"]). Maintained by runCreateProductFromDesignBlankCore's parent
+   * rollup; drives the structured `garment:` tags for color-pair merchandising.
+   */
+  garmentColors?: string[] | null;
   designFamily?: string | null;
   /** Denormalized from design when product is created (optional). */
   designSeries?: string | null;
