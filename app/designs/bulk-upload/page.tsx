@@ -67,6 +67,31 @@ function coverageCell(ok: boolean, optional: boolean) {
   return <span className="text-red-600">✗</span>;
 }
 
+/**
+ * Filename color token → canonical Ink-color value (Rally colorway convention:
+ * `rally_orange_rally_light.png` parses to theme "Orange" → seeds "orange").
+ * Multi-word canonical values ("royal blue") keep the shopper-facing tag pretty
+ * (`color:royal_blue` → "Color: Royal Blue"). Non-color tokens never match.
+ */
+const INK_COLOR_SEED_BY_TOKEN: Record<string, string> = {
+  orange: "orange",
+  red: "red",
+  royal: "royal blue",
+  navy: "navy",
+  green: "kelly green",
+  gold: "gold",
+  yellow: "yellow",
+  purple: "purple",
+  pink: "pink",
+  powder: "powder blue",
+  maroon: "maroon",
+  black: "black",
+  white: "white",
+  blue: "blue",
+  grey: "grey",
+  gray: "grey",
+};
+
 function safeStorageFileName(original: string, used: Set<string>): string {
   const base = (original.split(/[/\\]/).pop() || original).replace(/[^a-zA-Z0-9._-]/g, "_");
   let name = base;
@@ -116,6 +141,10 @@ export default function BulkDesignUploadPage() {
    * Per-item ink/brand accent color (e.g. "orange") — independent of garment fabric
    * colors. Flows to design.accentColor → product.accentColor → `color:` Shopify tag
    * + "Color: X" smart collection. Empty = no color tag.
+   *
+   * Auto-seeded from the filename when the parsed identity token is a recognized
+   * color (Rally colorway convention: `rally_orange_rally_light.png` → "orange").
+   * Non-color tokens ("Pillows", "City 69") never match, so team designs stay blank.
    */
   const [accentColorByItem, setAccentColorByItem] = useState<Record<string, string>>({});
   const [importing, setImporting] = useState(false);
@@ -267,6 +296,7 @@ export default function BulkDesignUploadPage() {
       const nextOw: Record<string, boolean> = {};
       const nextTargets: Record<string, string[]> = {};
       const nextLabels: Record<string, string> = {};
+      const nextInkColors: Record<string, string> = {};
       for (const it of serverItems) {
         nextActions[it.itemId] = it.confirmedAction || it.defaultAction;
         nextOw[it.itemId] = false;
@@ -281,11 +311,20 @@ export default function BulkDesignUploadPage() {
          */
         const parsedTheme = (it.themeName || "").trim();
         nextLabels[it.itemId] = parsedTheme;
+        /**
+         * Seed Ink color when the parsed identity token IS a color (Rally
+         * colorway filenames). Editable/clearable like the Label field.
+         */
+        const colorSeed = INK_COLOR_SEED_BY_TOKEN[parsedTheme.toLowerCase().replace(/[\s_]+/g, "")];
+        if (colorSeed) {
+          nextInkColors[it.itemId] = colorSeed;
+        }
       }
       setActionOverrides(nextActions);
       setOverwriteByItem(nextOw);
       setTargetBlanksByItem(nextTargets);
       setProductLabelByItem(nextLabels);
+      setAccentColorByItem(nextInkColors);
 
       setStep("review");
     } catch (e) {
