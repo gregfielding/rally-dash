@@ -1992,8 +1992,16 @@ exports.launchProductsFromDesign = functions.https.onCall(async (data, context) 
  * Uses onWrite so we can wait for the PNG-attach update — bulk + single-design flows both
  * create the doc with `files.lightPng = null` and patch it after upload.
  */
-exports.onDesignCreated = functions.firestore
-  .document("designs/{designId}")
+/**
+ * 540s/2GB: auto-launch runs product creation + official asset composition (Sharp
+ * renders + uploads) INLINE for every targeted blank × color. At the 60s default the
+ * trigger died mid-render on multi-blank launches — first blank's product spawned,
+ * the rest never ran (observed: Rally Orange created only the tank), and earlier
+ * "batch complete but 0 renders written" was the same guillotine mid-loop.
+ */
+exports.onDesignCreated = functions
+  .runWith({ memory: "2GB", timeoutSeconds: 540 })
+  .firestore.document("designs/{designId}")
   .onWrite(async (change, context) => {
     // Lazy: helpers below are defined later in this file (TDZ at module-load time).
     const handler = buildOnDesignCreated({
