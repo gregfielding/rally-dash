@@ -36,6 +36,8 @@ export interface ProductLikeForTags {
   sportCode?: string | null;
   leagueCode?: string | null;
   themeCode?: string | null;
+  /** Ink/brand accent color (e.g. "ORANGE") — independent of garment fabric color. */
+  accentColor?: string | null;
 }
 
 /**
@@ -68,6 +70,15 @@ export function buildProductTags(product: ProductLikeForTags | null | undefined)
 
   const themeName = t.themeName != null && String(t.themeName).trim() ? String(t.themeName).trim() : null;
 
+  /** Ink/brand accent color (e.g. "ORANGE") — independent of garment fabric color. */
+  const accentColor =
+    t.accentColor != null && String(t.accentColor).trim() ? t.accentColor : product.accentColor;
+  const accentColorName =
+    accentColor != null && String(accentColor).trim()
+      ? String(accentColor).trim().charAt(0).toUpperCase() + String(accentColor).trim().slice(1).toLowerCase()
+      : null;
+  const accentColorSlug = accentColorName ? slugifyUnderscore(accentColorName) : null;
+
   const productTypeName =
     t.productTypeName != null && String(t.productTypeName).trim() ? String(t.productTypeName).trim() : null;
   const productTypeSlug =
@@ -77,7 +88,9 @@ export function buildProductTags(product: ProductLikeForTags | null | undefined)
         ? slugifyUnderscore(productTypeName)
         : null;
 
-  const human = [cityName, teamName, leagueName, sportName, themeName, productTypeName].filter(Boolean);
+  const human = [cityName, teamName, leagueName, sportName, themeName, productTypeName, accentColorName].filter(
+    Boolean
+  );
 
   const themePart = normalizeTheme(themeName, themeCode);
   const structured = [
@@ -87,6 +100,7 @@ export function buildProductTags(product: ProductLikeForTags | null | undefined)
     sportCode != null && String(sportCode).trim() ? `sport:${String(sportCode).trim().toLowerCase()}` : null,
     themePart ? `theme:${themePart}` : null,
     productTypeSlug ? `product_type:${productTypeSlug}` : null,
+    accentColorSlug ? `color:${accentColorSlug}` : null,
   ].filter(Boolean);
 
   const out: string[] = [];
@@ -116,6 +130,7 @@ export function buildProductTagsFromRpProduct(product: RpProduct, blank?: RPBlan
     sportCode: product.sportCode ?? null,
     leagueCode: product.leagueCode ?? null,
     themeCode: product.themeCode ?? null,
+    accentColor: product.accentColor ?? null,
   });
 }
 

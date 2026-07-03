@@ -11,6 +11,7 @@ export const SHOPIFY_TAG_FIELD_MAP = {
   teamCode: "team",
   themeCode: "theme",
   modelCodes: "model",
+  accentColor: "color",
 } as const;
 
 export type ShopifyTagField = keyof typeof SHOPIFY_TAG_FIELD_MAP;

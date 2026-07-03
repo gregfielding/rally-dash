@@ -170,6 +170,8 @@ export interface RpTaxonomyDisplay {
   sportCode?: string | null;
   productTypeName?: string | null;
   productTypeSlug?: string | null;
+  /** Ink/brand accent color (e.g. "ORANGE") — independent of garment fabric color. */
+  accentColor?: string | null;
 }
 
 export interface Product {
@@ -1416,6 +1418,8 @@ export interface RpProduct {
   leagueCode?: string | null;
   teamCode?: string | null;
   themeCode?: string | null;
+  /** Ink/brand accent color (e.g. "ORANGE") — independent of garment fabric color. */
+  accentColor?: string | null;
   designFamily?: string | null;
   /** Denormalized from design when product is created (optional). */
   designSeries?: string | null;
@@ -3307,6 +3311,13 @@ export interface DesignDoc {
   designFamily?: string | null;     // e.g. 'WILL_DROP_FOR'
   teamCode?: string | null;         // e.g. 'GIANTS'
   themeCode?: string | null;        // e.g. 'FUNNY_BASEBALL' for generic/humor designs
+  /**
+   * Brand/ink accent color for the design's artwork (independent of garment fabric
+   * color, which lives per-variant). Drives the `color:` Shopify tag + smart collection
+   * (e.g. "Color: Orange") — a cross-catalog merchandising signal, not part of the
+   * league/team/blank identity key or SKU. e.g. 'ORANGE'.
+   */
+  accentColor?: string | null;
   taxonomy?: { sportName?: string; leagueName?: string; teamName?: string; themeName?: string } | null;
   /**
    * Operator's per-design picker selection from the bulk-upload review screen:

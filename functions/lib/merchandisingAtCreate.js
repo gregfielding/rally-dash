@@ -372,6 +372,9 @@ function inferTaxonomyForGeneratedSportsProduct(team, design, designShortNameFor
 
   const themeCode = inferThemeCodeFromDesign(design);
   const designFamily = inferDesignFamilyFromDesign(design);
+  /** Ink/brand accent color (e.g. "ORANGE") — independent of garment fabric color; not sport-context-gated. */
+  const accentColor =
+    design.accentColor && String(design.accentColor).trim() ? String(design.accentColor).trim().toUpperCase() : null;
 
   const teamDisplay = buildTeamDisplayName(team, design);
   const taxonomy = {
@@ -392,6 +395,7 @@ function inferTaxonomyForGeneratedSportsProduct(team, design, designShortNameFor
     leagueCode: hasSportsContext ? leagueCode || design.leagueCode || null : design.leagueCode ?? null,
     teamCode: hasSportsContext ? teamCode || design.teamCode || null : design.teamCode ?? null,
     themeCode: themeCode ?? design.themeCode ?? null,
+    accentColor,
     designFamily: designFamily ?? design.designFamily ?? null,
     taxonomy: {
       sportName: taxonomy.sportName ?? null,
@@ -465,6 +469,7 @@ function mergeFullTaxonomyFromInfer(team, design, blank, inferred) {
     leagueCode: inferred.leagueCode,
     teamCode: inferred.teamCode,
     themeCode: inferred.themeCode,
+    accentColor: inferred.accentColor,
     designFamily: inferred.designFamily,
     taxonomy,
   };
@@ -484,6 +489,7 @@ function rebuildProductTagsSnapshotFromSources(team, design, blank) {
     sportCode: tax.sportCode,
     leagueCode: tax.leagueCode,
     themeCode: tax.themeCode,
+    accentColor: tax.accentColor,
   });
   const tagsNormalized = tagsNormalizedFromTags(tags);
   return { tags, tagsNormalized, tax };
@@ -547,6 +553,7 @@ function buildResolvedMerchandisingBundle({
     sportCode: tax.sportCode,
     leagueCode: tax.leagueCode,
     themeCode: tax.themeCode,
+    accentColor: tax.accentColor,
   });
   const tagsNormalized = tagsNormalizedFromTags(tags);
 
@@ -661,6 +668,7 @@ function buildResolvedMerchandisingBundleForParent({
     sportCode: tax.sportCode,
     leagueCode: tax.leagueCode,
     themeCode: tax.themeCode,
+    accentColor: tax.accentColor,
   });
   const tagsNormalized = tagsNormalizedFromTags(tags);
 

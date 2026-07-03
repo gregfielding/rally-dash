@@ -33,6 +33,8 @@ const LEAF_PREFIX = {
   league: { handlePrefix: "league", titlePrefix: "League" },
   team: { handlePrefix: "team", titlePrefix: "Team" },
   theme: { handlePrefix: "theme", titlePrefix: "Theme" },
+  /** Ink/brand accent color (e.g. "color:orange") — cross-catalog "shop by color" collection. */
+  color: { handlePrefix: "color", titlePrefix: "Color" },
 };
 
 /**

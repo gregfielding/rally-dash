@@ -337,6 +337,7 @@ async function runCreateProductFromDesignBlankCore(ctx) {
       sportCode: parentBundle.tax.sportCode ?? null,
       leagueCode: parentBundle.tax.leagueCode ?? null,
       themeCode: parentBundle.tax.themeCode ?? null,
+      accentColor: parentBundle.tax.accentColor ?? null,
       designFamily: parentBundle.tax.designFamily ?? null,
       taxonomy: parentBundle.tax.taxonomy ?? null,
       baseProductKey: `DESIGN_${designId}_BLANK_${blankId}`,

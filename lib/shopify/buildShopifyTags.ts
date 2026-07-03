@@ -14,6 +14,8 @@ export interface ProductForShopifyTags {
   teamCode?: string | null;
   themeCode?: string | null;
   modelCodes?: string[] | null;
+  /** Ink/brand accent color (e.g. "ORANGE") — independent of garment fabric color. */
+  accentColor?: string | null;
 }
 
 /**
@@ -53,6 +55,9 @@ export function buildShopifyTags(product: ProductForShopifyTags | null | undefin
   }
   if (hasValue(product.themeCode)) {
     out.push(`${SHOPIFY_TAG_FIELD_MAP.themeCode}:${toTagValue(product.themeCode!)}`);
+  }
+  if (hasValue(product.accentColor)) {
+    out.push(`${SHOPIFY_TAG_FIELD_MAP.accentColor}:${toTagValue(product.accentColor!)}`);
   }
   if (Array.isArray(product.modelCodes)) {
     for (const code of product.modelCodes) {

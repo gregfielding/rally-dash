@@ -13,6 +13,7 @@ const TAG_PREFIX = {
   teamCode: "team",
   themeCode: "theme",
   modelCodes: "model",
+  accentColor: "color",
 };
 
 function toTagValue(value) {
@@ -48,6 +49,9 @@ function buildShopifyTags(product) {
   }
   if (hasValue(product.themeCode)) {
     out.push(`${TAG_PREFIX.themeCode}:${toTagValue(product.themeCode)}`);
+  }
+  if (hasValue(product.accentColor)) {
+    out.push(`${TAG_PREFIX.accentColor}:${toTagValue(product.accentColor)}`);
   }
   if (Array.isArray(product.modelCodes)) {
     for (const code of product.modelCodes) {
