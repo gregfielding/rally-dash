@@ -45,7 +45,7 @@ The typographic pivot makes every design programmatically generatable. No Illust
 
 ## Phase 5 — Shopify redesign & reconfiguration
 
-- [ ] [C→G] Collection architecture: by shelf (Know Ball / Lucky / After Dark / City / Trend Drop) × by sport × by color — mapped to existing tag schema (theme:/color:/sport:)
+- [x] [C→G] Collection architecture drafted 2026-07-05 → `RALLY_SHOPIFY_LAUNCH_ARCHITECTURE.md` (8 shelf themes wired into drop1Manifest + checklist Theme column; nav, PDP template, pricing bands, QA gate). Awaiting [G] approval of §6 items
 - [ ] [C] Wire smart-collection automation for new shelves (LEAF_PREFIX families already built)
 - [ ] [C→G] PDP template: size guide per blank, fabric copy, brand story block, cross-sell (matching set: tank ↔ panty; SKU color-line recs)
 - [ ] [C→G] Theme/nav/brand pages: bold-type anti-Etsy aesthetic, About page (founding story: female fan, actually a fan), FAQ, shipping/returns
