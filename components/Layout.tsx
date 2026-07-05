@@ -37,6 +37,16 @@ const primaryNav: NavItem[] = [
   { name: "Products", href: "/products", roles: ["ops", "admin"] },
 ];
 
+/**
+ * Launch-plan Phase 6 (2026-07-05): surfaces retired by the typographic-design
+ * direction are hidden from nav but stay routable via URL (bookmarks survive).
+ * Remove an href from this set to bring its entry back — one-line revert.
+ *   - /inspirations → AI concept generation; designs are typeset from the copy
+ *     manifest now (generate-design-files.js)
+ *   - /lora → identity training; parked until the Amber go/no-go (Phase 9)
+ */
+const HIDDEN_NAV_HREFS = new Set<string>(["/inspirations", "/lora"]);
+
 /** Renamed in the UI from "More" → "Admin" to make scope clear. */
 const moreNav: NavItem[] = [
   { name: "Catalog", href: "/catalog", roles: ["viewer", "editor", "ops", "admin"] },
@@ -48,7 +58,7 @@ const moreNav: NavItem[] = [
   { name: "LoRA Ops", href: "/lora", roles: ["ops", "admin"] },
   { name: "Asset review", href: "/review", roles: ["ops", "admin", "editor"] },
   { name: "Publish (legacy)", href: "/publish", roles: ["ops", "admin", "editor"] },
-];
+].filter((item) => !HIDDEN_NAV_HREFS.has(item.href));
 
 export default function Layout({ children }: LayoutProps) {
   const { user, adminUser, signOut, loading } = useAuth();
