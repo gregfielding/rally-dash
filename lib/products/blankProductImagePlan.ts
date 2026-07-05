@@ -38,6 +38,7 @@ const DESIGN_PRINT_SIDES_BY_STYLE_CODE: Record<string, ("front" | "back")[]> = {
   "8394": ["back"],
   "8390": ["back"],
   TR3008: ["front"],
+  "1822GD": ["front"],
   HF07: ["front"],
 };
 

@@ -90,6 +90,24 @@ const PIPELINE_CONFIG_BY_STYLE_CODE = {
      * for a per-blank checklist.
      */
   },
+  "1822GD": {
+    styleCode: "1822GD",
+    displayName: "Garment Dye Crop Tank (LA Apparel)",
+    pipelineReady: true,
+    requiresWarp: false,
+    requiresMask: true,
+    supportedSides: ["front", "back"],
+    /** Crop tank prints on the chest (front); design composites onto the front. */
+    designPrintSides: ["front"],
+    /**
+     * Activated 2026-07-05. Same approach as TR3008/HF07 — flat garment,
+     * warp early-exits via per-render config, generic sharp pipeline runs.
+     * Operator should upload flat/model photos, generate per-variant masks,
+     * and tune per-color render params via the Blank Render Profile editor.
+     * Note: cropped boxy silhouette = shorter print canvas than TR3008;
+     * expect smaller defaultScale / higher defaultY when tuning.
+     */
+  },
   HF07: {
     styleCode: "HF07",
     displayName: "Heavy Fleece Crewneck (LA Apparel)",
