@@ -38,55 +38,55 @@ const COLORWAYS = [
  */
 const DESIGNS = [
   // ---- Know More family (5 sports) — crew + tanks
-  { token: "kmbaseball", label: "Knows More Baseball", lines: ["JUST A GIRL WHO", "KNOWS MORE ABOUT", "BASEBALL THAN YOU."], blanks: ["crew", "tanks"] },
-  { token: "kmfootball", label: "Knows More Football", lines: ["JUST A GIRL WHO", "KNOWS MORE ABOUT", "FOOTBALL THAN YOU."], blanks: ["crew", "tanks"] },
-  { token: "kmbasket", label: "Knows More Basketball", lines: ["JUST A GIRL WHO", "KNOWS MORE ABOUT", "BASKETBALL THAN YOU."], blanks: ["crew", "tanks"] },
-  { token: "kmhockey", label: "Knows More Hockey", lines: ["JUST A GIRL WHO", "KNOWS MORE ABOUT", "HOCKEY THAN YOU."], blanks: ["crew", "tanks"] },
-  { token: "kmsoccer", label: "Knows More Soccer", lines: ["JUST A GIRL WHO", "KNOWS MORE ABOUT", "SOCCER THAN YOU."], blanks: ["crew", "tanks"] },
+  { token: "kmbaseball", theme: "KNOW_BALL", label: "Knows More Baseball", lines: ["JUST A GIRL WHO", "KNOWS MORE ABOUT", "BASEBALL THAN YOU."], blanks: ["crew", "tanks"] },
+  { token: "kmfootball", theme: "KNOW_BALL", label: "Knows More Football", lines: ["JUST A GIRL WHO", "KNOWS MORE ABOUT", "FOOTBALL THAN YOU."], blanks: ["crew", "tanks"] },
+  { token: "kmbasket", theme: "KNOW_BALL", label: "Knows More Basketball", lines: ["JUST A GIRL WHO", "KNOWS MORE ABOUT", "BASKETBALL THAN YOU."], blanks: ["crew", "tanks"] },
+  { token: "kmhockey", theme: "KNOW_BALL", label: "Knows More Hockey", lines: ["JUST A GIRL WHO", "KNOWS MORE ABOUT", "HOCKEY THAN YOU."], blanks: ["crew", "tanks"] },
+  { token: "kmsoccer", theme: "KNOW_BALL", label: "Knows More Soccer", lines: ["JUST A GIRL WHO", "KNOWS MORE ABOUT", "SOCCER THAN YOU."], blanks: ["crew", "tanks"] },
 
   // ---- Fluent family (4 sports) — crew + tanks
-  { token: "fluentfb", label: "Fluent Football", lines: ["FLUENT IN", "FOOTBALL."], blanks: ["crew", "tanks"] },
-  { token: "fluentbs", label: "Fluent Baseball", lines: ["FLUENT IN", "BASEBALL."], blanks: ["crew", "tanks"] },
-  { token: "fluentbk", label: "Fluent Basketball", lines: ["FLUENT IN", "BASKETBALL."], blanks: ["crew", "tanks"] },
-  { token: "fluenthk", label: "Fluent Hockey", lines: ["FLUENT IN", "HOCKEY."], blanks: ["crew", "tanks"] },
+  { token: "fluentfb", theme: "KNOW_BALL", label: "Fluent Football", lines: ["FLUENT IN", "FOOTBALL."], blanks: ["crew", "tanks"] },
+  { token: "fluentbs", theme: "KNOW_BALL", label: "Fluent Baseball", lines: ["FLUENT IN", "BASEBALL."], blanks: ["crew", "tanks"] },
+  { token: "fluentbk", theme: "KNOW_BALL", label: "Fluent Basketball", lines: ["FLUENT IN", "BASKETBALL."], blanks: ["crew", "tanks"] },
+  { token: "fluenthk", theme: "KNOW_BALL", label: "Fluent Hockey", lines: ["FLUENT IN", "HOCKEY."], blanks: ["crew", "tanks"] },
 
   // ---- Know-ball family
-  { token: "hotgirls", label: "Hot Girls Know Ball", lines: ["HOT GIRLS KNOW BALL."], align: "center", blanks: ["crew", "tanks", "panty"] },
-  { token: "knowball", label: "Know Ball Number", lines: ["MUST KNOW BALL", "IF YOU WANT", "MY NUMBER."], blanks: ["tanks"] },
+  { token: "hotgirls", theme: "KNOW_BALL", label: "Hot Girls Know Ball", lines: ["HOT GIRLS KNOW BALL."], align: "center", blanks: ["crew", "tanks", "panty"] },
+  { token: "knowball", theme: "KNOW_BALL", label: "Know Ball Number", lines: ["MUST KNOW BALL", "IF YOU WANT", "MY NUMBER."], blanks: ["tanks"] },
 
   // ---- She-talks-to-him
-  { token: "womsplbb", label: "Womansplain Baseball", lines: ["DON'T MAKE ME", "WOMANSPLAIN", "BASEBALL TO YOU."], blanks: ["tanks"] },
-  { token: "womsplfb", label: "Womansplain Football", lines: ["DON'T MAKE ME", "WOMANSPLAIN", "FOOTBALL TO YOU."], blanks: ["tanks"] },
-  { token: "mansplain", label: "Another Beer", lines: ["I DON'T NEED YOU", "TO MANSPLAIN.", "I NEED YOU TO GET", "ME ANOTHER BEER."], blanks: ["tanks"] },
-  { token: "drinkson", label: "Drinks On You", lines: ["DRINKS ON YOU", "AFTER THE GAME."], blanks: ["tanks"] },
-  { token: "kisscam", label: "Kiss Cam", lines: ["LET'S PRACTICE", "FOR THE KISS CAM."], blanks: ["tanks"] },
+  { token: "womsplbb", theme: "TALK", label: "Womansplain Baseball", lines: ["DON'T MAKE ME", "WOMANSPLAIN", "BASEBALL TO YOU."], blanks: ["tanks"] },
+  { token: "womsplfb", theme: "TALK", label: "Womansplain Football", lines: ["DON'T MAKE ME", "WOMANSPLAIN", "FOOTBALL TO YOU."], blanks: ["tanks"] },
+  { token: "mansplain", theme: "TALK", label: "Another Beer", lines: ["I DON'T NEED YOU", "TO MANSPLAIN.", "I NEED YOU TO GET", "ME ANOTHER BEER."], blanks: ["tanks"] },
+  { token: "drinkson", theme: "TALK", label: "Drinks On You", lines: ["DRINKS ON YOU", "AFTER THE GAME."], blanks: ["tanks"] },
+  { token: "kisscam", theme: "TALK", label: "Kiss Cam", lines: ["LET'S PRACTICE", "FOR THE KISS CAM."], blanks: ["tanks"] },
 
   // ---- Parlay family
-  { token: "parlayhi", label: "Parlay Hit", lines: ["MY PARLAY HIT,", "SO THIS SHIRT", "WAS FREE."], blanks: ["tanks"] },
-  { token: "parlayqu", label: "Parlay Queen", lines: ["PARLAY QUEEN."], align: "center", blanks: ["crew", "panty"] },
+  { token: "parlayhi", theme: "GAMEDAY", label: "Parlay Hit", lines: ["MY PARLAY HIT,", "SO THIS SHIRT", "WAS FREE."], blanks: ["tanks"] },
+  { token: "parlayqu", theme: "GAMEDAY", label: "Parlay Queen", lines: ["PARLAY QUEEN."], align: "center", blanks: ["crew", "panty"] },
 
   // ---- Gameday
-  { token: "tailgate", label: "Gameday MVP", lines: ["TAILGATING,", "SHOTGUNNING,", "BEER-BONGING,", "PARKING-LOT-", "TWERKING,", "MOST-FUN-HAVING,", "GAMEDAY MVP."], blanks: ["tanks"] },
-  { token: "baddecfb", label: "Football Bad Decisions", lines: ["FOOTBALL AND", "BAD DECISIONS."], blanks: ["tanks", "panty"] },
-  { token: "baddecbs", label: "Baseball Bad Decisions", lines: ["BASEBALL AND", "BAD DECISIONS."], blanks: ["tanks", "panty"] },
-  { token: "baddechk", label: "Hockey Bad Decisions", lines: ["HOCKEY AND", "BAD DECISIONS."], blanks: ["tanks", "panty"] },
+  { token: "tailgate", theme: "GAMEDAY", label: "Gameday MVP", lines: ["TAILGATING,", "SHOTGUNNING,", "BEER-BONGING,", "PARKING-LOT-", "TWERKING,", "MOST-FUN-HAVING,", "GAMEDAY MVP."], blanks: ["tanks"] },
+  { token: "baddecfb", theme: "GAMEDAY", label: "Football Bad Decisions", lines: ["FOOTBALL AND", "BAD DECISIONS."], blanks: ["tanks", "panty"] },
+  { token: "baddecbs", theme: "GAMEDAY", label: "Baseball Bad Decisions", lines: ["BASEBALL AND", "BAD DECISIONS."], blanks: ["tanks", "panty"] },
+  { token: "baddechk", theme: "GAMEDAY", label: "Hockey Bad Decisions", lines: ["HOCKEY AND", "BAD DECISIONS."], blanks: ["tanks", "panty"] },
 
   // ---- Brand / bridge
-  { token: "askme", label: "Ask Me", lines: ["ASK ME ABOUT MY", "RALLY PANTIES."], blanks: ["tanks"] },
-  { token: "notluck", label: "Not Luck", lines: ["IT'S NOT LUCK.", "IT'S MY PANTIES."], blanks: ["tanks"] },
-  { token: "pillows", label: "Pillows", lines: ["PILLOWS."], align: "center", blanks: ["tanks", "panty"] },
+  { token: "askme", theme: "RALLY", label: "Ask Me", lines: ["ASK ME ABOUT MY", "RALLY PANTIES."], blanks: ["tanks"] },
+  { token: "notluck", theme: "LUCKY", label: "Not Luck", lines: ["IT'S NOT LUCK.", "IT'S MY PANTIES."], blanks: ["tanks"] },
+  { token: "pillows", theme: "PILLOWS", label: "Pillows", lines: ["PILLOWS."], align: "center", blanks: ["tanks", "panty"] },
 
   // ---- Baddie family
-  { token: "baddiebb", label: "Baseball Baddie", lines: ["BASEBALL BADDIE."], align: "center", blanks: ["crew", "tanks", "panty", "thong"] },
-  { token: "baddiefb", label: "Football Baddie", lines: ["FOOTBALL BADDIE."], align: "center", blanks: ["crew", "tanks", "panty", "thong"] },
+  { token: "baddiebb", theme: "AFTER_DARK", label: "Baseball Baddie", lines: ["BASEBALL BADDIE."], align: "center", blanks: ["crew", "tanks", "panty", "thong"] },
+  { token: "baddiefb", theme: "AFTER_DARK", label: "Football Baddie", lines: ["FOOTBALL BADDIE."], align: "center", blanks: ["crew", "tanks", "panty", "thong"] },
 
   // ---- After dark
-  { token: "fantasy", label: "Fantasy Football", lines: ["I PUT THE FANTASY", "IN FANTASY FOOTBALL."], blanks: ["tanks"] },
-  { token: "flowers", label: "Floor Seats", lines: ["FLOWERS ARE FINE.", "FLOOR SEATS", "ARE FOREPLAY."], blanks: ["tanks"] },
-  { token: "comesoff", label: "Comes Off", lines: ["COMES OFF WHEN WE WIN."], align: "center", blanks: ["tanks", "panty", "thong"] },
-  { token: "rubforlu", label: "Rub For Luck", lines: ["(RUB FOR LUCK)"], align: "center", blanks: ["panty", "thong"] },
-  { token: "droptd", label: "Will Drop Touchdowns", lines: ["WILL DROP FOR", "TOUCHDOWNS."], blanks: ["panty"] },
-  { token: "drophr", label: "Will Drop Home Runs", lines: ["WILL DROP FOR", "HOME RUNS."], blanks: ["panty"] },
+  { token: "fantasy", theme: "AFTER_DARK", label: "Fantasy Football", lines: ["I PUT THE FANTASY", "IN FANTASY FOOTBALL."], blanks: ["tanks"] },
+  { token: "flowers", theme: "AFTER_DARK", label: "Floor Seats", lines: ["FLOWERS ARE FINE.", "FLOOR SEATS", "ARE FOREPLAY."], blanks: ["tanks"] },
+  { token: "comesoff", theme: "LUCKY", label: "Comes Off", lines: ["COMES OFF WHEN WE WIN."], align: "center", blanks: ["tanks", "panty", "thong"] },
+  { token: "rubforlu", theme: "LUCKY", label: "Rub For Luck", lines: ["(RUB FOR LUCK)"], align: "center", blanks: ["panty", "thong"] },
+  { token: "droptd", theme: "AFTER_DARK", label: "Will Drop Touchdowns", lines: ["WILL DROP FOR", "TOUCHDOWNS."], blanks: ["panty"] },
+  { token: "drophr", theme: "AFTER_DARK", label: "Will Drop Home Runs", lines: ["WILL DROP FOR", "HOME RUNS."], blanks: ["panty"] },
 ];
 
 /** Ink by GARMENT tone slot: _light file gets dark text, _dark file gets white text. */

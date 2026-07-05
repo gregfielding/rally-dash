@@ -149,7 +149,7 @@ async function runFull() {
     // Tone = the garment the file is used on: _light gets dark text, _dark gets white text.
     await emit(d, "light", INK_FOR_LIGHT_GARMENTS, "helvetica", align, files);
     await emit(d, "dark", INK_FOR_DARK_GARMENTS, "helvetica", align, files);
-    checklist.push({ token: d.token, label: d.label, ink: "", blanks: d.blanks.join(" + "), files });
+    checklist.push({ token: d.token, label: d.label, theme: d.theme || "", ink: "", blanks: d.blanks.join(" + "), files });
     console.log(`✓ ${d.token}  (${files.length} files)`);
   }
 
@@ -162,6 +162,7 @@ async function runFull() {
     checklist.push({
       token: c.token,
       label: c.label,
+      theme: "RALLY",
       ink: c.ink,
       blanks: "all garments",
       files,
@@ -176,13 +177,13 @@ async function runFull() {
     await emit({ token: c.nameToken, lines: [c.name] }, "light", c.hex, "helvetica", "center", nameFiles, "city");
     await emit({ token: c.nameToken, lines: [c.name] }, "dark", c.hex, "helvetica", "center", nameFiles, "city");
     await emit({ token: c.nameToken, lines: [c.name] }, "white", "#FFFFFF", "helvetica", "center", nameFiles, "city");
-    checklist.push({ token: `city/${c.nameToken}`, label: c.label, ink: c.ink, blanks: "crew (name)", files: nameFiles });
+    checklist.push({ token: `city/${c.nameToken}`, label: c.label, theme: "CITY", ink: c.ink, blanks: "crew (name)", files: nameFiles });
 
     const initFiles = [];
     await emit({ token: c.initToken, lines: [c.initials] }, "light", c.hex, "helvetica", "center", initFiles, "city");
     await emit({ token: c.initToken, lines: [c.initials] }, "dark", c.hex, "helvetica", "center", initFiles, "city");
     await emit({ token: c.initToken, lines: [c.initials] }, "white", "#FFFFFF", "helvetica", "center", initFiles, "city");
-    checklist.push({ token: `city/${c.initToken}`, label: `${c.label} Initials`, ink: c.ink, blanks: "thong (initials)", files: initFiles });
+    checklist.push({ token: `city/${c.initToken}`, label: `${c.label} Initials`, theme: "CITY", ink: c.ink, blanks: "thong (initials)", files: initFiles });
     console.log(`✓ city ${c.nameToken} + ${c.initToken}  (6 files)`);
   }
 
@@ -193,9 +194,9 @@ async function runFull() {
     "",
     "Review-screen settings per row (Team resolves to **Rally** automatically):",
     "",
-    "| Token | Label | Ink color field | Blanks to check | Files | Note |",
-    "|---|---|---|---|---|---|",
-    ...checklist.map((r) => `| ${r.token} | ${r.label} | ${r.ink || "—"} | ${r.blanks} | ${r.files.length} | ${r.note || ""} |`),
+    "| Token | Label | Theme | Ink color field | Blanks to check | Files | Note |",
+    "|---|---|---|---|---|---|---|",
+    ...checklist.map((r) => `| ${r.token} | ${r.label} | ${r.theme || "—"} | ${r.ink || "—"} | ${r.blanks} | ${r.files.length} | ${r.note || ""} |`),
     "",
     "**Blank key:** tanks = TR3008 (+1822GD once its photos/masks/tuning are done) · crew = HF07 · panty = 8394 · thong = 8390.",
     "**Post-spawn pruning:** archive low-contrast variants (white-ink files on White/Oatmeal garments; black-ink on Black/Vintage Black; eyeball Navy/Royal/Powder colorways on blue garments).",
