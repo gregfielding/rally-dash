@@ -62,11 +62,11 @@ The typographic pivot makes every design programmatically generatable. No Illust
 
 ## Phase 7 — Marketing engine
 
-- [ ] [C] Brand voice guide (one page: her-voice rules, viral test, banned words/marks)
-- [ ] [C] 30-day content calendar: TikTok/IG scripts riding the trend shelf (pointing meme, World Cup window, know-ball trend) + evergreen capsule content
-- [ ] [C] Launch email flow (3-part) + welcome flow for list
-- [ ] [C] Post-purchase survey (KPI: % female buyers — the acquisition-story metric) + repeat-rate tracking plan
-- [ ] [C] UGC engine plan: ASK ME ABOUT MY RALLY PANTIES as the conversation-starter product; screenshot-bait design rationale per product
+- [x] [C] Brand voice guide — `RALLY_MARKETING_LAUNCH_PACK.md` §1 (2026-07-05)
+- [x] [C] 30-day content calendar — pack §2 (Day 1 = drop live; weekly arcs: launch / betting / she-talks-to-him / after-dark)
+- [x] [C] Launch email + 3-part welcome flow + post-purchase email — pack §3
+- [x] [C] Post-purchase survey — pack §4 (3 questions; KPI: % female self-purchase = the acquisition-story number, baselined from day 1)
+- [x] [C] UGC engine — ASK ME ABOUT MY RALLY PANTIES recurring series + weekly screenshot contest (pack §2 D2/D29, §3 post-purchase)
 - [ ] [C→G] Seeding list criteria: women's-sports podcasts/creators (The GIST/Togethxr audience adjacents), tailgate creators, sports-betting women creators
 - [ ] [G] Social handles + posting cadence commitment
 
