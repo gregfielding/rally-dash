@@ -20,8 +20,8 @@ The typographic pivot makes every design programmatically generatable. No Illust
 
 ## Phase 2 — Blank readiness
 
-- [ ] [G] 1822GD: shoot or source flat + model photos for 6 colors (check if LAA wholesale terms permit using their product photography — if yes this shortcut applies to all future blanks)
-- [ ] [G] 1822GD: masks + per-color render targets in Blank editor (crop = smaller scale/higher Y than TR3008)
+- [x] [C] 1822GD FULLY SET UP 2026-07-05 (user-directed): LAA model photos wired for all 6 colors (LAA has NO flat shots — model-photo-only blank; heroes are on-model), chest quads eyeball-estimated per pose (refine in 4-corner editor if drift), SAM masks generated ($0.03), model_front render targets at quad-fill 0.8, renderProfileStatus approved. Proof render verified on Black (HOT GIRLS KNOW BALL). ⚠️ LAA photo licensing check (Phase 8) covers this blank too.
+- [ ] [G] Optional: refine 1822GD quads in the 4-corner editor; shoot own photos at the model shoot to replace LAA's
 - [ ] [G] Order LAA samples: 1822GD (6 colors), 83001 hot shorts (B/W/Grey)
 - [ ] [G] 83001 go/no-go after seam test print (word-gap artwork rule in manifest doc)
 - [x] [C] Created `design_teams/city_brand` 2026-07-05 (teamCode CITY; matrix: HF07 crew + 8390 thong, 6 variants each) — [G] authorized
