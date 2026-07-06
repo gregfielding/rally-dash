@@ -2723,6 +2723,12 @@ export interface RpProductPlacementOverrideSlice {
   defaultX?: number;
   defaultY?: number;
   defaultScale?: number;
+  /**
+   * Per-PRODUCT sizing multiplied over the per-color blank tuning (2026-07-05).
+   * Blank knobs encode photo geometry per color; this encodes the design-class
+   * size (1-line wordmark vs 3-line block on the same garment).
+   */
+  scaleMultiplier?: number;
   safeArea?: { x?: number; y?: number; w?: number; h?: number };
 }
 

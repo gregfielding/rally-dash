@@ -617,6 +617,8 @@ async function render8394DesignOnGarmentSharp(options) {
         quad: modelPrintQuad,
         outputWidth: blankWidth,
         outputHeight: blankHeight,
+        /** On-body size follows the same resolved scale as the flat targets. */
+        fillRatio: tuning && tuning.settings && tuning.settings.placement ? tuning.settings.placement.scale : 1,
       });
       resizedBasePng = await sharp(warpedCanvasPng).ensureAlpha().png().toBuffer();
       /**

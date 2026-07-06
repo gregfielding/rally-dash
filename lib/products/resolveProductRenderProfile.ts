@@ -107,6 +107,7 @@ function readStructuredPlacementOverride(
     slice.defaultX != null ||
     slice.defaultY != null ||
     slice.defaultScale != null ||
+    slice.scaleMultiplier != null ||
     (slice.safeArea != null &&
       (slice.safeArea.x != null ||
         slice.safeArea.y != null ||
@@ -310,6 +311,10 @@ export function resolveEffectivePlacement(
     if (structured.defaultX != null) defaultX = structured.defaultX;
     if (structured.defaultY != null) defaultY = structured.defaultY;
     if (structured.defaultScale != null) defaultScale = structured.defaultScale;
+    /** Mirrors functions/lib: per-product design-class sizing multiplied over per-color blank tuning. */
+    if (structured.scaleMultiplier != null && Number.isFinite(Number(structured.scaleMultiplier)) && Number(structured.scaleMultiplier) > 0) {
+      defaultScale = defaultScale * Number(structured.scaleMultiplier);
+    }
     safeArea = mergeSafeArea(safeArea, structured.safeArea);
     source = "product_override";
   } else if (legacy) {
@@ -389,6 +394,10 @@ export function resolveEffectivePlacementForRenderTarget(
     if (structured.defaultX != null) defaultX = structured.defaultX;
     if (structured.defaultY != null) defaultY = structured.defaultY;
     if (structured.defaultScale != null) defaultScale = structured.defaultScale;
+    /** Mirrors functions/lib: per-product design-class sizing multiplied over per-color blank tuning. */
+    if (structured.scaleMultiplier != null && Number.isFinite(Number(structured.scaleMultiplier)) && Number(structured.scaleMultiplier) > 0) {
+      defaultScale = defaultScale * Number(structured.scaleMultiplier);
+    }
     safeArea = mergeSafeArea(safeArea, structured.safeArea);
     source = "product_override";
   } else if (legacy) {

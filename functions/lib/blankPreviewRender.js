@@ -1092,6 +1092,8 @@ async function composeStageA({ db, storage, sharp, functions, input }) {
         quad: printQuad,
         outputWidth: blankWidth,
         outputHeight: blankHeight,
+        /** Parity with the product engine: on-body size follows the resolved placement scale. */
+        fillRatio: effectiveScale,
       });
       const warpedRaw = await sharp(warpedCanvasPng)
         .ensureAlpha()

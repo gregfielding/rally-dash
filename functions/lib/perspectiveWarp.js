@@ -182,7 +182,7 @@ function isValidNormalizedQuad(quad) {
  * @param {number} params.outputHeight  model photo height (px)
  * @returns {Promise<Buffer>} PNG buffer, outputWidth×outputHeight, RGBA
  */
-async function warpDesignToQuad({ sharp, designBuffer, quad, outputWidth, outputHeight }) {
+async function warpDesignToQuad({ sharp, designBuffer, quad, outputWidth, outputHeight, fillRatio }) {
   if (!isValidNormalizedQuad(quad)) {
     throw new Error("perspectiveWarp.warpDesignToQuad: invalid normalized quad");
   }
@@ -206,8 +206,17 @@ async function warpDesignToQuad({ sharp, designBuffer, quad, outputWidth, output
   const quadH = (edge(dPts[0], dPts[3]) + edge(dPts[1], dPts[2])) / 2;
   const quadAspect = quadH > 0 ? quadW / quadH : 1;
   const designAspect = preMeta.height > 0 ? preMeta.width / preMeta.height : 1;
+  /**
+   * fillRatio (0–1, default 1): fraction of the quad the design occupies —
+   * callers pass their resolved placement scale so on-body size follows the
+   * SAME per-color/per-product tuning knobs as the flat renders instead of
+   * always filling the print quad seam-to-seam.
+   */
+  const fill = Number.isFinite(fillRatio) && fillRatio > 0 ? Math.min(1, Math.max(0.2, fillRatio)) : 1;
+  const needsAspectFit =
+    Number.isFinite(quadAspect) && Number.isFinite(designAspect) && Math.abs(designAspect - quadAspect) / quadAspect > 0.01;
   let fittedBuffer = designBuffer;
-  if (Number.isFinite(quadAspect) && Number.isFinite(designAspect) && Math.abs(designAspect - quadAspect) / quadAspect > 0.01) {
+  if (needsAspectFit || fill < 0.999) {
     let canvasW;
     let canvasH;
     if (designAspect >= quadAspect) {
@@ -217,6 +226,9 @@ async function warpDesignToQuad({ sharp, designBuffer, quad, outputWidth, output
       canvasH = preMeta.height;
       canvasW = Math.max(1, Math.round(preMeta.height * quadAspect));
     }
+    // Shrink the design within the quad-aspect canvas by growing the canvas.
+    canvasW = Math.max(preMeta.width, Math.round(canvasW / fill));
+    canvasH = Math.max(preMeta.height, Math.round(canvasH / fill));
     fittedBuffer = await sharp({
       create: { width: canvasW, height: canvasH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
     })

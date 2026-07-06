@@ -52,6 +52,7 @@ function readStructuredPlacementOverride(product, side) {
     po.defaultX != null ||
     po.defaultY != null ||
     po.defaultScale != null ||
+    po.scaleMultiplier != null ||
     (po.safeArea &&
       (po.safeArea.x != null || po.safeArea.y != null || po.safeArea.w != null || po.safeArea.h != null));
   return has ? po : null;
@@ -246,6 +247,16 @@ function resolveEffectivePlacement(product, blank, side, variant) {
     if (structured.defaultX != null) defaultX = structured.defaultX;
     if (structured.defaultY != null) defaultY = structured.defaultY;
     if (structured.defaultScale != null) defaultScale = structured.defaultScale;
+    /**
+     * scaleMultiplier (2026-07-05): per-PRODUCT sizing layered ON TOP of the
+     * per-color blank tuning. Blank knobs encode photo geometry per color;
+     * this knob encodes the design-class size (a 1-line wordmark vs a 3-line
+     * block want different visual widths on the same garment). Multiplies
+     * whatever the chain resolved so per-color variance is preserved.
+     */
+    if (structured.scaleMultiplier != null && Number.isFinite(Number(structured.scaleMultiplier)) && Number(structured.scaleMultiplier) > 0) {
+      defaultScale = defaultScale * Number(structured.scaleMultiplier);
+    }
     safeArea = mergeSafeArea(safeArea, structured.safeArea);
     source = "product_override";
   } else if (legacy) {
@@ -316,6 +327,16 @@ function resolveEffectivePlacementForRenderTarget(product, blank, variant, targe
     if (structured.defaultX != null) defaultX = structured.defaultX;
     if (structured.defaultY != null) defaultY = structured.defaultY;
     if (structured.defaultScale != null) defaultScale = structured.defaultScale;
+    /**
+     * scaleMultiplier (2026-07-05): per-PRODUCT sizing layered ON TOP of the
+     * per-color blank tuning. Blank knobs encode photo geometry per color;
+     * this knob encodes the design-class size (a 1-line wordmark vs a 3-line
+     * block want different visual widths on the same garment). Multiplies
+     * whatever the chain resolved so per-color variance is preserved.
+     */
+    if (structured.scaleMultiplier != null && Number.isFinite(Number(structured.scaleMultiplier)) && Number(structured.scaleMultiplier) > 0) {
+      defaultScale = defaultScale * Number(structured.scaleMultiplier);
+    }
     safeArea = mergeSafeArea(safeArea, structured.safeArea);
     source = "product_override";
   } else if (legacy) {
@@ -550,6 +571,22 @@ function resolveEffectiveRenderTargetSettings(product, blank, variant, target) {
   const prodPatch = productPlacementToRenderTargetSettingsPatch(product, side);
   const productPlacementApplied = !!(prodPatch.placement && Object.keys(prodPatch.placement).length > 0);
   settings = mergeRenderTargetSettings(settings, prodPatch);
+
+  /**
+   * scaleMultiplier (2026-07-05): per-PRODUCT design-class sizing applied
+   * multiplicatively AFTER the whole chain (blank → per-color matrix →
+   * variant slice → product absolute overrides), so per-color photo-geometry
+   * tuning is preserved. This settings path is what the render engine
+   * actually consumes (tuning.settings.placement.scale).
+   */
+  const stMult = readStructuredPlacementOverride(product, side);
+  const mult = stMult && stMult.scaleMultiplier != null ? Number(stMult.scaleMultiplier) : null;
+  if (mult != null && Number.isFinite(mult) && mult > 0 && settings && settings.placement) {
+    const cur = Number(settings.placement.scale);
+    if (Number.isFinite(cur)) {
+      settings = { ...settings, placement: { ...settings.placement, scale: cur * mult } };
+    }
+  }
 
   return {
     settings,
