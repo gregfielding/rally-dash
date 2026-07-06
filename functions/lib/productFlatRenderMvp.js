@@ -514,6 +514,9 @@ async function render8394DesignOnGarmentSharp(options) {
     renderTreatment,
     renderSelectionLog,
     debugArtifacts,
+    /** Optional garment-silhouette mask PNG (rp_blank_masks model pose) — clips
+     *  the warped design where the body curves away (L7 parity with editor). */
+    garmentMaskBuffer,
   } = options;
 
   let artwork8394VisibleVerticalMetrics = null;
@@ -621,6 +624,45 @@ async function render8394DesignOnGarmentSharp(options) {
         fillRatio: tuning && tuning.settings && tuning.settings.placement ? tuning.settings.placement.scale : 1,
       });
       resizedBasePng = await sharp(warpedCanvasPng).ensureAlpha().png().toBuffer();
+      /**
+       * Garment-silhouette clip (L7 port from composeStageA, 2026-07-05): the
+       * quad is a flat rectangle but the body curves — without clipping by the
+       * model-pose mask, the design's edges float past the garment contour.
+       * Multiply warped-design alpha by the feathered SAM silhouette. Mean
+       * guard skips near-empty masks (failed segmentation) so a bad mask can't
+       * erase the whole design.
+       */
+      if (garmentMaskBuffer) {
+        try {
+          const featherSigma = Math.max(1, Math.round(blankWidth * 0.004));
+          const gmRaw = await sharp(garmentMaskBuffer)
+            .resize(blankWidth, blankHeight, { fit: "fill" })
+            .grayscale()
+            .blur(featherSigma)
+            .raw()
+            .toBuffer({ resolveWithObject: true });
+          const gm = gmRaw.data;
+          let gmSum = 0;
+          for (let p = 0; p < gm.length; p++) gmSum += gm[p];
+          const gmMean = gm.length > 0 ? gmSum / gm.length : 0;
+          if (gmMean >= 5) {
+            const designRaw = await sharp(resizedBasePng).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+            const d = designRaw.data;
+            for (let p = 0; p < gm.length; p++) {
+              const a = p * 4 + 3;
+              d[a] = Math.round((d[a] * gm[p]) / 255);
+            }
+            resizedBasePng = await sharp(d, { raw: { width: blankWidth, height: blankHeight, channels: 4 } })
+              .png()
+              .toBuffer();
+            console.log(`[render8394] garment-silhouette clip applied (${target}, featherσ=${featherSigma})`);
+          } else {
+            console.log(`[render8394] garment clip skipped (silhouette mean=${Math.round(gmMean)} < 5)`);
+          }
+        } catch (clipErr) {
+          console.warn(`[render8394] garment clip failed (${target}):`, clipErr && clipErr.message ? clipErr.message : clipErr);
+        }
+      }
       /**
        * The warped design is now a full-canvas RGBA at (0,0). Reset the placement
        * vars so the existing composite + metrics code (parameterized on these)

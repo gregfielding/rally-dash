@@ -254,6 +254,25 @@ async function composeOfficial8394ModelRole(ctx) {
 
   const renderSelectionLog = [];
 
+  /**
+   * Garment-silhouette mask (rp_blank_masks {blankId}_{variantId}_{model_*}):
+   * clips the quad-warped design where the body curves away from the flat
+   * print quad. Missing mask → null (engine no-ops; render is unclipped, same
+   * as pre-L7 behavior — the editor badge flags missing model masks).
+   */
+  let garmentMaskBuffer = null;
+  try {
+    const maskDocId = `${String(blank.blankId || "").trim()}_${blankVariantId}_${renderTarget}`;
+    const maskDoc = await db.collection("rp_blank_masks").doc(maskDocId).get();
+    const maskData = maskDoc.exists ? maskDoc.data() : null;
+    if (maskData && maskData.mask && maskData.mask.downloadUrl) {
+      const maskResp = await fetchFn(maskData.mask.downloadUrl);
+      if (maskResp.ok) garmentMaskBuffer = Buffer.from(await maskResp.arrayBuffer());
+    }
+  } catch (maskErr) {
+    console.warn("[officialProductModelCompose] garment mask fetch failed:", maskErr && maskErr.message ? maskErr.message : maskErr);
+  }
+
   const { flatCleanBuffer, flatBlendedBuffer } = await render8394DesignOnGarmentSharp({
     sharp,
     blankBuffer,
@@ -266,6 +285,7 @@ async function composeOfficial8394ModelRole(ctx) {
     target: renderTarget,
     renderTreatment,
     renderSelectionLog,
+    garmentMaskBuffer,
   });
 
   const outBuf = renderTreatment === "clean" ? flatCleanBuffer : flatBlendedBuffer;
