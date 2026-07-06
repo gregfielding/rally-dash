@@ -2729,6 +2729,8 @@ export interface RpProductPlacementOverrideSlice {
    * size (1-line wordmark vs 3-line block on the same garment).
    */
   scaleMultiplier?: number;
+  /** Target-scoped multiplier — wins over scaleMultiplier for that render target (e.g. { model_back: 1.3 }). */
+  scaleMultiplierByTarget?: Record<string, number>;
   safeArea?: { x?: number; y?: number; w?: number; h?: number };
 }
 

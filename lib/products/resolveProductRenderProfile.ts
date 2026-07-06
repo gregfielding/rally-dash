@@ -108,6 +108,7 @@ function readStructuredPlacementOverride(
     slice.defaultY != null ||
     slice.defaultScale != null ||
     slice.scaleMultiplier != null ||
+    slice.scaleMultiplierByTarget != null ||
     (slice.safeArea != null &&
       (slice.safeArea.x != null ||
         slice.safeArea.y != null ||

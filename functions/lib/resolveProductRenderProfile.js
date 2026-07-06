@@ -53,6 +53,7 @@ function readStructuredPlacementOverride(product, side) {
     po.defaultY != null ||
     po.defaultScale != null ||
     po.scaleMultiplier != null ||
+    po.scaleMultiplierByTarget != null ||
     (po.safeArea &&
       (po.safeArea.x != null || po.safeArea.y != null || po.safeArea.w != null || po.safeArea.h != null));
   return has ? po : null;
@@ -580,7 +581,18 @@ function resolveEffectiveRenderTargetSettings(product, blank, variant, target) {
    * actually consumes (tuning.settings.placement.scale).
    */
   const stMult = readStructuredPlacementOverride(product, side);
-  const mult = stMult && stMult.scaleMultiplier != null ? Number(stMult.scaleMultiplier) : null;
+  /**
+   * Target-scoped multiplier wins over the side-level one (2026-07-05): flat
+   * and model targets on the same side can need OPPOSITE corrections (panty
+   * flat_back was seam-to-seam -> 0.75, while model_back was already tuned
+   * conservatively per color and 0.75 made on-body text tiny).
+   * placementOverrides.{side}.scaleMultiplierByTarget = { model_back: 1.3, ... }
+   */
+  let mult = stMult && stMult.scaleMultiplier != null ? Number(stMult.scaleMultiplier) : null;
+  const byTarget = stMult && stMult.scaleMultiplierByTarget;
+  if (byTarget && byTarget[target] != null && Number.isFinite(Number(byTarget[target]))) {
+    mult = Number(byTarget[target]);
+  }
   if (mult != null && Number.isFinite(mult) && mult > 0 && settings && settings.placement) {
     const cur = Number(settings.placement.scale);
     if (Number.isFinite(cur)) {
