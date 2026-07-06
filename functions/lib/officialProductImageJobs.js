@@ -119,6 +119,15 @@ function buildVariantPatchForOfficialRole(admin, variantDoc, role, imageUrl, sto
     flat_front_clean: { role: "flat_front", lookType: "flat_clean", sort: 20, view: "front" },
     flat_back_designed: { role: "flat_back", lookType: "flat_blended", sort: 30, view: "back" },
     model_front_clean: { role: "model_front", lookType: "model_clean", sort: 40, view: "front" },
+    /**
+     * N3 front-print roles (tank/crew/tee). Missing from this map until
+     * 2026-07-05 — composes succeeded but the variant patch fell through every
+     * role branch, so only mockupUrl was written and PDP media stayed empty.
+     * A front-print plan never contains the *_clean front roles alongside
+     * these, so reusing the flat_front/model_front commerce roles is safe.
+     */
+    flat_front_designed: { role: "flat_front", lookType: "flat_blended", sort: 20, view: "front" },
+    model_front_designed: { role: "model_front", lookType: "model_blended", sort: 10, view: "front" },
   };
   const g = genMap[role];
   const recipeProvenance =
@@ -223,10 +232,14 @@ function buildVariantPatchForOfficialRole(admin, variantDoc, role, imageUrl, sto
 
   if (role === "model_back_designed") {
     flatRenders.model_blended = { ...(flatRenders.model_blended || {}), back: { ...slot, lookType: "model_blended", view: "back" } };
+  } else if (role === "model_front_designed") {
+    flatRenders.model_blended = { ...(flatRenders.model_blended || {}), front: { ...slot, lookType: "model_blended", view: "front" } };
   } else if (role === "model_front_clean") {
     flatRenders.model_clean = { ...(flatRenders.model_clean || {}), front: { ...slot, lookType: "model_clean", view: "front" } };
   } else if (role === "flat_front_clean") {
     flatRenders.flat_clean = { ...(flatRenders.flat_clean || {}), front: { ...slot, lookType: "flat_clean", view: "front" } };
+  } else if (role === "flat_front_designed") {
+    flatRenders.flat_blended = { ...(flatRenders.flat_blended || {}), front: { ...slot, lookType: "flat_blended", view: "front" } };
   } else if (role === "flat_back_designed") {
     flatRenders.flat_blended = { ...(flatRenders.flat_blended || {}), back: { ...slot, lookType: "flat_blended", view: "back" } };
   }
@@ -235,7 +248,7 @@ function buildVariantPatchForOfficialRole(admin, variantDoc, role, imageUrl, sto
   if (role === "model_back_designed" || role === "flat_back_designed") {
     media.heroBack = url;
   }
-  if (role === "model_front_clean" || role === "flat_front_clean") {
+  if (role === "model_front_clean" || role === "flat_front_clean" || role === "flat_front_designed" || role === "model_front_designed") {
     media.heroFront = url;
   }
 

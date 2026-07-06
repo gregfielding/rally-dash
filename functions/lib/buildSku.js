@@ -76,12 +76,20 @@ function buildDesignCodeForSku(p) {
     const s = String(raw).trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
     return s.slice(0, Math.max(1, maxLen));
   };
-  const tc = tryNormalize(p.themeCode, 10);
-  if (tc.length >= 2) return tc;
+  /**
+   * designFamily FIRST (2026-07-05 fix). designFamily is the per-design token
+   * (unique at 8 chars by convention); themeCode is the SHELF — many designs
+   * share it. themeCode-first made every same-shelf design collide on SKUs
+   * once shelf themes landed (10 KNOW_BALL designs starved each other's
+   * variants via the global SKU-uniqueness check). Historically theme ===
+   * family, which is why the old order looked correct.
+   */
   const fam = tryNormalize(p.designFamily, 8);
   const ser = tryNormalize(p.designSeries, 6);
   const combined = `${fam}${ser}`.slice(0, 10);
   if (combined.length >= 2) return combined;
+  const tc = tryNormalize(p.themeCode, 10);
+  if (tc.length >= 2) return tc;
   const dt = tryNormalize(p.designType, 10);
   if (dt.length >= 2) return dt;
   const id = tryNormalize(p.designId, 8);

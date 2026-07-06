@@ -182,19 +182,19 @@ for (const [name, impl] of implementations) {
   });
 
   describe(`buildDesignCodeForSku — ${name}`, () => {
-    it("prefers themeCode when ≥2 chars", () => {
+    it("prefers designFamily over themeCode (theme is the SHELF, shared across designs — 2026-07-05 priority flip)", () => {
       expect(
         impl.buildDesignCodeForSku({
-          themeCode: "PILLOWS",
-          designFamily: "ignored",
+          themeCode: "KNOW_BALL",
+          designFamily: "kmbaseball",
           designSeries: null,
           designType: "ignored",
           designId: "ignored",
         })
-      ).toBe("PILLOWS");
+      ).toBe("KMBASEBA");
     });
 
-    it("falls back to family+series when themeCode too short", () => {
+    it("family+series combine when both usable", () => {
       expect(
         impl.buildDesignCodeForSku({
           themeCode: "",
@@ -204,6 +204,18 @@ for (const [name, impl] of implementations) {
           designId: "abc123",
         })
       ).toBe("CITY69");
+    });
+
+    it("falls back to themeCode when family unusable", () => {
+      expect(
+        impl.buildDesignCodeForSku({
+          themeCode: "PILLOWS",
+          designFamily: null,
+          designSeries: null,
+          designType: "ignored",
+          designId: "ignored",
+        })
+      ).toBe("PILLOWS");
     });
 
     it("falls back to designType when family+series unusable", () => {

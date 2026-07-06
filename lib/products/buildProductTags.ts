@@ -16,17 +16,23 @@ export function slugifyUnderscore(value: string): string {
 }
 
 export function normalizeTheme(themeName: string | null | undefined, themeCode: string | null | undefined): string | null {
-  if (themeName != null && String(themeName).trim()) {
-    return String(themeName)
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, "_");
-  }
+  /**
+   * themeCode FIRST (2026-07-05 flip, mirrors functions/lib/buildProductTags.js).
+   * themeCode is the canonical shelf code smart collections key on; themeName is
+   * a display label (often the per-design productLabel), which fragmented one
+   * shelf into 30+ single-design theme tags.
+   */
   if (themeCode != null && String(themeCode).trim()) {
     return String(themeCode)
       .trim()
       .toLowerCase()
       .replace(/^city_/i, "");
+  }
+  if (themeName != null && String(themeName).trim()) {
+    return String(themeName)
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "_");
   }
   return null;
 }

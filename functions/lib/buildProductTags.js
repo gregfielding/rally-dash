@@ -17,17 +17,24 @@ function slugifyUnderscore(value) {
 }
 
 function normalizeTheme(themeName, themeCode) {
-  if (themeName != null && String(themeName).trim()) {
-    return String(themeName)
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, "_");
-  }
+  /**
+   * themeCode FIRST (2026-07-05 flip). themeCode is the canonical shelf code
+   * (KNOW_BALL → theme:know_ball) that smart collections key on; themeName is
+   * a display label (often the per-design productLabel), which fragmented one
+   * shelf into 30+ single-design theme tags. Conventions doc: tags come from
+   * CODES, names are display-only.
+   */
   if (themeCode != null && String(themeCode).trim()) {
     return String(themeCode)
       .trim()
       .toLowerCase()
       .replace(/^city_/i, "");
+  }
+  if (themeName != null && String(themeName).trim()) {
+    return String(themeName)
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "_");
   }
   return null;
 }

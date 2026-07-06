@@ -189,8 +189,50 @@ async function warpDesignToQuad({ sharp, designBuffer, quad, outputWidth, output
   const W = Math.max(1, Math.round(outputWidth));
   const Hh = Math.max(1, Math.round(outputHeight));
 
+  /**
+   * Aspect-fit (2026-07-05): the homography maps the design RECTANGLE onto the
+   * quad, so artwork whose aspect differs from the quad's was stretched to fill
+   * it — wide single-line text designs (3600×310) came out vertically smeared
+   * on-body while the flat path (which preserves aspect) was clean. Letterbox
+   * the design onto a transparent canvas matching the quad's pixel aspect
+   * BEFORE computing the warp; the design then keeps its proportions centered
+   * inside the quad. Square-ish artwork (aspect ≈ quad) is visually unchanged.
+   * Lives here so BOTH callers (engine + editor preview) stay identical.
+   */
+  const preMeta = await sharp(designBuffer).metadata();
+  const dPts = quadToPixels(quad, W, Hh);
+  const edge = (a, b) => Math.hypot(b.x - a.x, b.y - a.y);
+  const quadW = (edge(dPts[0], dPts[1]) + edge(dPts[3], dPts[2])) / 2;
+  const quadH = (edge(dPts[0], dPts[3]) + edge(dPts[1], dPts[2])) / 2;
+  const quadAspect = quadH > 0 ? quadW / quadH : 1;
+  const designAspect = preMeta.height > 0 ? preMeta.width / preMeta.height : 1;
+  let fittedBuffer = designBuffer;
+  if (Number.isFinite(quadAspect) && Number.isFinite(designAspect) && Math.abs(designAspect - quadAspect) / quadAspect > 0.01) {
+    let canvasW;
+    let canvasH;
+    if (designAspect >= quadAspect) {
+      canvasW = preMeta.width;
+      canvasH = Math.max(1, Math.round(preMeta.width / quadAspect));
+    } else {
+      canvasH = preMeta.height;
+      canvasW = Math.max(1, Math.round(preMeta.height * quadAspect));
+    }
+    fittedBuffer = await sharp({
+      create: { width: canvasW, height: canvasH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } },
+    })
+      .composite([
+        {
+          input: designBuffer,
+          left: Math.round((canvasW - preMeta.width) / 2),
+          top: Math.round((canvasH - preMeta.height) / 2),
+        },
+      ])
+      .png()
+      .toBuffer();
+  }
+
   // Load design as raw RGBA + its native dimensions.
-  const { data: srcData, info: srcInfo } = await sharp(designBuffer)
+  const { data: srcData, info: srcInfo } = await sharp(fittedBuffer)
     .ensureAlpha()
     .raw()
     .toBuffer({ resolveWithObject: true });
