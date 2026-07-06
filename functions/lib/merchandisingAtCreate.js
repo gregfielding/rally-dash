@@ -117,7 +117,12 @@ function buildStorefrontProductTypeWord(blank) {
   const cat = String(blank.garmentCategory || blank.category || "panty").toLowerCase();
   if (cat === "panty") return "Panty";
   if (cat === "thong") return "Thong";
-  if (cat === "tank") return "Tank";
+  if (cat === "tank") {
+    /** Crop silhouettes title differently (2026-07-05): "Crop Tank" disambiguates
+     *  1822GD products from TR3008 in lists and storefront titles. */
+    const gsTank = String(blank.garmentStyle || blank.styleName || "").toLowerCase();
+    return /\bcrop\b/.test(gsTank) ? "Crop Tank" : "Tank";
+  }
   if (cat === "crewneck") return "Crewneck";
   const gs = blank.garmentStyle && String(blank.garmentStyle).trim();
   if (gs) {

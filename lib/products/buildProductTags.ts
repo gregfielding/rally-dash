@@ -169,7 +169,11 @@ export function buildProductTypeForTags(blank: RPBlank | null | undefined): {
   let word = "Apparel";
   if (cat === "panty") word = "Panty";
   else if (cat === "thong") word = "Thong";
-  else if (cat === "tank") word = "Tank";
+  else if (cat === "tank") {
+    /** Mirrors functions/lib/merchandisingAtCreate: crop silhouettes title as "Crop Tank". */
+    const gsTank = String((blank as { garmentStyle?: string; styleName?: string } | null)?.garmentStyle || blank?.styleName || "").toLowerCase();
+    word = /\bcrop\b/.test(gsTank) ? "Crop Tank" : "Tank";
+  }
   else if (cat === "crewneck") word = "Crewneck";
   const gs = String(blank.garmentStyle || blank.styleName || "").toLowerCase();
   if (word === "Panty" && gs.includes("bikini")) {
